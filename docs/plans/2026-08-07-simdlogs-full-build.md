@@ -421,6 +421,29 @@ README with the published contract numbers, docs for the ES surface, versioning,
 
 ---
 
+## Decision points (the complete list)
+
+Every load-bearing choice in this plan, and the evidence that settles it. Anything not listed here is settled by convention — the simd-library discipline (tiers, conformance, wrong.md), the benchmark methodology, Go 1.26.2→1.27 — and must not be re-opened in review.
+
+| # | decision | open? | rule that settles it |
+|---|---|---|---|
+| 1 | Codec default: LZ4 vs zstd | settled | LZ4 default (decode speed is the scan bottleneck), zstd selectable per column; the gate's scan benchmarks enforce it |
+| 2 | Group reader: mmap vs async pread | open | `GroupReader` interface from day one; the gate compares page-fault latency and thrash under parallel query; whichever wins is the default, the loser stays behind the interface |
+| 3 | Text index: token bloom vs full postings | open | contract query class (d); token bloom ships regardless; postings only if text-selective queries are measured to dominate — recorded in wrong.md either way |
+| 4 | Group size: 64K vs 128K rows | open | swept early (Task 1.3 benchmark): skip granularity vs merge/IO amortization, on the contract corpus |
+| 5 | One file per group | settled | mmap append is racy; index file rewritten on commit |
+| 6 | Ingest sharding: hash of stream id | settled | VL-parity, writer concurrency; revisit only if the ingest benchmark shows a hotspot |
+| 7 | Loki/OTLP wire format: hand-decode vs generated proto | settled | hand-decode (few stable fields) with conformance against recorded bytes |
+| 8 | Parallelism: work-stealing pool over groups | settled | the plan DAG is group-parallel; per-group SIMD inside |
+| 9 | Dict threshold (when a column dicts) | open | measured from group encode stats: dict if cardinality < 10% of rows, swept later against scan cost |
+| 10 | Bloom budget per group | open | saturating per-group budget like the reference; tuned by measured false-positive rate on the contract corpus |
+| 11 | Flush triggers: 64K rows / 64 MB / 2 s | open | swept by the ingest benchmark; crash-safety semantics are fixed regardless |
+| 12 | Regex: stdlib RE2 on survivors only | settled | RE2 is the only honest regex; it never runs on skipped rows |
+| 13 | Prefetch: MADV_WILLNEED | open | lives behind the reader interface (decision 2); measure before advertising |
+| 14 | Toolchain: 1.26.2, 1.27 on release | settled | no toolchain-quirk dependencies, ever |
+
+When a gate measurement contradicts a settled decision, the decision changes and the entry lands in `docs/wrong.md` — that is the plan working, not failing.
+
 ## The plan's honesty clause
 
 Nothing in phases 1–4 may depend on a phase-5 kernel to be correct — the scalar references are the conformance baseline forever, and the kernels replace them by measurement. When a measurement contradicts a design decision here, the decision changes and the entry lands in `docs/wrong.md` — that is the plan working, not failing.
