@@ -146,8 +146,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/select/vmui", s.ui)
 	mux.HandleFunc("/", s.ui) // catch-all: serve the UI at the root
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)
-	mux.HandleFunc("/select/sql", s.sqlQuery)     // SQL SELECT subset (beyond VL)
-	mux.HandleFunc("/select/logsql/tail", s.tail) // live tail: stream matching rows as they arrive
+	mux.HandleFunc("/select/sql", s.sqlQuery)        // SQL SELECT subset (beyond VL)
+	mux.HandleFunc("/select/vector", s.vectorSearch) // k-NN over embeddings (beyond VL)
+	mux.HandleFunc("/select/logsql/tail", s.tail)    // live tail: stream matching rows as they arrive
 	mux.HandleFunc("/select/logsql/hits", s.selectHits)
 	mux.HandleFunc("/select/logsql/field_names", s.fieldNames)
 	mux.HandleFunc("/select/logsql/field_values", s.fieldValues)
@@ -339,6 +340,33 @@ func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
 	defer bw.Flush()
 	var buf []byte
 	for _, row := range query.RunPipeline(s.tn(r).store, q) {
+		buf = appendRowJSON(buf[:0], row)
+		bw.Write(buf)
+	}
+}
+
+// vectorSearch runs cosine k-NN over an embedding column -- semantic/vector log
+// search (beyond VL). Body: {"field":"emb","vector":[...],"k":10}; the time
+// window comes from start/end params. Embeddings are bring-your-own (logs carry
+// a vector column).
+func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Field  string    `json:"field"`
+		Vector []float32 `json:"vector"`
+		K      int       `json:"k"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if body.Field == "" {
+		body.Field = "emb"
+	}
+	from, to := timeWindow(r)
+	bw := bufio.NewWriter(w)
+	defer bw.Flush()
+	var buf []byte
+	for _, row := range query.VectorSearch(s.tn(r).store, from, to, body.Field, body.Vector, body.K) {
 		buf = appendRowJSON(buf[:0], row)
 		bw.Write(buf)
 	}

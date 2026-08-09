@@ -30,6 +30,8 @@ type Column struct {
 	Type ColumnType
 	Dict *DictColumn // for ColDict
 	Ts   []int64     // for ColTimestamp
+	Vec  []float32   // for ColVector (flat, Rows*Dim)
+	Dim  int         // for ColVector
 }
 
 // Group is the in-memory form: columns plus the row count.
@@ -103,6 +105,9 @@ func (g *Group) Marshal() []byte {
 					timeMax = t
 				}
 			}
+		case ColVector:
+			m.Width = c.Dim
+			b = append(b, encodeVectors(c.Vec, c.Dim)...)
 		}
 		m.DataLen = len(b) - m.DataOff
 		metas[ci] = m

@@ -8,6 +8,7 @@ package storage
 
 import (
 	"encoding/binary"
+	"math"
 	"math/bits"
 	"sort"
 
@@ -20,7 +21,20 @@ type ColumnType uint8
 const (
 	ColDict      ColumnType = iota // deduped value table + bit-packed indices
 	ColTimestamp                   // int64, delta + varint
+	ColVector                      // dense float32 embeddings: dim u32 + n*dim float32 LE
 )
+
+// encodeVectors lays out a dense embedding column: the dimension then the row
+// vectors, little-endian float32. Raw (no compression) -- embeddings are
+// high-entropy and read whole for k-NN.
+func encodeVectors(vec []float32, dim int) []byte {
+	out := make([]byte, 4+len(vec)*4)
+	binary.LittleEndian.PutUint32(out, uint32(dim))
+	for i, f := range vec {
+		binary.LittleEndian.PutUint32(out[4+i*4:], math.Float32bits(f))
+	}
+	return out
+}
 
 // DictColumn is a dictionary-encoded string column: the sorted distinct
 // values and one index per row into them.
