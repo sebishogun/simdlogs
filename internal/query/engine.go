@@ -230,6 +230,21 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	if !pointRead {
 		ts = g.TimestampsRange("_time", lo, hi)
 	}
+	// Many matches: decode each materialize column once and index into it,
+	// rather than a per-row DictValueAt point read (which decompresses a dict
+	// block per field per row). Bulk-decoding every materialize column only
+	// pays when the match set is a large fraction of the group; below n/8 the
+	// point reads win (the needle and selective AND stay lazy).
+	if cnt >= n/16 {
+		for _, f := range matFields {
+			if _, ok := cols[f]; ok {
+				continue
+			}
+			if idx, dict := g.DictIndices(f); idx != nil {
+				cols[f] = col{idx: idx, dict: dict}
+			}
+		}
+	}
 	sel.ForEach(func(i int) {
 		var t int64
 		if pointRead {
