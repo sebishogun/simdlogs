@@ -39,6 +39,9 @@ type Server struct {
 
 	rmu   sync.Mutex
 	rules []*logRule // metrics-from-logs: LogsQL evaluated on a timer, exposed on /metrics
+
+	amu    sync.Mutex
+	alerts []*alertRule // alerting: LogsQL count vs a threshold, exposed on /alerts
 }
 
 // NewServer opens (or creates) the data directory at dir and returns the
@@ -99,9 +102,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/logs", s.insertOTLPLogs)         // OpenTelemetry OTLP/HTTP logs (JSON)
 	mux.HandleFunc("/insert/journald", s.insertJournald) // systemd journal export (systemd-journal-upload)
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	mux.HandleFunc("/admin/backup", s.backup) // tar snapshot for offline restore
-	mux.HandleFunc("/metrics", s.metrics)     // Prometheus text exposition
-	mux.HandleFunc("/vmui", s.ui)             // web UI (vmui equivalent)
+	mux.HandleFunc("/admin/backup", s.backup)  // tar snapshot for offline restore
+	mux.HandleFunc("/metrics", s.metrics)      // Prometheus text exposition
+	mux.HandleFunc("/alerts", s.alertsHandler) // alerting rule state
+	mux.HandleFunc("/vmui", s.ui)              // web UI (vmui equivalent)
 	mux.HandleFunc("/select/vmui", s.ui)
 	mux.HandleFunc("/", s.ui) // catch-all: serve the UI at the root
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)

@@ -45,6 +45,37 @@ func TestWebUI(t *testing.T) {
 	}
 }
 
+func TestAlerting(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	postBody(t, ts, `{"_time":1,"level":"error"}`+"\n"+`{"_time":2,"level":"error"}`+"\n")
+	if err := srv.AddAlertRule("many_errors", "level:=error", ">", 1, 0); err != nil { // 2 > 1 -> firing
+		t.Fatal(err)
+	}
+	if err := srv.AddAlertRule("too_many_errors", "level:=error", ">", 5, 0); err != nil { // 2 > 5 -> not
+		t.Fatal(err)
+	}
+	var resp struct {
+		Alerts []struct {
+			Name   string  `json:"name"`
+			Firing bool    `json:"firing"`
+			Value  float64 `json:"value"`
+		}
+	}
+	getJSON(t, ts.URL+"/alerts", &resp)
+	got := map[string]bool{}
+	for _, a := range resp.Alerts {
+		got[a.Name] = a.Firing
+		if a.Value != 2 {
+			t.Fatalf("alert %s value = %v want 2", a.Name, a.Value)
+		}
+	}
+	if !got["many_errors"] || got["too_many_errors"] {
+		t.Fatalf("alert firing states = %v want many_errors:true too_many_errors:false", got)
+	}
+}
+
 func TestMetricsFromLogs(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())
