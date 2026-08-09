@@ -47,6 +47,10 @@ func TestClusterWriteRouting(t *testing.T) {
 	if n := len(strings.Split(strings.TrimSpace(string(body)), "\n")); n != 4 {
 		t.Fatalf("federated read got %d rows, want 4:\n%s", n, body)
 	}
+	// Federated group-by count sums across both backends.
+	if m := statsBy(t, fs, "service"); m["s"] != 4 {
+		t.Fatalf("federated stats by service = %v, want s:4", m)
+	}
 }
 
 // TestClusterFederation stands up two storage nodes with different data and a

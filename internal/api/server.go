@@ -265,6 +265,10 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 // selectHits returns per-bucket counts over the time window: the
 // reference's /select/logsql/hits shape (a histogram for dashboards).
 func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 {
+		s.federatedHits(w, r)
+		return
+	}
 	q, err := parseRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
@@ -352,6 +356,10 @@ func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 {
+		s.federatedStatsQuery(w, r)
+		return
+	}
 	q, err := parseRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), 400)

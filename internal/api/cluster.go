@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"sort"
@@ -140,6 +141,106 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 		bw.WriteString(rw.line)
 		bw.WriteByte('\n')
 	}
+}
+
+// fanOut sends the same GET (path + the request's raw query + tenant headers)
+// to every backend concurrently and returns the response bodies. A backend
+// that errors contributes nothing rather than failing the whole query.
+func (s *Server) fanOut(r *http.Request, path string) [][]byte {
+	out := make([][]byte, len(s.backends))
+	var wg sync.WaitGroup
+	for i, b := range s.backends {
+		wg.Add(1)
+		go func(i int, b string) {
+			defer wg.Done()
+			req, err := http.NewRequestWithContext(r.Context(), "GET", b+path+"?"+r.URL.RawQuery, nil)
+			if err != nil {
+				return
+			}
+			for _, h := range []string{"AccountID", "ProjectID"} {
+				if v := r.Header.Get(h); v != "" {
+					req.Header.Set(h, v)
+				}
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			out[i] = body
+		}(i, b)
+	}
+	wg.Wait()
+	return out
+}
+
+// federatedStatsQuery merges stats across storage nodes: a total count is
+// summed; a group-by count sums each value's hits. (avg/quantile across shards
+// need sum+count / sketch merge -- a follow-up; count and count-by are exact.)
+func (s *Server) federatedStatsQuery(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	bodies := s.fanOut(r, "/select/logsql/stats_query")
+	if r.FormValue("by") == "" {
+		total := 0
+		for _, b := range bodies {
+			var v struct {
+				Count int `json:"count"`
+			}
+			if json.Unmarshal(b, &v) == nil {
+				total += v.Count
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"count": total})
+		return
+	}
+	type vc struct {
+		Value string `json:"value"`
+		Hits  int    `json:"hits"`
+	}
+	merged := map[string]int{}
+	for _, b := range bodies {
+		var v struct {
+			Stats []vc `json:"stats"`
+		}
+		if json.Unmarshal(b, &v) == nil {
+			for _, s := range v.Stats {
+				merged[s.Value] += s.Hits
+			}
+		}
+	}
+	stats := make([]vc, 0, len(merged))
+	for val, h := range merged {
+		stats = append(stats, vc{val, h})
+	}
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Hits > stats[j].Hits })
+	json.NewEncoder(w).Encode(map[string]any{"stats": stats})
+}
+
+// federatedHits sums per-bucket histogram counts across storage nodes.
+func (s *Server) federatedHits(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	type hit struct {
+		Time  string `json:"_time"`
+		Count int    `json:"hits"`
+	}
+	merged := map[string]int{}
+	for _, b := range s.fanOut(r, "/select/logsql/hits") {
+		var v struct {
+			Hits []hit `json:"hits"`
+		}
+		if json.Unmarshal(b, &v) == nil {
+			for _, h := range v.Hits {
+				merged[h.Time] += h.Count
+			}
+		}
+	}
+	out := make([]hit, 0, len(merged))
+	for tm, c := range merged {
+		out = append(out, hit{tm, c})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Time < out[j].Time })
+	json.NewEncoder(w).Encode(map[string]any{"hits": out})
 }
 
 // rowLineTime extracts and parses the "_time":"..." value from a result line
