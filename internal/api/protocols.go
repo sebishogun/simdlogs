@@ -3,60 +3,59 @@ package api
 import (
 	"io"
 	"net/http"
-	"sync/atomic"
-	"time"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
 )
 
-// backup streams a tar of the store's group files: a consistent point-in-time
+// backup streams a tar of the tenant's group files: a consistent point-in-time
 // snapshot for offline restore via storage.RestoreTar.
 func (s *Server) backup(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.Header().Set("Content-Disposition", `attachment; filename="simdlogs-backup.tar"`)
-	if err := s.store.BackupTar(w); err != nil {
+	if err := s.tn(r).store.BackupTar(w); err != nil {
 		http.Error(w, err.Error(), 500)
 	}
 }
 
-// fallbackTS returns a per-record timestamp source for lines without their
-// own: wall-clock plus a monotonic bump so a burst ingested in the same
-// nanosecond still gets distinct, ordered timestamps. Atomic because the
-// parallel ingest path calls it from many goroutines.
-func (s *Server) fallbackTS() func() int64 {
-	return func() int64 { return time.Now().UnixNano() + atomic.AddInt64(&s.mono, 1) }
+// ingestBody reads the request body and hands it to one of the protocol
+// parsers against the request's tenant writer, then flushes. status is the
+// success code the protocol's clients expect.
+func (s *Server) ingestBody(w http.ResponseWriter, r *http.Request, status int,
+	parse func(*ingest.Writer, []byte, func() int64) (int, int)) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	tn := s.tn(r)
+	parse(tn.w, body, tn.fallbackTS())
+	if err := tn.w.Flush(); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.WriteHeader(status)
 }
 
-// insertLoki ingests a Grafana Loki push body (JSON). Loki clients expect a
-// 204 on success.
+// insertLoki ingests a Grafana Loki push body (JSON); clients expect 204.
 func (s *Server) insertLoki(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-	ingest.IngestLoki(s.w, body, s.fallbackTS())
-	if err := s.w.Flush(); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	s.ingestBody(w, r, http.StatusNoContent, ingest.IngestLoki)
 }
 
-// insertJournald ingests the systemd journal export format (the body
-// systemd-journal-upload POSTs).
+// insertJournald ingests the systemd journal export (systemd-journal-upload).
 func (s *Server) insertJournald(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-	ingest.IngestJournald(s.w, body, s.fallbackTS())
-	if err := s.w.Flush(); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	w.WriteHeader(http.StatusAccepted)
+	s.ingestBody(w, r, http.StatusAccepted, ingest.IngestJournald)
+}
+
+// insertSyslog ingests syslog lines over HTTP (one per line). The native
+// transport is UDP/TCP via ListenSyslog; this is for HTTP forwarders.
+func (s *Server) insertSyslog(w http.ResponseWriter, r *http.Request) {
+	s.ingestBody(w, r, http.StatusNoContent, ingest.IngestSyslog)
+}
+
+// insertDatadog ingests a Datadog logs-intake body (JSON array or object);
+// Datadog's intake returns 202 Accepted.
+func (s *Server) insertDatadog(w http.ResponseWriter, r *http.Request) {
+	s.ingestBody(w, r, http.StatusAccepted, ingest.IngestDatadog)
 }
 
 // insertOTLPLogs ingests an OpenTelemetry logs export (OTLP/HTTP, JSON). The
@@ -67,44 +66,12 @@ func (s *Server) insertOTLPLogs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	ingest.IngestOTLPLogs(s.w, body, s.fallbackTS())
-	if err := s.w.Flush(); err != nil {
+	tn := s.tn(r)
+	ingest.IngestOTLPLogs(tn.w, body, tn.fallbackTS())
+	if err := tn.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte("{}")) // empty ExportLogsServiceResponse == full success
-}
-
-// insertSyslog ingests syslog lines over HTTP (one message per line). The
-// native transport is UDP/TCP :514 via ListenSyslog; this endpoint is for
-// clients that forward syslog over HTTP.
-func (s *Server) insertSyslog(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-	ingest.IngestSyslog(s.w, body, s.fallbackTS())
-	if err := s.w.Flush(); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// insertDatadog ingests a Datadog logs-intake body (JSON array or object).
-// Datadog's intake returns 202 Accepted on success.
-func (s *Server) insertDatadog(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-	ingest.IngestDatadog(s.w, body, s.fallbackTS())
-	if err := s.w.Flush(); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	w.WriteHeader(http.StatusAccepted)
 }

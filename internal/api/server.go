@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
@@ -21,34 +22,52 @@ import (
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
-// Server holds the store and the ingest writer behind the HTTP surface.
+// Server holds the per-tenant stores behind the HTTP surface. A request's
+// tenant (AccountID:ProjectID headers, default 0:0) selects an isolated store;
+// see tenant.go.
 type Server struct {
-	store      *storage.Store
-	w          *ingest.Writer
+	dir        string
+	mu         sync.Mutex
+	tenants    map[string]*tenant
+	def        *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
+	strmFlds   []string
 	started    time.Time
-	mono       int64
-	nIngestReq int64 // ingest requests, bumped by the metrics middleware (atomic)
+	nIngestReq int64 // ingest requests (atomic)
 	nQueryReq  int64 // query requests (atomic)
 }
 
-// NewServer opens (or creates) a store at dir and returns the server.
+// NewServer opens (or creates) the data directory at dir and returns the
+// server with its default tenant ready.
 func NewServer(dir string) (*Server, error) {
-	s, err := storage.OpenStore(dir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	srv := &Server{dir: dir, tenants: map[string]*tenant{}, started: time.Now()}
+	// Optional stream-field default from the environment, so a deployment can
+	// synthesize _stream without a code change. Set before the default tenant
+	// opens so it inherits the policy.
+	if v := strings.TrimSpace(os.Getenv("SIMDLOGS_STREAM_FIELDS")); v != "" {
+		srv.strmFlds = splitCSV(v)
+	}
+	def, err := srv.tenant("0", "0")
 	if err != nil {
 		return nil, err
 	}
-	srv := &Server{store: s, w: ingest.NewWriter(s), started: time.Now()}
-	// Optional stream-field default from the environment, so a deployment can
-	// synthesize _stream without a code change.
-	if v := strings.TrimSpace(os.Getenv("SIMDLOGS_STREAM_FIELDS")); v != "" {
-		srv.SetStreamFields(splitCSV(v))
-	}
+	srv.def = def
 	return srv, nil
 }
 
 // SetStreamFields declares the fields that identify a log stream; ingested
-// records then carry a synthesized _stream label built from them.
-func (s *Server) SetStreamFields(fields []string) { s.w.SetStreamFields(fields) }
+// records then carry a synthesized _stream label built from them. Applies to
+// existing tenants and any opened later.
+func (s *Server) SetStreamFields(fields []string) {
+	s.mu.Lock()
+	s.strmFlds = append([]string(nil), fields...)
+	for _, tn := range s.tenants {
+		tn.w.SetStreamFields(fields)
+	}
+	s.mu.Unlock()
+}
 
 // splitCSV splits a comma-separated list, trimming spaces and dropping empties.
 func splitCSV(v string) []string {
@@ -87,7 +106,7 @@ func (s *Server) Handler() http.Handler {
 	// The Elasticsearch search surface VictoriaLogs lacks.
 	mux.HandleFunc("/_search", s.esSearch)
 	mux.HandleFunc("/_count", s.esCount)
-	return s.countRequests(mux)
+	return s.withTenant(mux)
 }
 
 // insertJSONLine ingests an NDJSON body and flushes it into a group.
@@ -99,14 +118,15 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 	}
 	// Fallback timestamp for a line missing _time; atomic because the
 	// parallel path calls it from many shard goroutines.
-	fallback := s.fallbackTS()
+	tn := s.tn(r)
+	fallback := tn.fallbackTS()
 	var ing, skip int
 	if len(body) >= ingest.MinParallelBytes {
-		ing, skip = ingest.IngestJSONLinesParallel(s.store, body, fallback)
+		ing, skip = ingest.IngestJSONLinesParallel(tn.store, body, fallback)
 	} else {
 		// Small body: reuse the persistent writer, no per-request pool churn.
-		ing, skip = ingest.IngestJSONLines(s.w, body, fallback)
-		if err := s.w.Flush(); err != nil {
+		ing, skip = ingest.IngestJSONLines(tn.w, body, fallback)
+		if err := tn.w.Flush(); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -121,9 +141,9 @@ func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	fallback := s.fallbackTS()
-	ing, skip := ingest.IngestLogfmt(s.w, body, fallback)
-	if err := s.w.Flush(); err != nil {
+	tn := s.tn(r)
+	ing, skip := ingest.IngestLogfmt(tn.w, body, tn.fallbackTS())
+	if err := tn.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -141,7 +161,7 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 	if len(q.Pipes) == 0 {
 		q.MatAll = true // a bare select returns whole records, not just filter fields
 	}
-	rows := query.RunPipeline(s.store, q) // applies the pipe chain; == Run when there are none
+	rows := query.RunPipeline(s.tn(r).store, q) // applies the pipe chain; == Run when there are none
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	// Hand-built NDJSON: no map[string]any, no reflection. The engine
@@ -204,15 +224,16 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("X-Accel-Buffering", "no") // don't let a proxy buffer the stream
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()                // send headers now so the client's request returns and it can read
-	cursor := s.store.TailCursor() // only groups that arrive after we subscribe
+	flusher.Flush() // send headers now so the client's request returns and it can read
+	store := s.tn(r).store
+	cursor := store.TailCursor() // only groups that arrive after we subscribe
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
 	bw := bufio.NewWriter(w)
 	ctx := r.Context()
 	var buf []byte
 	for {
-		readers, nc := s.store.GroupsAfterID(cursor)
+		readers, nc := store.GroupsAfterID(cursor)
 		if len(readers) > 0 {
 			cursor = nc
 			for _, row := range query.RunPipeline(readerStore(readers), q) {
@@ -244,7 +265,7 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 			step = int64(d)
 		}
 	}
-	buckets := query.Histogram(s.store, q, step)
+	buckets := query.Histogram(s.tn(r).store, q, step)
 	type hit struct {
 		Time  string `json:"_time"`
 		Count int    `json:"hits"`
@@ -300,12 +321,12 @@ func parseTimeParam(v string) (int64, bool) {
 
 func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
 	from, to := timeWindow(r)
-	json.NewEncoder(w).Encode(map[string]any{"names": query.FieldNames(s.store, from, to)})
+	json.NewEncoder(w).Encode(map[string]any{"names": query.FieldNames(s.tn(r).store, from, to)})
 }
 
 func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
 	from, to := timeWindow(r)
-	json.NewEncoder(w).Encode(map[string]any{"values": query.FieldValues(s.store, r.FormValue("field"), from, to)})
+	json.NewEncoder(w).Encode(map[string]any{"values": query.FieldValues(s.tn(r).store, r.FormValue("field"), from, to)})
 }
 
 func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +337,7 @@ func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
 			k = n
 		}
 	}
-	json.NewEncoder(w).Encode(map[string]any{"facets": query.Facets(s.store, from, to, k)})
+	json.NewEncoder(w).Encode(map[string]any{"facets": query.Facets(s.tn(r).store, from, to, k)})
 }
 
 func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
@@ -327,10 +348,10 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	by := r.FormValue("by")
 	if by == "" {
-		json.NewEncoder(w).Encode(map[string]any{"count": query.Count(s.store, q)})
+		json.NewEncoder(w).Encode(map[string]any{"count": query.Count(s.tn(r).store, q)})
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]any{"stats": query.StatsByField(s.store, q, by)})
+	json.NewEncoder(w).Encode(map[string]any{"stats": query.StatsByField(s.tn(r).store, q, by)})
 }
 
 func timeWindow(r *http.Request) (int64, int64) {

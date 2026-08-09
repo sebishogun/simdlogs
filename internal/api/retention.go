@@ -10,7 +10,11 @@ func (s *Server) EnforceRetention(maxAge time.Duration) int {
 		return 0
 	}
 	cutoff := time.Now().UnixNano() - int64(maxAge)
-	return s.store.DropGroupsBefore(cutoff)
+	dropped := 0
+	s.forEachTenant(func(tn *tenant) {
+		dropped += tn.store.DropGroupsBefore(cutoff)
+	})
+	return dropped
 }
 
 // StartRetention enforces maxAge every interval until the returned stop is

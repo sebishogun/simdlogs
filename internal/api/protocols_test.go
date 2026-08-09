@@ -10,12 +10,67 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
+
+func TestMultitenancyIsolation(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(acc, body string) {
+		req, _ := http.NewRequest("POST", ts.URL+"/insert/jsonline", strings.NewReader(body))
+		if acc != "" {
+			req.Header.Set("AccountID", acc)
+		}
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+	}
+	post("1", `{"_time":1,"service":"tenant1"}`+"\n")
+	post("2", `{"_time":2,"service":"tenant2"}`+"\n")
+
+	byService := func(acc string) map[string]int {
+		req, _ := http.NewRequest("GET", ts.URL+"/select/logsql/stats_query?query=*&by=service", nil)
+		if acc != "" {
+			req.Header.Set("AccountID", acc)
+		}
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var st struct {
+			Stats []struct {
+				Value string `json:"value"`
+				Hits  int    `json:"hits"`
+			}
+		}
+		json.NewDecoder(r.Body).Decode(&st)
+		r.Body.Close()
+		m := map[string]int{}
+		for _, v := range st.Stats {
+			m[v.Value] = v.Hits
+		}
+		return m
+	}
+	if m := byService("1"); m["tenant1"] != 1 || m["tenant2"] != 0 {
+		t.Fatalf("tenant 1 sees %v, want only tenant1", m)
+	}
+	if m := byService("2"); m["tenant2"] != 1 || m["tenant1"] != 0 {
+		t.Fatalf("tenant 2 sees %v, want only tenant2", m)
+	}
+	if m := byService(""); len(m) != 0 { // default 0:0 tenant has nothing
+		t.Fatalf("default tenant should be empty, saw %v", m)
+	}
+}
 
 func TestMetrics(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
@@ -61,8 +116,10 @@ func TestBackupRestore(t *testing.T) {
 	}
 	r.Body.Close()
 
+	// A per-tenant backup restores into that tenant's store dir; the default
+	// tenant lives under tenant-0-0.
 	dir := t.TempDir()
-	if err := storage.RestoreTar(&buf, dir); err != nil {
+	if err := storage.RestoreTar(&buf, filepath.Join(dir, "tenant-0-0")); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	srv2, err := NewServer(dir)
@@ -84,13 +141,13 @@ func TestRetention(t *testing.T) {
 	recent := time.Now().UnixNano()
 	postBody(t, ts, fmt.Sprintf(`{"_time":%d,"service":"a","_msg":"old"}`+"\n", old))
 	postBody(t, ts, fmt.Sprintf(`{"_time":%d,"service":"b","_msg":"new"}`+"\n", recent))
-	if n := srv.store.Len(); n != 2 {
+	if n := srv.def.store.Len(); n != 2 {
 		t.Fatalf("want 2 groups before retention, got %d", n)
 	}
 	if dropped := srv.EnforceRetention(24 * time.Hour); dropped != 1 {
 		t.Fatalf("dropped %d groups, want 1", dropped)
 	}
-	if n := srv.store.Len(); n != 1 {
+	if n := srv.def.store.Len(); n != 1 {
 		t.Fatalf("want 1 group after retention, got %d", n)
 	}
 	if st := statsBy(t, ts, "service"); st["a"] != 0 || st["b"] != 1 {

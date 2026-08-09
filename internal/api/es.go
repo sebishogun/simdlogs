@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
@@ -56,7 +55,8 @@ func (s *Server) esSearch(w http.ResponseWriter, r *http.Request) {
 	if body.Size > 0 {
 		q.Limit = body.Size
 	}
-	rows := query.Run(s.store, q)
+	q.MatAll = true // ES _source expects the whole document, not just filter fields
+	rows := query.Run(s.tn(r).store, q)
 	hits := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
 		src := map[string]any{"@timestamp": time.Unix(0, row.Time).UTC().Format(time.RFC3339Nano)}
@@ -77,7 +77,7 @@ func (s *Server) esCount(w http.ResponseWriter, r *http.Request) {
 	var body esQuery
 	json.NewDecoder(r.Body).Decode(&body)
 	q := esToQuery(body.Query)
-	json.NewEncoder(w).Encode(map[string]any{"count": query.Count(s.store, q)})
+	json.NewEncoder(w).Encode(map[string]any{"count": query.Count(s.tn(r).store, q)})
 }
 
 // esToQuery maps the DSL subset onto the planner's Query. A range on a
@@ -177,9 +177,9 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	fallback := func() int64 { return time.Now().UnixNano() + atomic.AddInt64(&s.mono, 1) }
-	ing, skip := ingest.IngestJSONLines(s.w, docs.Bytes(), fallback)
-	if err := s.w.Flush(); err != nil {
+	tn := s.tn(r)
+	ing, skip := ingest.IngestJSONLines(tn.w, docs.Bytes(), tn.fallbackTS())
+	if err := tn.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}

@@ -29,10 +29,11 @@ func (s *Server) ListenSyslog(addr string) (udp net.PacketConn, tcp net.Listener
 	return udp, tcp, nil
 }
 
-// serveSyslogUDP treats each datagram as one syslog message.
+// serveSyslogUDP treats each datagram as one syslog message. The syslog
+// transport carries no tenant header, so it feeds the default tenant.
 func (s *Server) serveSyslogUDP(c net.PacketConn) {
 	buf := make([]byte, 64*1024) // max practical syslog datagram
-	fallback := s.fallbackTS()
+	fallback := s.def.fallbackTS()
 	for {
 		n, _, err := c.ReadFrom(buf)
 		if err != nil {
@@ -41,8 +42,8 @@ func (s *Server) serveSyslogUDP(c net.PacketConn) {
 		if n == 0 {
 			continue
 		}
-		ingest.IngestSyslog(s.w, buf[:n], fallback)
-		s.w.Flush()
+		ingest.IngestSyslog(s.def.w, buf[:n], fallback)
+		s.def.w.Flush()
 	}
 }
 
@@ -59,7 +60,7 @@ func (s *Server) serveSyslogTCP(l net.Listener) {
 
 func (s *Server) handleSyslogConn(conn net.Conn) {
 	defer conn.Close()
-	fallback := s.fallbackTS()
+	fallback := s.def.fallbackTS()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -67,7 +68,7 @@ func (s *Server) handleSyslogConn(conn net.Conn) {
 		if len(line) == 0 {
 			continue
 		}
-		ingest.IngestSyslog(s.w, line, fallback)
-		s.w.Flush()
+		ingest.IngestSyslog(s.def.w, line, fallback)
+		s.def.w.Flush()
 	}
 }
