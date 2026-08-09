@@ -3,11 +3,84 @@ package api
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+func statsBy(t *testing.T, ts *httptest.Server, field string) map[string]int {
+	t.Helper()
+	var st struct {
+		Stats []struct {
+			Value string `json:"value"`
+			Hits  int    `json:"hits"`
+		}
+	}
+	getJSON(t, ts.URL+"/select/logsql/stats_query?query=*&by="+field, &st)
+	m := map[string]int{}
+	for _, v := range st.Stats {
+		m[v.Value] = v.Hits
+	}
+	return m
+}
+
+func TestSyslogIngestHTTP(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	body := "<11>1 2023-11-14T22:13:20Z host1 app1 - - - boom\n" +
+		"<11>1 2023-11-14T22:13:21Z host2 app2 - - - boom2\n" +
+		"<14>1 2023-11-14T22:13:22Z host3 app3 - - - ok\n"
+	r, err := http.Post(ts.URL+"/insert/syslog", "text/plain", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.StatusCode != http.StatusNoContent {
+		t.Fatalf("syslog status %d want 204", r.StatusCode)
+	}
+	io.Copy(io.Discard, r.Body)
+	r.Body.Close()
+	// PRI 11 -> severity err, PRI 14 -> severity info.
+	if s := statsBy(t, ts, "severity"); s["err"] != 2 || s["info"] != 1 {
+		t.Fatalf("syslog stats by severity = %v want err:2 info:1", s)
+	}
+}
+
+func TestSyslogListenUDP(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	udp, tcp, err := srv.ListenSyslog("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	defer tcp.Close()
+
+	c, err := net.Dial("udp", udp.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte("<14>1 2023-11-14T22:13:22Z h app - - - datagram")); err != nil {
+		t.Fatal(err)
+	}
+
+	// UDP + async flush: poll the query until the record lands (or time out).
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if statsBy(t, ts, "severity")["info"] == 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("syslog UDP datagram never became queryable")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
 
 func TestLogfmtIngest(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
@@ -112,6 +185,35 @@ func TestDatadogIngest(t *testing.T) {
 	}
 	if e := statsBy("env"); e["prod"] != 2 { // ddtags split into a field
 		t.Fatalf("datadog ddtags env = %v want prod:2", e)
+	}
+}
+
+func TestOTLPLogsIngest(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	body := `{"resourceLogs":[{"resource":{"attributes":[{"key":"service","value":{"stringValue":"api"}}]},"scopeLogs":[{"logRecords":[
+		{"timeUnixNano":"1700000000000000000","severityText":"ERROR","body":{"stringValue":"boom"},"attributes":[{"key":"code","value":{"intValue":"500"}}]},
+		{"timeUnixNano":"1700000000001000000","severityText":"ERROR","body":{"stringValue":"boom2"}},
+		{"timeUnixNano":"1700000000002000000","severityText":"INFO","body":{"stringValue":"ok"}}
+	]}]}]}`
+	r, err := http.Post(ts.URL+"/v1/logs", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.StatusCode != 200 {
+		t.Fatalf("otlp status %d want 200", r.StatusCode)
+	}
+	io.Copy(io.Discard, r.Body)
+	r.Body.Close()
+	if s := statsBy(t, ts, "severity"); s["ERROR"] != 2 || s["INFO"] != 1 {
+		t.Fatalf("otlp stats by severity = %v want ERROR:2 INFO:1", s)
+	}
+	if s := statsBy(t, ts, "service"); s["api"] != 3 { // resource attribute propagated to every record
+		t.Fatalf("otlp resource attr service = %v want api:3", s)
+	}
+	if s := statsBy(t, ts, "code"); s["500"] != 1 { // record attribute, int encoded as string
+		t.Fatalf("otlp record attr code = %v want 500:1", s)
 	}
 }
 
