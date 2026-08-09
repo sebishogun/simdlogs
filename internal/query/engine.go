@@ -19,6 +19,7 @@ type Query struct {
 	From, To int64
 	Preds    []Pred // implicit-AND predicates (programmatic callers, ES planner)
 	Filter   *Expr  // boolean filter tree from LogsQL; takes precedence when set
+	Pipes    []Pipe // LogsQL pipe chain (stats/sort/limit/fields), applied after the filter
 	Limit    int
 }
 

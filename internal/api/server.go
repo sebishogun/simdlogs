@@ -85,7 +85,7 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	rows := query.Run(s.store, q)
+	rows := query.RunPipeline(s.store, q) // applies the pipe chain; == Run when there are none
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	// Hand-built NDJSON: no map[string]any, no reflection. The engine

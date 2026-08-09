@@ -36,8 +36,17 @@ func ParseLogsQL(s string) (*Query, error) {
 	if err != nil {
 		return nil, err
 	}
+	pipes, err := p.parsePipes()
+	if err != nil {
+		return nil, err
+	}
 	if p.peek().kind != tEOF {
 		return nil, fmt.Errorf("simdlogs: unexpected %q in query", p.peek().val)
+	}
+	q.Pipes = pipes
+	// A match-all filter (empty AND) leaves both Preds and Filter empty.
+	if e.Op == OpAnd && len(e.Kids) == 0 {
+		return q, nil
 	}
 	if preds, ok := flatConjunction(e); ok {
 		q.Preds = preds
@@ -81,6 +90,7 @@ const (
 	tLParen
 	tRParen
 	tComma
+	tPipe
 	tAnd
 	tOr
 	tNot
@@ -93,7 +103,7 @@ type token struct {
 
 func lexSpecial(c byte) bool {
 	switch c {
-	case ' ', '\t', '\n', '\r', '(', ')', ',', ':', '=', '~', '>', '<', '"':
+	case ' ', '\t', '\n', '\r', '(', ')', ',', ':', '=', '~', '>', '<', '"', '|':
 		return true
 	}
 	return false
@@ -114,6 +124,9 @@ func lexLogsQL(s string) ([]token, error) {
 			i++
 		case c == ',':
 			out = append(out, token{",", tComma})
+			i++
+		case c == '|':
+			out = append(out, token{"|", tPipe})
 			i++
 		case c == ':':
 			out = append(out, token{":", tColon})
@@ -270,6 +283,9 @@ func (p *lqlParser) parseTerm() (*Expr, error) {
 		return nil, fmt.Errorf("simdlogs: unexpected %q", t.val)
 	}
 	if p.peek().kind != tColon {
+		if t.val == "*" {
+			return &Expr{Op: OpAnd}, nil // match all (empty conjunction)
+		}
 		// bare word -> substring on _msg
 		return &Expr{Op: OpLeaf, Pred: Pred{Field: "_msg", Kind: Contains, Value: t.val}}, nil
 	}
@@ -358,4 +374,219 @@ func (p *lqlParser) value() (string, error) {
 		return "", fmt.Errorf("simdlogs: expected a value, got %q", t.val)
 	}
 	return t.val, nil
+}
+
+// ---- pipes ----
+
+func (p *lqlParser) parsePipes() ([]Pipe, error) {
+	var pipes []Pipe
+	for p.peek().kind == tPipe {
+		p.next()
+		name := p.next()
+		if name.kind != tIdent {
+			return nil, fmt.Errorf("simdlogs: expected a pipe name, got %q", name.val)
+		}
+		switch strings.ToLower(name.val) {
+		case "stats":
+			sp, err := p.parseStats()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, sp)
+		case "sort":
+			sp, err := p.parseSort()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, sp)
+		case "limit", "head":
+			n, err := p.intArg()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &LimitPipe{N: n})
+		case "fields":
+			fs, err := p.parseBareFieldList()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &FieldsPipe{Keep: fs})
+		default:
+			return nil, fmt.Errorf("simdlogs: unknown pipe %q", name.val)
+		}
+	}
+	return pipes, nil
+}
+
+func (p *lqlParser) parseStats() (*StatsPipe, error) {
+	sp := &StatsPipe{}
+	if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "by") {
+		p.next()
+		fs, err := p.parseFieldGroup()
+		if err != nil {
+			return nil, err
+		}
+		sp.By = fs
+	}
+	for {
+		a, err := p.parseAgg()
+		if err != nil {
+			return nil, err
+		}
+		sp.Aggs = append(sp.Aggs, a)
+		if p.peek().kind == tComma {
+			p.next()
+			continue
+		}
+		break
+	}
+	if len(sp.Aggs) == 0 {
+		return nil, fmt.Errorf("simdlogs: stats needs at least one aggregation")
+	}
+	return sp, nil
+}
+
+func (p *lqlParser) parseAgg() (Agg, error) {
+	fn := p.next()
+	if fn.kind != tIdent {
+		return Agg{}, fmt.Errorf("simdlogs: expected an aggregation, got %q", fn.val)
+	}
+	if p.peek().kind != tLParen {
+		return Agg{}, fmt.Errorf("simdlogs: expected ( after %s", fn.val)
+	}
+	p.next() // (
+	field := ""
+	if k := p.peek().kind; k == tIdent || k == tString {
+		field = p.next().val
+	}
+	if p.peek().kind != tRParen {
+		return Agg{}, fmt.Errorf("simdlogs: expected ) in %s()", fn.val)
+	}
+	p.next() // )
+	kind, ok := aggKind(fn.val)
+	if !ok {
+		return Agg{}, fmt.Errorf("simdlogs: unknown aggregation %q", fn.val)
+	}
+	a := Agg{Field: field, Kind: kind}
+	if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
+		p.next()
+		al := p.next()
+		if al.kind != tIdent && al.kind != tString {
+			return Agg{}, fmt.Errorf("simdlogs: expected an alias after 'as'")
+		}
+		a.Alias = al.val
+	}
+	if a.Alias == "" {
+		if field == "" {
+			a.Alias = strings.ToLower(fn.val)
+		} else {
+			a.Alias = strings.ToLower(fn.val) + "(" + field + ")"
+		}
+	}
+	return a, nil
+}
+
+func (p *lqlParser) parseSort() (*SortPipe, error) {
+	sp := &SortPipe{}
+	if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "by") {
+		p.next()
+		fs, err := p.parseFieldGroup()
+		if err != nil {
+			return nil, err
+		}
+		sp.By = fs
+	}
+	for p.peek().kind == tIdent {
+		switch strings.ToLower(p.peek().val) {
+		case "desc":
+			p.next()
+			sp.Desc = true
+		case "asc":
+			p.next()
+		case "limit":
+			p.next()
+			n, err := p.intArg()
+			if err != nil {
+				return nil, err
+			}
+			sp.Limit = n
+		default:
+			return sp, nil
+		}
+	}
+	return sp, nil
+}
+
+// parseFieldGroup reads `(a, b, c)` or a single bare field.
+func (p *lqlParser) parseFieldGroup() ([]string, error) {
+	if p.peek().kind != tLParen {
+		if k := p.peek().kind; k == tIdent || k == tString {
+			return []string{p.next().val}, nil
+		}
+		return nil, fmt.Errorf("simdlogs: expected ( or a field")
+	}
+	p.next() // (
+	var fs []string
+	for p.peek().kind != tRParen && p.peek().kind != tEOF {
+		f := p.next()
+		if f.kind != tIdent && f.kind != tString {
+			return nil, fmt.Errorf("simdlogs: bad field %q", f.val)
+		}
+		fs = append(fs, f.val)
+		if p.peek().kind == tComma {
+			p.next()
+		}
+	}
+	if p.peek().kind != tRParen {
+		return nil, fmt.Errorf("simdlogs: expected )")
+	}
+	p.next()
+	return fs, nil
+}
+
+// parseBareFieldList reads `a, b, c` with no parentheses (the fields pipe).
+func (p *lqlParser) parseBareFieldList() ([]string, error) {
+	var fs []string
+	for {
+		f := p.next()
+		if f.kind != tIdent && f.kind != tString {
+			return nil, fmt.Errorf("simdlogs: bad field %q", f.val)
+		}
+		fs = append(fs, f.val)
+		if p.peek().kind == tComma {
+			p.next()
+			continue
+		}
+		break
+	}
+	return fs, nil
+}
+
+func (p *lqlParser) intArg() (int, error) {
+	t := p.next()
+	n, err := strconv.Atoi(t.val)
+	if err != nil {
+		return 0, fmt.Errorf("simdlogs: expected a number, got %q", t.val)
+	}
+	return n, nil
+}
+
+func aggKind(name string) (AggKind, bool) {
+	switch strings.ToLower(name) {
+	case "count":
+		return AggCount, true
+	case "sum":
+		return AggSum, true
+	case "avg":
+		return AggAvg, true
+	case "min":
+		return AggMin, true
+	case "max":
+		return AggMax, true
+	case "uniq":
+		return AggUniq, true
+	case "count_uniq":
+		return AggCountUniq, true
+	}
+	return 0, false
 }
