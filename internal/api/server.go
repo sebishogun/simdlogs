@@ -44,6 +44,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/_bulk", s.esBulk) // Elasticsearch bulk ingest
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)
+	mux.HandleFunc("/select/logsql/tail", s.tail) // live tail: stream matching rows as they arrive
 	mux.HandleFunc("/select/logsql/hits", s.selectHits)
 	mux.HandleFunc("/select/logsql/field_names", s.fieldNames)
 	mux.HandleFunc("/select/logsql/field_values", s.fieldValues)
@@ -103,6 +104,9 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	if len(q.Pipes) == 0 {
+		q.MatAll = true // a bare select returns whole records, not just filter fields
+	}
 	rows := query.RunPipeline(s.store, q) // applies the pipe chain; == Run when there are none
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
@@ -111,22 +115,84 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 	// wire time, so the result bytes are appended directly here.
 	var buf []byte
 	for _, row := range rows {
-		buf = buf[:0]
-		buf = append(buf, `{"_time":"`...)
-		buf = time.Unix(0, row.Time).UTC().AppendFormat(buf, time.RFC3339Nano)
-		buf = append(buf, '"')
-		for _, f := range row.Fields {
-			if f.Key == "_time" {
-				continue
-			}
-			buf = append(buf, ',', '"')
-			buf = appendJSONString(buf, f.Key)
-			buf = append(buf, '"', ':', '"')
-			buf = appendJSONString(buf, f.Value)
-			buf = append(buf, '"')
-		}
-		buf = append(buf, '}', '\n')
+		buf = appendRowJSON(buf[:0], row)
 		bw.Write(buf)
+	}
+}
+
+// appendRowJSON serializes one result row as an NDJSON object (trailing
+// newline). Shared by the batch select and the live tail so both emit the
+// identical wire shape.
+func appendRowJSON(buf []byte, row query.Row) []byte {
+	buf = append(buf, `{"_time":"`...)
+	buf = time.Unix(0, row.Time).UTC().AppendFormat(buf, time.RFC3339Nano)
+	buf = append(buf, '"')
+	for _, f := range row.Fields {
+		if f.Key == "_time" {
+			continue
+		}
+		buf = append(buf, ',', '"')
+		buf = appendJSONString(buf, f.Key)
+		buf = append(buf, '"', ':', '"')
+		buf = appendJSONString(buf, f.Value)
+		buf = append(buf, '"')
+	}
+	buf = append(buf, '}', '\n')
+	return buf
+}
+
+// readerStore adapts a fixed set of group readers to the query.Store
+// interface, so the live tail can run the ordinary filter/materialize path
+// over just the groups that arrived since the last poll.
+type readerStore []*storage.Reader
+
+func (rs readerStore) Groups(_, _ int64) []*storage.Reader { return rs }
+
+// tail streams matching rows as new groups are ingested: VictoriaLogs'
+// /select/logsql/tail. It subscribes at the current high-water group id and
+// polls for later ones, running the LogsQL filter over each and flushing
+// matches as NDJSON. The connection lives until the client disconnects.
+func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
+	q, err := parseRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	q.From, q.To = 0, int64(1)<<62 // live: match every timestamp in the new groups
+	q.Pipes = nil                  // tail streams raw records; a stats/sort pipe would never terminate
+	q.Limit = 0
+	q.MatAll = true // whole records, like the batch select
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Accel-Buffering", "no") // don't let a proxy buffer the stream
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()                // send headers now so the client's request returns and it can read
+	cursor := s.store.TailCursor() // only groups that arrive after we subscribe
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	bw := bufio.NewWriter(w)
+	ctx := r.Context()
+	var buf []byte
+	for {
+		readers, nc := s.store.GroupsAfterID(cursor)
+		if len(readers) > 0 {
+			cursor = nc
+			for _, row := range query.RunPipeline(readerStore(readers), q) {
+				buf = appendRowJSON(buf[:0], row)
+				bw.Write(buf)
+			}
+			bw.Flush()
+			flusher.Flush()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
 	}
 }
 

@@ -154,3 +154,37 @@ func (s *Store) Len() int {
 	defer s.mu.RUnlock()
 	return len(s.groups)
 }
+
+// TailCursor is the live-tail watermark: the delivery boundary a tailer
+// subscribes at, so it streams only groups appended afterward. It is one past
+// the highest current id (0 on an empty store), which -- because ids start at
+// 0 -- is what makes even the first-ever group tailable.
+func (s *Store) TailCursor() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var next uint64 // 0 => empty store; first group (id 0) is >= 0 and thus delivered
+	for _, g := range s.groups {
+		if g.id+1 > next {
+			next = g.id + 1
+		}
+	}
+	return next
+}
+
+// GroupsAfterID returns the readers of groups at or beyond the cursor, and the
+// advanced watermark -- the live-tail poll: each tick processes only what
+// arrived since the last cursor. Pair with TailCursor for the initial value.
+func (s *Store) GroupsAfterID(cursor uint64) (readers []*Reader, next uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	next = cursor
+	for _, g := range s.groups {
+		if g.id >= cursor {
+			readers = append(readers, g.reader)
+			if g.id+1 > next {
+				next = g.id + 1
+			}
+		}
+	}
+	return readers, next
+}

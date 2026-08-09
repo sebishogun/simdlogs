@@ -124,6 +124,35 @@ func TestMorePipes(t *testing.T) {
 	}
 }
 
+func TestStoreTailCursor(t *testing.T) {
+	s, err := storage.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(v string) *storage.Group {
+		d := storage.BuildDict([]string{v})
+		return &storage.Group{Rows: 1, Columns: []storage.Column{
+			{Name: "_time", Type: storage.ColTimestamp, Ts: []int64{1}},
+			{Name: "service", Type: storage.ColDict, Dict: &d},
+		}}
+	}
+	c := s.TailCursor() // 0 on the empty store
+	if _, err := s.AppendGroup(mk("a")); err != nil {
+		t.Fatal(err)
+	}
+	r1, c1 := s.GroupsAfterID(c) // the first-ever group (id 0) must be tailable
+	if len(r1) != 1 {
+		t.Fatalf("first group not tailed: %d readers", len(r1))
+	}
+	if _, err := s.AppendGroup(mk("b")); err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := s.GroupsAfterID(c1) // next poll sees only the newly-appended group
+	if len(r2) != 1 {
+		t.Fatalf("second poll saw %d readers, want 1 (only the new group)", len(r2))
+	}
+}
+
 func TestFilterPipe(t *testing.T) {
 	s := statsStore(t) // service a:3, b:2
 	q, err := ParseLogsQL(`* | stats by (service) count() as c | filter c:>2`)

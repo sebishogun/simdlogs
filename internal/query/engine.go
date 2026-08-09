@@ -22,6 +22,7 @@ type Query struct {
 	Pipes       []Pipe   // LogsQL pipe chain (stats/sort/limit/fields), applied after the filter
 	Materialize []string // extra fields to materialize for the pipes (beyond predicate fields)
 	Limit       int
+	MatAll      bool // materialize every column (full-record output: bare selects, live tail)
 }
 
 // PredKind selects the comparison.
@@ -200,6 +201,13 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	}
 	for _, f := range q.Materialize { // fields the pipe chain needs
 		addField(f)
+	}
+	if q.MatAll { // full-record output: every column, not just the filtered ones
+		for _, f := range g.ColumnNames() {
+			if f != "_time" {
+				addField(f)
+			}
+		}
 	}
 
 	cnt := sel.Count()

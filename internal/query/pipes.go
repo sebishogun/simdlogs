@@ -108,6 +108,7 @@ func RunPipeline(s Store, q *Query) []Row {
 	var rows []Row
 	pipes := q.Pipes
 	if len(pipes) > 0 {
+		q.MatAll = false // pipes project their own fields; skip full-record materialize
 		if sp, ok := pipes[0].(*StatsPipe); ok {
 			rows = runStats(s, q, sp)
 			pipes = pipes[1:]
