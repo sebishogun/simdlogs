@@ -80,6 +80,43 @@ func (r *Reader) TimestampAt(name string, row int) (int64, bool) {
 	return decodeTsAt(data, row), true
 }
 
+// TimeRangeMaskInto fills out with out[i] = from <= ts[i] < to for the named
+// timestamp column, skipping blocks whose [min,max] miss the window and
+// decoding only the boundary blocks -- the windowed-query time filter that
+// avoids a whole-column decode.
+func (r *Reader) TimeRangeMaskInto(name string, from, to int64, out []bool) []bool {
+	m := r.col(name)
+	if m == nil || m.Type != ColTimestamp {
+		return out[:0]
+	}
+	data := r.blob[m.DataOff : m.DataOff+m.DataLen]
+	return decodeTimeRangeInto(data, r.Rows, from, to, out)
+}
+
+// TimeWindowSpan returns the row range [lo,hi) covering the blocks that
+// overlap [from,to), from the checkpoint header alone. A windowed query
+// restricts its predicate scan to this span.
+func (r *Reader) TimeWindowSpan(name string, from, to int64) (int, int) {
+	m := r.col(name)
+	if m == nil || m.Type != ColTimestamp {
+		return 0, 0
+	}
+	data := r.blob[m.DataOff : m.DataOff+m.DataLen]
+	return timeWindowSpan(data, r.Rows, from, to)
+}
+
+// TimestampsRange decodes rows [lo,hi) of the named timestamp column into a
+// slice indexed from lo -- the windowed aggregation/materialize path, which
+// needs only the window span's times, not the whole column.
+func (r *Reader) TimestampsRange(name string, lo, hi int) []int64 {
+	m := r.col(name)
+	if m == nil || m.Type != ColTimestamp {
+		return nil
+	}
+	data := r.blob[m.DataOff : m.DataOff+m.DataLen]
+	return decodeTsRange(data, lo, hi)
+}
+
 // DictIndices decodes the per-row dictionary indices of a dict column,
 // and returns them with the dict table for value lookup.
 func (r *Reader) DictIndices(name string) ([]uint32, []string) {

@@ -17,11 +17,11 @@ identical wire calls:
 
 | query class (3M rows) | result |
 |---|---|
-| rare-value needle (full span) | simdlogs **12.6x** faster (23x engine-only) |
-| selective query (returns rows) | simdlogs **4.5x** faster |
-| aggregation (hits) | simdlogs **2.0x** faster |
-| full-scan count (engine, parallel) | **3.7x** the serial path |
-| ingest (synchronous, durable) | **2.78M rec/s** (was 384K), ~5.6x VL |
+| rare-value needle (full span) | simdlogs **13.2x** faster (23x engine-only) |
+| aggregation (hits) | simdlogs **6.0x** faster |
+| selective query (returns rows) | simdlogs **5.4x** faster |
+| windowed count (engine) | **13x** (block-skip, 839us -> 65us) |
+| ingest (synchronous, durable) | **2.81M rec/s** (was 384K), ~5.7x VL |
 
 Method, the discipline the simd repos hold to: deterministic corpus, both
 engines interleaved in one process with identical wire calls, each class
@@ -62,9 +62,15 @@ asynchronously, queryable only after a flush; even against its raw ~3s
 accept this is ~2.8x). LZ4 compression (1.43x here) is the footprint lever
 for the 100M+ scale where groups stop being cache-resident.
 
-Standing at 3M rows: faster on every class measured -- 2x at the
-aggregation, 4.5x at the selective row query, 12.6x (23x engine-only) at
-the needle, 5.6x at ingest. docs/wrong.md carries the full arc: the
+Windowed queries got a second lever: the timestamp checkpoints carry each
+block's min and max, so a query skips every block whose range misses the
+window without decoding it and restricts its predicate scan to the window's
+block span. A windowed count went from 839us to 65us in the engine (13x),
+and the aggregation head-to-head from 2.1x to 6.0x.
+
+Standing at 3M rows: faster on every class measured -- 6.0x at the
+aggregation, 5.4x at the selective row query, 13.2x (23x engine-only) at
+the needle, 5.7x at ingest. docs/wrong.md carries the full arc: the
 premise that measurement first refuted, and the engine work that turned the
 needle class from a loss into the widest win.
 
@@ -81,8 +87,8 @@ decode, bitpacked decode, SIMD hash, bitshuffle -- shipped in simd
 v1.18-v1.20 and are consumed directly.
 
 **Head-to-head vs VictoriaLogs** (the reference clone as a subprocess), 3M
-rows: 12.6x on the rare needle (23x engine-only), 4.5x on the selective row
-query, 2.0x on aggregation, 2.78M rec/s ingest (~5.6x VL). The arc from a refuted
+rows: 13.2x on the rare needle (23x engine-only), 5.4x on the selective row
+query, 6.0x on aggregation, 2.81M rec/s ingest (~5.7x VL). The arc from a refuted
 premise (VL first won the needle by 6.4x) through the vectorized-execution
 build and the three needle-path fixes is in docs/wrong.md, entries in order.
 

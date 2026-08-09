@@ -62,6 +62,19 @@ func BenchmarkEngineCount(b *testing.B) {
 }
 
 var sinkI int
+var sinkH map[int64]int
+
+func BenchmarkEngineHistogram(b *testing.B) {
+	s, lo, hi := benchStore(b, 3_000_000, 128*1024)
+	from := lo + (hi-lo)/2
+	to := from + (hi-lo)/50
+	q := &Query{From: from, To: to, Preds: []Pred{{Field: "service", Kind: Eq, Value: "auth"}}}
+	step := (to - from) / 20
+	b.ResetTimer()
+	for b.Loop() {
+		sinkH = Histogram(s, q, step)
+	}
+}
 
 func BenchmarkEngineFullScanCount(b *testing.B) {
 	s, lo, hi := benchStore(b, 3_000_000, 128*1024) // ~23 groups

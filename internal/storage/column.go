@@ -127,13 +127,20 @@ func decodeIndices(b []byte, n, width int) []uint32 {
 // selective query's handful of matches no longer decodes the whole column.
 const tsBlock = 512
 
+// tsHdrStride is the per-block checkpoint size: byte offset (u32), the
+// running timestamp before the block (i64, for the point seek), and the
+// block's min and max timestamp (i64 each, for the range skip).
+const tsHdrStride = 28
+
 // encodeTimestamps delta-encodes then zig-zag varints int64 timestamps,
-// prefixed with a checkpoint header. The stream itself is unchanged (row 0
-// as a delta from zero, the rest deltas); the header adds, per block, the
-// byte offset of the block's first row and the absolute timestamp of the
-// row before it, the two things a seek needs.
+// prefixed with a checkpoint header. The stream itself is just deltas (row 0
+// from zero, the rest from the prior row); the header records, per block,
+// the byte offset of its first row, the timestamp of the row before it (the
+// seek base), and the block's min and max -- so a query skips a whole block
+// whose [min,max] misses the window without decoding it, and restricts its
+// per-row work to the blocks the window actually spans.
 //
-//	header: numBlocks u32, blockSize u32, then per block { off u32, base i64 }
+//	header: numBlocks u32, blockSize u32, then per block { off u32, base i64, min i64, max i64 }
 //	stream: zig-zag varint deltas, one per row
 func encodeTimestamps(ts []int64) []byte {
 	n := len(ts)
@@ -143,12 +150,22 @@ func encodeTimestamps(ts []int64) []byte {
 	numBlocks := (n + tsBlock - 1) / tsBlock
 	offs := make([]uint32, numBlocks)
 	bases := make([]int64, numBlocks)
+	mins := make([]int64, numBlocks)
+	maxs := make([]int64, numBlocks)
 	var stream []byte
 	var prev int64
 	for i, t := range ts {
+		b := i / tsBlock
 		if i%tsBlock == 0 {
-			offs[i/tsBlock] = uint32(len(stream))
-			bases[i/tsBlock] = prev // timestamp of the row before this block
+			offs[b] = uint32(len(stream))
+			bases[b] = prev // timestamp of the row before this block
+			mins[b], maxs[b] = t, t
+		}
+		if t < mins[b] {
+			mins[b] = t
+		}
+		if t > maxs[b] {
+			maxs[b] = t
 		}
 		d := t
 		if i > 0 {
@@ -157,23 +174,116 @@ func encodeTimestamps(ts []int64) []byte {
 		prev = t
 		stream = binary.AppendUvarint(stream, zigzag(d))
 	}
-	out := make([]byte, 0, 8+numBlocks*12+len(stream))
+	out := make([]byte, 0, 8+numBlocks*tsHdrStride+len(stream))
 	out = appU32(out, uint32(numBlocks))
 	out = appU32(out, uint32(tsBlock))
 	for k := 0; k < numBlocks; k++ {
 		out = appU32(out, offs[k])
 		out = appI64(out, bases[k])
+		out = appI64(out, mins[k])
+		out = appI64(out, maxs[k])
 	}
 	return append(out, stream...)
 }
+
+// tsHeaderLen is the byte length of the checkpoint header.
+func tsHeaderLen(b []byte) int { return 8 + int(get32(b, 0))*tsHdrStride }
 
 // tsStream returns the varint stream past the checkpoint header.
 func tsStream(b []byte) []byte {
 	if len(b) < 8 {
 		return nil
 	}
+	return b[tsHeaderLen(b):]
+}
+
+func geti64(b []byte) int64 { return int64(binary.LittleEndian.Uint64(b)) }
+
+// timeWindowSpan returns the row range [lo,hi) covering every block whose
+// [min,max] overlaps [from,to) -- read from the header alone, no decode. A
+// query restricts its per-row predicate scan to this span, so a narrow
+// window over a big group touches a fraction of the rows. Returns 0,0 when
+// no block overlaps.
+func timeWindowSpan(b []byte, n int, from, to int64) (int, int) {
+	if len(b) < 8 {
+		return 0, n
+	}
 	numBlocks := int(get32(b, 0))
-	return b[8+numBlocks*12:]
+	bs := int(get32(b, 4))
+	lo, hi := n, 0
+	for k := 0; k < numBlocks; k++ {
+		hdr := 8 + k*tsHdrStride
+		mn := geti64(b[hdr+12:])
+		mx := geti64(b[hdr+20:])
+		if mx < from || mn >= to {
+			continue
+		}
+		bl := k * bs
+		bh := bl + bs
+		if bh > n {
+			bh = n
+		}
+		if bl < lo {
+			lo = bl
+		}
+		if bh > hi {
+			hi = bh
+		}
+	}
+	if lo >= hi {
+		return 0, 0
+	}
+	return lo, hi
+}
+
+// decodeTimeRangeInto fills out[i] = from <= ts[i] < to, skipping blocks
+// whose [min,max] miss the window (never decoded), setting whole blocks that
+// fall entirely inside, and decoding only the boundary blocks. out is
+// cleared to n and returned.
+func decodeTimeRangeInto(b []byte, n int, from, to int64, out []bool) []bool {
+	if cap(out) < n {
+		out = make([]bool, n)
+	} else {
+		out = out[:n]
+		for i := range out {
+			out[i] = false
+		}
+	}
+	if len(b) < 8 {
+		return out
+	}
+	numBlocks := int(get32(b, 0))
+	bs := int(get32(b, 4))
+	stream := b[8+numBlocks*tsHdrStride:]
+	for k := 0; k < numBlocks; k++ {
+		hdr := 8 + k*tsHdrStride
+		mn := geti64(b[hdr+12:])
+		mx := geti64(b[hdr+20:])
+		if mx < from || mn >= to {
+			continue // block entirely outside the window
+		}
+		lo := k * bs
+		hi := lo + bs
+		if hi > n {
+			hi = n
+		}
+		if mn >= from && mx < to {
+			for i := lo; i < hi; i++ {
+				out[i] = true // block entirely inside
+			}
+			continue
+		}
+		// Boundary block: decode it and compare per row.
+		prev := geti64(b[hdr+4:])
+		pos := int(get32(b, hdr))
+		for i := lo; i < hi; i++ {
+			d, w := binary.Uvarint(stream[pos:])
+			pos += w
+			prev += unzigzag(d)
+			out[i] = prev >= from && prev < to
+		}
+	}
+	return out
 }
 
 // decodeTimestamps reverses the whole column through simd.VarintDecode,
@@ -205,6 +315,32 @@ func decodeInto(b []byte, raw []uint64, out []int64) (int, error) {
 	return got, nil
 }
 
+// decodeTsRange decodes rows [lo,hi) into a slice indexed from lo, seeking to
+// the block containing lo rather than the column start -- so a windowed query
+// decodes only its window's span, not the whole column.
+func decodeTsRange(b []byte, lo, hi int) []int64 {
+	if hi <= lo || len(b) < 8 {
+		return nil
+	}
+	numBlocks := int(get32(b, 0))
+	bs := int(get32(b, 4))
+	stream := b[8+numBlocks*tsHdrStride:]
+	k := lo / bs
+	hdr := 8 + k*tsHdrStride
+	prev := geti64(b[hdr+4:])
+	pos := int(get32(b, hdr))
+	out := make([]int64, hi-lo)
+	for i := k * bs; i < hi; i++ {
+		d, w := binary.Uvarint(stream[pos:])
+		pos += w
+		prev += unzigzag(d)
+		if i >= lo {
+			out[i-lo] = prev
+		}
+	}
+	return out
+}
+
 // decodeTsAt returns the timestamp of one row by seeking to its checkpoint
 // block and decoding at most tsBlock deltas forward -- the selective-query
 // materialize path, which needs a few rows' times, not the whole column.
@@ -215,10 +351,10 @@ func decodeTsAt(b []byte, row int) int64 {
 	if k >= numBlocks {
 		return 0
 	}
-	hdr := 8 + k*12
+	hdr := 8 + k*tsHdrStride
 	off := int(get32(b, hdr))
 	prev := int64(binary.LittleEndian.Uint64(b[hdr+4:]))
-	stream := b[8+numBlocks*12:]
+	stream := b[8+numBlocks*tsHdrStride:]
 	pos := off
 	for i := k * bs; i <= row; i++ {
 		d, n := binary.Uvarint(stream[pos:])

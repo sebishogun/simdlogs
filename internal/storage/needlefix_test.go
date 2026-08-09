@@ -42,6 +42,46 @@ func TestTimestampAtMatchesFullDecode(t *testing.T) {
 	}
 }
 
+// TestTimeRangeMaskNonMonotonic verifies the per-block min/max range skip
+// agrees with a brute-force scan even when timestamps are out of order within
+// the group (the skip must not assume monotonicity), and that every matching
+// row falls inside the reported window span.
+func TestTimeRangeMaskNonMonotonic(t *testing.T) {
+	n := 3*tsBlock + 100
+	ts := make([]int64, n)
+	for i := range ts {
+		ts[i] = int64((i * 2654435761) % 100000) // scattered, non-monotonic
+	}
+	svc := make([]string, n)
+	for i := range svc {
+		svc[i] = "x"
+	}
+	sd := BuildDict(svc)
+	g := &Group{Rows: n, Columns: []Column{
+		{Name: "_time", Type: ColTimestamp, Ts: ts},
+		{Name: "service", Type: ColDict, Dict: &sd},
+	}}
+	r, err := ReadGroup(g.Marshal())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []struct{ from, to int64 }{
+		{0, 100000}, {1000, 5000}, {50000, 50001}, {-10, 10}, {99999, 200000},
+	} {
+		mask := r.TimeRangeMaskInto("_time", w.from, w.to, nil)
+		lo, hi := r.TimeWindowSpan("_time", w.from, w.to)
+		for i := 0; i < n; i++ {
+			want := ts[i] >= w.from && ts[i] < w.to
+			if mask[i] != want {
+				t.Fatalf("window [%d,%d) row %d ts=%d: mask=%v want=%v", w.from, w.to, i, ts[i], mask[i], want)
+			}
+			if want && (i < lo || i >= hi) {
+				t.Fatalf("window [%d,%d): matching row %d outside span [%d,%d)", w.from, w.to, i, lo, hi)
+			}
+		}
+	}
+}
+
 // TestPostingRowsSeek verifies the O(1) byte-offset seek returns exactly the
 // rows a brute-force scan would, for every id including the last -- the id at
 // the far end of the varint stream, which the previous single-table form

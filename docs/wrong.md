@@ -328,3 +328,31 @@ number is synchronous and durable on POST return. Ingest, the one class VL
 led, is now a decisive win, and every measured class is simdlogs': needle
 14x, selective 4.5x, aggregation 2.1x, ingest 5.6x. Next perf target is the
 aggregation, the smallest of those multiples.
+
+## Windowed queries: per-block timestamp min/max range skip
+
+The aggregation was the weakest win, so the windowed path got profiled: at a
+1/50 window it still did O(full-group) timestamp decode and predicate scan on
+each overlapping group -- varintDecodeU64AVX512 was 26% of the profile. The
+timestamp checkpoints already existed (byte offset + base per 512-row block);
+adding each block's min and max lets a query skip a whole block whose range
+misses the window without decoding it, set whole blocks that fall inside, and
+decode only the boundary blocks -- and restrict the materialize/bucketing
+decode to the window's block span (decodeTsRange). No monotonicity assumed;
+the skip is per-block min/max, verified against a brute-force scan on
+shuffled timestamps.
+
+    engine, 3M rows, 1/50 window, minimum of three:
+      windowed count:      839us -> 65us    12.9x
+      histogram (hits):    1.62ms -> 479us  3.4x
+      selective row query: 1.46ms -> 1.09ms 1.34x (materialize span-limited)
+
+    wire head-to-head vs VictoriaLogs:
+      aggregation (hits):  2.1x -> 6.0x
+      selective query:     4.5x -> 5.4x
+      needle:              13.2x  ingest: 5.7x
+
+The aggregation, the class that was 2.1x, is now 6.0x. The remaining
+windowed lever is restricting the equality/predicate scan to the block span
+(done for the time filter, not yet for the value scan) -- tracked in the
+perf-max task.

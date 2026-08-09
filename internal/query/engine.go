@@ -101,15 +101,15 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	sel.SetAll()
 
 	// Time predicate. Skip it entirely when the whole group is inside the
-	// window (the selective and full-span cases) -- no timestamp decode at
-	// all -- and use the vectorized range mask otherwise, never the per-row
-	// scalar loop that decoded and set 128K bits to filter nothing. This is
-	// the same skip the count path already had; the row path was decoding
-	// every timestamp of a needle's group only to keep all the bits.
-	var ts []int64 // decoded at most once, reused for filter and materialize
-	if g.TimeMin < q.From || g.TimeMax >= q.To {
-		ts = g.Timestamps("_time", nil, nil)
-		sel.And(rangeMaskInto(ts, q.From, q.To))
+	// window; otherwise the block-aware mask skips blocks whose [min,max]
+	// miss the window and decodes only the boundary blocks -- never the whole
+	// column, and never the per-row scalar loop the row path once ran.
+	windowed := g.TimeMin < q.From || g.TimeMax >= q.To
+	if windowed {
+		mask := g.TimeRangeMaskInto("_time", q.From, q.To, nil)
+		tb := NewBitset(n)
+		packBools(tb, mask)
+		sel.And(tb)
 	}
 
 	// Decode each predicate field's indices+dict once, reused for both the
@@ -135,21 +135,28 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	if cnt == 0 {
 		return out // no match in this group: never decode its timestamps
 	}
-	// Timestamps for the Time field. If the time filter already decoded the
-	// column, reuse it. Otherwise, when few rows match (the selective case),
-	// point-read each match's timestamp from its checkpoint block -- O(few x
-	// block) and no whole-column allocation. Only a match set large enough
-	// that the point reads would cost more than one pass falls back to the
-	// full decode.
-	if ts == nil && cnt > g.Rows/256 {
-		ts = g.Timestamps("_time", nil, nil)
+	// Timestamps for the Time field. Restrict the decode to the window's
+	// block span; when matches are sparse enough that the span decode would
+	// cost more than point reads (the needle), read each match's time from
+	// its checkpoint block instead.
+	lo, hi := 0, n
+	if windowed {
+		lo, hi = g.TimeWindowSpan("_time", q.From, q.To)
+		if lo >= hi {
+			lo, hi = 0, n
+		}
+	}
+	var ts []int64
+	pointRead := cnt*tsBlockGuess < hi-lo
+	if !pointRead {
+		ts = g.TimestampsRange("_time", lo, hi)
 	}
 	sel.ForEach(func(i int) {
-		t := int64(0)
-		if ts != nil {
-			t = ts[i]
-		} else if v, ok := g.TimestampAt("_time", i); ok {
-			t = v
+		var t int64
+		if pointRead {
+			t, _ = g.TimestampAt("_time", i)
+		} else {
+			t = ts[i-lo]
 		}
 		row := Row{Time: t, Fields: make(map[string]string, len(q.Preds))}
 		for _, p := range q.Preds {
@@ -166,6 +173,12 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	})
 	return out
 }
+
+// tsBlockGuess approximates the timestamp checkpoint stride for the
+// materialize crossover: point-read when the matches are sparse relative to
+// the span, span-decode otherwise. It need not equal the storage stride
+// exactly -- it only picks the cheaper path.
+const tsBlockGuess = 512
 
 // predBitsetCol is predBitset over already-decoded indices/dict.
 func predBitsetCol(g *storage.Reader, p *Pred, idx []uint32, dict []string, n int) *Bitset {
@@ -250,16 +263,23 @@ func Count(s Store, q *Query) int {
 // the /select/logsql/hits shape -- again without materializing rows.
 func Histogram(s Store, q *Query, step int64) map[int64]int {
 	out := map[int64]int{}
-	raw := []uint64(nil)
-	tbuf := []int64(nil)
 	for _, g := range s.Groups(q.From, q.To) {
 		if !groupCanMatch(g, q) {
 			continue
 		}
 		sel := matchBitset(g, q)
-		ts := g.Timestamps("_time", raw, tbuf)
+		if sel.Count() == 0 {
+			continue
+		}
+		// Bucket only the matched rows' times, and decode only the window's
+		// block span for them, not the whole timestamp column.
+		lo, hi := g.TimeWindowSpan("_time", q.From, q.To)
+		if lo >= hi {
+			lo, hi = 0, g.Rows
+		}
+		ts := g.TimestampsRange("_time", lo, hi)
 		sel.ForEach(func(i int) {
-			out[ts[i]/step*step]++
+			out[ts[i-lo]/step*step]++
 		})
 	}
 	return out
@@ -272,12 +292,15 @@ func matchBitset(g *storage.Reader, q *Query) *Bitset {
 	n := g.Rows
 	sel := NewBitset(n)
 	sel.SetAll()
-	// Time: skip the per-row filter entirely when the whole group is
-	// inside the window (the common selective-window case) -- no _time
-	// decode at all.
+	// Time: skip the per-row filter entirely when the whole group is inside
+	// the window (no _time touched); otherwise the block-aware mask skips
+	// blocks whose [min,max] miss the window and decodes only the boundary
+	// blocks, never the whole column.
 	if g.TimeMin < q.From || g.TimeMax >= q.To {
-		ts := g.Timestamps("_time", nil, nil)
-		sel.And(rangeMaskInto(ts, q.From, q.To))
+		mask := g.TimeRangeMaskInto("_time", q.From, q.To, nil)
+		tb := NewBitset(n)
+		packBools(tb, mask)
+		sel.And(tb)
 	}
 	for i := range q.Preds {
 		p := &q.Preds[i]
@@ -351,27 +374,4 @@ func boolsAsBytes(s []bool) []byte {
 		return nil
 	}
 	return unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), len(s))
-}
-
-// rangeMaskInto builds the bitset of rows whose timestamp is in [from,to)
-// with vector range compares (GreaterEqualScalarInto and LessScalarInto)
-// packed to bits -- the time predicate the design's Task 3.3 covers along
-// with equality, replacing the per-row scalar loop that ran on every
-// candidate group.
-func rangeMaskInto(ts []int64, from, to int64) *Bitset {
-	n := len(ts)
-	b := NewBitset(n)
-	if n == 0 {
-		return b
-	}
-	ge := make([]bool, n)
-	lt := make([]bool, n)
-	simd.GreaterEqualScalarInto(ge, ts, from)
-	simd.LessScalarInto(lt, ts, to)
-	// keep where both hold: pack ge, then AND the packed lt over it.
-	packBools(b, ge)
-	ltb := NewBitset(n)
-	packBools(ltb, lt)
-	b.And(ltb)
-	return b
 }
