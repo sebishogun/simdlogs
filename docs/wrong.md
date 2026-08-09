@@ -47,3 +47,28 @@ of VL's 8M-row blocks (forcing a full-block scan) against one of our 128K
 groups. The scale measurement is the honest place to make that claim; at
 this corpus size, 1.8x query and a real (flush-fenced) ingest lead are
 what is earned.
+
+## Scale head-to-head at 3M rows: 1.6x query, ingest even — NOT orders of magnitude
+
+    ingest:          simdlogs 441K rec/s   VL 533K rec/s   VL faster
+    selective query: simdlogs 5.73 ms      VL 8.92 ms      1.6x
+
+The larger corpus dissolved the ingest "win" from the 200K run: with the
+3s VL-flush wait now a small fraction of a bigger ingest, VL is in fact
+slightly faster ingesting, so the earlier 7x was mostly the async
+artifact and is retracted. The selective query holds a real but modest
+1.6x.
+
+This misses the design's stated bar -- orders of magnitude -- and the
+reason is worth stating straight rather than burying. VictoriaLogs is
+well engineered: within its 8M-row block it has a per-block time index
+and blooms, so a selective query over a 3M-row single block is not the
+naive full scan the design's premise assumed. The granularity advantage
+(128K groups vs 8M blocks) only starts to bite above 8M rows, where VL
+holds multiple coarse blocks -- and even there the gap will be a small
+multiple, not 10-100x, unless the query path gets materially cheaper
+(lazy per-lane decode, avoiding the per-candidate-group _time decode the
+5.73 ms is mostly spent in). The orders-of-magnitude claim is, on this
+evidence, aspirational; the honest current standing is "competitive,
+modestly faster on selective queries, comparable on ingest." The README
+says exactly that until a measurement earns more.

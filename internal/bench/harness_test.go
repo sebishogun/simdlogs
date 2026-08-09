@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -49,6 +50,11 @@ func TestHeadToHead(t *testing.T) {
 		t.Skip("head-to-head is a report, run with -run TestHeadToHead")
 	}
 	n := 200_000
+	if v := os.Getenv("SIMDLOGS_BENCH_N"); v != "" {
+		if x, err := strconv.Atoi(v); err == nil {
+			n = x
+		}
+	}
 	nd, lo, hi := corpusNDJSON(n)
 
 	// simdlogs in-process.
