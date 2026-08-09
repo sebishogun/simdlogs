@@ -8,6 +8,9 @@ Design: [docs/design.md](docs/design.md).
 
 ## The claim, and what measurement did to it
 
+![simdlogs vs VictoriaLogs](docs/bench.svg)
+
+
 The design aimed for orders of magnitude over VictoriaLogs on selective
 scan-heavy queries. The head-to-head harness refuted the premise it
 rested on. Measured at 3M rows, both engines on one machine, identical
