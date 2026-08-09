@@ -95,6 +95,19 @@ func RunPipeline(s Store, q *Query) []Row {
 // runStats aggregates matched rows by the group-by fields during the scan,
 // accumulating each aggregation without building the matched rows.
 func runStats(s Store, q *Query, sp *StatsPipe) []Row {
+	// Fast path: `by (field) count()` is the footer posting counts --
+	// StatsByField reads them from the offset table without a per-row scan
+	// for whole-in-window groups (the 1078x trick). This is the common
+	// top-N / group-by shape.
+	if len(sp.By) == 1 && len(sp.Aggs) == 1 && sp.Aggs[0].Kind == AggCount {
+		alias := sp.Aggs[0].Alias
+		vcs := StatsByField(s, q, sp.By[0])
+		out := make([]Row, 0, len(vcs))
+		for _, vc := range vcs {
+			out = append(out, Row{Fields: []Field{{sp.By[0], vc.Value}, {alias, strconv.Itoa(vc.Count)}}})
+		}
+		return out
+	}
 	acc := map[string]*statEntry{}
 	var key []byte
 	for _, g := range s.Groups(q.From, q.To) {
