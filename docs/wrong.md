@@ -72,3 +72,18 @@ multiple, not 10-100x, unless the query path gets materially cheaper
 evidence, aspirational; the honest current standing is "competitive,
 modestly faster on selective queries, comparable on ingest." The README
 says exactly that until a measurement earns more.
+
+## The aggregation class is also ~1.6x, not orders of magnitude
+
+The no-materialization count/histogram path (group-skip, then popcount of
+the match bitset, no row built) was the design's best-case bet. At 3M
+rows the hits/agg head-to-head is 1.6x (1.8ms vs 2.9ms) -- the same
+modest multiple as the row query. VictoriaLogs' aggregation is well
+optimized too. Conclusion, stated plainly: against a well-engineered
+VictoriaLogs at 200K-3M rows, simdlogs is competitive and ~1.5-1.6x
+faster on selective queries and aggregations, comparable on ingest. The
+orders-of-magnitude bar the design set is not met and, on this evidence,
+is not a small-corpus property -- it would need the >8M-row regime where
+VL's coarse blocks force real over-scan, and likely more query-path work,
+and even then a large multiple against this competitor is not assured.
+The honest headline is a small multiple, and the README says so.

@@ -100,11 +100,7 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 			step = int64(d)
 		}
 	}
-	rows := query.Run(s.store, q)
-	buckets := map[int64]int{}
-	for _, row := range rows {
-		buckets[row.Time/step*step]++
-	}
+	buckets := query.Histogram(s.store, q, step)
 	type hit struct {
 		Time  string `json:"_time"`
 		Count int    `json:"hits"`

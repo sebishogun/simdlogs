@@ -110,6 +110,14 @@ func TestHeadToHead(t *testing.T) {
 		n, vlIngest, float64(n)/vlIngest.Seconds(), vlQuery)
 	t.Logf("HEAD-TO-HEAD selective query: simdlogs %v vs VL %v = %.1fx",
 		slQuery, vlQuery, float64(vlQuery)/float64(slQuery))
+
+	// The aggregation class -- /select/logsql/hits -- is the design's best
+	// case: count by time bucket, no row materialized. Same window, both.
+	hq := url.Values{"query": {"service:=auth"}, "start": {wlo}, "end": {whi}, "step": {"1m"}}.Encode()
+	slHits := timeQuery(t, func() { get(t, sl.URL+"/select/logsql/hits?"+hq) })
+	vlHits := timeQuery(t, func() { get(t, vl+"/select/logsql/hits?"+hq) })
+	t.Logf("HEAD-TO-HEAD hits/agg: simdlogs %v vs VL %v = %.1fx",
+		slHits, vlHits, float64(vlHits)/float64(slHits))
 }
 
 func post(t *testing.T, url string, body []byte) {

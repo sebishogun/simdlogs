@@ -187,3 +187,66 @@ func containsSubstr(s, sub string) bool {
 	}
 	return false
 }
+
+// Count returns how many rows match q, without materializing any -- the
+// aggregation hot path. It is the design's best case: group-skip by
+// footer, then popcount of the match bitset, no per-row map, no field
+// decode beyond the predicate columns. This is where finer skip
+// granularity turns into a real margin over a scan-and-count.
+func Count(s Store, q *Query) int {
+	total := 0
+	for _, g := range s.Groups(q.From, q.To) {
+		if !groupCanMatch(g, q) {
+			continue
+		}
+		total += matchBitset(g, q).Count()
+	}
+	return total
+}
+
+// Histogram buckets match counts by time at the given step (nanoseconds),
+// the /select/logsql/hits shape -- again without materializing rows.
+func Histogram(s Store, q *Query, step int64) map[int64]int {
+	out := map[int64]int{}
+	raw := []uint64(nil)
+	tbuf := []int64(nil)
+	for _, g := range s.Groups(q.From, q.To) {
+		if !groupCanMatch(g, q) {
+			continue
+		}
+		sel := matchBitset(g, q)
+		ts := g.Timestamps("_time", raw, tbuf)
+		sel.ForEach(func(i int) {
+			out[ts[i]/step*step]++
+		})
+	}
+	return out
+}
+
+// matchBitset builds the selection for a group: time window AND every
+// predicate, each column decoded once. Shared by Count, Histogram and the
+// row path.
+func matchBitset(g *storage.Reader, q *Query) *Bitset {
+	n := g.Rows
+	sel := NewBitset(n)
+	sel.SetAll()
+	// Time: skip the per-row filter entirely when the whole group is
+	// inside the window (the common selective-window case) -- no _time
+	// decode at all.
+	if g.TimeMin < q.From || g.TimeMax >= q.To {
+		ts := g.Timestamps("_time", nil, nil)
+		tsel := NewBitset(n)
+		for i, t := range ts {
+			if t >= q.From && t < q.To {
+				tsel.Set(i)
+			}
+		}
+		sel.And(tsel)
+	}
+	for i := range q.Preds {
+		p := &q.Preds[i]
+		idx, dict := g.DictIndices(p.Field)
+		sel.And(predBitsetCol(g, p, idx, dict, n))
+	}
+	return sel
+}
