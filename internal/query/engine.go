@@ -2,6 +2,8 @@ package query
 
 import (
 	"regexp"
+	"strconv"
+	"strings"
 	"unsafe"
 
 	"github.com/sebishogun/simd"
@@ -15,7 +17,8 @@ import (
 // footer can skip on.
 type Query struct {
 	From, To int64
-	Preds    []Pred
+	Preds    []Pred // implicit-AND predicates (programmatic callers, ES planner)
+	Filter   *Expr  // boolean filter tree from LogsQL; takes precedence when set
 	Limit    int
 }
 
@@ -23,17 +26,48 @@ type Query struct {
 type PredKind uint8
 
 const (
-	Eq       PredKind = iota // field := value  (dict-id equality)
-	Contains                 // field ~ substr  (substring, bloom-skippable)
-	Regexp                   // field ~ /re/    (RE2 on survivors only)
+	Eq       PredKind = iota // field := value   (dict-id equality)
+	Contains                 // field ~ substr   (substring, bloom-skippable)
+	Regexp                   // field ~ /re/     (RE2 on survivors only)
+	Lt                       // field < num      (numeric compare over the dict)
+	Le                       // field <= num
+	Gt                       // field > num
+	Ge                       // field >= num
+	In                       // field in (a,b,c) (set membership)
+	Prefix                   // field = val*     (dict range on a prefix)
 )
 
-// Pred is one field predicate.
+// Pred is one field predicate. Fields ordered large-to-small (pointers and
+// strings, then float64, then the byte-sized Kind last) to avoid interior
+// padding.
 type Pred struct {
-	Field string
-	Kind  PredKind
-	Value string
-	re    *regexp.Regexp
+	Field  string         // Eq/Contains/Regexp/Prefix key
+	Value  string         // Eq/Contains/Regexp/Prefix value
+	Values []string       // In
+	re     *regexp.Regexp // compiled Regexp
+	Num    float64        // Lt/Le/Gt/Ge
+	Kind   PredKind
+}
+
+// ExprOp is the node kind of a boolean filter tree.
+type ExprOp uint8
+
+const (
+	OpLeaf ExprOp = iota // a single Pred
+	OpAnd
+	OpOr
+	OpNot
+)
+
+// Expr is a boolean tree of predicates -- LogsQL's AND/OR/NOT/parentheses.
+// A leaf carries one Pred; And/Or carry children; Not carries one child.
+// Query.Filter holds it; when nil the engine falls back to Preds (implicit
+// AND) so existing programmatic callers keep working.
+type Expr struct {
+	Pred  Pred    // OpLeaf
+	Kids  []*Expr // OpAnd, OpOr
+	Child *Expr   // OpNot
+	Op    ExprOp
 }
 
 // Field is one decoded key/value of a matched row.
@@ -88,8 +122,13 @@ func Run(s Store, q *Query) []Row {
 }
 
 // groupCanMatch rejects a group whose footer proves a required equality
-// value absent -- the bloom + dict scan, no row decode.
+// value absent -- the bloom + dict scan, no row decode. For a filter tree it
+// prunes on the AND-of-equality leaves only (an OR branch or a non-equality
+// leaf could still match, so those never reject).
 func groupCanMatch(g *storage.Reader, q *Query) bool {
+	if q.Filter != nil {
+		return exprCanMatch(g, q.Filter)
+	}
 	for i := range q.Preds {
 		p := &q.Preds[i]
 		if p.Kind == Eq && g.ColumnExists(p.Field) && !g.DictContains(p.Field, p.Value) {
@@ -121,23 +160,41 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 		sel.And(tb)
 	}
 
-	// Decode each predicate field's indices+dict once, reused for both the
-	// filter and the materialize. Equality goes through eqPredBitset, which
-	// takes the posting path for a rare value and decodes no column at all.
+	// Predicate bitset and the fields to materialize. A filter tree evaluates
+	// recursively (its leaf fields are what we output); the flat Preds path
+	// decodes each field once and reuses it for both filter and materialize.
 	type col struct {
 		idx  []uint32
 		dict []string
 	}
 	cols := make(map[string]col, len(q.Preds))
-	for i := range q.Preds {
-		p := &q.Preds[i]
-		if p.Kind == Eq {
-			sel.And(eqPredBitset(g, p, n))
-			continue
+	var matFields []string
+	seenF := map[string]bool{}
+	addField := func(f string) {
+		if !seenF[f] {
+			seenF[f] = true
+			matFields = append(matFields, f)
 		}
-		idx, dict := g.DictIndices(p.Field)
-		cols[p.Field] = col{idx: idx, dict: dict}
-		sel.And(predBitsetCol(g, p, idx, dict, n))
+	}
+	if q.Filter != nil {
+		sel.And(evalExpr(g, q.Filter, n))
+		fs := map[string]bool{}
+		filterFields(q.Filter, fs)
+		for f := range fs {
+			addField(f)
+		}
+	} else {
+		for i := range q.Preds {
+			p := &q.Preds[i]
+			addField(p.Field)
+			if p.Kind == Eq {
+				sel.And(eqPredBitset(g, p, n))
+				continue
+			}
+			idx, dict := g.DictIndices(p.Field)
+			cols[p.Field] = col{idx: idx, dict: dict}
+			sel.And(predBitsetCol(g, p, idx, dict, n))
+		}
 	}
 
 	cnt := sel.Count()
@@ -195,42 +252,74 @@ func predBitsetCol(g *storage.Reader, p *Pred, idx []uint32, dict []string, n in
 	if idx == nil {
 		return b
 	}
-	switch p.Kind {
-	case Eq:
+	// Equality is the vectorized residual scan: one vpcmpeqd per lane over
+	// the encoded indices (EqualScalarInto), then pack the bool mask to bits
+	// (MaskBits) -- no per-row compare. The design's Task 3.3, replacing
+	// VictoriaLogs' scalar filter_exact pattern.
+	if p.Kind == Eq {
 		id := g.DictID(p.Field, p.Value)
 		if id < 0 {
 			return b
 		}
-		// Vectorized residual scan: one vpcmpeqd per lane over the encoded
-		// indices (EqualScalarInto), then pack the bool mask to bits
-		// (MaskBits) -- no per-row compare, no per-row Set. The design's
-		// Task 3.3, replacing VictoriaLogs' scalar filter_exact pattern.
 		eqMaskInto(b, idx, uint32(id))
+		return b
+	}
+	// Every other kind marks which dict values match, then maps rows through
+	// the indices. The test runs once per distinct value, not per row, so a
+	// low-cardinality column is cheap regardless of predicate complexity.
+	hit := make([]bool, len(dict))
+	switch p.Kind {
 	case Contains:
-		hit := make([]bool, len(dict))
 		for di, d := range dict {
 			hit[di] = containsSubstr(d, p.Value)
-		}
-		for i, v := range idx {
-			if hit[v] {
-				b.Set(i)
-			}
 		}
 	case Regexp:
 		if p.re == nil {
 			p.re = regexp.MustCompile(p.Value)
 		}
-		hit := make([]bool, len(dict))
 		for di, d := range dict {
 			hit[di] = p.re.MatchString(d)
 		}
-		for i, v := range idx {
-			if hit[v] {
-				b.Set(i)
+	case Prefix:
+		for di, d := range dict {
+			hit[di] = strings.HasPrefix(d, p.Value)
+		}
+	case In:
+		set := make(map[string]bool, len(p.Values))
+		for _, v := range p.Values {
+			set[v] = true
+		}
+		for di, d := range dict {
+			hit[di] = set[d]
+		}
+	case Lt, Le, Gt, Ge:
+		for di, d := range dict {
+			if f, err := strconv.ParseFloat(d, 64); err == nil {
+				hit[di] = cmpNum(f, p.Kind, p.Num)
 			}
 		}
 	}
+	for i, v := range idx {
+		if hit[v] {
+			b.Set(i)
+		}
+	}
 	return b
+}
+
+// cmpNum applies a numeric comparison predicate.
+func cmpNum(f float64, kind PredKind, want float64) bool {
+	switch kind {
+	case Lt:
+		return f < want
+	case Le:
+		return f <= want
+	case Gt:
+		return f > want
+	case Ge:
+		return f >= want
+	}
+	return false
 }
 
 func containsSubstr(s, sub string) bool {
@@ -325,6 +414,10 @@ func matchBitset(g *storage.Reader, q *Query) *Bitset {
 		tb := NewBitset(n)
 		packBools(tb, mask)
 		sel.And(tb)
+	}
+	if q.Filter != nil {
+		sel.And(evalExpr(g, q.Filter, n))
+		return sel
 	}
 	for i := range q.Preds {
 		p := &q.Preds[i]
