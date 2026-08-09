@@ -250,6 +250,36 @@ func TestCollapseNums(t *testing.T) {
 	}
 }
 
+func TestRankPipe(t *testing.T) {
+	s, err := storage.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := storage.BuildDict([]string{
+		"error error timeout in handler", // score 3 (2 error + 1 timeout)
+		"ok",                             // score 0
+		"error handling request",         // score 1
+	})
+	if _, err := s.AppendGroup(&storage.Group{Rows: 3, Columns: []storage.Column{
+		{Name: "_time", Type: storage.ColTimestamp, Ts: []int64{1, 2, 3}},
+		{Name: "_msg", Type: storage.ColDict, Dict: &msg},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	pq, err := ParseLogsQL(`* | rank "error timeout"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pq.From, pq.To = 0, int64(1)<<62
+	rows := RunPipeline(s, pq)
+	if len(rows) != 3 {
+		t.Fatalf("rank got %d rows", len(rows))
+	}
+	if rowField(rows[0], "_score") != "3" || rowField(rows[2], "_score") != "0" {
+		t.Fatalf("rank order = %s..%s, want 3 first, 0 last", rowField(rows[0], "_score"), rowField(rows[2], "_score"))
+	}
+}
+
 func TestPatternTemplating(t *testing.T) {
 	// pattern also collapses hex/uuid identifiers to <ID>.
 	if got := templatize("req deadbeef12345678 done in 5ms", true); got != "req <ID> done in <N>ms" {

@@ -301,6 +301,8 @@ func pipeFields(pipes []Pipe) []string {
 			add(t.fields...)
 		case *CollapseNumsPipe:
 			add(orDefault(t.Field, "_msg"))
+		case *RankPipe:
+			add(orDefault(t.Field, "_msg"))
 		}
 	}
 	return out
@@ -716,6 +718,36 @@ func isHexID(tok string) bool {
 		}
 	}
 	return hasDigit && hasLetter
+}
+
+// RankPipe is `rank "term1 term2" [at field]`: score each row by how often the
+// terms appear in the field (default _msg), write _score, and sort by it
+// descending -- relevance ranking of full-text matches, which VictoriaLogs
+// (time-ordered only) does not offer.
+type RankPipe struct {
+	Terms []string
+	Field string
+}
+
+func (p *RankPipe) apply(rows []Row) []Row {
+	f := p.Field
+	if f == "" {
+		f = "_msg"
+	}
+	for ri := range rows {
+		v := rowField(rows[ri], f)
+		score := 0
+		for _, t := range p.Terms {
+			score += strings.Count(v, t)
+		}
+		setRowField(&rows[ri], "_score", strconv.Itoa(score))
+	}
+	sort.SliceStable(rows, func(a, b int) bool {
+		sa, _ := strconv.Atoi(rowField(rows[a], "_score"))
+		sb, _ := strconv.Atoi(rowField(rows[b], "_score"))
+		return sa > sb
+	})
+	return rows
 }
 
 // setRowField updates key in place, or appends it -- the mutation the

@@ -610,6 +610,21 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				fp.As = a
 			}
 			pipes = append(pipes, fp)
+		case "rank":
+			terms := p.next()
+			if terms.kind != tString && terms.kind != tIdent {
+				return nil, fmt.Errorf("simdlogs: rank expects quoted terms, got %q", terms.val)
+			}
+			rp := &RankPipe{Terms: strings.Fields(terms.val)}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "at") {
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				rp.Field = f
+			}
+			pipes = append(pipes, rp)
 		case "collapse_nums", "pattern":
 			cp := &CollapseNumsPipe{Full: strings.EqualFold(name.val, "pattern")}
 			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "at") {
