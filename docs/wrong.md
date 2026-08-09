@@ -408,3 +408,51 @@ The needle is still O(groups) (340ns/group is the bloom check itself); a
 global value->group index would make it O(1). Bloom RAM grows ~1.2GB per
 billion rows -- the global index is the RAM-leaner endgame. Next: the
 VictoriaLogs head-to-head at this scale, both from disk.
+
+## Footprint breakdown: the 3.47x realistic loss is postings + dict on near-unique columns (2026-08)
+
+Realistic corpus, 100K rows, one group, `TestFootprintBreakdown`:
+
+    section     KB     %     what it is
+    postings    6268   42    inverted index: rows per distinct value
+    dict        5890   40    the distinct strings themselves
+    index       1831   12    bit-packed dict-id per row
+    bloom        573    4     per-column membership filter
+    time         299    2     delta+zigzag+varint timestamps
+    TOTAL      14863         152 bytes/row
+
+Per column, the bulk is the near-unique fields:
+
+    trace_id  3375KB (post 1086 dict 1958)   ~100K distinct / 100K rows
+    span_id   2559KB (post 1086 dict 1143)
+    path      2269KB (post 1037 dict  908)
+    _msg      2264KB (post  894 dict 1067)
+    bytes     1349KB (post  675 dict  415)
+
+The finding: for a near-unique column every distinct value owns a ~1-row
+posting list, so the postings section is essentially the identity permutation
+0,1,2,... -- it costs 42% of the file and buys **zero** query speed (a posting
+list of length 1 is no faster than reading the one row). The low-cardinality
+columns (host/service/level/...) are the opposite: small postings (69-134KB)
+that genuinely accelerate group-by and equality.
+
+So the earlier postings-skip experiment skipped the wrong end. It dropped
+postings for *common* values (count > n/8) -- exactly the lists that pay --
+and kept them for the rare ones that don't, saving 2% and breaking two tests.
+The correct lever is adaptive per column: **drop the whole postings (and the
+dict-id index) for a column whose distinct/rows ratio is above a threshold,
+storing its values inline; keep the full index for low-card columns.** Query
+impact is nil in principle -- near-unique equality/substring already scans,
+since a 1-row posting list is not an acceleration.
+
+Estimated: dropping postings on the seven near-unique columns saves ~5.5MB of
+6.3MB postings; dropping their dict-id index saves ~1.4MB of 1.8MB. Total
+~14.9MB -> ~8MB, 152 -> ~80 bytes/row. That closes most of the 3.47x but not
+all of it: the remaining ~5.9MB dict is high-entropy hex/uuid/message text
+that LZ4 barely compresses and VL stores too. Beating VL outright likely also
+needs a stronger codec on those specific columns -- but zstd decode is not on
+the simd kernel, so it trades scan speed for bytes, which must be measured
+before it lands (the whole point is fastest AND smallest, not one at the other's
+cost). This is a v8 storage-format change touching crash-safety and the query
+path; it is a deliberate campaign, not a drive-by, and the number above is the
+entry.
