@@ -1,6 +1,6 @@
 module github.com/sebishogun/simdlogs
 
-go 1.26.2
+go 1.26.5
 
 require (
 	github.com/sebishogun/simd v1.20.0
