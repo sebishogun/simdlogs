@@ -124,6 +124,76 @@ func TestMorePipes(t *testing.T) {
 	}
 }
 
+func TestTransformPipes(t *testing.T) {
+	// A store whose _msg carries JSON and a formattable pattern.
+	s, err := storage.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := storage.BuildDict([]string{
+		`{"level":"error","code":500}`,
+		`{"level":"info","code":200}`,
+	})
+	lvl := storage.BuildDict([]string{"error", "info"})
+	if _, err := s.AppendGroup(&storage.Group{Rows: 2, Columns: []storage.Column{
+		{Name: "_time", Type: storage.ColTimestamp, Ts: []int64{1, 2}},
+		{Name: "_msg", Type: storage.ColDict, Dict: &msg},
+		{Name: "level", Type: storage.ColDict, Dict: &lvl},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	run := func(q string) []Row {
+		pq, err := ParseLogsQL(q)
+		if err != nil {
+			t.Fatalf("parse %q: %v", q, err)
+		}
+		pq.From, pq.To = 0, int64(1)<<62
+		return RunPipeline(s, pq)
+	}
+
+	// unpack_json: _msg's JSON keys become fields.
+	uj := run(`* | unpack_json`)
+	byLevel := map[string]Row{}
+	for _, r := range uj {
+		byLevel[rowField(r, "level")] = r
+	}
+	if rowField(byLevel["error"], "code") != "500" || rowField(byLevel["info"], "code") != "200" {
+		t.Fatalf("unpack_json code = %v", uj)
+	}
+
+	// format: build a field from a template.
+	fm := run(`* | format "<level>=<_msg>" as line`)
+	found := false
+	for _, r := range fm {
+		if rowField(r, "line") == `error={"level":"error","code":500}` {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("format line not found in %v", fm)
+	}
+
+	// extract: pull code out of the JSON text via a literal/capture pattern.
+	ex := run(`* | extract "\"code\":<code>}" from _msg`)
+	codes := map[string]bool{}
+	for _, r := range ex {
+		codes[rowField(r, "code")] = true
+	}
+	if !codes["500"] || !codes["200"] {
+		t.Fatalf("extract codes = %v want 500 and 200", codes)
+	}
+
+	// math: arithmetic over an unpacked numeric field.
+	mt := run(`* | unpack_json | math "(code + 1) / 2" as half`)
+	halves := map[string]bool{}
+	for _, r := range mt {
+		halves[rowField(r, "half")] = true
+	}
+	if !halves["250.5"] || !halves["100.5"] { // (500+1)/2, (200+1)/2
+		t.Fatalf("math half = %v want 250.5 and 100.5", halves)
+	}
+}
+
 func TestStoreTailCursor(t *testing.T) {
 	s, err := storage.OpenStore(t.TempDir())
 	if err != nil {

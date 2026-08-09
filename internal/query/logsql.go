@@ -552,6 +552,83 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, err
 			}
 			pipes = append(pipes, &FilterPipe{Expr: e})
+		case "unpack_json":
+			up := &UnpackJSONPipe{}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "from") {
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				up.From = f
+			}
+			if p.peek().kind == tIdent && (strings.EqualFold(p.peek().val, "prefix") || strings.EqualFold(p.peek().val, "result_prefix")) {
+				p.next()
+				pf, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				up.Prefix = pf
+			}
+			pipes = append(pipes, up)
+		case "extract":
+			ep := &ExtractPipe{}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "from") {
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				ep.From = f
+			}
+			pat := p.next()
+			if pat.kind != tString && pat.kind != tIdent {
+				return nil, fmt.Errorf("simdlogs: extract expects a pattern string, got %q", pat.val)
+			}
+			ep.Pattern = pat.val
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "from") { // trailing `from field` too
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				ep.From = f
+			}
+			pipes = append(pipes, ep)
+		case "format":
+			tpl := p.next()
+			if tpl.kind != tString && tpl.kind != tIdent {
+				return nil, fmt.Errorf("simdlogs: format expects a template string, got %q", tpl.val)
+			}
+			fp := &FormatPipe{Template: tpl.val}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
+				p.next()
+				a, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				fp.As = a
+			}
+			pipes = append(pipes, fp)
+		case "math", "eval":
+			ex := p.next()
+			if ex.kind != tString {
+				return nil, fmt.Errorf("simdlogs: math expects a quoted expression, got %q", ex.val)
+			}
+			node, flds, err := parseMath(ex.val)
+			if err != nil {
+				return nil, err
+			}
+			mp := &MathPipe{expr: node, fields: flds, As: "math"}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
+				p.next()
+				a, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				mp.As = a
+			}
+			pipes = append(pipes, mp)
 		default:
 			return nil, fmt.Errorf("simdlogs: unknown pipe %q", name.val)
 		}

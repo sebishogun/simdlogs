@@ -1,6 +1,7 @@
 package query
 
 import (
+	"encoding/json"
 	"regexp"
 	"sort"
 	"strconv"
@@ -156,9 +157,41 @@ func pipeFields(pipes []Pipe) []string {
 			for f := range fs {
 				add(f)
 			}
+		case *UnpackJSONPipe:
+			add(orDefault(t.From, "_msg"))
+		case *ExtractPipe:
+			add(orDefault(t.From, "_msg"))
+		case *FormatPipe:
+			add(templateFields(t.Template)...)
+		case *MathPipe:
+			add(t.fields...)
 		}
 	}
 	return out
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+// templateFields returns the <name> placeholders referenced by a format
+// template, so they are materialized before the pipe runs.
+func templateFields(tpl string) []string {
+	var fs []string
+	for i := 0; i < len(tpl); {
+		if tpl[i] == '<' {
+			if j := strings.IndexByte(tpl[i:], '>'); j >= 0 {
+				fs = append(fs, tpl[i+1:i+j])
+				i += j + 1
+				continue
+			}
+		}
+		i++
+	}
+	return fs
 }
 
 // runStats aggregates matched rows by the group-by fields during the scan,
@@ -454,6 +487,167 @@ func (p *FilterPipe) apply(rows []Row) []Row {
 		}
 	}
 	return out
+}
+
+// setRowField updates key in place, or appends it -- the mutation the
+// transform pipes (unpack_json/format/extract) share.
+func setRowField(r *Row, key, val string) {
+	for i := range r.Fields {
+		if r.Fields[i].Key == key {
+			r.Fields[i].Value = val
+			return
+		}
+	}
+	r.Fields = append(r.Fields, Field{key, val})
+}
+
+// UnpackJSONPipe is `unpack_json [from field] [prefix p]`: parse the (JSON
+// object) source field and add each of its keys as a field. Default source is
+// _msg.
+type UnpackJSONPipe struct {
+	From   string
+	Prefix string
+}
+
+func (p *UnpackJSONPipe) apply(rows []Row) []Row {
+	from := p.From
+	if from == "" {
+		from = "_msg"
+	}
+	for ri := range rows {
+		var m map[string]json.RawMessage
+		if json.Unmarshal([]byte(rowField(rows[ri], from)), &m) != nil {
+			continue // not a JSON object; leave the row unchanged
+		}
+		for k, raw := range m {
+			setRowField(&rows[ri], p.Prefix+k, jsonRawScalar(raw))
+		}
+	}
+	return rows
+}
+
+// jsonRawScalar renders a JSON value as a plain string (a string unquoted,
+// anything else as its source bytes).
+func jsonRawScalar(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	return string(raw)
+}
+
+// FormatPipe is `format "template" as field`: build a field from a template
+// whose <name> placeholders are replaced by field values.
+type FormatPipe struct {
+	Template string
+	As       string
+}
+
+func (p *FormatPipe) apply(rows []Row) []Row {
+	as := p.As
+	if as == "" {
+		as = "_msg"
+	}
+	for ri := range rows {
+		setRowField(&rows[ri], as, expandTemplate(p.Template, rows[ri]))
+	}
+	return rows
+}
+
+// expandTemplate replaces each <name> in tpl with rowField(name); literal text
+// is copied through. An unclosed < is copied literally.
+func expandTemplate(tpl string, r Row) string {
+	var sb strings.Builder
+	for i := 0; i < len(tpl); {
+		if tpl[i] == '<' {
+			if j := strings.IndexByte(tpl[i:], '>'); j >= 0 {
+				sb.WriteString(rowField(r, tpl[i+1:i+j]))
+				i += j + 1
+				continue
+			}
+		}
+		sb.WriteByte(tpl[i])
+		i++
+	}
+	return sb.String()
+}
+
+// ExtractPipe is `extract "pattern" [from field]`: pull fields out of the
+// source (default _msg) with a pattern of literal text and <name> captures,
+// each capture running up to the next literal.
+type ExtractPipe struct {
+	From    string
+	Pattern string
+}
+
+// extractTok is one pattern token: a literal (cap == "") or a capture.
+type extractTok struct {
+	lit string
+	cap string
+}
+
+func parseExtractPattern(pat string) []extractTok {
+	var toks []extractTok
+	for i := 0; i < len(pat); {
+		if pat[i] == '<' {
+			e := strings.IndexByte(pat[i:], '>')
+			if e < 0 {
+				toks = append(toks, extractTok{lit: pat[i:]})
+				break
+			}
+			toks = append(toks, extractTok{cap: pat[i+1 : i+e]})
+			i += e + 1
+			continue
+		}
+		nb := strings.IndexByte(pat[i:], '<')
+		if nb < 0 {
+			toks = append(toks, extractTok{lit: pat[i:]})
+			break
+		}
+		toks = append(toks, extractTok{lit: pat[i : i+nb]})
+		i += nb
+	}
+	return toks
+}
+
+func (p *ExtractPipe) apply(rows []Row) []Row {
+	from := p.From
+	if from == "" {
+		from = "_msg"
+	}
+	toks := parseExtractPattern(p.Pattern)
+	for ri := range rows {
+		src := rowField(rows[ri], from)
+		for ti := 0; ti < len(toks); ti++ {
+			t := toks[ti]
+			if t.cap == "" { // literal: skip past it, or give up on this row
+				idx := strings.Index(src, t.lit)
+				if idx < 0 {
+					break
+				}
+				src = src[idx+len(t.lit):]
+				continue
+			}
+			// capture: up to the next literal, or to the end
+			var next string
+			if ti+1 < len(toks) {
+				next = toks[ti+1].lit
+			}
+			if next == "" {
+				setRowField(&rows[ri], t.cap, src)
+				src = ""
+				continue
+			}
+			end := strings.Index(src, next)
+			if end < 0 {
+				setRowField(&rows[ri], t.cap, src)
+				break
+			}
+			setRowField(&rows[ri], t.cap, src[:end])
+			src = src[end:]
+		}
+	}
+	return rows
 }
 
 // matchRow evaluates a filter tree against one materialized row (string
