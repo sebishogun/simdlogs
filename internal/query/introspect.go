@@ -75,7 +75,20 @@ func StatsByField(s Store, q *Query, field string) []ValueCount {
 		if !groupCanMatch(g, q) {
 			continue
 		}
+		// Fast path: with no predicate and the whole group inside the window,
+		// `stats by (field) count()` is exactly the posting offset table's
+		// per-value counts -- a footer read, no column decode, no per-row
+		// loop. Only a predicate or a boundary group needs the scan.
+		if len(q.Preds) == 0 && g.TimeMin >= q.From && g.TimeMax < q.To {
+			for _, vc := range g.ValueCounts(field) {
+				counts[vc.Value] += vc.Count
+			}
+			continue
+		}
 		sel := matchBitset(g, q)
+		if sel.Count() == 0 {
+			continue
+		}
 		idx, dict := g.DictIndices(field)
 		if idx == nil {
 			continue

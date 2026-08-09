@@ -63,6 +63,34 @@ func BenchmarkEngineCount(b *testing.B) {
 
 var sinkI int
 var sinkH map[int64]int
+var sinkVC []ValueCount
+
+func BenchmarkStatsByField(b *testing.B) {
+	s, lo, hi := benchStore(b, 3_000_000, 128*1024)
+	q := &Query{From: lo, To: hi + 1} // full span, group all rows by service
+	b.ResetTimer()
+	for b.Loop() {
+		sinkVC = StatsByField(s, q, "service")
+	}
+}
+
+func BenchmarkFieldValues(b *testing.B) {
+	s, lo, hi := benchStore(b, 3_000_000, 128*1024)
+	b.ResetTimer()
+	for b.Loop() {
+		sinkVC = FieldValues(s, "service", lo, hi+1)
+	}
+}
+
+func BenchmarkFacets(b *testing.B) {
+	s, lo, hi := benchStore(b, 3_000_000, 128*1024)
+	b.ResetTimer()
+	for b.Loop() {
+		sinkF = Facets(s, lo, hi+1, 10)
+	}
+}
+
+var sinkF map[string][]ValueCount
 
 func BenchmarkEngineHistogram(b *testing.B) {
 	s, lo, hi := benchStore(b, 3_000_000, 128*1024)
