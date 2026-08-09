@@ -356,3 +356,33 @@ The aggregation, the class that was 2.1x, is now 6.0x. The remaining
 windowed lever is restricting the equality/predicate scan to the block span
 (done for the time filter, not yet for the value scan) -- tracked in the
 perf-max task.
+
+## The 3M wins were cache-hot; the disk regime is the real test
+
+Called out correctly: the head-to-head numbers were measured with the whole
+store RAM-resident -- every group blob AND every decoded dictionary on the
+heap -- so simdlogs queries never touched disk, while VictoriaLogs goes
+through its block/storage layer. Not apples-to-apples, and a billion rows
+OOM'd (killed at ~600M): ~40GB of decoded dict strings alone. Victory was
+claimed too fast.
+
+Fix (committed): mmap the group files (reader.blob is a view into the
+mapping) and store the dictionary uncompressed with an offset table, so a
+membership probe binary-searches it straight from the mmap -- no eager
+decode, no dict on the heap. At rest the heap holds only footers.
+
+The store now runs a billion rows from disk without OOM (RAM stayed ~7GB
+for the build), and the honest disk-regime numbers, engine, minimum of N:
+
+    scale     groups   needle    selective   full-count   regime
+    100M         763   209us     3.5ms       2.2ms        cache-hot
+    1B          7630   13.2ms    136ms       77ms         disk (mmap)
+
+The needle degrades to 1724ns/group at 1B because the per-group bloom is
+saturated (128K high-cardinality values into 2048 bits -> always "maybe"),
+so every group falls through to a dict binary-search that pages from disk.
+A cardinality-sized bloom rejects from the in-RAM footer without the disk
+search; a global value->group index removes the per-group scan entirely.
+Those are the scale levers, and the VictoriaLogs comparison must be run at
+this scale, both from disk, before any claim -- neither is done yet. The
+3M/5-13x numbers are cache-hot and are not extrapolated to a billion.
