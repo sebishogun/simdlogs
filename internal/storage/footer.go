@@ -1,8 +1,6 @@
 package storage
 
 import (
-	"sort"
-
 	"github.com/sebishogun/simd"
 )
 
@@ -39,7 +37,7 @@ func (r *Reader) DictContains(name, value string) bool {
 	if !bloomMaybe(m.Bloom, value) {
 		return false
 	}
-	return dictLookup(m.DictData, value) >= 0
+	return dictSectionSearch(r.dictSec(m), m.DictLen, value) >= 0
 }
 
 func (r *Reader) col(name string) *colMeta {
@@ -49,6 +47,23 @@ func (r *Reader) col(name string) *colMeta {
 		}
 	}
 	return nil
+}
+
+// dictSec returns the column's random-access dict section, a view into the
+// mmap'd blob -- no decode, no copy.
+func (r *Reader) dictSec(m *colMeta) []byte {
+	return r.blob[m.DictOff : m.DictOff+m.DictLen2]
+}
+
+// idxBytes is the byte length of a dict column's bit-packed indices, computed
+// from the row count and width so a read slices exactly the indices and not
+// the postings/dict that follow them in the blob.
+func (r *Reader) idxBytes(m *colMeta) int {
+	if r.Rows == 0 {
+		return 0
+	}
+	words := (r.Rows*m.Width+31)/32 + 1
+	return words * 4
 }
 
 // Timestamps decodes the timestamp column named, reusing the buffers.
@@ -124,8 +139,8 @@ func (r *Reader) DictIndices(name string) ([]uint32, []string) {
 	if m == nil || m.Type != ColDict {
 		return nil, nil
 	}
-	data := r.blob[m.DataOff : m.DataOff+m.DataLen]
-	return decodeIndices(data, r.Rows, m.Width), m.DictData
+	data := r.blob[m.DataOff : m.DataOff+r.idxBytes(m)]
+	return decodeIndices(data, r.Rows, m.Width), dictSectionAll(r.dictSec(m), m.DictLen)
 }
 
 // DictValueAt returns the value of a dict column at one row, decoding
@@ -145,10 +160,10 @@ func (r *Reader) DictValueAt(name string, row int) (string, bool) {
 		v |= uint64(data[bit/8+k]) << (8 * k)
 	}
 	id := uint32(v>>uint(bit%8)) & (uint32(1)<<uint(w) - 1)
-	if int(id) >= len(m.DictData) {
+	if int(id) >= m.DictLen {
 		return "", false
 	}
-	return m.DictData[id], true
+	return dictSectionAt(r.dictSec(m), m.DictLen, int(id)), true
 }
 
 // DictID returns the index of value in the named column's dictionary, or
@@ -159,19 +174,7 @@ func (r *Reader) DictID(name, value string) int {
 	if m == nil || m.Type != ColDict {
 		return -1
 	}
-	return dictLookup(m.DictData, value)
-}
-
-// dictLookup binary-searches a sorted dictionary for value, returning its
-// id or -1. BuildDict sorts the dict, so this is O(log n) where the naive
-// scan was O(n) -- the fix that made the selective needle competitive,
-// since a high-cardinality column's dict is as large as the row count.
-func dictLookup(dict []string, value string) int {
-	i := sort.Search(len(dict), func(i int) bool { return dict[i] >= value })
-	if i < len(dict) && dict[i] == value {
-		return i
-	}
-	return -1
+	return dictSectionSearch(r.dictSec(m), m.DictLen, value)
 }
 
 // EqualityCount returns a dict value's id and its row count, read from
@@ -186,7 +189,7 @@ func (r *Reader) EqualityCount(name, value string) (id, count int, ok bool) {
 	if !bloomMaybe(m.Bloom, value) {
 		return -1, 0, true
 	}
-	id = dictLookup(m.DictData, value)
+	id = dictSectionSearch(r.dictSec(m), m.DictLen, value)
 	if id < 0 {
 		return -1, 0, true
 	}
@@ -208,7 +211,7 @@ func (r *Reader) EqualityRows(name, value string) (rows []uint32, has bool) {
 	if !bloomMaybe(m.Bloom, value) {
 		return nil, true // provably absent
 	}
-	id := dictLookup(m.DictData, value)
+	id := dictSectionSearch(r.dictSec(m), m.DictLen, value)
 	if id < 0 {
 		return nil, true
 	}
@@ -315,11 +318,12 @@ func (r *Reader) ValueCounts(name string) []ValueCount {
 	}
 	blob := r.blob[m.PostOff : m.PostOff+m.PostLen]
 	no := int(le32(blob))
-	out := make([]ValueCount, 0, len(m.DictData))
-	for id := 0; id+1 < no && id < len(m.DictData); id++ {
+	sec := r.dictSec(m)
+	out := make([]ValueCount, 0, m.DictLen)
+	for id := 0; id+1 < no && id < m.DictLen; id++ {
 		start := le32(blob[4+id*4:])
 		end := le32(blob[4+(id+1)*4:])
-		out = append(out, ValueCount{Value: m.DictData[id], Count: int(end - start)})
+		out = append(out, ValueCount{Value: dictSectionAt(sec, m.DictLen, id), Count: int(end - start)})
 	}
 	return out
 }

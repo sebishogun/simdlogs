@@ -25,6 +25,7 @@ type groupEntry struct {
 	reader  *Reader
 	timeMin int64
 	timeMax int64
+	unmap   func() error // releases the mmap backing reader.blob
 }
 
 // OpenStore opens or creates a store rooted at dir, loading any groups
@@ -36,12 +37,13 @@ func OpenStore(dir string) (*Store, error) {
 	s := &Store{dir: dir}
 	files, _ := filepath.Glob(filepath.Join(dir, "group-*.bin"))
 	for _, f := range files {
-		b, err := os.ReadFile(f)
+		b, unmap, err := mmapFile(f)
 		if err != nil {
 			return nil, err
 		}
 		r, err := ReadGroup(b)
 		if err != nil {
+			unmap()
 			return nil, err // a truncated partial flush is skipped by the index, see AppendGroup
 		}
 		var id uint64
@@ -49,7 +51,7 @@ func OpenStore(dir string) (*Store, error) {
 		if id >= s.nextID {
 			s.nextID = id + 1
 		}
-		s.groups = append(s.groups, &groupEntry{id: id, path: f, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax})
+		s.groups = append(s.groups, &groupEntry{id: id, path: f, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax, unmap: unmap})
 	}
 	s.sortGroups()
 	return s, nil
@@ -83,15 +85,39 @@ func (s *Store) AppendGroup(g *Group) (uint64, error) {
 	if err := os.Rename(tmp, final); err != nil {
 		return 0, err
 	}
-	r, err := ReadGroup(blob)
+	// Map the freshly written file rather than keeping the marshaled blob on
+	// the heap, so a large store holds only its working set in RAM (the OS
+	// pages the mapping in and out). The Marshal output is now free to GC.
+	mb, unmap, err := mmapFile(final)
 	if err != nil {
 		return 0, err
 	}
+	r, err := ReadGroup(mb)
+	if err != nil {
+		unmap()
+		return 0, err
+	}
 	s.mu.Lock()
-	s.groups = append(s.groups, &groupEntry{id: id, path: final, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax})
+	s.groups = append(s.groups, &groupEntry{id: id, path: final, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax, unmap: unmap})
 	s.sortGroups()
 	s.mu.Unlock()
 	return id, nil
+}
+
+// Close releases every group's mmap. The store must not be used afterward.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var firstErr error
+	for _, g := range s.groups {
+		if g.unmap != nil {
+			if err := g.unmap(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	s.groups = nil
+	return firstErr
 }
 
 func (s *Store) sortGroups() {
