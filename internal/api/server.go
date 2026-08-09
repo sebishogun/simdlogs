@@ -145,6 +145,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/select/vmui", s.ui)
 	mux.HandleFunc("/", s.ui) // catch-all: serve the UI at the root
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)
+	mux.HandleFunc("/select/sql", s.sqlQuery)     // SQL SELECT subset (beyond VL)
 	mux.HandleFunc("/select/logsql/tail", s.tail) // live tail: stream matching rows as they arrive
 	mux.HandleFunc("/select/logsql/hits", s.selectHits)
 	mux.HandleFunc("/select/logsql/field_names", s.fieldNames)
@@ -317,6 +318,28 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-tick.C:
 		}
+	}
+}
+
+// sqlQuery runs a SQL SELECT (subset) by translating it to LogsQL -- the query
+// interface VictoriaLogs does not have. Results stream as NDJSON like the
+// LogsQL select.
+func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
+	q, err := query.ParseSQL(r.FormValue("query"))
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	q.From, q.To = timeWindow(r)
+	if len(q.Pipes) == 0 {
+		q.MatAll = true
+	}
+	bw := bufio.NewWriter(w)
+	defer bw.Flush()
+	var buf []byte
+	for _, row := range query.RunPipeline(s.tn(r).store, q) {
+		buf = appendRowJSON(buf[:0], row)
+		bw.Write(buf)
 	}
 }
 
