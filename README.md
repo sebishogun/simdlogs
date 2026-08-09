@@ -16,24 +16,31 @@ scan-heavy queries. The head-to-head harness refuted the premise it
 rested on. Measured at 3M rows, both engines on one machine, identical
 wire calls:
 
-| query class | result |
+| query class (3M rows) | result |
 |---|---|
-| common-value equality | simdlogs **1.9x** faster |
+| selective query (returns rows) | simdlogs **4.4x** faster |
 | aggregation (hits) | simdlogs **2.0x** faster |
-| rare-value selective (needle) | **VictoriaLogs 2.0x faster** |
-| ingest | comparable |
+| full-scan count (engine, parallel) | **3.7x** the serial path |
+| rare-value needle | **VictoriaLogs ~2.8x faster** |
+| ingest | comparable, VL slightly ahead |
 
-The design assumed VictoriaLogs scans up to 8M rows for a selective
-query. It does not -- its per-block bloom and per-field indexing make the
-needle query a strength. Building the design's deferred Phase 8 (a
-per-group posting index) and binary-searching the dictionary took the
-needle from a 6.4x loss to 2.0x -- real progress, still behind.
-simdlogs is ~2x faster on common-value queries and aggregations, ~2x
-slower on rare selective ones, comparable on ingest: a competitive,
-correct, VL-wire-compatible engine, not a dominant one. Orders of
-magnitude is unmet and, on all evidence here, not achievable against this
-competitor at these scales. docs/wrong.md has the full analysis. This
-README states what was measured, not what was hoped.
+The design's whole vectorized-execution half was built after an external
+review found it missing: the residual scan is now vpcmpeqd + pack over
+encoded indices (equality) and vector range compares (time), not the
+scalar per-row loop that was VictoriaLogs' own anti-pattern; query
+execution fans across cores over groups; and the result path is
+hand-built NDJSON, no reflection. That took the selective row query from
+1.9x to 4.4x. The rare needle is still VictoriaLogs' -- its per-field
+index wins the one-in-a-billion lookup, and the named next step is a
+global value->group index (Phase 9). Ingest is comparable; LZ4 dictionary
+compression (1.43x here) is the footprint lever for the 100M+ scale where
+groups stop being cache-resident.
+
+Honest standing: competitive-to-strong on the classes it targets (2-4.4x),
+behind on the rare needle, comparable on ingest. Orders of magnitude
+against a well-engineered VictoriaLogs is not reached, and the needle
+class is genuinely theirs. docs/wrong.md carries the full arc, including
+the premise that measurement killed and the levers that recovered from it.
 
 ## Status
 
