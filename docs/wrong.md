@@ -266,3 +266,33 @@ without the global value->group index the loss entry named as the lever. The
 three engine bugs above were the whole gap. The premise entry ("VL WINS the
 rare-selective query") stands as the record of what was true then; this is
 what is true now, measured to the same standard.
+
+## Ingest was serial parse-then-flush; overlapping them: 384K -> 803K rec/s
+
+Ingest was the one class VictoriaLogs led. Profiling IngestJSONLines
+(BenchmarkIngest, 500K records, parse + intern + flush, no HTTP) split the
+cost almost evenly and, critically, serially:
+
+    flushLocked   49%   BuildDict 30% (sort + two hash maps), Marshal 17%
+    parse         ~50%  simdjson Parse + buildIndex, ForEachKey, buffering
+
+The parser filled a group, then blocked while that group's dictionaries
+built, encoded and fsynced -- 31 of 32 cores idle through every flush.
+Optimizing flush alone caps at ~1.3x (halving 49% -> 0.75 total); the win
+is overlap. A group's buffers are now handed to a pool of flush workers and
+the parser continues into fresh buffers, the two halves running at once --
+the reference ingests asynchronously for the same reason.
+
+    3M rows, wire, flush-fenced (both queryable):
+      before:  384K rec/s
+      after:   803K rec/s   2.1x, and now ahead of VL's 495K
+
+Honest caveat kept: simdlogs' number is synchronous and durable when the
+POST returns; VictoriaLogs accepts asynchronously (the harness adds 3s for
+it to flush before querying, so its raw accept is ~3.1s for 3M, a touch
+faster than our 3.74s). We trade a little raw accept latency for durability
+on return and still lead on the flush-fenced basis the query comparison
+requires. A further lever measured but not yet taken: BuildDict builds two
+hash maps (a dedup set and an id table) where one pass with provisional ids
+and an index remap would do -- ~2s of the 6s, deferred since async already
+put ingest ahead.
