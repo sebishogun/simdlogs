@@ -110,7 +110,13 @@ func TestScaleVsVL(t *testing.T) {
 	vlDir, _ := os.MkdirTemp(dirBase, "scalevl-vl-")
 	defer os.RemoveAll(vlDir)
 	abs, _ := filepath.Abs(binPath)
-	cmd := exec.Command(abs, "-httpListenAddr=127.0.0.1:19429", "-storageDataPath="+vlDir, "-retentionPeriod=10y")
+	// VL runs with its own defaults (memory included) -- the fair comparison.
+	// SIMDLOGS_VL_MEMPCT can still cap it on a constrained box.
+	args := []string{"-httpListenAddr=127.0.0.1:19429", "-storageDataPath=" + vlDir, "-retentionPeriod=10y"}
+	if memPct := os.Getenv("SIMDLOGS_VL_MEMPCT"); memPct != "" {
+		args = append(args, "-memory.allowedPercent="+memPct)
+	}
+	cmd := exec.Command(abs, args...)
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start VL: %v", err)

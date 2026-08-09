@@ -1,78 +1,212 @@
 package storage
 
-// The dictionary is stored for random access straight from the mmap'd file:
-// D+1 uint32 offsets, then the concatenated sorted strings. A membership
-// probe binary-searches it in place -- log(D) page touches, no decode, no
-// heap -- so a store of billions of rows answers a needle without
-// materializing any group's dictionary in RAM. This replaces the old
-// LZ4'd-in-the-footer dict, which had to be decompressed into a []string at
-// open time (tens of GB of strings at scale). Footprint trades for it: the
-// section is uncompressed, but it is on disk and paged on demand.
+// The dictionary is stored block-compressed for random access from the
+// mmap'd file: values are grouped into small sorted blocks, each block LZ4'd,
+// with an uncompressed sparse index of every block's first value. A lookup
+// binary-searches the first-value index (no decompression) to find the one
+// block that could hold the value, then decompresses just that block and
+// searches within it. So a store of billions of rows answers a membership
+// probe by touching one small compressed block -- compression back (the
+// uncompressed section was ~4-5x larger on disk) without giving up the mmap
+// random access that keeps decoded dictionaries off the heap.
+//
+// This is the standard columnar-DB shape (Parquet/ORC/ClickHouse string
+// columns): compress in blocks, index the block boundaries.
+//
+// Layout:
+//
+//	numBlocks u32, blockSize u32
+//	fvOff[numBlocks+1] u32                 -- offsets into the first-value blob
+//	fvLen u32, first-value blob            -- each block's first value, uncompressed
+//	per block: compOff u32, compLen u32, rawLen u32
+//	compLenTotal u32, compressed blocks    -- each block raw = [k+1 offsets u32][strings], LZ4'd
 
-// marshalDictSection lays out a sorted dict as [D+1 offsets][strings].
-func marshalDictSection(dict []string) []byte {
+const dictBlock = 64
+
+// marshalRawBlock lays out one block's values as [k+1 offsets][strings], the
+// uncompressed form that a decompressed block decodes to.
+func marshalRawBlock(vals []string) []byte {
 	strsLen := 0
-	for _, s := range dict {
+	for _, s := range vals {
 		strsLen += len(s)
 	}
-	out := make([]byte, 0, 4*(len(dict)+1)+strsLen)
+	out := make([]byte, 0, 4*(len(vals)+1)+strsLen)
 	var off uint32
-	for _, s := range dict {
+	for _, s := range vals {
 		out = appU32(out, off)
 		off += uint32(len(s))
 	}
 	out = appU32(out, off)
-	for _, s := range dict {
+	for _, s := range vals {
 		out = append(out, s...)
 	}
 	return out
 }
 
-// dictSectionAt returns the i-th value, copied out of the mapping so it is
-// safe to keep after the mapping is released.
-func dictSectionAt(sec []byte, n, i int) string {
-	base := 4 * (n + 1)
-	o0 := get32(sec, 4*i)
-	o1 := get32(sec, 4*(i+1))
-	return string(sec[base+int(o0) : base+int(o1)])
+// marshalDictSection block-compresses a sorted dict.
+func marshalDictSection(dict []string) []byte {
+	n := len(dict)
+	numBlocks := 0
+	if n > 0 {
+		numBlocks = (n + dictBlock - 1) / dictBlock
+	}
+	var fvStr []byte
+	fvOff := make([]uint32, numBlocks+1)
+	type bi struct{ compOff, compLen, rawLen uint32 }
+	idx := make([]bi, numBlocks)
+	var comp []byte
+	for k := 0; k < numBlocks; k++ {
+		lo := k * dictBlock
+		hi := lo + dictBlock
+		if hi > n {
+			hi = n
+		}
+		fvOff[k] = uint32(len(fvStr))
+		fvStr = append(fvStr, dict[lo]...)
+		raw := marshalRawBlock(dict[lo:hi])
+		c := lz4Compress(raw)
+		idx[k] = bi{uint32(len(comp)), uint32(len(c)), uint32(len(raw))}
+		comp = append(comp, c...)
+	}
+	fvOff[numBlocks] = uint32(len(fvStr))
+
+	out := make([]byte, 0, 8+4*(numBlocks+1)+4+len(fvStr)+numBlocks*12+4+len(comp))
+	out = appU32(out, uint32(numBlocks))
+	out = appU32(out, dictBlock)
+	for _, o := range fvOff {
+		out = appU32(out, o)
+	}
+	out = appU32(out, uint32(len(fvStr)))
+	out = append(out, fvStr...)
+	for _, e := range idx {
+		out = appU32(out, e.compOff)
+		out = appU32(out, e.compLen)
+		out = appU32(out, e.rawLen)
+	}
+	out = appU32(out, uint32(len(comp)))
+	out = append(out, comp...)
+	return out
 }
 
-// dictSectionSearch binary-searches the sorted section for value, returning
-// its id or -1. The string(sec[...]) comparisons do not allocate -- the
-// compiler elides the conversion in a comparison.
+// dictSec navigates a marshaled dict section without decompressing anything.
+type dictSec struct {
+	numBlocks int
+	fvOff     []byte // fvOff table, numBlocks+1 u32
+	fvStr     []byte // first-value strings
+	idx       []byte // block index, numBlocks*12
+	comp      []byte // compressed blocks
+}
+
+func parseDictSec(sec []byte) dictSec {
+	if len(sec) < 8 {
+		return dictSec{}
+	}
+	nb := int(get32(sec, 0))
+	p := 8
+	fvOff := sec[p : p+4*(nb+1)]
+	p += 4 * (nb + 1)
+	fvLen := int(get32(sec, p))
+	p += 4
+	fvStr := sec[p : p+fvLen]
+	p += fvLen
+	idx := sec[p : p+nb*12]
+	p += nb * 12
+	compLen := int(get32(sec, p))
+	p += 4
+	comp := sec[p : p+compLen]
+	return dictSec{numBlocks: nb, fvOff: fvOff, fvStr: fvStr, idx: idx, comp: comp}
+}
+
+func (d dictSec) firstVal(k int) string {
+	o0 := get32(d.fvOff, 4*k)
+	o1 := get32(d.fvOff, 4*(k+1))
+	return string(d.fvStr[o0:o1])
+}
+
+// block decompresses block k into [k'+1 offsets][strings].
+func (d dictSec) block(k int) []byte {
+	compOff := int(get32(d.idx, k*12))
+	compLen := int(get32(d.idx, k*12+4))
+	rawLen := int(get32(d.idx, k*12+8))
+	return lz4Decompress(d.comp[compOff:compOff+compLen], rawLen)
+}
+
+// blockValAt reads value i within a decompressed block of count vals.
+func blockValAt(raw []byte, count, i int) string {
+	base := 4 * (count + 1)
+	o0 := get32(raw, 4*i)
+	o1 := get32(raw, 4*(i+1))
+	return string(raw[base+int(o0) : base+int(o1)])
+}
+
+// blockCount is how many values block k holds.
+func (d dictSec) blockCount(k, n int) int {
+	c := n - k*dictBlock
+	if c > dictBlock {
+		c = dictBlock
+	}
+	return c
+}
+
+// dictSectionSearch returns value's id or -1, decompressing at most one block.
 func dictSectionSearch(sec []byte, n int, value string) int {
-	base := 4 * (n + 1)
-	lo, hi := 0, n
+	d := parseDictSec(sec)
+	if d.numBlocks == 0 {
+		return -1
+	}
+	// Largest block k with firstVal(k) <= value.
+	lo, hi := 0, d.numBlocks
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
-		o0 := get32(sec, 4*mid)
-		o1 := get32(sec, 4*(mid+1))
-		if string(sec[base+int(o0):base+int(o1)]) < value {
+		if d.firstVal(mid) <= value {
 			lo = mid + 1
 		} else {
 			hi = mid
 		}
 	}
-	if lo < n {
-		o0 := get32(sec, 4*lo)
-		o1 := get32(sec, 4*(lo+1))
-		if string(sec[base+int(o0):base+int(o1)]) == value {
-			return lo
+	k := lo - 1
+	if k < 0 {
+		return -1 // value precedes the first value
+	}
+	raw := d.block(k)
+	cnt := d.blockCount(k, n)
+	blo, bhi := 0, cnt
+	for blo < bhi {
+		mid := int(uint(blo+bhi) >> 1)
+		if blockValAt(raw, cnt, mid) < value {
+			blo = mid + 1
+		} else {
+			bhi = mid
 		}
+	}
+	if blo < cnt && blockValAt(raw, cnt, blo) == value {
+		return k*dictBlock + blo
 	}
 	return -1
 }
 
-// dictSectionAll materializes the whole dict -- the scan path (substring,
-// regexp, group-by), which needs every value; allocated on demand per query,
-// not held at rest.
+// dictSectionAt returns the i-th value, decompressing its block.
+func dictSectionAt(sec []byte, n, i int) string {
+	d := parseDictSec(sec)
+	k := i / dictBlock
+	if k >= d.numBlocks {
+		return ""
+	}
+	raw := d.block(k)
+	return blockValAt(raw, d.blockCount(k, n), i%dictBlock)
+}
+
+// dictSectionAll materializes the whole dict -- the scan path, decompressing
+// every block once.
 func dictSectionAll(sec []byte, n int) []string {
-	out := make([]string, n)
-	base := 4 * (n + 1)
-	for i := 0; i < n; i++ {
-		o0 := get32(sec, 4*i)
-		o1 := get32(sec, 4*(i+1))
-		out[i] = string(sec[base+int(o0) : base+int(o1)])
+	d := parseDictSec(sec)
+	out := make([]string, 0, n)
+	for k := 0; k < d.numBlocks; k++ {
+		raw := d.block(k)
+		cnt := d.blockCount(k, n)
+		for i := 0; i < cnt; i++ {
+			out = append(out, blockValAt(raw, cnt, i))
+		}
 	}
 	return out
 }
