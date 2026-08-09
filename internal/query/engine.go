@@ -36,10 +36,19 @@ type Pred struct {
 	re    *regexp.Regexp
 }
 
-// Row is a materialized result: the decoded field values of a match.
+// Field is one decoded key/value of a matched row.
+type Field struct {
+	Key   string
+	Value string
+}
+
+// Row is a materialized result: the decoded field values of a match. Fields
+// is an ordered slice, not a map -- a query returns a handful of fields per
+// row and one small slice per row is far cheaper than a map allocation and
+// its hashing, which the profile showed dominating the selective query.
 type Row struct {
 	Time   int64
-	Fields map[string]string
+	Fields []Field
 }
 
 // Store is the read surface the engine needs; storage.Store satisfies it.
@@ -158,15 +167,15 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 		} else {
 			t = ts[i-lo]
 		}
-		row := Row{Time: t, Fields: make(map[string]string, len(q.Preds))}
+		row := Row{Time: t, Fields: make([]Field, 0, len(q.Preds))}
 		for _, p := range q.Preds {
 			// Prefer a decoded column if we already have one; otherwise
 			// (the posting path skipped the full decode) fetch just this
 			// row's value -- O(1), keeping the selective query lazy.
 			if c := cols[p.Field]; c.idx != nil {
-				row.Fields[p.Field] = c.dict[c.idx[i]]
+				row.Fields = append(row.Fields, Field{p.Field, c.dict[c.idx[i]]})
 			} else if v, ok := g.DictValueAt(p.Field, i); ok {
-				row.Fields[p.Field] = v
+				row.Fields = append(row.Fields, Field{p.Field, v})
 			}
 		}
 		out = append(out, row)

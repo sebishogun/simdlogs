@@ -4,22 +4,22 @@
 <text x="14" y="46" class="mut" font-size="12">query latency in microseconds, lower is better; warmup + min of 25, both engines, identical wire calls</text>
 <text x="14" y="84">rare needle (full span)</text>
 <rect x="200" y="73" width="2" height="13" rx="2" fill="#3aa675"/>
-<text x="208" y="84" font-size="11">ours 23  <tspan font-weight="700">13.2x</tspan></text>
+<text x="208" y="84" font-size="11">ours 24  <tspan font-weight="700">12.5x</tspan></text>
 <rect x="200" y="89" width="10" height="10" rx="2" fill="#bbb"/>
-<text x="216" y="98" class="mut" font-size="10">VictoriaLogs 299</text>
-<text x="14" y="130">aggregation (hits)</text>
-<rect x="200" y="119" width="18" height="13" rx="2" fill="#3aa675"/>
-<text x="224" y="130" font-size="11">ours 528  <tspan font-weight="700">6.0x</tspan></text>
-<rect x="200" y="135" width="104" height="10" rx="2" fill="#bbb"/>
-<text x="310" y="144" class="mut" font-size="10">VictoriaLogs 3.1K</text>
-<text x="14" y="176">selective query (rows)</text>
-<rect x="200" y="165" width="67" height="13" rx="2" fill="#3aa675"/>
-<text x="273" y="176" font-size="11">ours 2.0K  <tspan font-weight="700">5.4x</tspan></text>
-<rect x="200" y="181" width="360" height="10" rx="2" fill="#bbb"/>
-<text x="566" y="190" class="mut" font-size="10">VictoriaLogs 10.8K</text>
+<text x="216" y="98" class="mut" font-size="10">VictoriaLogs 301</text>
+<text x="14" y="130">selective query (rows)</text>
+<rect x="200" y="119" width="42" height="13" rx="2" fill="#3aa675"/>
+<text x="248" y="130" font-size="11">ours 1.3K  <tspan font-weight="700">8.5x</tspan></text>
+<rect x="200" y="135" width="360" height="10" rx="2" fill="#bbb"/>
+<text x="566" y="144" class="mut" font-size="10">VictoriaLogs 11.4K</text>
+<text x="14" y="176">aggregation (hits)</text>
+<rect x="200" y="165" width="17" height="13" rx="2" fill="#3aa675"/>
+<text x="223" y="176" font-size="11">ours 531  <tspan font-weight="700">6.7x</tspan></text>
+<rect x="200" y="181" width="113" height="10" rx="2" fill="#bbb"/>
+<text x="319" y="190" class="mut" font-size="10">VictoriaLogs 3.6K</text>
 <text x="14" y="222">windowed count (engine)</text>
 <rect x="200" y="211" width="2" height="13" rx="2" fill="#3aa675"/>
 <text x="208" y="222" font-size="11">ours 65  <tspan font-weight="700">12.9x</tspan></text>
-<rect x="200" y="227" width="28" height="10" rx="2" fill="#bbb"/>
-<text x="234" y="236" class="mut" font-size="10">pre-blockskip 839</text>
+<rect x="200" y="227" width="27" height="10" rx="2" fill="#bbb"/>
+<text x="233" y="236" class="mut" font-size="10">pre-blockskip 839</text>
 </svg>

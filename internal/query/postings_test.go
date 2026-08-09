@@ -37,12 +37,23 @@ func TestNeedleCorrectness(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("needle matched %d rows, want 1", len(rows))
 	}
-	if rows[0].Fields["trace"] != "NEEDLE-XYZ" {
-		t.Fatalf("needle field not materialized: %q", rows[0].Fields["trace"])
+	if got := fieldValue(rows[0], "trace"); got != "NEEDLE-XYZ" {
+		t.Fatalf("needle field not materialized: %q", got)
 	}
 	// Count path agrees.
 	if c := Count(s, &Query{From: 0, To: int64(1) << 62,
 		Preds: []Pred{{Field: "trace", Kind: Eq, Value: "NEEDLE-XYZ"}}}); c != 1 {
 		t.Fatalf("Count needle = %d, want 1", c)
 	}
+}
+
+// fieldValue returns a row's value for key, or "" -- Fields is an ordered
+// slice, not a map.
+func fieldValue(r Row, key string) string {
+	for _, f := range r.Fields {
+		if f.Key == key {
+			return f.Value
+		}
+	}
+	return ""
 }

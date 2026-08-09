@@ -17,10 +17,11 @@ identical wire calls:
 
 | query class (3M rows) | result |
 |---|---|
-| rare-value needle (full span) | simdlogs **13.2x** faster (23x engine-only) |
-| aggregation (hits) | simdlogs **6.0x** faster |
-| selective query (returns rows) | simdlogs **5.4x** faster |
+| rare-value needle (full span) | simdlogs **12.6x** faster (23x engine-only) |
+| selective query (returns rows) | simdlogs **8.5x** faster |
+| aggregation (hits) | simdlogs **6.7x** faster |
 | windowed count (engine) | **13x** (block-skip, 839us -> 65us) |
+| group-by (stats by field, engine) | **1078x** (footer postings, 3.56ms -> 3.3us) |
 | ingest (synchronous, durable) | **2.81M rec/s** (was 384K), ~5.7x VL |
 
 Method, the discipline the simd repos hold to: deterministic corpus, both
@@ -68,8 +69,8 @@ window without decoding it and restricts its predicate scan to the window's
 block span. A windowed count went from 839us to 65us in the engine (13x),
 and the aggregation head-to-head from 2.1x to 6.0x.
 
-Standing at 3M rows: faster on every class measured -- 6.0x at the
-aggregation, 5.4x at the selective row query, 13.2x (23x engine-only) at
+Standing at 3M rows: faster on every class measured -- 6.7x at the
+aggregation, 8.5x at the selective row query, 12.6x (23x engine-only) at
 the needle, 5.7x at ingest. docs/wrong.md carries the full arc: the
 premise that measurement first refuted, and the engine work that turned the
 needle class from a loss into the widest win.

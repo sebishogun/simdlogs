@@ -97,14 +97,14 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 		buf = append(buf, `{"_time":"`...)
 		buf = time.Unix(0, row.Time).UTC().AppendFormat(buf, time.RFC3339Nano)
 		buf = append(buf, '"')
-		for k, v := range row.Fields {
-			if k == "_time" {
+		for _, f := range row.Fields {
+			if f.Key == "_time" {
 				continue
 			}
 			buf = append(buf, ',', '"')
-			buf = appendJSONString(buf, k)
+			buf = appendJSONString(buf, f.Key)
 			buf = append(buf, '"', ':', '"')
-			buf = appendJSONString(buf, v)
+			buf = appendJSONString(buf, f.Value)
 			buf = append(buf, '"')
 		}
 		buf = append(buf, '}', '\n')

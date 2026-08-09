@@ -56,8 +56,8 @@ func (s *Server) esSearch(w http.ResponseWriter, r *http.Request) {
 	hits := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
 		src := map[string]any{"@timestamp": time.Unix(0, row.Time).UTC().Format(time.RFC3339Nano)}
-		for k, v := range row.Fields {
-			src[k] = v
+		for _, f := range row.Fields {
+			src[f.Key] = f.Value
 		}
 		hits = append(hits, map[string]any{"_source": src})
 	}
