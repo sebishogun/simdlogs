@@ -31,6 +31,7 @@ type Server struct {
 	tenants    map[string]*tenant
 	def        *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
 	strmFlds   []string
+	backends   []string // peer node base URLs; when set, selects fan out and merge (vmselect role)
 	started    time.Time
 	nIngestReq int64 // ingest requests (atomic)
 	nQueryReq  int64 // query requests (atomic)
@@ -156,6 +157,10 @@ func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
 // selectQuery runs a parsed LogsQL query and streams matched rows as
 // NDJSON, the reference's /select/logsql/query response shape.
 func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 { // select-router: fan out to the storage nodes and merge
+		s.federatedSelect(w, r)
+		return
+	}
 	q, err := parseRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), 400)

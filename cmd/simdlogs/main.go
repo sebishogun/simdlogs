@@ -20,6 +20,7 @@ func main() {
 	retention := flag.Duration("retention", 0, "drop data older than this (e.g. 720h); 0 disables")
 	streamFields := flag.String("stream-fields", "", "comma-separated fields that identify a log stream (synthesizes _stream)")
 	syslogAddr := flag.String("syslog", "", "also listen for syslog on this UDP/TCP address (e.g. :514)")
+	backends := flag.String("select-backends", "", "comma-separated peer node URLs; when set this node is a select router (vmselect role)")
 	flag.Parse()
 
 	srv, err := api.NewServer(*dir)
@@ -28,6 +29,10 @@ func main() {
 	}
 	if *streamFields != "" {
 		srv.SetStreamFields(strings.Split(*streamFields, ","))
+	}
+	if *backends != "" {
+		srv.SetBackends(strings.Split(*backends, ","))
+		log.Printf("select-router mode: %s", *backends)
 	}
 	if *retention > 0 {
 		stop := srv.StartRetention(*retention, time.Hour)
