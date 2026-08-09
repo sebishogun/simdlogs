@@ -223,6 +223,31 @@ func TestStoreTailCursor(t *testing.T) {
 	}
 }
 
+func TestQuantileAgg(t *testing.T) {
+	s := statsStore(t) // a: latency 10,20,60 ; b: 30,40
+	run := func(q string) map[string]string {
+		pq, err := ParseLogsQL(q)
+		if err != nil {
+			t.Fatalf("parse %q: %v", q, err)
+		}
+		pq.From, pq.To = 0, int64(1)<<62
+		m := map[string]string{}
+		for _, r := range RunPipeline(s, pq) {
+			m[rowField(r, "service")] = rowField(r, "p")
+		}
+		return m
+	}
+	if m := run(`* | stats by (service) quantile(0.5, latency) as p`); m["a"] != "20" || m["b"] != "35" {
+		t.Fatalf("median latency = %v want a:20 b:35", m)
+	}
+	if m := run(`* | stats by (service) quantile(1, latency) as p`); m["a"] != "60" {
+		t.Fatalf("p100 latency a = %q want 60", m["a"])
+	}
+	if m := run(`* | stats by (service) median(latency) as p`); m["a"] != "20" {
+		t.Fatalf("median() a = %q want 20", m["a"])
+	}
+}
+
 func TestFilterPipe(t *testing.T) {
 	s := statsStore(t) // service a:3, b:2
 	q, err := ParseLogsQL(`* | stats by (service) count() as c | filter c:>2`)

@@ -30,12 +30,14 @@ const (
 	AggMax
 	AggUniq
 	AggCountUniq
+	AggQuantile
 )
 
 // Agg is one aggregation in a stats pipe.
 type Agg struct {
 	Field string // "" for count()
 	Alias string
+	P     float64 // percentile for quantile() (0..1)
 	Kind  AggKind
 }
 
@@ -93,6 +95,7 @@ type statSlot struct {
 	sum, min, max float64
 	cnt           int64 // numeric samples (avg denominator)
 	set           map[string]struct{}
+	vals          []float64 // numeric samples for quantile() (exact)
 	has           bool
 }
 
@@ -275,6 +278,9 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 				if err != nil {
 					continue
 				}
+				if a.Kind == AggQuantile {
+					sl.vals = append(sl.vals, f)
+				}
 				if !sl.has || f < sl.min {
 					sl.min = f
 				}
@@ -318,11 +324,35 @@ func formatAgg(a *Agg, sl *statSlot, rows int64) string {
 		return trimFloat(sl.max)
 	case AggUniq, AggCountUniq:
 		return strconv.Itoa(len(sl.set))
+	case AggQuantile:
+		return trimFloat(quantileOf(sl.vals, a.P))
 	}
 	return ""
 }
 
 func trimFloat(f float64) string { return strconv.FormatFloat(f, 'f', -1, 64) }
+
+// quantileOf returns the p-quantile (0..1) of vals by linear interpolation
+// between the two nearest ranks -- exact, not sketched. It sorts in place; the
+// slice is the aggregation's own sample buffer, discarded after.
+func quantileOf(vals []float64, p float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sort.Float64s(vals)
+	if p <= 0 {
+		return vals[0]
+	}
+	if p >= 1 {
+		return vals[len(vals)-1]
+	}
+	pos := p * float64(len(vals)-1)
+	lo := int(pos)
+	if lo+1 >= len(vals) {
+		return vals[lo]
+	}
+	return vals[lo] + (pos-float64(lo))*(vals[lo+1]-vals[lo])
+}
 
 // rowField returns a row's value for key.
 func rowField(r Row, key string) string {

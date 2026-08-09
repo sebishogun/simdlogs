@@ -673,6 +673,23 @@ func (p *lqlParser) parseAgg() (Agg, error) {
 		return Agg{}, fmt.Errorf("simdlogs: expected ( after %s", fn.val)
 	}
 	p.next() // (
+	kind, ok := aggKind(fn.val)
+	if !ok {
+		return Agg{}, fmt.Errorf("simdlogs: unknown aggregation %q", fn.val)
+	}
+	// quantile(p, field) takes a leading percentile; median(field) is p=0.5.
+	pct := 0.5
+	if kind == AggQuantile && !strings.EqualFold(fn.val, "median") {
+		pt := p.next()
+		v, err := strconv.ParseFloat(pt.val, 64)
+		if err != nil {
+			return Agg{}, fmt.Errorf("simdlogs: quantile expects a percentile 0..1, got %q", pt.val)
+		}
+		pct = v
+		if p.peek().kind == tComma {
+			p.next()
+		}
+	}
 	field := ""
 	if k := p.peek().kind; k == tIdent || k == tString {
 		field = p.next().val
@@ -681,11 +698,7 @@ func (p *lqlParser) parseAgg() (Agg, error) {
 		return Agg{}, fmt.Errorf("simdlogs: expected ) in %s()", fn.val)
 	}
 	p.next() // )
-	kind, ok := aggKind(fn.val)
-	if !ok {
-		return Agg{}, fmt.Errorf("simdlogs: unknown aggregation %q", fn.val)
-	}
-	a := Agg{Field: field, Kind: kind}
+	a := Agg{Field: field, Kind: kind, P: pct}
 	if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
 		p.next()
 		al := p.next()
@@ -831,6 +844,8 @@ func aggKind(name string) (AggKind, bool) {
 		return AggUniq, true
 	case "count_uniq":
 		return AggCountUniq, true
+	case "quantile", "median":
+		return AggQuantile, true
 	}
 	return 0, false
 }
