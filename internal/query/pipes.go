@@ -102,8 +102,23 @@ func accSample(e *statEntry, aggs []Agg, valOf func(j int) string) {
 		}
 		val := valOf(j)
 		sl := &e.slots[j]
-		if a.Kind == AggUniq || a.Kind == AggCountUniq {
+		if a.Kind == AggUniq { // uniq returns the values, so it stays exact
 			sl.set[val] = struct{}{}
+			continue
+		}
+		if a.Kind == AggCountUniq {
+			if sl.hll != nil {
+				sl.hll.add(val)
+				continue
+			}
+			sl.set[val] = struct{}{}
+			if len(sl.set) > hllThreshold { // spill the exact set into a bounded sketch
+				sl.hll = newHLL()
+				for v := range sl.set {
+					sl.hll.add(v)
+				}
+				sl.set = nil
+			}
 			continue
 		}
 		f, err := strconv.ParseFloat(val, 64)
@@ -183,9 +198,15 @@ type statSlot struct {
 	sum, min, max float64
 	cnt           int64 // numeric samples (avg denominator)
 	set           map[string]struct{}
-	vals          []float64 // numeric samples for quantile() (exact)
+	hll           *hyperLogLog // count_uniq once the set exceeds hllThreshold (bounded RAM)
+	vals          []float64    // numeric samples for quantile() (exact)
 	has           bool
 }
+
+// hllThreshold is where count_uniq switches from an exact set to HyperLogLog:
+// below it the answer is exact; above it RAM is bounded at ~16KB regardless of
+// cardinality (vs an unbounded set that OOMs at billion-row scale).
+const hllThreshold = 8192
 
 // statEntry is one group-by key's accumulators.
 type statEntry struct {
@@ -381,7 +402,12 @@ func formatAgg(a *Agg, sl *statSlot, rows int64) string {
 		return trimFloat(sl.min)
 	case AggMax:
 		return trimFloat(sl.max)
-	case AggUniq, AggCountUniq:
+	case AggUniq:
+		return strconv.Itoa(len(sl.set))
+	case AggCountUniq:
+		if sl.hll != nil {
+			return strconv.Itoa(sl.hll.count())
+		}
 		return strconv.Itoa(len(sl.set))
 	case AggQuantile:
 		return trimFloat(quantileOf(sl.vals, a.P))
