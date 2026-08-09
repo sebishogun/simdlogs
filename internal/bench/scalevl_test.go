@@ -1,0 +1,139 @@
+package bench
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/sebishogun/simdlogs/internal/api"
+)
+
+// TestScaleVsVL is the from-disk head-to-head at scale: the same corpus is
+// streamed in chunks to both engines over HTTP (no giant NDJSON buffer), each
+// writes to its own disk-backed store, then the same needle / selective /
+// aggregation queries hit both. This is the fair comparison -- both through
+// their HTTP surface, both from disk -- that the cache-hot 3M numbers were
+// not. Run:
+//
+//	SIMDLOGS_SCALEVL=1 SIMDLOGS_SCALEVL_N=300000000 go test -run TestScaleVsVL -v -timeout 60m ./internal/bench/
+//
+// Needs the VL binary at internal/bench/victoria-logs. Disk-heavy; pick N to
+// fit RAM headroom (VL buffers a lot ingesting at scale).
+func TestScaleVsVL(t *testing.T) {
+	if os.Getenv("SIMDLOGS_SCALEVL") == "" {
+		t.Skip("set SIMDLOGS_SCALEVL=1 to run the scale head-to-head")
+	}
+	N := 100_000_000
+	if v := os.Getenv("SIMDLOGS_SCALEVL_N"); v != "" {
+		if x, err := strconv.Atoi(v); err == nil {
+			N = x
+		}
+	}
+	const chunkRows = 1_000_000
+	const needle = "NEEDLEc0ffee42scale"
+	services := []string{"api", "auth", "billing", "cache", "db", "gateway", "worker", "scheduler"}
+	base := time.Unix(1_700_000_000, 0).UTC()
+	// span: 1us per row keeps a wide window; lo/hi in nanos.
+	lo := base.UnixNano()
+	hi := lo + int64(N)*1000
+
+	// streamChunks generates the deterministic corpus in NDJSON chunks and
+	// hands each to fn, once -- so the same bytes go to both engines.
+	streamChunks := func(fn func(chunk []byte)) {
+		var buf bytes.Buffer
+		buf.Grow(chunkRows * 96)
+		for i := 0; i < N; i++ {
+			ts := base.Add(time.Duration(i) * time.Microsecond)
+			tr := strconv.FormatInt(int64(i), 16)
+			if i == N-1000 {
+				tr = needle
+			}
+			fmt.Fprintf(&buf, `{"_time":%q,"service":%q,"trace":%q}`+"\n",
+				ts.Format(time.RFC3339Nano), services[i%len(services)], tr)
+			if (i+1)%chunkRows == 0 {
+				fn(buf.Bytes())
+				buf.Reset()
+			}
+		}
+		if buf.Len() > 0 {
+			fn(buf.Bytes())
+		}
+	}
+
+	dirBase := os.Getenv("SIMDLOGS_SCALE_DIR")
+	if dirBase == "" {
+		dirBase = "/var/tmp"
+	}
+
+	// ---- simdlogs, HTTP, disk-backed ----
+	slDir, _ := os.MkdirTemp(dirBase, "scalevl-sl-")
+	defer os.RemoveAll(slDir)
+	srv, err := api.NewServer(slDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl := httptest.NewServer(srv.Handler())
+	defer sl.Close()
+
+	full := time.Unix(0, lo).UTC().Format(time.RFC3339Nano)
+	fullEnd := time.Unix(0, hi+1).UTC().Format(time.RFC3339Nano)
+	wlo := time.Unix(0, lo+(hi-lo)/2).UTC().Format(time.RFC3339Nano)
+	whi := time.Unix(0, lo+(hi-lo)/2+(hi-lo)/50).UTC().Format(time.RFC3339Nano)
+
+	t0 := time.Now()
+	streamChunks(func(c []byte) { post(t, sl.URL+"/insert/jsonline", c) })
+	slIngest := time.Since(t0)
+	nq := url.Values{"query": {"trace:=" + needle}, "start": {full}, "end": {fullEnd}}.Encode()
+	sq := url.Values{"query": {"service:=auth"}, "start": {wlo}, "end": {whi}}.Encode()
+	hq := url.Values{"query": {"service:=auth"}, "start": {wlo}, "end": {whi}, "step": {"1m"}}.Encode()
+	slNeedle := timeQuery(t, func() { get(t, sl.URL+"/select/logsql/query?"+nq) })
+	slSel := timeQuery(t, func() { get(t, sl.URL+"/select/logsql/query?"+sq) })
+	slAgg := timeQuery(t, func() { get(t, sl.URL+"/select/logsql/hits?"+hq) })
+	t.Logf("simdlogs  N=%d: ingest %v (%.2fM rec/s) | needle %v selective %v agg %v",
+		N, slIngest.Round(time.Millisecond), float64(N)/slIngest.Seconds()/1e6, slNeedle, slSel, slAgg)
+
+	// ---- VictoriaLogs, HTTP, disk-backed ----
+	binPath := "victoria-logs"
+	if _, err := os.Stat(binPath); err != nil {
+		t.Log("VL binary not staged; simdlogs numbers recorded, VL half skipped")
+		return
+	}
+	vlDir, _ := os.MkdirTemp(dirBase, "scalevl-vl-")
+	defer os.RemoveAll(vlDir)
+	abs, _ := filepath.Abs(binPath)
+	cmd := exec.Command(abs, "-httpListenAddr=127.0.0.1:19429", "-storageDataPath="+vlDir, "-retentionPeriod=10y")
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start VL: %v", err)
+	}
+	defer cmd.Process.Kill()
+	vl := "http://127.0.0.1:19429"
+	waitReady(t, vl+"/insert/ready", 30*time.Second)
+
+	t0 = time.Now()
+	streamChunks(func(c []byte) { post(t, vl+"/insert/jsonline", c) })
+	time.Sleep(5 * time.Second) // let VL flush before querying
+	vlIngest := time.Since(t0)
+	vlNeedle := timeQuery(t, func() { get(t, vl+"/select/logsql/query?"+nq) })
+	vlSel := timeQuery(t, func() { get(t, vl+"/select/logsql/query?"+sq) })
+	vlAgg := timeQuery(t, func() { get(t, vl+"/select/logsql/hits?"+hq) })
+	t.Logf("victorialogs N=%d: ingest %v (%.2fM rec/s) | needle %v selective %v agg %v",
+		N, vlIngest.Round(time.Millisecond), float64(N)/vlIngest.Seconds()/1e6, vlNeedle, vlSel, vlAgg)
+
+	t.Logf("SCALE HEAD-TO-HEAD N=%d | needle %.1fx | selective %.1fx | agg %.1fx | ingest sl/vl %.2f",
+		N, ratio(vlNeedle, slNeedle), ratio(vlSel, slSel), ratio(vlAgg, slAgg),
+		vlIngest.Seconds()/slIngest.Seconds())
+}
+
+func ratio(a, b time.Duration) float64 { return float64(a) / float64(b) }
+
+var _ = http.MethodGet
