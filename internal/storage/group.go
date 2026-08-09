@@ -19,7 +19,7 @@ import (
 
 const (
 	magic   = 0x736C6F67 // "slog"
-	version = 1
+	version = 2
 	// MaxRows is the group ceiling; ingest flushes at or before it.
 	MaxRows = 128 * 1024
 )
@@ -125,9 +125,11 @@ func (g *Group) Marshal() []byte {
 		for _, w := range m.Bloom {
 			b = appU64(b, w)
 		}
-		for _, s := range m.DictData {
-			b = appStr(b, s)
-		}
+		blob := marshalDictBlob(m.DictData)
+		comp := lz4Compress(blob)
+		b = appU32(b, uint32(len(blob))) // uncompressed length
+		b = appU32(b, uint32(len(comp)))
+		b = append(b, comp...)
 	}
 	b = appU32(b, uint32(len(b)-footStart))
 	return b
@@ -184,10 +186,16 @@ func ReadGroup(b []byte) (*Reader, error) {
 			m.Bloom[j] = binary.LittleEndian.Uint64(f[p:])
 			p += 8
 		}
-		m.DictData = make([]string, m.DictLen)
-		for j := 0; j < m.DictLen; j++ {
-			m.DictData[j], p = getStr(f, p)
+		uncomp := int(get32(f, p))
+		p += 4
+		clen := int(get32(f, p))
+		p += 4
+		if clen > 0 {
+			m.DictData = unmarshalDictBlob(lz4Decompress(f[p:p+clen], uncomp), m.DictLen)
+		} else {
+			m.DictData = nil
 		}
+		p += clen
 		r.cols[i] = m
 	}
 	return r, nil
