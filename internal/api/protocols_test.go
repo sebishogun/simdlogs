@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"net"
@@ -185,6 +187,49 @@ func TestDatadogIngest(t *testing.T) {
 	}
 	if e := statsBy("env"); e["prod"] != 2 { // ddtags split into a field
 		t.Fatalf("datadog ddtags env = %v want prod:2", e)
+	}
+}
+
+func TestJournaldIngest(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	var b bytes.Buffer
+	// Entry 1: uses a binary length-prefixed MESSAGE whose value contains a
+	// newline -- only correct byte-level framing recovers it intact.
+	b.WriteString("__REALTIME_TIMESTAMP=1700000000000000\n")
+	b.WriteString("PRIORITY=3\n")
+	b.WriteString("MESSAGE\n")
+	msg := "line1\nline2"
+	var ln [8]byte
+	binary.LittleEndian.PutUint64(ln[:], uint64(len(msg)))
+	b.Write(ln[:])
+	b.WriteString(msg)
+	b.WriteByte('\n')
+	b.WriteString("_HOSTNAME=host1\n")
+	b.WriteString("\n") // entry boundary
+	// Entry 2: all text fields.
+	b.WriteString("__REALTIME_TIMESTAMP=1700000000001000\nPRIORITY=6\nMESSAGE=ok\n_HOSTNAME=host2\n")
+
+	r, err := http.Post(ts.URL+"/insert/journald", "application/vnd.fdo.journal", &b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.StatusCode != http.StatusAccepted {
+		t.Fatalf("journald status %d want 202", r.StatusCode)
+	}
+	io.Copy(io.Discard, r.Body)
+	r.Body.Close()
+
+	if p := statsBy(t, ts, "priority"); p["3"] != 1 || p["6"] != 1 {
+		t.Fatalf("journald stats by priority = %v want 3:1 6:1", p)
+	}
+	if h := statsBy(t, ts, "hostname"); h["host1"] != 1 || h["host2"] != 1 { // leading _ stripped
+		t.Fatalf("journald stats by hostname = %v want host1:1 host2:1", h)
+	}
+	if m := statsBy(t, ts, "_msg"); m["line1\nline2"] != 1 || m["ok"] != 1 { // binary value round-trips
+		t.Fatalf("journald _msg = %v want the newline-containing message intact", m)
 	}
 }
 

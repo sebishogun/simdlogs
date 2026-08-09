@@ -33,6 +33,22 @@ func (s *Server) insertLoki(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// insertJournald ingests the systemd journal export format (the body
+// systemd-journal-upload POSTs).
+func (s *Server) insertJournald(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	ingest.IngestJournald(s.w, body, s.fallbackTS())
+	if err := s.w.Flush(); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
 // insertOTLPLogs ingests an OpenTelemetry logs export (OTLP/HTTP, JSON). The
 // OTLP spec expects a 200 with an ExportLogsServiceResponse body.
 func (s *Server) insertOTLPLogs(w http.ResponseWriter, r *http.Request) {
