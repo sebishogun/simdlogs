@@ -1,11 +1,15 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
+	"github.com/sebishogun/simdlogs/internal/ingest"
 	"github.com/sebishogun/simdlogs/internal/query"
 )
 
@@ -138,4 +142,51 @@ func toStr(v any) string {
 		return "false"
 	}
 	return ""
+}
+
+// esBulk ingests the Elasticsearch _bulk NDJSON: alternating action and
+// document lines. The action ({"index":{...}} / "create" / "update" /
+// "delete") is dropped -- delete carries no document, the rest are followed
+// by the doc line, which is ingested like jsonline (@timestamp counts as the
+// timestamp). So Filebeat/Logstash/Fluentd/OTel-ES exporters point here
+// unchanged.
+func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	var docs bytes.Buffer
+	lines := bytes.Split(body, []byte("\n"))
+	for i := 0; i < len(lines); i++ {
+		line := bytes.TrimSpace(lines[i])
+		if len(line) == 0 {
+			continue
+		}
+		if bytes.Contains(line, []byte(`"delete"`)) {
+			continue // delete action: no document follows
+		}
+		// index/create/update: the next non-empty line is the document.
+		for i+1 < len(lines) {
+			i++
+			d := bytes.TrimSpace(lines[i])
+			if len(d) > 0 {
+				docs.Write(d)
+				docs.WriteByte('\n')
+				break
+			}
+		}
+	}
+	fallback := func() int64 { return time.Now().UnixNano() + atomic.AddInt64(&s.mono, 1) }
+	ing, skip := ingest.IngestJSONLines(s.w, docs.Bytes(), fallback)
+	if err := s.w.Flush(); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	items := make([]map[string]any, 0, ing)
+	for i := 0; i < ing; i++ {
+		items = append(items, map[string]any{"create": map[string]any{"status": 201}})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"took": 0, "errors": skip > 0, "items": items})
 }

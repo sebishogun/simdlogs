@@ -40,6 +40,8 @@ func NewServer(dir string) (*Server, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/insert/jsonline", s.insertJSONLine)
+	mux.HandleFunc("/insert/logfmt", s.insertLogfmt)
+	mux.HandleFunc("/_bulk", s.esBulk) // Elasticsearch bulk ingest
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)
 	mux.HandleFunc("/select/logsql/hits", s.selectHits)
@@ -73,6 +75,22 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+	}
+	json.NewEncoder(w).Encode(map[string]int{"ingested": ing, "skipped": skip})
+}
+
+// insertLogfmt ingests a logfmt body (key=value lines) and flushes it.
+func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	fallback := func() int64 { return time.Now().UnixNano() + atomic.AddInt64(&s.mono, 1) }
+	ing, skip := ingest.IngestLogfmt(s.w, body, fallback)
+	if err := s.w.Flush(); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
 	}
 	json.NewEncoder(w).Encode(map[string]int{"ingested": ing, "skipped": skip})
 }

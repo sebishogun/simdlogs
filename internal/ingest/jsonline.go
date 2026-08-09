@@ -124,14 +124,14 @@ func IngestJSONLines(w *Writer, data []byte, fallback func() int64) (ingested, s
 			switch val.Kind() {
 			case simdjson.String:
 				s := val.String()
-				if key == "_time" {
+				if isTimeKey(key) {
 					if t, ok := parseTime(s); ok {
 						ts, haveTS = t, true
 					}
 				}
 				fields[key] = s
 			case simdjson.Number:
-				if key == "_time" {
+				if isTimeKey(key) {
 					ts, haveTS = val.Int(), true
 				}
 				fields[key] = strconv.FormatFloat(val.Float(), 'f', -1, 64)
@@ -152,6 +152,10 @@ func IngestJSONLines(w *Writer, data []byte, fallback func() int64) (ingested, s
 	}
 	return ingested, skipped
 }
+
+// isTimeKey reports whether a field carries the record timestamp: _time
+// (LogsQL) or @timestamp (Elasticsearch / OpenTelemetry / ECS).
+func isTimeKey(k string) bool { return k == "_time" || k == "@timestamp" }
 
 func indexByte(b []byte, c byte) int {
 	for i := 0; i < len(b); i++ {
