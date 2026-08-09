@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -155,7 +156,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/_count", s.esCount)
 	// In router mode, writes forward to storage nodes (outermost, before the
 	// tenant/local path); reads fall through to withTenant -> federatedSelect.
-	return s.routeWrites(s.withTenant(mux))
+	// recoverPanic is outermost so one bad request can never take the server down.
+	return recoverPanic(s.routeWrites(s.withTenant(mux)))
+}
+
+// recoverPanic turns a handler panic into a 500 and keeps the server serving --
+// a single malformed request must never crash the process.
+func recoverPanic(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if v := recover(); v != nil {
+				log.Printf("simdlogs: panic serving %s: %v", r.URL.Path, v)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+			}
+		}()
+		h.ServeHTTP(w, r)
+	})
 }
 
 // insertJSONLine ingests an NDJSON body and flushes it into a group.

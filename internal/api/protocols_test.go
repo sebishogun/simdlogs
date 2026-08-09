@@ -18,6 +18,17 @@ import (
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
+func TestRecoverPanic(t *testing.T) {
+	h := recoverPanic(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("panic handled with %d, want 500", rec.Code)
+	}
+}
+
 func TestServerClose(t *testing.T) {
 	dir := t.TempDir()
 	srv, err := NewServer(dir)
