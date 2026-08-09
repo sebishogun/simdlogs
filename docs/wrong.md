@@ -456,3 +456,48 @@ before it lands (the whole point is fastest AND smallest, not one at the other's
 cost). This is a v8 storage-format change touching crash-safety and the query
 path; it is a deliberate campaign, not a drive-by, and the number above is the
 entry.
+
+## CORRECTION: dropping near-unique postings is a 90x needle regression (2026-08)
+
+The entry above ("the 3.47x loss is identity postings on near-unique columns")
+claimed those posting lists "buy zero query speed." An interleaved A/B on the
+realistic 1M corpus disproves it:
+
+    skipPostings   needle          footprint (of VL)
+    off (baseline) 31.5us  28.9x   3.47x
+    on (adaptive)  2824us   0.3x   2.31x
+
+Dropping trace_id's postings made the needle **90x slower** -- a 28.9x win over
+VL turned into a 0.3x loss -- to buy a footprint that STILL loses (2.31x). The
+wrong trade, rejected and reverted.
+
+Why the earlier reasoning was wrong: a length-1 posting list is not "no faster
+than reading the one row." With postings the needle is bloom-hit -> DictID ->
+postingRows: one row, no column decode. Without postings, EqualityCount returns
+not-ok and the engine decodes the whole group's dict-id index and scans 128K
+rows. The postings are what avoid the full-column decode -- exactly the needle's
+speed. Footprint and needle-speed are in direct tension here; the index is the
+speed.
+
+## The honest realistic baseline: we do NOT win every class
+
+The same run, simdlogs vs VictoriaLogs, 1M realistic rows, both from disk:
+
+    needle     28.9x   WIN
+    and         3.6x   WIN
+    topN         307x  WIN
+    groupby      432x  WIN
+    histogram    3.3x  WIN
+    ingest       4.1x  WIN
+    common       0.7x  LOSS
+    or           0.7x  LOSS
+    substring    0.8x  LOSS
+    footprint    3.47x LOSS (of VL)
+
+So "beat VL on all benchmarks" is not met on the baseline either: common-value
+retrieval, OR, substring, and footprint all lose. These -- not near-unique
+postings -- are the real targets. common/or return many rows (VL streams them
+leaner); substring scans _msg (VL's per-block tokenized bloom prunes more).
+The footprint fix must come from the dict (40%, high-entropy text) WITHOUT
+touching the postings that power the needle -- a stronger dict codec on the
+scan-cold path, measured against both size and needle latency.
