@@ -11,7 +11,9 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
@@ -32,7 +34,29 @@ func NewServer(dir string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{store: s, w: ingest.NewWriter(s)}, nil
+	srv := &Server{store: s, w: ingest.NewWriter(s)}
+	// Optional stream-field default from the environment, so a deployment can
+	// synthesize _stream without a code change.
+	if v := strings.TrimSpace(os.Getenv("SIMDLOGS_STREAM_FIELDS")); v != "" {
+		srv.SetStreamFields(splitCSV(v))
+	}
+	return srv, nil
+}
+
+// SetStreamFields declares the fields that identify a log stream; ingested
+// records then carry a synthesized _stream label built from them.
+func (s *Server) SetStreamFields(fields []string) { s.w.SetStreamFields(fields) }
+
+// splitCSV splits a comma-separated list, trimming spaces and dropping empties.
+func splitCSV(v string) []string {
+	parts := strings.Split(v, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // Handler wires the routes.

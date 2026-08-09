@@ -8,10 +8,46 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestStreamModel(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	srv.SetStreamFields([]string{"app", "host"})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	body := `{"_time":1,"app":"nginx","host":"h1","_msg":"a"}
+{"_time":2,"app":"nginx","host":"h1","_msg":"b"}
+{"_time":3,"app":"redis","host":"h2","_msg":"c"}
+`
+	r, err := http.Post(ts.URL+"/insert/jsonline", "application/x-ndjson", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, r.Body)
+	r.Body.Close()
+
+	// _stream is synthesized (keys sorted) from the declared stream fields.
+	st := statsBy(t, ts, "_stream")
+	if st[`{app="nginx",host="h1"}`] != 2 || st[`{app="redis",host="h2"}`] != 1 {
+		t.Fatalf("stats by _stream = %v", st)
+	}
+	// The selector queries the underlying label fields.
+	q := "_stream:{app=\"nginx\"}"
+	r, err = http.Get(ts.URL + "/select/logsql/query?query=" + url.QueryEscape(q))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	if n := len(strings.Split(strings.TrimSpace(string(b)), "\n")); n != 2 {
+		t.Fatalf("_stream:{app=nginx} returned %d rows, want 2\n%s", n, b)
+	}
+}
 
 func statsBy(t *testing.T, ts *httptest.Server, field string) map[string]int {
 	t.Helper()

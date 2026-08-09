@@ -15,6 +15,8 @@ import (
 //	field:>N >=N <N <=N     numeric comparison
 //	field:in(a,b,c)        set membership
 //	field:val*             prefix ; field:*sub* / *sub  substring
+//	_stream:{k="v",k=~re}  stream selector (= != =~ !~ over label fields)
+//	!term                  NOT (also the NOT keyword)
 //	a bare word            substring on _msg
 //
 // A flat conjunction lowers to Query.Preds (the lean path the engine already
@@ -94,6 +96,8 @@ const (
 	tAnd
 	tOr
 	tNot
+	tLBrace // { -- opens a _stream selector
+	tRBrace // }
 )
 
 type token struct {
@@ -103,7 +107,7 @@ type token struct {
 
 func lexSpecial(c byte) bool {
 	switch c {
-	case ' ', '\t', '\n', '\r', '(', ')', ',', ':', '=', '~', '>', '<', '"', '|':
+	case ' ', '\t', '\n', '\r', '(', ')', ',', ':', '=', '~', '>', '<', '"', '|', '{', '}', '!':
 		return true
 	}
 	return false
@@ -131,9 +135,35 @@ func lexLogsQL(s string) ([]token, error) {
 		case c == ':':
 			out = append(out, token{":", tColon})
 			i++
-		case c == '=' || c == '~':
-			out = append(out, token{string(c), tOp})
+		case c == '{':
+			out = append(out, token{"{", tLBrace})
 			i++
+		case c == '}':
+			out = append(out, token{"}", tRBrace})
+			i++
+		case c == '=':
+			i++
+			if i < len(s) && s[i] == '~' { // =~  regexp match
+				out = append(out, token{"=~", tOp})
+				i++
+			} else {
+				out = append(out, token{"=", tOp})
+			}
+		case c == '~':
+			out = append(out, token{"~", tOp})
+			i++
+		case c == '!':
+			i++
+			switch {
+			case i < len(s) && s[i] == '=': // !=  not-equal
+				out = append(out, token{"!=", tOp})
+				i++
+			case i < len(s) && s[i] == '~': // !~  regexp not-match
+				out = append(out, token{"!~", tOp})
+				i++
+			default: // bare ! is a NOT prefix (e.g. !error)
+				out = append(out, token{"!", tNot})
+			}
 		case c == '>' || c == '<':
 			op := string(c)
 			i++
@@ -290,11 +320,64 @@ func (p *lqlParser) parseTerm() (*Expr, error) {
 		return &Expr{Op: OpLeaf, Pred: Pred{Field: "_msg", Kind: Contains, Value: t.val}}, nil
 	}
 	p.next() // consume ':'
+	if strings.EqualFold(t.val, "_stream") && p.peek().kind == tLBrace {
+		return p.parseStreamSelector()
+	}
 	pred, err := p.parseMatcher(t.val)
 	if err != nil {
 		return nil, err
 	}
 	return &Expr{Op: OpLeaf, Pred: pred}, nil
+}
+
+// parseStreamSelector parses `_stream:{label=val, label=~re, label!=val, ...}`
+// -- VictoriaLogs' stream selector -- into an AND of predicates over the
+// underlying label fields (which are ordinary stored fields here). = and =~ are
+// equality/regexp; != and !~ wrap them in NOT. An empty selector matches all.
+func (p *lqlParser) parseStreamSelector() (*Expr, error) {
+	p.next() // {
+	var kids []*Expr
+	for p.peek().kind != tRBrace && p.peek().kind != tEOF {
+		label := p.next()
+		if label.kind != tIdent && label.kind != tString {
+			return nil, fmt.Errorf("simdlogs: stream selector: expected a label, got %q", label.val)
+		}
+		op := p.next()
+		if op.kind != tOp {
+			return nil, fmt.Errorf("simdlogs: stream selector: expected an operator after %q, got %q", label.val, op.val)
+		}
+		val, err := p.value()
+		if err != nil {
+			return nil, err
+		}
+		leaf := &Expr{Op: OpLeaf, Pred: Pred{Field: label.val, Value: val}}
+		switch op.val {
+		case "=":
+			leaf.Pred.Kind = Eq
+		case "=~":
+			leaf.Pred.Kind = Regexp
+		case "!=":
+			leaf.Pred.Kind = Eq
+			leaf = &Expr{Op: OpNot, Child: leaf}
+		case "!~":
+			leaf.Pred.Kind = Regexp
+			leaf = &Expr{Op: OpNot, Child: leaf}
+		default:
+			return nil, fmt.Errorf("simdlogs: stream selector: bad operator %q (use = != =~ !~)", op.val)
+		}
+		kids = append(kids, leaf)
+		if p.peek().kind == tComma {
+			p.next()
+		}
+	}
+	if p.peek().kind != tRBrace {
+		return nil, fmt.Errorf("simdlogs: stream selector: expected }")
+	}
+	p.next() // }
+	if len(kids) == 1 {
+		return kids[0], nil
+	}
+	return &Expr{Op: OpAnd, Kids: kids}, nil
 }
 
 func (p *lqlParser) parseMatcher(field string) (Pred, error) {

@@ -13,6 +13,8 @@ package ingest
 
 import (
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +44,7 @@ type Writer struct {
 	ts       []int64
 	cols     map[string]*colBuf
 	colOrder []string
+	strmFlds []string // fields that identify a log stream; synthesize _stream from them
 	bytes    int
 	lastFlsh time.Time
 	mu       sync.Mutex
@@ -134,6 +137,25 @@ func (w *Writer) Add(ts int64, fields map[string]string) {
 		cb.vals = append(cb.vals, v)
 		w.bytes += len(k) + len(v)
 	}
+	// Synthesize the _stream label from the configured stream fields, so
+	// `stats by (_stream)` and stream-scoped retention have a value to group
+	// on. The selector `_stream:{...}` queries the underlying label fields
+	// directly and needs no column, so this is opt-in (empty strmFlds = off).
+	if len(w.strmFlds) > 0 {
+		if sv := buildStreamLabel(w.strmFlds, fields); sv != "" {
+			cb := w.cols["_stream"]
+			if cb == nil {
+				cb = &colBuf{name: "_stream", vals: make([]string, row)}
+				w.cols["_stream"] = cb
+				w.colOrder = append(w.colOrder, "_stream")
+			}
+			for len(cb.vals) < row {
+				cb.vals = append(cb.vals, "")
+			}
+			cb.vals = append(cb.vals, sv)
+			w.bytes += len("_stream") + len(sv)
+		}
+	}
 	// pad columns this row did not set
 	for _, k := range w.colOrder {
 		cb := w.cols[k]
@@ -144,6 +166,46 @@ func (w *Writer) Add(ts int64, fields map[string]string) {
 	if len(w.ts) >= FlushRows || w.bytes >= FlushBytes || nowFn().Sub(w.lastFlsh) >= FlushEvery {
 		w.flushLocked()
 	}
+}
+
+// SetStreamFields declares which fields identify a log stream. When set, Add
+// synthesizes a canonical _stream label ({k="v",...}, keys sorted) from those
+// of them present on each record. Set once before ingest; safe under the same
+// lock Add takes.
+func (w *Writer) SetStreamFields(fs []string) {
+	w.mu.Lock()
+	w.strmFlds = append(w.strmFlds[:0], fs...)
+	w.mu.Unlock()
+}
+
+// buildStreamLabel renders the present stream fields as a canonical VL-style
+// stream label; keys are sorted so the same label set always yields the same
+// string (and thus the same dict id). Empty when no stream field is present.
+func buildStreamLabel(streamFields []string, fields map[string]string) string {
+	type kv struct{ k, v string }
+	present := make([]kv, 0, len(streamFields))
+	for _, k := range streamFields {
+		if v, ok := fields[k]; ok && v != "" {
+			present = append(present, kv{k, v})
+		}
+	}
+	if len(present) == 0 {
+		return ""
+	}
+	sort.Slice(present, func(i, j int) bool { return present[i].k < present[j].k })
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, p := range present {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(p.k)
+		sb.WriteString(`="`)
+		sb.WriteString(p.v)
+		sb.WriteByte('"')
+	}
+	sb.WriteByte('}')
+	return sb.String()
 }
 
 // Flush enqueues the buffered rows and waits for every in-flight group to
