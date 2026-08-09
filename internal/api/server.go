@@ -35,6 +35,7 @@ type Server struct {
 	started    time.Time
 	nIngestReq int64 // ingest requests (atomic)
 	nQueryReq  int64 // query requests (atomic)
+	rr         int64 // round-robin cursor for write routing (atomic)
 }
 
 // NewServer opens (or creates) the data directory at dir and returns the
@@ -110,7 +111,9 @@ func (s *Server) Handler() http.Handler {
 	// The Elasticsearch search surface VictoriaLogs lacks.
 	mux.HandleFunc("/_search", s.esSearch)
 	mux.HandleFunc("/_count", s.esCount)
-	return s.withTenant(mux)
+	// In router mode, writes forward to storage nodes (outermost, before the
+	// tenant/local path); reads fall through to withTenant -> federatedSelect.
+	return s.routeWrites(s.withTenant(mux))
 }
 
 // insertJSONLine ingests an NDJSON body and flushes it into a group.

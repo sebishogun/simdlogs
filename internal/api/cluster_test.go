@@ -1,12 +1,53 @@
 package api
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+// TestClusterWriteRouting checks that ingest through a router spreads across
+// storage nodes round-robin and a federated read then returns every record.
+func TestClusterWriteRouting(t *testing.T) {
+	mk := func() (*Server, *httptest.Server) {
+		srv, err := NewServer(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return srv, httptest.NewServer(srv.Handler())
+	}
+	s1, b1 := mk()
+	defer b1.Close()
+	s2, b2 := mk()
+	defer b2.Close()
+
+	front, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	front.SetBackends([]string{b1.URL, b2.URL})
+	fs := httptest.NewServer(front.Handler())
+	defer fs.Close()
+
+	for i := 0; i < 4; i++ {
+		postBody(t, fs, fmt.Sprintf(`{"_time":%d,"service":"s","_msg":"m%d"}`+"\n", 1000+i, i))
+	}
+	if a, b := s1.def.store.TotalRows(), s2.def.store.TotalRows(); a != 2 || b != 2 {
+		t.Fatalf("write spread = %d/%d, want 2/2 across backends", a, b)
+	}
+	r, err := http.Get(fs.URL + "/select/logsql/query?query=*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	if n := len(strings.Split(strings.TrimSpace(string(body)), "\n")); n != 4 {
+		t.Fatalf("federated read got %d rows, want 4:\n%s", n, body)
+	}
+}
 
 // TestClusterFederation stands up two storage nodes with different data and a
 // front router pointed at both, then queries the front and checks the rows are
