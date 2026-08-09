@@ -18,6 +18,33 @@ import (
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
+func TestWebUI(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	r, err := http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	if r.StatusCode != 200 || !strings.Contains(string(b), "LogsQL explorer") {
+		t.Fatalf("ui: status %d, has title %v", r.StatusCode, strings.Contains(string(b), "LogsQL explorer"))
+	}
+	if ct := r.Header.Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("ui content-type %q", ct)
+	}
+	// An unknown path is a 404, not the UI.
+	r2, err := http.Get(ts.URL + "/definitely-not-a-route")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2.Body.Close()
+	if r2.StatusCode != 404 {
+		t.Fatalf("unknown path status %d, want 404", r2.StatusCode)
+	}
+}
+
 func TestMultitenancyIsolation(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())

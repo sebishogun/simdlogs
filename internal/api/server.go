@@ -96,6 +96,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("/admin/backup", s.backup) // tar snapshot for offline restore
 	mux.HandleFunc("/metrics", s.metrics)     // Prometheus text exposition
+	mux.HandleFunc("/vmui", s.ui)             // web UI (vmui equivalent)
+	mux.HandleFunc("/select/vmui", s.ui)
+	mux.HandleFunc("/", s.ui) // catch-all: serve the UI at the root
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)
 	mux.HandleFunc("/select/logsql/tail", s.tail) // live tail: stream matching rows as they arrive
 	mux.HandleFunc("/select/logsql/hits", s.selectHits)

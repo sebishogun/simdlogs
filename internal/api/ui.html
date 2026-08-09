@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>simdlogs</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --line: #e2e2e2;
+    --accent: #2563eb; --bar: #93c5fd; --err: #dc2626; --card: #f7f7f8;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --fg: #e6e6e6; --muted: #9aa0aa; --line: #262b33;
+      --accent: #60a5fa; --bar: #1e3a8a; --err: #f87171; --card: #171a21;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         background: var(--bg); color: var(--fg); }
+  header { padding: 14px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 12px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+  header .tag { color: var(--muted); font-size: 12px; }
+  main { padding: 16px 18px; max-width: 1200px; margin: 0 auto; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  input, select, button { font: inherit; color: var(--fg); background: var(--bg);
+         border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  #q { flex: 1 1 420px; font-family: var(--mono); }
+  input[type=datetime-local] { color-scheme: light dark; }
+  button { background: var(--accent); color: #fff; border-color: transparent; cursor: pointer; font-weight: 600; }
+  button.secondary { background: var(--card); color: var(--fg); border-color: var(--line); font-weight: 500; }
+  button:active { transform: translateY(1px); }
+  .muted { color: var(--muted); }
+  #status { min-height: 18px; font-size: 12.5px; }
+  #status.error { color: var(--err); }
+  #hist { display: flex; align-items: flex-end; gap: 1px; height: 60px; margin: 6px 0 14px;
+          border-bottom: 1px solid var(--line); }
+  #hist .b { flex: 1; background: var(--bar); min-height: 1px; border-radius: 2px 2px 0 0; }
+  table { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12.5px; }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+  th, td { text-align: left; padding: 6px 9px; border-bottom: 1px solid var(--line); vertical-align: top;
+           white-space: nowrap; max-width: 480px; overflow: hidden; text-overflow: ellipsis; }
+  th { position: sticky; top: 0; background: var(--card); font-weight: 600; }
+  tr:hover td { background: var(--card); }
+  td.time { color: var(--muted); }
+  .examples { font-size: 12px; }
+  .examples code { font-family: var(--mono); background: var(--card); padding: 1px 5px; border-radius: 4px;
+                   cursor: pointer; border: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<header>
+  <h1>simdlogs</h1>
+  <span class="tag">LogsQL explorer</span>
+</header>
+<main>
+  <div class="row">
+    <input id="q" placeholder='LogsQL, e.g.  level:=error  |  service:=api and status:>=500  |  * | stats by (level) count()' spellcheck="false">
+    <button id="run">Run</button>
+  </div>
+  <div class="row">
+    <label class="muted">from <input type="datetime-local" id="start"></label>
+    <label class="muted">to <input type="datetime-local" id="end"></label>
+    <label class="muted">limit <input id="limit" type="number" value="200" min="1" style="width:90px"></label>
+    <select id="tenant" title="AccountID (tenant)"><option value="">tenant 0</option></select>
+    <button class="secondary" id="clear">Clear time</button>
+  </div>
+  <div class="examples muted">
+    try:
+    <code>level:=error</code>
+    <code>_msg:~"timeout"</code>
+    <code>* | stats by (service) count() as c | sort by (c) desc | limit 10</code>
+    <code>_stream:{service="api"}</code>
+  </div>
+  <div id="hist"></div>
+  <div id="status" class="muted"></div>
+  <div class="tablewrap"><table id="out"></table></div>
+</main>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var q = $("q"), out = $("out"), status = $("status"), hist = $("hist");
+
+  function headers() {
+    var t = $("tenant").value;
+    return t ? { "AccountID": t } : {};
+  }
+  function toNano(v) { // datetime-local -> unix ns, or ""
+    if (!v) return "";
+    var ms = new Date(v).getTime();
+    return isNaN(ms) ? "" : String(ms * 1000000);
+  }
+  function params() {
+    var p = new URLSearchParams();
+    p.set("query", q.value || "*");
+    var s = toNano($("start").value), e = toNano($("end").value);
+    if (s) p.set("start", s);
+    if (e) p.set("end", e);
+    return p;
+  }
+  function setStatus(msg, isErr) {
+    status.textContent = msg;
+    status.className = isErr ? "error" : "muted";
+  }
+
+  function renderRows(text) {
+    var lines = text.split("\n").filter(function (l) { return l.trim() !== ""; });
+    var rows = [];
+    var keys = [];
+    var seen = {};
+    lines.forEach(function (l) {
+      var obj;
+      try { obj = JSON.parse(l); } catch (e) { return; }
+      rows.push(obj);
+      Object.keys(obj).forEach(function (k) {
+        if (k !== "_time" && !seen[k]) { seen[k] = true; keys.push(k); }
+      });
+    });
+    keys.sort();
+    var cols = ["_time"].concat(keys);
+    var html = "<thead><tr>";
+    cols.forEach(function (c) { html += "<th>" + esc(c) + "</th>"; });
+    html += "</tr></thead><tbody>";
+    rows.forEach(function (r) {
+      html += "<tr>";
+      cols.forEach(function (c) {
+        var cls = c === "_time" ? ' class="time"' : "";
+        html += "<td" + cls + ">" + esc(r[c] === undefined ? "" : String(r[c])) + "</td>";
+      });
+      html += "</tr>";
+    });
+    html += "</tbody>";
+    out.innerHTML = html;
+    return rows.length;
+  }
+
+  function esc(s) {
+    return s.replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  function loadHist() {
+    hist.innerHTML = "";
+    var p = params();
+    p.set("step", "1m");
+    fetch("/select/logsql/hits?" + p.toString(), { headers: headers() })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        var hits = (j && j.hits) || [];
+        hits.sort(function (a, b) { return a._time < b._time ? -1 : 1; });
+        var max = 1;
+        hits.forEach(function (h) { if (h.hits > max) max = h.hits; });
+        hits.forEach(function (h) {
+          var b = document.createElement("div");
+          b.className = "b";
+          b.style.height = Math.max(1, Math.round((h.hits / max) * 58)) + "px";
+          b.title = h._time + ": " + h.hits;
+          hist.appendChild(b);
+        });
+      })
+      .catch(function () {});
+  }
+
+  function run() {
+    setStatus("running...");
+    out.innerHTML = "";
+    var p = params();
+    p.set("limit", $("limit").value || "200");
+    var t0 = performance.now();
+    fetch("/select/logsql/query?" + p.toString(), { headers: headers() })
+      .then(function (r) {
+        if (!r.ok) { return r.text().then(function (t) { throw new Error(t || r.status); }); }
+        return r.text();
+      })
+      .then(function (text) {
+        var n = renderRows(text);
+        var ms = Math.round(performance.now() - t0);
+        setStatus(n + " rows in " + ms + " ms");
+        loadHist();
+      })
+      .catch(function (e) { setStatus(String(e.message || e), true); });
+  }
+
+  $("run").addEventListener("click", run);
+  q.addEventListener("keydown", function (e) { if (e.key === "Enter") run(); });
+  $("clear").addEventListener("click", function () { $("start").value = ""; $("end").value = ""; });
+  Array.prototype.forEach.call(document.querySelectorAll(".examples code"), function (c) {
+    c.addEventListener("click", function () { q.value = c.textContent; run(); });
+  });
+
+  // Seed a couple of tenant options so multitenant deployments are reachable.
+  for (var i = 1; i <= 4; i++) {
+    var o = document.createElement("option");
+    o.value = String(i); o.textContent = "tenant " + i;
+    $("tenant").appendChild(o);
+  }
+
+  q.value = "*";
+  run();
+})();
+</script>
+</body>
+</html>
