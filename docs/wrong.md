@@ -528,3 +528,34 @@ faster than VL. The index is the speed and the size at once. Honest positions:
 (2) a dict-codec campaign to approach/beat VL disk at a measured scan-speed cost
 [not done -- deliberate, needs the dep/codec decision and an A/B on scan latency].
 Building compact mode was rejected: it loses on both axes.
+
+## Compact mode measured: 15% smaller for 2-10x slower -- a bad trade, opt-in only (2026-08)
+
+Built the opt-in compact codec the footprint research pointed to: the dict is
+40% of the file and our LZ4 gets only ~2x on it (no entropy coding) where stdlib
+flate gets ~4x. So compact mode flates the dict blocks (per-block codec flagged
+in rawLen's high bit -> no format-version change, old data reads as LZ4).
+
+Measured, realistic 1M head-to-head, default vs compact:
+
+    metric      default        compact
+    footprint   3.47x of VL    2.95x of VL   (only ~15% smaller)
+    needle      27x            4.5x
+    common      1.0x           0.5x
+    and         3.5x           0.3x
+    or          1.2x           0.7x
+    substring   1.1x           0.6x
+    ingest      4.1x           1.9x
+
+The footprint gain is only ~15% because only the dict flates -- postings (42%)
+and the dict-id index (12%) are untouched. Meanwhile every value-reading query
+slows 2-10x: point reads (materialize) and scans now flate-decode dict blocks
+instead of the SIMD LZ4 kernel; `and` craters 3.5x->0.3x because its per-row
+point reads each pay a flate block decode.
+
+Verdict: a bad trade for a queryable store (little size, big speed). Kept as an
+opt-in (-compact) for cold archival of rarely-queried data only; the default is
+unchanged (fast LZ4). This is the measured confirmation that footprint parity
+with VL is not reachable without also sacrificing query speed -- the index and
+the fast codec are the speed, and they are the size. The default position
+stands: faster than VL on every query + ingest, 3.47x its disk.

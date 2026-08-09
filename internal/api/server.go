@@ -31,6 +31,7 @@ type Server struct {
 	tenants    map[string]*tenant
 	def        *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
 	strmFlds   []string
+	compact    bool     // compact mode default for new tenants (flate dict)
 	backends   []string // peer node base URLs; when set, selects fan out and merge (vmselect role)
 	started    time.Time
 	nIngestReq int64 // ingest requests (atomic)
@@ -85,6 +86,18 @@ func (s *Server) Close() error {
 		}
 	}
 	return firstErr
+}
+
+// SetCompact enables compact mode on every tenant: flushed groups flate their
+// dictionaries for a smaller footprint at the cost of slower dict decode.
+// Opt-in; the default stays fast LZ4.
+func (s *Server) SetCompact(on bool) {
+	s.mu.Lock()
+	for _, tn := range s.tenants {
+		tn.w.SetCompact(on)
+	}
+	s.compact = on
+	s.mu.Unlock()
 }
 
 // SetStreamFields declares the fields that identify a log stream; ingested
@@ -158,7 +171,7 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 	fallback := tn.fallbackTS()
 	var ing, skip int
 	if len(body) >= ingest.MinParallelBytes {
-		ing, skip = ingest.IngestJSONLinesParallel(tn.store, body, fallback)
+		ing, skip = ingest.IngestJSONLinesParallel(tn.store, body, fallback, s.compact)
 	} else {
 		// Small body: reuse the persistent writer, no per-request pool churn.
 		ing, skip = ingest.IngestJSONLines(tn.w, body, fallback)

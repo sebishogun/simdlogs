@@ -68,6 +68,9 @@ func (s *Server) tenant(acc, proj string) (*tenant, error) {
 	if len(s.strmFlds) > 0 {
 		tn.w.SetStreamFields(s.strmFlds)
 	}
+	if s.compact {
+		tn.w.SetCompact(true)
+	}
 	s.tenants[key] = tn
 	return tn, nil
 }

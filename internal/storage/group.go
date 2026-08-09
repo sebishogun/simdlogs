@@ -36,6 +36,7 @@ type Column struct {
 type Group struct {
 	Rows    int
 	Columns []Column
+	Compact bool // compact mode: flate the dict (smaller, slower decode); opt-in
 }
 
 // colMeta is the footer's per-column skip record.
@@ -89,7 +90,7 @@ func (g *Group) Marshal() []byte {
 			b = buildPostings(c.Dict.Indices, len(c.Dict.Dict)).marshal(b)
 			m.PostLen = len(b) - m.PostOff
 			m.DictOff = len(b)
-			b = append(b, marshalDictSection(c.Dict.Dict)...)
+			b = append(b, marshalDictSection(c.Dict.Dict, g.Compact)...)
 			m.DictLen2 = len(b) - m.DictOff
 		case ColTimestamp:
 			data := encodeTimestamps(c.Ts)

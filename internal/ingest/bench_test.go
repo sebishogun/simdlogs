@@ -45,6 +45,6 @@ func BenchmarkIngestParallel(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		s, _ := storage.OpenStore(b.TempDir())
-		IngestJSONLinesParallel(s, nd, fallback)
+		IngestJSONLinesParallel(s, nd, fallback, false)
 	}
 }

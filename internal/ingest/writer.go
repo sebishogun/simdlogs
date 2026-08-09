@@ -45,6 +45,7 @@ type Writer struct {
 	cols     map[string]*colBuf
 	colOrder []string
 	strmFlds []string // fields that identify a log stream; synthesize _stream from them
+	compact  bool     // compact mode: flate the dict (smaller groups, slower decode)
 	bytes    int
 	lastFlsh time.Time
 	mu       sync.Mutex
@@ -68,6 +69,7 @@ type flushJob struct {
 	ts       []int64
 	colOrder []string
 	vals     map[string][]string
+	compact  bool
 }
 
 // NewWriter makes a writer over the store and starts its flush pool.
@@ -106,7 +108,7 @@ func (w *Writer) worker() {
 			d := storage.BuildDict(j.vals[k])
 			cols = append(cols, storage.Column{Name: k, Type: storage.ColDict, Dict: &d})
 		}
-		g := &storage.Group{Rows: len(j.ts), Columns: cols}
+		g := &storage.Group{Rows: len(j.ts), Columns: cols, Compact: j.compact}
 		if _, err := w.store.AppendGroup(g); err != nil {
 			e := err
 			w.flushErr.CompareAndSwap(nil, &e)
@@ -178,6 +180,15 @@ func (w *Writer) SetStreamFields(fs []string) {
 	w.mu.Unlock()
 }
 
+// SetCompact enables compact mode: flushed groups flate their dictionaries for
+// a smaller on-disk footprint, at the cost of slower dict decode. Opt-in; the
+// default (LZ4) is unchanged. Set once before ingest.
+func (w *Writer) SetCompact(on bool) {
+	w.mu.Lock()
+	w.compact = on
+	w.mu.Unlock()
+}
+
 // buildStreamLabel renders the present stream fields as a canonical VL-style
 // stream label; keys are sorted so the same label set always yields the same
 // string (and thus the same dict id). Empty when no stream field is present.
@@ -243,7 +254,7 @@ func (w *Writer) flushLocked() {
 		vals[k] = w.cols[k].vals
 	}
 	w.pending.Add(1)
-	w.jobs <- flushJob{ts: w.ts, colOrder: w.colOrder, vals: vals}
+	w.jobs <- flushJob{ts: w.ts, colOrder: w.colOrder, vals: vals, compact: w.compact}
 
 	// Fresh buffers; the job owns the handed-off ones.
 	w.ts = make([]int64, 0, FlushRows)

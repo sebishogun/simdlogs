@@ -89,6 +89,10 @@ func TestRealistic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if os.Getenv("SIMDLOGS_COMPACT") != "" {
+		srv.SetCompact(true) // A/B: compact-mode dict codec
+		t.Log("compact mode ON")
+	}
 	sl := httptest.NewServer(srv.Handler())
 	defer sl.Close()
 	t0 := time.Now()

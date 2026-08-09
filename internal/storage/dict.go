@@ -43,8 +43,15 @@ func marshalRawBlock(vals []string) []byte {
 	return out
 }
 
-// marshalDictSection block-compresses a sorted dict.
-func marshalDictSection(dict []string) []byte {
+// dictCodecFlate is the high bit of a block's rawLen field, marking the block
+// as flate- rather than LZ4-compressed. Blocks are tiny so the real rawLen
+// never approaches 2^31; this keeps compact-mode data self-describing per
+// block with no format-version change (old data has the bit clear = LZ4).
+const dictCodecFlate = uint32(1) << 31
+
+// marshalDictSection block-compresses a sorted dict. compact selects the flate
+// codec (smaller, slower decode) over the default LZ4 (fast SIMD decode).
+func marshalDictSection(dict []string, compact bool) []byte {
 	n := len(dict)
 	numBlocks := 0
 	if n > 0 {
@@ -64,8 +71,15 @@ func marshalDictSection(dict []string) []byte {
 		fvOff[k] = uint32(len(fvStr))
 		fvStr = append(fvStr, dict[lo]...)
 		raw := marshalRawBlock(dict[lo:hi])
-		c := lz4Compress(raw)
-		idx[k] = bi{uint32(len(comp)), uint32(len(c)), uint32(len(raw))}
+		var c []byte
+		rawLen := uint32(len(raw))
+		if compact {
+			c = flateCompress(raw)
+			rawLen |= dictCodecFlate
+		} else {
+			c = lz4Compress(raw)
+		}
+		idx[k] = bi{uint32(len(comp)), uint32(len(c)), rawLen}
 		comp = append(comp, c...)
 	}
 	fvOff[numBlocks] = uint32(len(fvStr))
@@ -123,12 +137,18 @@ func (d dictSec) firstVal(k int) string {
 	return string(d.fvStr[o0:o1])
 }
 
-// block decompresses block k into [k'+1 offsets][strings].
+// block decompresses block k into [k'+1 offsets][strings], dispatching on the
+// per-block codec flagged in rawLen's high bit (default LZ4, compact flate).
 func (d dictSec) block(k int) []byte {
 	compOff := int(get32(d.idx, k*12))
 	compLen := int(get32(d.idx, k*12+4))
-	rawLen := int(get32(d.idx, k*12+8))
-	return lz4Decompress(d.comp[compOff:compOff+compLen], rawLen)
+	rawField := get32(d.idx, k*12+8)
+	rawLen := int(rawField &^ dictCodecFlate)
+	comp := d.comp[compOff : compOff+compLen]
+	if rawField&dictCodecFlate != 0 {
+		return flateDecompress(comp, rawLen)
+	}
+	return lz4Decompress(comp, rawLen)
 }
 
 // blockValAt reads value i within a decompressed block of count vals.

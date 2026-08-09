@@ -22,10 +22,11 @@ const MinParallelBytes = 1 << 20
 // box; sharding the parse is the lever. Shard count and per-shard flush
 // pool are sized so the total goroutines stay near the core count rather
 // than oversubscribing. Falls back to serial for a small body.
-func IngestJSONLinesParallel(store *storage.Store, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestJSONLinesParallel(store *storage.Store, data []byte, fallback func() int64, compact bool) (ingested, skipped int) {
 	shards := runtime.NumCPU() / 3
 	if shards < 2 || len(data) < MinParallelBytes {
 		w := NewWriter(store)
+		w.SetCompact(compact)
 		i, s := IngestJSONLines(w, data, fallback)
 		w.Close()
 		return i, s
@@ -41,6 +42,7 @@ func IngestJSONLinesParallel(store *storage.Store, data []byte, fallback func() 
 		go func(chunk []byte) {
 			defer wg.Done()
 			w := NewWriterWorkers(store, 2)
+			w.SetCompact(compact)
 			i, s := IngestJSONLines(w, chunk, fallback)
 			w.Close()
 			atomic.AddInt64(&ing, int64(i))
