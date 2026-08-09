@@ -610,6 +610,17 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				fp.As = a
 			}
 			pipes = append(pipes, fp)
+		case "collapse_nums", "pattern":
+			cp := &CollapseNumsPipe{}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "at") {
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				cp.Field = f
+			}
+			pipes = append(pipes, cp)
 		case "math", "eval":
 			ex := p.next()
 			if ex.kind != tString {

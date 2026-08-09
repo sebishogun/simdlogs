@@ -223,6 +223,33 @@ func TestStoreTailCursor(t *testing.T) {
 	}
 }
 
+func TestCollapseNums(t *testing.T) {
+	s, err := storage.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three lines, same template once the request id / count are collapsed.
+	msg := storage.BuildDict([]string{"req 123 done in 5ms", "req 456 done in 12ms", "req 7 done in 300ms"})
+	if _, err := s.AppendGroup(&storage.Group{Rows: 3, Columns: []storage.Column{
+		{Name: "_time", Type: storage.ColTimestamp, Ts: []int64{1, 2, 3}},
+		{Name: "_msg", Type: storage.ColDict, Dict: &msg},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	pq, err := ParseLogsQL(`* | collapse_nums | stats by (_msg) count() as c`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pq.From, pq.To = 0, int64(1)<<62
+	rows := RunPipeline(s, pq)
+	if len(rows) != 1 || rowField(rows[0], "c") != "3" {
+		t.Fatalf("collapse_nums mining = %v want one template count 3", rows)
+	}
+	if got := rowField(rows[0], "_msg"); got != "req <N> done in <N>ms" {
+		t.Fatalf("collapsed template = %q", got)
+	}
+}
+
 func TestQuantileAgg(t *testing.T) {
 	s := statsStore(t) // a: latency 10,20,60 ; b: 30,40
 	run := func(q string) map[string]string {

@@ -47,7 +47,95 @@ type StatsPipe struct {
 	Aggs []Agg
 }
 
-func (p *StatsPipe) apply(rows []Row) []Row { return rows } // handled by RunPipeline
+// apply aggregates a materialized row stream -- stats used mid-pipe (e.g. after
+// collapse_nums or a filter). A leading stats instead runs during the scan via
+// RunPipeline/runStats and never reaches here.
+func (p *StatsPipe) apply(rows []Row) []Row {
+	acc := map[string]*statEntry{}
+	var order []string
+	var key []byte
+	for _, r := range rows {
+		key = key[:0]
+		for _, f := range p.By {
+			key = append(key, rowField(r, f)...)
+			key = append(key, 0)
+		}
+		e := acc[string(key)]
+		if e == nil {
+			by := make([]string, len(p.By))
+			for j, f := range p.By {
+				by[j] = rowField(r, f)
+			}
+			e = newStatEntry(by, p.Aggs)
+			acc[string(key)] = e
+			order = append(order, string(key))
+		}
+		accSample(e, p.Aggs, func(j int) string { return rowField(r, p.Aggs[j].Field) })
+	}
+	out := make([]Row, 0, len(order))
+	for _, k := range order {
+		out = append(out, statEntryRow(p, acc[k]))
+	}
+	return out
+}
+
+// newStatEntry allocates an entry with the sets the uniq aggregations need.
+func newStatEntry(by []string, aggs []Agg) *statEntry {
+	e := &statEntry{by: by, slots: make([]statSlot, len(aggs))}
+	for j := range aggs {
+		if aggs[j].Kind == AggUniq || aggs[j].Kind == AggCountUniq {
+			e.slots[j].set = map[string]struct{}{}
+		}
+	}
+	return e
+}
+
+// accSample folds one sample into an entry: valOf(j) is the value of aggregation
+// j's field on this sample. Shared by the during-scan and mid-pipe stats so the
+// two never drift.
+func accSample(e *statEntry, aggs []Agg, valOf func(j int) string) {
+	e.rows++
+	for j := range aggs {
+		a := &aggs[j]
+		if a.Field == "" {
+			continue // count()
+		}
+		val := valOf(j)
+		sl := &e.slots[j]
+		if a.Kind == AggUniq || a.Kind == AggCountUniq {
+			sl.set[val] = struct{}{}
+			continue
+		}
+		f, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			continue
+		}
+		if a.Kind == AggQuantile {
+			sl.vals = append(sl.vals, f)
+		}
+		if !sl.has || f < sl.min {
+			sl.min = f
+		}
+		if !sl.has || f > sl.max {
+			sl.max = f
+		}
+		sl.sum += f
+		sl.cnt++
+		sl.has = true
+	}
+}
+
+// statEntryRow renders one group-by entry as an output row.
+func statEntryRow(sp *StatsPipe, e *statEntry) Row {
+	fields := make([]Field, 0, len(sp.By)+len(sp.Aggs))
+	for j, f := range sp.By {
+		fields = append(fields, Field{f, e.by[j]})
+	}
+	for j := range sp.Aggs {
+		fields = append(fields, Field{sp.Aggs[j].Alias, formatAgg(&sp.Aggs[j], &e.slots[j], e.rows)})
+	}
+	return Row{Fields: fields}
+}
 
 // SortPipe is `sort by (fields) [desc] [limit N]`.
 type SortPipe struct {
@@ -144,6 +232,13 @@ func pipeFields(pipes []Pipe) []string {
 	}
 	for _, p := range pipes {
 		switch t := p.(type) {
+		case *StatsPipe: // a mid-pipe stats needs its group-by and agg fields materialized
+			add(t.By...)
+			for _, a := range t.Aggs {
+				if a.Field != "" {
+					add(a.Field)
+				}
+			}
 		case *SortPipe:
 			add(t.By...)
 		case *UniqPipe:
@@ -168,6 +263,8 @@ func pipeFields(pipes []Pipe) []string {
 			add(templateFields(t.Template)...)
 		case *MathPipe:
 			add(t.fields...)
+		case *CollapseNumsPipe:
+			add(orDefault(t.Field, "_msg"))
 		}
 	}
 	return out
@@ -251,58 +348,20 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 						by[j] = byDict[j][byCol[j][i]]
 					}
 				}
-				e = &statEntry{by: by, slots: make([]statSlot, len(sp.Aggs))}
-				for j := range sp.Aggs {
-					if sp.Aggs[j].Kind == AggUniq || sp.Aggs[j].Kind == AggCountUniq {
-						e.slots[j].set = map[string]struct{}{}
-					}
-				}
+				e = newStatEntry(by, sp.Aggs)
 				acc[string(key)] = e
 			}
-			e.rows++
-			for j := range sp.Aggs {
-				a := &sp.Aggs[j]
-				if a.Field == "" {
-					continue // count()
-				}
-				var val string
+			accSample(e, sp.Aggs, func(j int) string {
 				if aggCol[j] != nil {
-					val = aggDict[j][aggCol[j][i]]
+					return aggDict[j][aggCol[j][i]]
 				}
-				sl := &e.slots[j]
-				if a.Kind == AggUniq || a.Kind == AggCountUniq {
-					sl.set[val] = struct{}{}
-					continue
-				}
-				f, err := strconv.ParseFloat(val, 64)
-				if err != nil {
-					continue
-				}
-				if a.Kind == AggQuantile {
-					sl.vals = append(sl.vals, f)
-				}
-				if !sl.has || f < sl.min {
-					sl.min = f
-				}
-				if !sl.has || f > sl.max {
-					sl.max = f
-				}
-				sl.sum += f
-				sl.cnt++
-				sl.has = true
-			}
+				return ""
+			})
 		})
 	}
 	out := make([]Row, 0, len(acc))
 	for _, e := range acc {
-		fields := make([]Field, 0, len(sp.By)+len(sp.Aggs))
-		for j, f := range sp.By {
-			fields = append(fields, Field{f, e.by[j]})
-		}
-		for j := range sp.Aggs {
-			fields = append(fields, Field{sp.Aggs[j].Alias, formatAgg(&sp.Aggs[j], &e.slots[j], e.rows)})
-		}
-		out = append(out, Row{Fields: fields})
+		out = append(out, statEntryRow(sp, e))
 	}
 	return out
 }
@@ -517,6 +576,42 @@ func (p *FilterPipe) apply(rows []Row) []Row {
 		}
 	}
 	return out
+}
+
+// CollapseNumsPipe is `collapse_nums [at field]`: replace each run of digits in
+// the field (default _msg) with <N>, turning variable log lines into a stable
+// template. `stats by (_msg) count()` after it mines the top log patterns --
+// VictoriaLogs' collapse_nums, and the basis for pattern analytics.
+type CollapseNumsPipe struct{ Field string }
+
+func (p *CollapseNumsPipe) apply(rows []Row) []Row {
+	f := p.Field
+	if f == "" {
+		f = "_msg"
+	}
+	for ri := range rows {
+		setRowField(&rows[ri], f, collapseNums(rowField(rows[ri], f)))
+	}
+	return rows
+}
+
+// collapseNums replaces every maximal run of ASCII digits with "<N>".
+func collapseNums(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	inNum := false
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			if !inNum {
+				sb.WriteString("<N>")
+				inNum = true
+			}
+			continue
+		}
+		inNum = false
+		sb.WriteByte(s[i])
+	}
+	return sb.String()
 }
 
 // setRowField updates key in place, or appends it -- the mutation the
