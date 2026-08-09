@@ -175,6 +175,83 @@ func (s *Server) fanOut(r *http.Request, path string) [][]byte {
 	return out
 }
 
+// fanOutPost sends the same POST (body + tenant headers) to every backend and
+// returns the response bodies -- the ES surface fans out this way, since its
+// query is a JSON body rather than URL params.
+func (s *Server) fanOutPost(r *http.Request, path string, body []byte) [][]byte {
+	out := make([][]byte, len(s.backends))
+	var wg sync.WaitGroup
+	for i, b := range s.backends {
+		wg.Add(1)
+		go func(i int, b string) {
+			defer wg.Done()
+			req, err := http.NewRequestWithContext(r.Context(), "POST", b+path, bytes.NewReader(body))
+			if err != nil {
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			for _, h := range []string{"AccountID", "ProjectID"} {
+				if v := r.Header.Get(h); v != "" {
+					req.Header.Set(h, v)
+				}
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+			rb, _ := io.ReadAll(resp.Body)
+			out[i] = rb
+		}(i, b)
+	}
+	wg.Wait()
+	return out
+}
+
+// federatedESCount sums the ES _count across storage nodes.
+func (s *Server) federatedESCount(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	total := 0
+	for _, b := range s.fanOutPost(r, "/_count", body) {
+		var v struct {
+			Count int `json:"count"`
+		}
+		if json.Unmarshal(b, &v) == nil {
+			total += v.Count
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"count": total})
+}
+
+// federatedESSearch merges ES _search hits across storage nodes.
+func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	var hits []json.RawMessage
+	total := 0
+	for _, b := range s.fanOutPost(r, "/_search", body) {
+		var v struct {
+			Hits struct {
+				Total struct {
+					Value int `json:"value"`
+				} `json:"total"`
+				Hits []json.RawMessage `json:"hits"`
+			} `json:"hits"`
+		}
+		if json.Unmarshal(b, &v) == nil {
+			total += v.Hits.Total.Value
+			hits = append(hits, v.Hits.Hits...)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"hits": map[string]any{
+			"total": map[string]any{"value": total, "relation": "eq"},
+			"hits":  hits,
+		},
+	})
+}
+
 // federatedStatsQuery merges stats across storage nodes: a total count is
 // summed; a group-by count sums each value's hits. (avg/quantile across shards
 // need sum+count / sketch merge -- a follow-up; count and count-by are exact.)

@@ -46,6 +46,10 @@ type esExists struct {
 }
 
 func (s *Server) esSearch(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 {
+		s.federatedESSearch(w, r)
+		return
+	}
 	var body esQuery
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), 400)
@@ -74,6 +78,10 @@ func (s *Server) esSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) esCount(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 {
+		s.federatedESCount(w, r)
+		return
+	}
 	var body esQuery
 	json.NewDecoder(r.Body).Decode(&body)
 	q := esToQuery(body.Query)
