@@ -87,3 +87,40 @@ is not a small-corpus property -- it would need the >8M-row regime where
 VL's coarse blocks force real over-scan, and likely more query-path work,
 and even then a large multiple against this competitor is not assured.
 The honest headline is a small multiple, and the README says so.
+
+## The design's central premise is refuted: VL WINS the rare-selective query
+
+This is the finding the whole project turned on, and measurement killed
+the thesis. The design (docs/design.md, "Why this exists") rests on the
+claim that VictoriaLogs, on a selective query, decompresses and scans up
+to 8M rows because its skip granularity is a whole block. The rare-needle
+head-to-head -- one planted value, queried over the full span, the exact
+case the design said simdlogs would win 10-100x:
+
+    RARE needle, full span:  simdlogs 2.30 ms   VL 0.36 ms   VL 6.4x FASTER
+
+VL is six times faster at the query simdlogs was built to dominate. The
+premise is wrong: VictoriaLogs does not scan 8M rows for a needle. Its
+per-block bloom plus its per-field indexing find the value's block and
+touch it surgically; it is a genuinely well-engineered selective path.
+simdlogs, even skipping 22 of 23 groups by bloom, still decodes the whole
+128K-row survivor group's column to find one row -- the "lazy per-lane
+decode" and a real per-group posting index (the design's deferred Phase
+8) are what a competitive needle path needs, and the design deferred
+exactly the structure that turns out to be load-bearing.
+
+Honest standing across the classes measured at 3M rows:
+
+    common-value query (service:=auth):  simdlogs 2.0x faster
+    aggregation (hits):                  simdlogs 1.8x faster
+    rare-value selective query:          VL 6.4x faster
+    ingest:                              comparable (VL slightly ahead)
+
+The orders-of-magnitude bar is not met, and the specific class the design
+promised it on is a loss. Recording this in full, per the AGENTS.md rule
+that a finding costing a measurement is the deliverable, is worth more
+than a number massaged to fit the claim. simdlogs is a working,
+VL-compatible engine that is competitive on common queries and behind on
+selective ones; the design's reason-for-existing needs the posting index
+before its headline claim is even plausible, and even then, against this
+competitor, 10-100x is not supported by any evidence gathered here.

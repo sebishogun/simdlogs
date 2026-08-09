@@ -28,9 +28,12 @@ import (
 // This is a report, not a gate -- the numbers land in the commit message
 // and the README, with losses shown.
 
+const needle = "NEEDLEc0ffee42"
+
 func corpusNDJSON(n int) ([]byte, int64, int64) {
 	var b bytes.Buffer
 	var lo, hi int64
+	i := 0
 	corpus.Gen(42, n, func(r corpus.Record) {
 		t := r.Time.UnixNano()
 		if lo == 0 || t < lo {
@@ -39,8 +42,15 @@ func corpusNDJSON(n int) ([]byte, int64, int64) {
 		if t > hi {
 			hi = t
 		}
-		fmt.Fprintf(&b, `{"_time":%q,"level":%q,"service":%q,"_msg":%q}`+"\n",
-			r.Time.UTC().Format(time.RFC3339Nano), r.Level, r.Service, r.Message)
+		trace := r.TraceID
+		// One rare needle, planted in a single record near the end so its
+		// group is late in time -- a genuinely selective equality.
+		if i == n-100 {
+			trace = needle
+		}
+		fmt.Fprintf(&b, `{"_time":%q,"level":%q,"service":%q,"trace":%q,"_msg":%q}`+"\n",
+			r.Time.UTC().Format(time.RFC3339Nano), r.Level, r.Service, trace, r.Message)
+		i++
 	})
 	return b.Bytes(), lo, hi
 }
@@ -118,6 +128,18 @@ func TestHeadToHead(t *testing.T) {
 	vlHits := timeQuery(t, func() { get(t, vl+"/select/logsql/hits?"+hq) })
 	t.Logf("HEAD-TO-HEAD hits/agg: simdlogs %v vs VL %v = %.1fx",
 		slHits, vlHits, float64(vlHits)/float64(slHits))
+
+	// The design's actual claim: a RARE value over the FULL span. simdlogs'
+	// per-group bloom rejects every group but the needle's without decoding
+	// it; VictoriaLogs must scan whole 8M-row blocks its coarse bloom
+	// cannot rule out. This is the selective query, not a common value.
+	full := time.Unix(0, lo).UTC().Format(time.RFC3339Nano)
+	fullEnd := time.Unix(0, hi+1).UTC().Format(time.RFC3339Nano)
+	nq := url.Values{"query": {"trace:=" + needle}, "start": {full}, "end": {fullEnd}}.Encode()
+	slNeedle := timeQuery(t, func() { get(t, sl.URL+"/select/logsql/query?"+nq) })
+	vlNeedle := timeQuery(t, func() { get(t, vl+"/select/logsql/query?"+nq) })
+	t.Logf("HEAD-TO-HEAD RARE needle (full span): simdlogs %v vs VL %v = %.1fx",
+		slNeedle, vlNeedle, float64(vlNeedle)/float64(slNeedle))
 }
 
 func post(t *testing.T, url string, body []byte) {

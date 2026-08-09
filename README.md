@@ -6,17 +6,29 @@ orders-of-magnitude better numbers on the same machine.
 
 Design: [docs/design.md](docs/design.md).
 
-## The claim, and where it actually stands
+## The claim, and what measurement did to it
 
-The design aims for orders of magnitude over VictoriaLogs on selective
-scan-heavy queries. Measured head-to-head so far (200K-3M rows, both
-engines on one machine, identical wire calls): **1.6-1.8x on the
-selective query, comparable on ingest** -- real but not yet the bar. The
-honest reasons are in docs/wrong.md: VictoriaLogs is well engineered, its
-8M-row blocks carry their own time index and blooms, and the granularity
-advantage (128K groups) only bites above 8M rows and with a cheaper query
-path (lazy per-lane decode). This README states the earned number, not
-the aspiration, and moves as measurements do.
+The design aimed for orders of magnitude over VictoriaLogs on selective
+scan-heavy queries. The head-to-head harness refuted the premise it
+rested on. Measured at 3M rows, both engines on one machine, identical
+wire calls:
+
+| query class | result |
+|---|---|
+| common-value equality | simdlogs **2.0x** faster |
+| aggregation (hits) | simdlogs **1.8x** faster |
+| **rare-value selective** (the headline case) | **VictoriaLogs 6.4x faster** |
+| ingest | comparable, VL slightly ahead |
+
+The design assumed VictoriaLogs scans up to 8M rows for a selective
+query. It does not -- its per-block bloom and per-field indexing make the
+needle query its strength, not its weakness. simdlogs is competitive on
+common queries and behind on selective ones. Orders of magnitude is
+unmet, and the class it was promised on is a loss. docs/wrong.md has the
+full, unvarnished analysis; a real per-group posting index (the design's
+deferred Phase 8) is the minimum for a competitive selective path, and
+even then the evidence here does not support 10-100x against this
+competitor. This README states what was measured, not what was hoped.
 
 ## Status
 
