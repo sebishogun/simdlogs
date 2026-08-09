@@ -53,8 +53,12 @@ type Store interface {
 // only survivors are decoded and scanned. This layered skip is where the
 // orders of magnitude over a whole-block scan come from.
 func Run(s Store, q *Query) []Row {
+	groups := s.Groups(q.From, q.To)
+	if len(groups) >= parallelMinGroups && q.Limit == 0 {
+		return runParallel(groups, q)
+	}
 	var out []Row
-	for _, g := range s.Groups(q.From, q.To) {
+	for _, g := range groups {
 		if !groupCanMatch(g, q) {
 			continue // footer skip: no column of this group decoded
 		}
@@ -204,8 +208,12 @@ func containsSubstr(s, sub string) bool {
 // decode beyond the predicate columns. This is where finer skip
 // granularity turns into a real margin over a scan-and-count.
 func Count(s Store, q *Query) int {
+	groups := s.Groups(q.From, q.To)
+	if len(groups) >= parallelMinGroups {
+		return countParallel(groups, q)
+	}
 	total := 0
-	for _, g := range s.Groups(q.From, q.To) {
+	for _, g := range groups {
 		if !groupCanMatch(g, q) {
 			continue
 		}

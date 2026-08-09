@@ -62,3 +62,12 @@ func BenchmarkEngineCount(b *testing.B) {
 }
 
 var sinkI int
+
+func BenchmarkEngineFullScanCount(b *testing.B) {
+	s, lo, hi := benchStore(b, 3_000_000, 128*1024) // ~23 groups
+	q := &Query{From: lo, To: hi + 1, Preds: []Pred{{Field: "service", Kind: Eq, Value: "auth"}}}
+	b.ResetTimer()
+	for b.Loop() {
+		sinkI = Count(s, q)
+	}
+}
