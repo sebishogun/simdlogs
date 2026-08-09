@@ -9,6 +9,16 @@ import (
 	"github.com/sebishogun/simdlogs/internal/ingest"
 )
 
+// backup streams a tar of the store's group files: a consistent point-in-time
+// snapshot for offline restore via storage.RestoreTar.
+func (s *Server) backup(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.Header().Set("Content-Disposition", `attachment; filename="simdlogs-backup.tar"`)
+	if err := s.store.BackupTar(w); err != nil {
+		http.Error(w, err.Error(), 500)
+	}
+}
+
 // fallbackTS returns a per-record timestamp source for lines without their
 // own: wall-clock plus a monotonic bump so a burst ingested in the same
 // nanosecond still gets distinct, ordered timestamps. Atomic because the

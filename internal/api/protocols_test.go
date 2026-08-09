@@ -13,7 +13,42 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sebishogun/simdlogs/internal/storage"
 )
+
+func TestBackupRestore(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	// Two separate inserts -> two immutable group files.
+	postBody(t, ts, `{"_time":1,"service":"a","_msg":"x"}`+"\n"+`{"_time":2,"service":"a","_msg":"y"}`+"\n")
+	postBody(t, ts, `{"_time":3,"service":"b","_msg":"z"}`+"\n")
+
+	r, err := http.Get(ts.URL + "/admin/backup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r.Body); err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+
+	dir := t.TempDir()
+	if err := storage.RestoreTar(&buf, dir); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	srv2, err := NewServer(dir)
+	if err != nil {
+		t.Fatalf("open restored store: %v", err)
+	}
+	ts2 := httptest.NewServer(srv2.Handler())
+	defer ts2.Close()
+	if st := statsBy(t, ts2, "service"); st["a"] != 2 || st["b"] != 1 {
+		t.Fatalf("restored stats by service = %v want a:2 b:1", st)
+	}
+}
 
 func TestRetention(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())

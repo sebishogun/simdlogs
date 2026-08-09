@@ -72,6 +72,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/logs", s.insertOTLPLogs)         // OpenTelemetry OTLP/HTTP logs (JSON)
 	mux.HandleFunc("/insert/journald", s.insertJournald) // systemd journal export (systemd-journal-upload)
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	mux.HandleFunc("/admin/backup", s.backup) // tar snapshot for offline restore
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)
 	mux.HandleFunc("/select/logsql/tail", s.tail) // live tail: stream matching rows as they arrive
 	mux.HandleFunc("/select/logsql/hits", s.selectHits)
