@@ -1,6 +1,7 @@
 package query
 
 import (
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -82,6 +83,10 @@ type RenamePipe struct{ From, To []string }
 // DeletePipe is `delete a, b` / `drop a, b` -- remove those fields.
 type DeletePipe struct{ Drop []string }
 
+// FilterPipe is `filter <expr>` -- a filter applied mid-pipe over the row
+// stream (e.g. after stats: `... | stats by(x) count() c | filter c:>10`).
+type FilterPipe struct{ Expr *Expr }
+
 // statSlot accumulates one aggregation for one group-by key.
 type statSlot struct {
 	sum, min, max float64
@@ -144,6 +149,12 @@ func pipeFields(pipes []Pipe) []string {
 			add(t.From...)
 		case *FieldsPipe:
 			add(t.Keep...)
+		case *FilterPipe:
+			fs := map[string]bool{}
+			filterFields(t.Expr, fs)
+			for f := range fs {
+				add(f)
+			}
 		}
 	}
 	return out
@@ -432,6 +443,73 @@ func (p *RenamePipe) apply(rows []Row) []Row {
 		}
 	}
 	return rows
+}
+
+func (p *FilterPipe) apply(rows []Row) []Row {
+	out := rows[:0]
+	for _, r := range rows {
+		if matchRow(r, p.Expr) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// matchRow evaluates a filter tree against one materialized row (string
+// fields) -- the mid-pipe filter, distinct from evalExpr which runs over a
+// group's columns.
+func matchRow(r Row, e *Expr) bool {
+	switch e.Op {
+	case OpAnd:
+		for _, k := range e.Kids {
+			if !matchRow(r, k) {
+				return false
+			}
+		}
+		return true
+	case OpOr:
+		for _, k := range e.Kids {
+			if matchRow(r, k) {
+				return true
+			}
+		}
+		return false
+	case OpNot:
+		return !matchRow(r, e.Child)
+	default: // OpLeaf
+		return matchPredRow(r, &e.Pred)
+	}
+}
+
+func matchPredRow(r Row, p *Pred) bool {
+	v := rowField(r, p.Field)
+	switch p.Kind {
+	case Eq:
+		return v == p.Value
+	case Contains:
+		return strings.Contains(v, p.Value)
+	case Prefix:
+		return strings.HasPrefix(v, p.Value)
+	case In:
+		for _, x := range p.Values {
+			if x == v {
+				return true
+			}
+		}
+		return false
+	case Regexp:
+		if p.re == nil {
+			p.re = regexp.MustCompile(p.Value)
+		}
+		return p.re.MatchString(v)
+	case Lt, Le, Gt, Ge:
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return false
+		}
+		return cmpNum(f, p.Kind, p.Num)
+	}
+	return false
 }
 
 func (p *DeletePipe) apply(rows []Row) []Row {

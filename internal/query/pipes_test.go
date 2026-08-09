@@ -123,3 +123,16 @@ func TestMorePipes(t *testing.T) {
 		}
 	}
 }
+
+func TestFilterPipe(t *testing.T) {
+	s := statsStore(t) // service a:3, b:2
+	q, err := ParseLogsQL(`* | stats by (service) count() as c | filter c:>2`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.From, q.To = 0, int64(1)<<62
+	rows := RunPipeline(s, q)
+	if len(rows) != 1 || rowField(rows[0], "service") != "a" {
+		t.Fatalf("filter c:>2 = %v want [service=a]", rows)
+	}
+}

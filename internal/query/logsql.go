@@ -463,6 +463,12 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, err
 			}
 			pipes = append(pipes, &DeletePipe{Drop: fs})
+		case "filter", "where":
+			e, err := p.parseOr()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &FilterPipe{Expr: e})
 		default:
 			return nil, fmt.Errorf("simdlogs: unknown pipe %q", name.val)
 		}
