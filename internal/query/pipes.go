@@ -127,6 +127,15 @@ func accSample(e *statEntry, aggs []Agg, valOf func(j int) string) {
 		}
 		if a.Kind == AggQuantile {
 			sl.vals = append(sl.vals, f)
+			if len(sl.vals) >= quantileCap*2 { // bound RAM: thin the sorted samples by half
+				sort.Float64s(sl.vals)
+				j := 0
+				for i := 0; i < len(sl.vals); i += 2 {
+					sl.vals[j] = sl.vals[i]
+					j++
+				}
+				sl.vals = sl.vals[:j]
+			}
 		}
 		if !sl.has || f < sl.min {
 			sl.min = f
@@ -207,6 +216,12 @@ type statSlot struct {
 // below it the answer is exact; above it RAM is bounded at ~16KB regardless of
 // cardinality (vs an unbounded set that OOMs at billion-row scale).
 const hllThreshold = 8192
+
+// quantileCap bounds a quantile aggregation's sample buffer: past 2x this the
+// sorted samples are thinned by half (keep every other), which preserves the
+// distribution's shape -- and thus the quantile -- while keeping RAM bounded no
+// matter how many rows a group-by key spans. Exact below the cap.
+const quantileCap = 65536
 
 // statEntry is one group-by key's accumulators.
 type statEntry struct {
