@@ -123,12 +123,12 @@ func parseRequest(r *http.Request) (*query.Query, error) {
 		return nil, err
 	}
 	if v := r.FormValue("start"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n, ok := parseTimeParam(v); ok {
 			q.From = n
 		}
 	}
 	if v := r.FormValue("end"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n, ok := parseTimeParam(v); ok {
 			q.To = n
 		}
 	}
@@ -141,4 +141,19 @@ func parseRequest(r *http.Request) (*query.Query, error) {
 		}
 	}
 	return q, nil
+}
+
+// parseTimeParam accepts a unix-nanoseconds integer or an RFC3339 string
+// (the format VictoriaLogs uses), returning nanoseconds. Accepting both
+// lets the head-to-head hand both engines the identical window string.
+func parseTimeParam(v string) (int64, bool) {
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return n, true
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t.UnixNano(), true
+		}
+	}
+	return 0, false
 }

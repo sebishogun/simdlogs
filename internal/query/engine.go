@@ -75,8 +75,11 @@ func groupCanMatch(g *storage.Reader, q *Query) bool {
 	return true
 }
 
-// appendMatches decodes the survivor group, builds the match bitset with
-// the vectorized predicates, and materializes the selected rows.
+// appendMatches decodes the survivor group ONCE per column, builds the
+// match bitset with the vectorized predicates, and materializes only the
+// selected rows. The earlier version decoded a column inside the per-row
+// loop -- O(matches x column) -- which lost the head-to-head; each column
+// is now decoded exactly once and indexed into.
 func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	n := g.Rows
 	sel := NewBitset(n)
@@ -92,36 +95,47 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	}
 	sel.And(tsel)
 
-	for i := range q.Preds {
-		p := &q.Preds[i]
-		sel.And(predBitset(g, p, n))
+	// Decode each predicate field's indices+dict once, reused for both the
+	// filter and the materialize.
+	type col struct {
+		idx  []uint32
+		dict []string
+	}
+	cols := make(map[string]col, len(q.Preds))
+	getCol := func(field string) col {
+		if c, ok := cols[field]; ok {
+			return c
+		}
+		idx, dict := g.DictIndices(field)
+		c := col{idx: idx, dict: dict}
+		cols[field] = c
+		return c
 	}
 
-	limit := q.Limit
+	for i := range q.Preds {
+		p := &q.Preds[i]
+		c := getCol(p.Field)
+		sel.And(predBitsetCol(g, p, c.idx, c.dict, n))
+	}
+
 	sel.ForEach(func(i int) {
-		row := Row{Time: ts[i], Fields: map[string]string{}}
-		row.Fields["_time"] = ""
-		// Materialize the predicate fields (a real select would take a
-		// projection list; here every dict column is available).
+		row := Row{Time: ts[i], Fields: make(map[string]string, len(q.Preds))}
 		for _, p := range q.Preds {
-			if idx, dict := g.DictIndices(p.Field); idx != nil {
-				row.Fields[p.Field] = dict[idx[i]]
+			c := cols[p.Field]
+			if c.idx != nil {
+				row.Fields[p.Field] = c.dict[c.idx[i]]
 			}
 		}
 		out = append(out, row)
-		_ = limit
 	})
 	return out
 }
 
-// predBitset builds the per-row match mask for one predicate. Equality on
-// a dict column is one id compare per row (no string compares) over the
-// decoded indices; substring and regexp fall to the survivors.
-func predBitset(g *storage.Reader, p *Pred, n int) *Bitset {
+// predBitsetCol is predBitset over already-decoded indices/dict.
+func predBitsetCol(g *storage.Reader, p *Pred, idx []uint32, dict []string, n int) *Bitset {
 	b := NewBitset(n)
-	idx, dict := g.DictIndices(p.Field)
 	if idx == nil {
-		return b // absent column matches nothing
+		return b
 	}
 	switch p.Kind {
 	case Eq:

@@ -1,3 +1,4 @@
 docs/bench/
 docs/figures/
 *.test
+internal/bench/victoria-logs
