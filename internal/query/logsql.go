@@ -611,7 +611,7 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 			}
 			pipes = append(pipes, fp)
 		case "collapse_nums", "pattern":
-			cp := &CollapseNumsPipe{}
+			cp := &CollapseNumsPipe{Full: strings.EqualFold(name.val, "pattern")}
 			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "at") {
 				p.next()
 				f, err := p.value()

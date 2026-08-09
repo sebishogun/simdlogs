@@ -250,6 +250,17 @@ func TestCollapseNums(t *testing.T) {
 	}
 }
 
+func TestPatternTemplating(t *testing.T) {
+	// pattern also collapses hex/uuid identifiers to <ID>.
+	if got := templatize("req deadbeef12345678 done in 5ms", true); got != "req <ID> done in <N>ms" {
+		t.Fatalf("pattern full = %q want 'req <ID> done in <N>ms'", got)
+	}
+	// collapse_nums (Full=false) leaves the hex token, only digits collapse.
+	if got := templatize("req deadbeef12345678 done in 5ms", false); got != "req deadbeef<N> done in <N>ms" {
+		t.Fatalf("collapse_nums = %q", got)
+	}
+}
+
 func TestQuantileAgg(t *testing.T) {
 	s := statsStore(t) // a: latency 10,20,60 ; b: 30,40
 	run := func(q string) map[string]string {

@@ -619,11 +619,14 @@ func (p *FilterPipe) apply(rows []Row) []Row {
 	return out
 }
 
-// CollapseNumsPipe is `collapse_nums [at field]`: replace each run of digits in
-// the field (default _msg) with <N>, turning variable log lines into a stable
-// template. `stats by (_msg) count()` after it mines the top log patterns --
-// VictoriaLogs' collapse_nums, and the basis for pattern analytics.
-type CollapseNumsPipe struct{ Field string }
+// CollapseNumsPipe is `collapse_nums [at field]` (digits -> <N>, VictoriaLogs'
+// semantics) or `pattern [at field]` (Full: also hex/uuid tokens -> <ID>, a
+// drain-style templater). Either way `stats by (_msg) count()` after it mines
+// the top log patterns.
+type CollapseNumsPipe struct {
+	Field string
+	Full  bool
+}
 
 func (p *CollapseNumsPipe) apply(rows []Row) []Row {
 	f := p.Field
@@ -631,9 +634,18 @@ func (p *CollapseNumsPipe) apply(rows []Row) []Row {
 		f = "_msg"
 	}
 	for ri := range rows {
-		setRowField(&rows[ri], f, collapseNums(rowField(rows[ri], f)))
+		setRowField(&rows[ri], f, templatize(rowField(rows[ri], f), p.Full))
 	}
 	return rows
+}
+
+// templatize collapses variable tokens to placeholders. Full also collapses
+// hex/uuid-ish identifiers (before the digit pass, so their digits do not leak).
+func templatize(s string, full bool) string {
+	if full {
+		s = collapseHexTokens(s)
+	}
+	return collapseNums(s)
 }
 
 // collapseNums replaces every maximal run of ASCII digits with "<N>".
@@ -653,6 +665,57 @@ func collapseNums(s string) string {
 		sb.WriteByte(s[i])
 	}
 	return sb.String()
+}
+
+// collapseHexTokens replaces alphanumeric tokens that look like hex identifiers
+// (>=8 chars, all hex, mixing a letter and a digit -- request ids, hashes, uuid
+// segments) with <ID>. Pure-digit tokens are left for collapseNums.
+func collapseHexTokens(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if !isAlnum(s[i]) {
+			sb.WriteByte(s[i])
+			i++
+			continue
+		}
+		j := i
+		for j < len(s) && isAlnum(s[j]) {
+			j++
+		}
+		tok := s[i:j]
+		if isHexID(tok) {
+			sb.WriteString("<ID>")
+		} else {
+			sb.WriteString(tok)
+		}
+		i = j
+	}
+	return sb.String()
+}
+
+func isAlnum(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+func isHexID(tok string) bool {
+	if len(tok) < 8 {
+		return false
+	}
+	hasDigit, hasLetter := false, false
+	for i := 0; i < len(tok); i++ {
+		c := tok[i]
+		switch {
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F':
+			hasLetter = true
+		default:
+			return false // non-hex char -> not an id
+		}
+	}
+	return hasDigit && hasLetter
 }
 
 // setRowField updates key in place, or appends it -- the mutation the
