@@ -30,25 +30,38 @@ type DictColumn struct {
 }
 
 // BuildDict interns values into a sorted dictionary and per-row indices.
+// One hash map, not two: the first pass assigns each distinct value a
+// provisional (first-seen) id and records every row's, then the distinct
+// set is sorted and an array remap rewrites the provisional ids to sorted
+// ones. The earlier form built a dedup set and then a second id table and
+// looked the id up per row -- two maps and a per-row map lookup where one
+// map and an array index do, the ingest hot path's largest single cost.
 func BuildDict(values []string) DictColumn {
-	seen := map[string]struct{}{}
-	for _, v := range values {
-		seen[v] = struct{}{}
+	id := make(map[string]uint32, len(values))
+	dict := make([]string, 0, len(values))
+	prov := make([]uint32, len(values))
+	for i, v := range values {
+		x, ok := id[v]
+		if !ok {
+			x = uint32(len(dict))
+			id[v] = x
+			dict = append(dict, v)
+		}
+		prov[i] = x
 	}
-	dict := make([]string, 0, len(seen))
-	for v := range seen {
-		dict = append(dict, v)
-	}
-	sort.Strings(dict)
-	id := make(map[string]uint32, len(dict))
-	for i, v := range dict {
-		id[v] = uint32(i)
+	sorted := make([]string, len(dict))
+	copy(sorted, dict)
+	sort.Strings(sorted)
+	// remap[provisional id] -> sorted id, from the sorted order.
+	remap := make([]uint32, len(dict))
+	for newID, v := range sorted {
+		remap[id[v]] = uint32(newID)
 	}
 	idx := make([]uint32, len(values))
-	for i, v := range values {
-		idx[i] = id[v]
+	for i, p := range prov {
+		idx[i] = remap[p]
 	}
-	return DictColumn{Dict: dict, Indices: idx}
+	return DictColumn{Dict: sorted, Indices: idx}
 }
 
 // bitWidth is the bits needed to hold the largest index.
