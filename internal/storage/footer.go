@@ -1,6 +1,10 @@
 package storage
 
-import "github.com/sebishogun/simd"
+import (
+	"sort"
+
+	"github.com/sebishogun/simd"
+)
 
 // Reader is a parsed group: skip metadata from the footer, column data
 // decoded on demand. The skip methods answer from the footer alone,
@@ -35,12 +39,7 @@ func (r *Reader) DictContains(name, value string) bool {
 	if !bloomMaybe(m.Bloom, value) {
 		return false
 	}
-	for _, d := range m.DictData {
-		if d == value {
-			return true
-		}
-	}
-	return false
+	return dictLookup(m.DictData, value) >= 0
 }
 
 func (r *Reader) col(name string) *colMeta {
@@ -80,6 +79,29 @@ func (r *Reader) DictIndices(name string) ([]uint32, []string) {
 	return decodeIndices(data, r.Rows, m.Width), m.DictData
 }
 
+// DictValueAt returns the value of a dict column at one row, decoding
+// only that row's index bits -- O(1), so materializing a handful of
+// matched rows never decodes the whole column. The selective path's
+// materialize step.
+func (r *Reader) DictValueAt(name string, row int) (string, bool) {
+	m := r.col(name)
+	if m == nil || m.Type != ColDict || row < 0 || row >= r.Rows {
+		return "", false
+	}
+	data := r.blob[m.DataOff : m.DataOff+m.DataLen]
+	w := m.Width
+	bit := row * w
+	var v uint64
+	for k := 0; k < 8 && bit/8+k < len(data); k++ {
+		v |= uint64(data[bit/8+k]) << (8 * k)
+	}
+	id := uint32(v>>uint(bit%8)) & (uint32(1)<<uint(w) - 1)
+	if int(id) >= len(m.DictData) {
+		return "", false
+	}
+	return m.DictData[id], true
+}
+
 // DictID returns the index of value in the named column's dictionary, or
 // -1 -- the equality filter's fast path: one comparison per row against
 // this id over the decoded indices, no string compares.
@@ -88,12 +110,38 @@ func (r *Reader) DictID(name, value string) int {
 	if m == nil || m.Type != ColDict {
 		return -1
 	}
-	for i, d := range m.DictData {
-		if d == value {
-			return i
-		}
+	return dictLookup(m.DictData, value)
+}
+
+// dictLookup binary-searches a sorted dictionary for value, returning its
+// id or -1. BuildDict sorts the dict, so this is O(log n) where the naive
+// scan was O(n) -- the fix that made the selective needle competitive,
+// since a high-cardinality column's dict is as large as the row count.
+func dictLookup(dict []string, value string) int {
+	i := sort.Search(len(dict), func(i int) bool { return dict[i] >= value })
+	if i < len(dict) && dict[i] == value {
+		return i
 	}
 	return -1
+}
+
+// EqualityRows returns the row ids where the named dict column equals
+// value, read from the posting index without decoding the column's
+// per-row indices at all -- the selective-query path. ok is false if the
+// value is absent (empty rows) but the lookup was valid.
+func (r *Reader) EqualityRows(name, value string) (rows []uint32, has bool) {
+	m := r.col(name)
+	if m == nil || m.Type != ColDict || m.PostLen == 0 {
+		return nil, false
+	}
+	if !bloomMaybe(m.Bloom, value) {
+		return nil, true // provably absent
+	}
+	id := dictLookup(m.DictData, value)
+	if id < 0 {
+		return nil, true
+	}
+	return postingRows(r.blob[m.PostOff:m.PostOff+m.PostLen], id), true
 }
 
 // ---- dict-value bloom, on the simd hash ----

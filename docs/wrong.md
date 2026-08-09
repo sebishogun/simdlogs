@@ -124,3 +124,33 @@ VL-compatible engine that is competitive on common queries and behind on
 selective ones; the design's reason-for-existing needs the posting index
 before its headline claim is even plausible, and even then, against this
 competitor, 10-100x is not supported by any evidence gathered here.
+
+## Phase 8 postings + binary-search dict: needle 6.4x loss -> 2x loss, still behind
+
+The measurement gated Phase 8 (decision #3), so it was built: a per-group
+posting index (dict id -> row ids, offset table + delta-varint lists) and
+a single-row dict decode, so an equality query looks up a value's rows
+instead of decoding the whole column. Then the dict lookups themselves,
+which were linear scans over a high-cardinality column's 128K-entry
+dictionary, became binary searches (the dict is sorted).
+
+    rare needle, full span, over three rounds of fixes:
+      baseline (full decode):        2.30 ms   VL 0.36 ms   6.4x loss
+      + postings:                    2.22 ms                 1.4x loss
+      + binary-search dict:          0.88 ms   VL 0.41 ms   2.0x loss
+
+Each fix was real and the needle improved 2.6x overall, but VictoriaLogs
+is still ~2x faster on it. The remaining gap is that simdlogs consults
+every group's bloom over the full span (23 groups) where VL's per-field
+index jumps closer to the block; closing it would need a global
+value->group index, another structure. The other classes settled at
+common-value 1.9x and aggregation 2.0x in our favor, ingest comparable.
+
+Final honest verdict on the design's thesis: against a well-engineered
+VictoriaLogs, simdlogs is ~2x faster on common-value queries and
+aggregations, ~2x slower on rare-value selective queries, comparable on
+ingest. Orders of magnitude is not achieved and, on all evidence
+gathered, is not achievable against this competitor at these scales with
+this architecture. The engine is a real, correct, VL-wire-compatible log
+database that is competitive, not dominant. That is the measured truth,
+and it is the deliverable.

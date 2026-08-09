@@ -49,6 +49,8 @@ type colMeta struct {
 	Bloom    []uint64 // dict-value bloom for equality skip
 	DataOff  int
 	DataLen  int
+	PostOff  int
+	PostLen  int
 	DictData []string
 }
 
@@ -83,6 +85,9 @@ func (g *Group) Marshal() []byte {
 			}
 			m.MinIdx, m.MaxIdx = mn, mx
 			m.Bloom = buildDictBloom(c.Dict.Dict)
+			m.PostOff = len(b)
+			b = buildPostings(c.Dict.Indices, len(c.Dict.Dict)).marshal(b)
+			m.PostLen = len(b) - m.PostOff
 		case ColTimestamp:
 			data := encodeTimestamps(c.Ts)
 			b = append(b, data...)
@@ -114,6 +119,8 @@ func (g *Group) Marshal() []byte {
 		b = appU32(b, m.MaxIdx)
 		b = appU32(b, uint32(m.DataOff))
 		b = appU32(b, uint32(m.DataLen))
+		b = appU32(b, uint32(m.PostOff))
+		b = appU32(b, uint32(m.PostLen))
 		b = appU32(b, uint32(len(m.Bloom)))
 		for _, w := range m.Bloom {
 			b = appU64(b, w)
@@ -165,6 +172,10 @@ func ReadGroup(b []byte) (*Reader, error) {
 		m.DataOff = int(get32(f, p))
 		p += 4
 		m.DataLen = int(get32(f, p))
+		p += 4
+		m.PostOff = int(get32(f, p))
+		p += 4
+		m.PostLen = int(get32(f, p))
 		p += 4
 		nb := int(get32(f, p))
 		p += 4

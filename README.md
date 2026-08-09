@@ -15,20 +15,22 @@ wire calls:
 
 | query class | result |
 |---|---|
-| common-value equality | simdlogs **2.0x** faster |
-| aggregation (hits) | simdlogs **1.8x** faster |
-| **rare-value selective** (the headline case) | **VictoriaLogs 6.4x faster** |
-| ingest | comparable, VL slightly ahead |
+| common-value equality | simdlogs **1.9x** faster |
+| aggregation (hits) | simdlogs **2.0x** faster |
+| rare-value selective (needle) | **VictoriaLogs 2.0x faster** |
+| ingest | comparable |
 
 The design assumed VictoriaLogs scans up to 8M rows for a selective
 query. It does not -- its per-block bloom and per-field indexing make the
-needle query its strength, not its weakness. simdlogs is competitive on
-common queries and behind on selective ones. Orders of magnitude is
-unmet, and the class it was promised on is a loss. docs/wrong.md has the
-full, unvarnished analysis; a real per-group posting index (the design's
-deferred Phase 8) is the minimum for a competitive selective path, and
-even then the evidence here does not support 10-100x against this
-competitor. This README states what was measured, not what was hoped.
+needle query a strength. Building the design's deferred Phase 8 (a
+per-group posting index) and binary-searching the dictionary took the
+needle from a 6.4x loss to 2.0x -- real progress, still behind.
+simdlogs is ~2x faster on common-value queries and aggregations, ~2x
+slower on rare selective ones, comparable on ingest: a competitive,
+correct, VL-wire-compatible engine, not a dominant one. Orders of
+magnitude is unmet and, on all evidence here, not achievable against this
+competitor at these scales. docs/wrong.md has the full analysis. This
+README states what was measured, not what was hoped.
 
 ## Status
 

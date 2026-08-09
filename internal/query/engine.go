@@ -114,6 +114,16 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 
 	for i := range q.Preds {
 		p := &q.Preds[i]
+		if p.Kind == Eq {
+			if rows, ok := g.EqualityRows(p.Field, p.Value); ok {
+				pb := NewBitset(n)
+				for _, row := range rows {
+					pb.Set(int(row))
+				}
+				sel.And(pb)
+				continue
+			}
+		}
 		c := getCol(p.Field)
 		sel.And(predBitsetCol(g, p, c.idx, c.dict, n))
 	}
@@ -121,9 +131,13 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	sel.ForEach(func(i int) {
 		row := Row{Time: ts[i], Fields: make(map[string]string, len(q.Preds))}
 		for _, p := range q.Preds {
-			c := cols[p.Field]
-			if c.idx != nil {
+			// Prefer a decoded column if we already have one; otherwise
+			// (the posting path skipped the full decode) fetch just this
+			// row's value -- O(1), keeping the selective query lazy.
+			if c := cols[p.Field]; c.idx != nil {
 				row.Fields[p.Field] = c.dict[c.idx[i]]
+			} else if v, ok := g.DictValueAt(p.Field, i); ok {
+				row.Fields[p.Field] = v
 			}
 		}
 		out = append(out, row)
@@ -245,6 +259,18 @@ func matchBitset(g *storage.Reader, q *Query) *Bitset {
 	}
 	for i := range q.Preds {
 		p := &q.Preds[i]
+		if p.Kind == Eq {
+			if rows, ok := g.EqualityRows(p.Field, p.Value); ok {
+				// Posting-index path: build the predicate mask from the
+				// value's row list, no per-row index decode.
+				pb := NewBitset(n)
+				for _, row := range rows {
+					pb.Set(int(row))
+				}
+				sel.And(pb)
+				continue
+			}
+		}
 		idx, dict := g.DictIndices(p.Field)
 		sel.And(predBitsetCol(g, p, idx, dict, n))
 	}
