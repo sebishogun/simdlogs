@@ -70,3 +70,11 @@ func (b *Bitset) ForEach(fn func(int)) {
 		}
 	}
 }
+
+// bytesForPack returns the words as a byte slice sized to exactly cover n
+// bits (MaskBits writes ceil(n/8) bytes). The words back it, so MaskBits
+// writes straight into the bitset.
+func (b *Bitset) bytesForPack() []byte {
+	nb := (b.n + 7) / 8
+	return b.bytes()[:nb]
+}

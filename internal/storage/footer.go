@@ -125,6 +125,28 @@ func dictLookup(dict []string, value string) int {
 	return -1
 }
 
+// EqualityCount returns a dict value's id and its row count, read from
+// the posting offset table alone (a difference of two prefix sums) -- so
+// the query planner can choose the posting path for a rare value or the
+// vectorized scan for a common one without decoding anything.
+func (r *Reader) EqualityCount(name, value string) (id, count int, ok bool) {
+	m := r.col(name)
+	if m == nil || m.Type != ColDict || m.PostLen == 0 {
+		return 0, 0, false
+	}
+	if !bloomMaybe(m.Bloom, value) {
+		return -1, 0, true
+	}
+	id = dictLookup(m.DictData, value)
+	if id < 0 {
+		return -1, 0, true
+	}
+	blob := r.blob[m.PostOff : m.PostOff+m.PostLen]
+	start := le32(blob[4+id*4:])
+	end := le32(blob[4+(id+1)*4:])
+	return id, int(end - start), true
+}
+
 // EqualityRows returns the row ids where the named dict column equals
 // value, read from the posting index without decoding the column's
 // per-row indices at all -- the selective-query path. ok is false if the

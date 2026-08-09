@@ -81,15 +81,27 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 	rows := query.Run(s.store, q)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
-	enc := json.NewEncoder(bw)
+	// Hand-built NDJSON: no map[string]any, no reflection. The engine
+	// produces rows in ~1.5ms; the reflective encoder was doubling the
+	// wire time, so the result bytes are appended directly here.
+	var buf []byte
 	for _, row := range rows {
-		obj := map[string]any{"_time": time.Unix(0, row.Time).UTC().Format(time.RFC3339Nano)}
+		buf = buf[:0]
+		buf = append(buf, `{"_time":"`...)
+		buf = time.Unix(0, row.Time).UTC().AppendFormat(buf, time.RFC3339Nano)
+		buf = append(buf, '"')
 		for k, v := range row.Fields {
-			if k != "_time" {
-				obj[k] = v
+			if k == "_time" {
+				continue
 			}
+			buf = append(buf, ',', '"')
+			buf = appendJSONString(buf, k)
+			buf = append(buf, '"', ':', '"')
+			buf = appendJSONString(buf, v)
+			buf = append(buf, '"')
 		}
-		enc.Encode(obj)
+		buf = append(buf, '}', '\n')
+		bw.Write(buf)
 	}
 }
 
@@ -209,4 +221,31 @@ func timeWindow(r *http.Request) (int64, int64) {
 		}
 	}
 	return from, to
+}
+
+// appendJSONString appends s with the JSON-mandatory escapes only (quote,
+// backslash, controls) -- enough for header/field values, and far cheaper
+// than encoding/json's reflection path for a hot result loop.
+func appendJSONString(b []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			b = append(b, '\\', '"')
+		case c == '\\':
+			b = append(b, '\\', '\\')
+		case c < 0x20:
+			b = append(b, '\\', 'u', '0', '0', hexdig(c>>4), hexdig(c&0xf))
+		default:
+			b = append(b, c)
+		}
+	}
+	return b
+}
+
+func hexdig(n byte) byte {
+	if n < 10 {
+		return '0' + n
+	}
+	return 'a' + n - 10
 }

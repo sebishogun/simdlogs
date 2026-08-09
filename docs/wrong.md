@@ -154,3 +154,28 @@ gathered, is not achievable against this competitor at these scales with
 this architecture. The engine is a real, correct, VL-wire-compatible log
 database that is competitive, not dominant. That is the measured truth,
 and it is the deliverable.
+
+## The review was right: vectorized scan + NDJSON took the row query 1.9x -> 4.1x
+
+The code review (external) found the design's Task 3.3 -- the vectorized
+residual scan -- was never built: the equality filter was a scalar Go
+loop with per-row Set, VictoriaLogs' own filter_exact anti-pattern, the
+thing the design existed to replace. Built it:
+
+  - equality: EqualScalarInto (vpcmpeqd per lane) + MaskBits (pack to
+    bits), chosen over the posting path when the value is common
+    (count > n/8); postings still serve rare values.
+  - time range: GreaterEqualScalarInto + LessScalarInto + pack + AND,
+    replacing the per-row scalar window loop that ran on every group.
+
+Those alone barely moved the wire number (1.9x), which localized the real
+cost: the pure engine was already 1.5ms (Run) / 0.9ms (Count) at 3M rows;
+the other ~4ms was HTTP plus a reflection-based json.Encoder over a
+map[string]any per row. Hand-built NDJSON (no map, no reflection) took
+the selective row query to 4.1x (2.7ms vs VL 11.2ms). Aggregation stayed
+2.0x (no materialization to speed up), the needle 0.4x (VL's index still
+wins the rare lookup).
+
+Lesson recorded: a vectorized filter is invisible when serialization
+dominates. Profile the whole path before crediting or blaming the kernel
+-- the engine was never the 5.8ms, the encoder was.

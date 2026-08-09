@@ -2,6 +2,9 @@ package query
 
 import (
 	"regexp"
+	"unsafe"
+
+	"github.com/sebishogun/simd"
 
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
@@ -115,14 +118,8 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	for i := range q.Preds {
 		p := &q.Preds[i]
 		if p.Kind == Eq {
-			if rows, ok := g.EqualityRows(p.Field, p.Value); ok {
-				pb := NewBitset(n)
-				for _, row := range rows {
-					pb.Set(int(row))
-				}
-				sel.And(pb)
-				continue
-			}
+			sel.And(eqPredBitset(g, p, n))
+			continue
 		}
 		c := getCol(p.Field)
 		sel.And(predBitsetCol(g, p, c.idx, c.dict, n))
@@ -157,12 +154,11 @@ func predBitsetCol(g *storage.Reader, p *Pred, idx []uint32, dict []string, n in
 		if id < 0 {
 			return b
 		}
-		want := uint32(id)
-		for i, v := range idx {
-			if v == want {
-				b.Set(i)
-			}
-		}
+		// Vectorized residual scan: one vpcmpeqd per lane over the encoded
+		// indices (EqualScalarInto), then pack the bool mask to bits
+		// (MaskBits) -- no per-row compare, no per-row Set. The design's
+		// Task 3.3, replacing VictoriaLogs' scalar filter_exact pattern.
+		eqMaskInto(b, idx, uint32(id))
 	case Contains:
 		hit := make([]bool, len(dict))
 		for di, d := range dict {
@@ -249,30 +245,101 @@ func matchBitset(g *storage.Reader, q *Query) *Bitset {
 	// decode at all.
 	if g.TimeMin < q.From || g.TimeMax >= q.To {
 		ts := g.Timestamps("_time", nil, nil)
-		tsel := NewBitset(n)
-		for i, t := range ts {
-			if t >= q.From && t < q.To {
-				tsel.Set(i)
-			}
-		}
-		sel.And(tsel)
+		sel.And(rangeMaskInto(ts, q.From, q.To))
 	}
 	for i := range q.Preds {
 		p := &q.Preds[i]
 		if p.Kind == Eq {
-			if rows, ok := g.EqualityRows(p.Field, p.Value); ok {
-				// Posting-index path: build the predicate mask from the
-				// value's row list, no per-row index decode.
-				pb := NewBitset(n)
-				for _, row := range rows {
-					pb.Set(int(row))
-				}
-				sel.And(pb)
-				continue
-			}
+			sel.And(eqPredBitset(g, p, n))
+			continue
 		}
 		idx, dict := g.DictIndices(p.Field)
 		sel.And(predBitsetCol(g, p, idx, dict, n))
 	}
 	return sel
+}
+
+// eqPredBitset chooses the equality path by selectivity: a rare value
+// (few rows) reads its posting list directly, no column decode; a common
+// value takes the vectorized residual scan (vpcmpeqd + pack) over the
+// decoded indices, which beats iterating a huge posting list one Set at a
+// time. The crossover is one eighth of the group -- below it the postings
+// win, above it the scan does.
+func eqPredBitset(g *storage.Reader, p *Pred, n int) *Bitset {
+	b := NewBitset(n)
+	id, count, ok := g.EqualityCount(p.Field, p.Value)
+	if !ok {
+		// No postings for this column: fall back to a decode + scan.
+		idx, dict := g.DictIndices(p.Field)
+		return predBitsetCol(g, p, idx, dict, n)
+	}
+	if id < 0 || count == 0 {
+		return b // provably absent
+	}
+	if count <= n/8 {
+		rows, _ := g.EqualityRows(p.Field, p.Value)
+		for _, row := range rows {
+			b.Set(int(row))
+		}
+		return b
+	}
+	idx, _ := g.DictIndices(p.Field)
+	eqMaskInto(b, idx, uint32(id))
+	return b
+}
+
+// eqMaskInto fills b with the rows where idx == want, using the simd
+// compare and pack kernels: EqualScalarInto writes a bool per row with
+// one vector compare per lane, MaskBits packs those bools to the bitset's
+// words. Both are kernel paths; the Go loop the design set out to kill is
+// gone.
+func eqMaskInto(b *Bitset, idx []uint32, want uint32) {
+	n := len(idx)
+	if n == 0 {
+		return
+	}
+	bools := make([]bool, n)
+	simd.EqualScalarInto(bools, idx, want)
+	packBools(b, bools)
+}
+
+// packBools ORs a bool mask into b's words via MaskBits (bit set where the
+// bool byte is 1). b starts clear for a fresh predicate bitset.
+func packBools(b *Bitset, bools []bool) {
+	if len(bools) == 0 {
+		return
+	}
+	bb := b.bytesForPack()
+	boolBytes := boolsAsBytes(bools)
+	simd.MaskBits(bb, boolBytes, 1)
+}
+
+func boolsAsBytes(s []bool) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), len(s))
+}
+
+// rangeMaskInto builds the bitset of rows whose timestamp is in [from,to)
+// with vector range compares (GreaterEqualScalarInto and LessScalarInto)
+// packed to bits -- the time predicate the design's Task 3.3 covers along
+// with equality, replacing the per-row scalar loop that ran on every
+// candidate group.
+func rangeMaskInto(ts []int64, from, to int64) *Bitset {
+	n := len(ts)
+	b := NewBitset(n)
+	if n == 0 {
+		return b
+	}
+	ge := make([]bool, n)
+	lt := make([]bool, n)
+	simd.GreaterEqualScalarInto(ge, ts, from)
+	simd.LessScalarInto(lt, ts, to)
+	// keep where both hold: pack ge, then AND the packed lt over it.
+	packBools(b, ge)
+	ltb := NewBitset(n)
+	packBools(ltb, lt)
+	b.And(ltb)
+	return b
 }
