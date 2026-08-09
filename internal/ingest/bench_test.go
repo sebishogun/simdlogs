@@ -34,3 +34,17 @@ func BenchmarkIngest(b *testing.B) {
 		w.Close()
 	}
 }
+
+// BenchmarkIngestParallel is the sharded parse path the server takes for a
+// large body -- the parser was the bottleneck once flushing went async.
+func BenchmarkIngestParallel(b *testing.B) {
+	nd := ndjson(500_000)
+	var mono int64
+	fallback := func() int64 { mono++; return mono }
+	b.SetBytes(int64(len(nd)))
+	b.ResetTimer()
+	for b.Loop() {
+		s, _ := storage.OpenStore(b.TempDir())
+		IngestJSONLinesParallel(s, nd, fallback)
+	}
+}

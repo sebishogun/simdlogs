@@ -1,10 +1,83 @@
 package ingest
 
 import (
+	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
 
 	"github.com/sebishogun/simdjson"
+
+	"github.com/sebishogun/simdlogs/internal/storage"
 )
+
+// MinParallelBytes is the body size below which parallel ingest is not worth
+// the goroutine and per-shard writer setup; a small POST stays serial.
+const MinParallelBytes = 1 << 20
+
+// IngestJSONLinesParallel splits an NDJSON body at line boundaries and
+// ingests the chunks concurrently, each through its own writer over the
+// shared store (AppendGroup is concurrency-safe). The parser was the ingest
+// bottleneck once flushing went async and single-threaded on a many-core
+// box; sharding the parse is the lever. Shard count and per-shard flush
+// pool are sized so the total goroutines stay near the core count rather
+// than oversubscribing. Falls back to serial for a small body.
+func IngestJSONLinesParallel(store *storage.Store, data []byte, fallback func() int64) (ingested, skipped int) {
+	shards := runtime.NumCPU() / 3
+	if shards < 2 || len(data) < MinParallelBytes {
+		w := NewWriter(store)
+		i, s := IngestJSONLines(w, data, fallback)
+		w.Close()
+		return i, s
+	}
+	chunks := splitLines(data, shards)
+	var ing, skp int64
+	var wg sync.WaitGroup
+	for _, c := range chunks {
+		if len(c) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(chunk []byte) {
+			defer wg.Done()
+			w := NewWriterWorkers(store, 2)
+			i, s := IngestJSONLines(w, chunk, fallback)
+			w.Close()
+			atomic.AddInt64(&ing, int64(i))
+			atomic.AddInt64(&skp, int64(s))
+		}(c)
+	}
+	wg.Wait()
+	return int(ing), int(skp)
+}
+
+// splitLines cuts data into at most n chunks, each ending on a newline so no
+// line is split across chunks.
+func splitLines(data []byte, n int) [][]byte {
+	if n <= 1 {
+		return [][]byte{data}
+	}
+	out := make([][]byte, 0, n)
+	target := len(data) / n
+	start := 0
+	for len(out) < n-1 && start < len(data) {
+		end := start + target
+		if end >= len(data) {
+			break
+		}
+		nl := indexByte(data[end:], '\n')
+		if nl < 0 {
+			break
+		}
+		end += nl + 1
+		out = append(out, data[start:end])
+		start = end
+	}
+	if start < len(data) {
+		out = append(out, data[start:])
+	}
+	return out
+}
 
 // IngestJSONLines parses NDJSON log lines through simdjson and appends
 // each object's fields to the writer. A record's timestamp comes from the

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
@@ -59,13 +60,19 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	ing, skip := ingest.IngestJSONLines(s.w, body, func() int64 {
-		s.mono++
-		return time.Now().UnixNano() + s.mono
-	})
-	if err := s.w.Flush(); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+	// Fallback timestamp for a line missing _time; atomic because the
+	// parallel path calls it from many shard goroutines.
+	fallback := func() int64 { return time.Now().UnixNano() + atomic.AddInt64(&s.mono, 1) }
+	var ing, skip int
+	if len(body) >= ingest.MinParallelBytes {
+		ing, skip = ingest.IngestJSONLinesParallel(s.store, body, fallback)
+	} else {
+		// Small body: reuse the persistent writer, no per-request pool churn.
+		ing, skip = ingest.IngestJSONLines(s.w, body, fallback)
+		if err := s.w.Flush(); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 	}
 	json.NewEncoder(w).Encode(map[string]int{"ingested": ing, "skipped": skip})
 }

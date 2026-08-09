@@ -68,14 +68,22 @@ type flushJob struct {
 }
 
 // NewWriter makes a writer over the store and starts its flush pool.
-func NewWriter(s *storage.Store) *Writer {
+func NewWriter(s *storage.Store) *Writer { return NewWriterWorkers(s, flushWorkers) }
+
+// NewWriterWorkers is NewWriter with an explicit flush-pool size, for
+// sharded parallel ingest where many writers share the cores and each wants
+// a smaller pool (see IngestJSONLinesParallel).
+func NewWriterWorkers(s *storage.Store, workers int) *Writer {
+	if workers < 1 {
+		workers = 1
+	}
 	w := &Writer{
 		store:    s,
 		cols:     map[string]*colBuf{},
 		lastFlsh: nowFn(),
-		jobs:     make(chan flushJob, flushWorkers),
+		jobs:     make(chan flushJob, workers),
 	}
-	for i := 0; i < flushWorkers; i++ {
+	for i := 0; i < workers; i++ {
 		w.workers.Add(1)
 		go w.worker()
 	}

@@ -296,3 +296,35 @@ requires. A further lever measured but not yet taken: BuildDict builds two
 hash maps (a dedup set and an id table) where one pass with provisional ids
 and an index remap would do -- ~2s of the 6s, deferred since async already
 put ingest ahead.
+
+## Ingest, continued: one-map dict and sharded parse -- 803K -> 2.78M rec/s
+
+The async pipeline moved the bottleneck to the parser, so the profile
+changed and two more levers opened.
+
+BuildDict, the flush's biggest cost, built a dedup set and then a second id
+table and looked the id up per row -- two maps and a random probe into a
+128K-entry map per row. One pass with provisional first-seen ids, a sort,
+and an array remap does it with one map and an array index:
+
+    BenchmarkBuildDict highcard (128K distinct):  34.0ms -> 8.9ms  3.8x
+
+End-to-end ingest barely moved on that alone -- proof the bottleneck really
+had shifted -- because flush now runs on workers while the single-threaded
+parser is the wall-clock limit. The parse tree was 11s on one core against
+a flush tree of 17s spread over four. So the parser was sharded: the NDJSON
+body is split at line boundaries into NumCPU/3 chunks, each parsed by its
+own goroutine through its own writer (a small flush pool each) over the
+shared store, whose AppendGroup is already concurrency-safe (marshal outside
+the lock, index update inside). Race detector clean on the concurrent path.
+
+    500K records, BenchmarkIngest:          677K rec/s
+    500K records, BenchmarkIngestParallel:  2.66M rec/s   3.9x (at load 8.7)
+    3M records, wire head-to-head:          384K -> 2.78M rec/s
+
+2.78M rec/s is ~5.6x VictoriaLogs' reported 495K, and ~2.8x even against
+its raw async accept (~3s for 3M, the 3s flush-wait removed). simdlogs'
+number is synchronous and durable on POST return. Ingest, the one class VL
+led, is now a decisive win, and every measured class is simdlogs': needle
+14x, selective 4.5x, aggregation 2.1x, ingest 5.6x. Next perf target is the
+aggregation, the smallest of those multiples.

@@ -21,7 +21,7 @@ identical wire calls:
 | selective query (returns rows) | simdlogs **4.5x** faster |
 | aggregation (hits) | simdlogs **2.0x** faster |
 | full-scan count (engine, parallel) | **3.7x** the serial path |
-| ingest (synchronous, durable) | **803K rec/s** (was 384K), ahead of VL |
+| ingest (synchronous, durable) | **2.78M rec/s** (was 384K), ~5.6x VL |
 
 Method, the discipline the simd repos hold to: deterministic corpus, both
 engines interleaved in one process with identical wire calls, each class
@@ -51,17 +51,20 @@ timestamp reads took the needle from a 2.8x loss to a 12.6x wire win
 (24.3us vs 305us). Subtracting each harness's HTTP floor -- simdlogs
 in-process at 13.5us, VL cross-process at 53.9us -- the engine-only needle
 is 23x (10.8us vs 251us), and the pure-engine benchmark is 7.2us doing 149x
-fewer instructions than a full scan. Ingest flushes asynchronously -- a
-full group's dictionary build and marshal run on a worker pool while the
-parser fills the next, the two halves overlapped -- which took 3M rows from
-384K to 803K rec/s, synchronous and durable when the POST returns
-(VictoriaLogs accepts asynchronously, queryable only after a flush). LZ4
-compression (1.43x here) is the footprint lever for the 100M+ scale where
-groups stop being cache-resident.
+fewer instructions than a full scan. Ingest was rebuilt in three steps:
+flushing went to a worker pool (dictionary build and marshal overlap the
+parser); BuildDict dropped from two hash maps to one (3.8x on a
+high-cardinality column); and the parser -- the bottleneck once flush went
+async -- was sharded across cores, each shard its own writer over the
+shared store. Together they took 3M rows from 384K to 2.78M rec/s,
+synchronous and durable when the POST returns (VictoriaLogs accepts
+asynchronously, queryable only after a flush; even against its raw ~3s
+accept this is ~2.8x). LZ4 compression (1.43x here) is the footprint lever
+for the 100M+ scale where groups stop being cache-resident.
 
-Standing at 3M rows: faster on every query class measured -- 2x at the
+Standing at 3M rows: faster on every class measured -- 2x at the
 aggregation, 4.5x at the selective row query, 12.6x (23x engine-only) at
-the needle -- and now ahead on ingest. docs/wrong.md carries the full arc: the
+the needle, 5.6x at ingest. docs/wrong.md carries the full arc: the
 premise that measurement first refuted, and the engine work that turned the
 needle class from a loss into the widest win.
 
@@ -79,7 +82,7 @@ v1.18-v1.20 and are consumed directly.
 
 **Head-to-head vs VictoriaLogs** (the reference clone as a subprocess), 3M
 rows: 12.6x on the rare needle (23x engine-only), 4.5x on the selective row
-query, 2.0x on aggregation, 803K rec/s ingest (ahead of VL). The arc from a refuted
+query, 2.0x on aggregation, 2.78M rec/s ingest (~5.6x VL). The arc from a refuted
 premise (VL first won the needle by 6.4x) through the vectorized-execution
 build and the three needle-path fixes is in docs/wrong.md, entries in order.
 
