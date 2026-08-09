@@ -40,4 +40,5 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	m("simdlogs_insert_requests_total", "Ingest requests received.", "counter", atomic.LoadInt64(&s.nIngestReq))
 	m("simdlogs_query_requests_total", "Query requests received.", "counter", atomic.LoadInt64(&s.nQueryReq))
 	m("simdlogs_uptime_seconds", "Process uptime in seconds.", "gauge", int64(time.Since(s.started).Seconds()))
+	s.writeRuleMetrics(w) // metrics-from-logs rules
 }

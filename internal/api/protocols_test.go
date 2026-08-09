@@ -45,6 +45,35 @@ func TestWebUI(t *testing.T) {
 	}
 }
 
+func TestMetricsFromLogs(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	postBody(t, ts, `{"_time":1,"level":"error"}`+"\n"+`{"_time":2,"level":"error"}`+"\n"+`{"_time":3,"level":"info"}`+"\n")
+	if err := srv.AddMetricRule("by_level", "*", "level", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.AddMetricRule("errors", "level:=error", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	r, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	body := string(b)
+	for _, want := range []string{
+		`logs_by_level{level="error"} 2`,
+		`logs_by_level{level="info"} 1`,
+		"logs_errors 2",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics-from-logs missing %q:\n%s", want, body)
+		}
+	}
+}
+
 func TestMultitenancyIsolation(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())

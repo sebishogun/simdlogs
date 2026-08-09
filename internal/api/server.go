@@ -36,6 +36,9 @@ type Server struct {
 	nIngestReq int64 // ingest requests (atomic)
 	nQueryReq  int64 // query requests (atomic)
 	rr         int64 // round-robin cursor for write routing (atomic)
+
+	rmu   sync.Mutex
+	rules []*logRule // metrics-from-logs: LogsQL evaluated on a timer, exposed on /metrics
 }
 
 // NewServer opens (or creates) the data directory at dir and returns the
