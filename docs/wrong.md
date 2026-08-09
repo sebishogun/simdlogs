@@ -386,3 +386,25 @@ search; a global value->group index removes the per-group scan entirely.
 Those are the scale levers, and the VictoriaLogs comparison must be run at
 this scale, both from disk, before any claim -- neither is done yet. The
 3M/5-13x numbers are cache-hot and are not extrapolated to a billion.
+
+## Two scale fixes: block-compressed dict + sized bloom
+
+The uncompressed dict made a 1B store 57GB (~4-5x VL). Block-compressing it
+(64-value LZ4 blocks + an uncompressed first-value index for random access)
+brought a group from 1.6x to 0.98x of raw -- footprint back, mmap access
+kept, at the cost of one block-decompress per membership probe. That made
+the sized bloom necessary: the old 2048-bit bloom saturated on a
+high-cardinality column, so every group decompressed a block; sizing it to
+cardinality (~10 bits/value, k=7) rejects almost every non-matching group
+from the in-RAM footer. Together, engine, 1B from disk, minimum of N:
+
+    metric        saturated bloom, uncompressed   sized bloom, compressed
+    needle        13.2ms  (1724ns/group)          2.59ms (340ns/group)
+    selective     136ms                           49.9ms
+    full-count    77ms                            26ms
+    ingest        4.6M rec/s                      5.5M rec/s
+
+The needle is still O(groups) (340ns/group is the bloom check itself); a
+global value->group index would make it O(1). Bloom RAM grows ~1.2GB per
+billion rows -- the global index is the RAM-leaner endgame. Next: the
+VictoriaLogs head-to-head at this scale, both from disk.

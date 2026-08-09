@@ -38,7 +38,10 @@ func TestScaleVsVL(t *testing.T) {
 			N = x
 		}
 	}
-	const chunkRows = 1_000_000
+	// Big chunks so each shard of the parallel ingest fills whole 128K
+	// groups rather than many small ones (a 1M chunk split across shards
+	// made sub-128K groups and inflated the group count).
+	const chunkRows = 8_000_000
 	const needle = "NEEDLEc0ffee42scale"
 	services := []string{"api", "auth", "billing", "cache", "db", "gateway", "worker", "scheduler"}
 	base := time.Unix(1_700_000_000, 0).UTC()

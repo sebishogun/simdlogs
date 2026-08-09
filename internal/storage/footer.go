@@ -220,10 +220,31 @@ func (r *Reader) EqualityRows(name, value string) (rows []uint32, has bool) {
 
 // ---- dict-value bloom, on the simd hash ----
 
-const bloomWords = 32 // 2048 bits per column; saturates like the reference
+// The bloom is sized to the column's cardinality (~bloomBits per value, k
+// hashes) so it does not saturate on a high-cardinality column -- a fixed
+// 2048-bit bloom filled with 128K values is always "maybe", which at scale
+// forces a dict block-decompress on every group. A sized bloom rejects
+// almost every non-matching group from the in-RAM footer, so a needle over
+// tens of thousands of groups never touches their dict data.
+const (
+	bloomBits     = 10 // bits per value -> ~1% false-positive rate at k=7
+	bloomK        = 7
+	bloomMinWords = 4
+)
+
+func bloomWordsFor(n int) int {
+	if n < 1 {
+		return bloomMinWords
+	}
+	words := (n*bloomBits + 63) / 64
+	if words < bloomMinWords {
+		words = bloomMinWords
+	}
+	return words
+}
 
 func buildDictBloom(dict []string) []uint64 {
-	bloom := make([]uint64, bloomWords)
+	bloom := make([]uint64, bloomWordsFor(len(dict)))
 	keys := make([]uint64, len(dict))
 	hashStrings(dict, keys)
 	for _, h := range keys {
@@ -241,26 +262,25 @@ func bloomMaybe(bloom []uint64, value string) bool {
 }
 
 func set(bloom []uint64, h uint64) {
-	for _, b := range twoBits(h, len(bloom)) {
+	nbits := uint64(len(bloom) * 64)
+	h1, h2 := h, (h>>32)|1 // enhanced double hashing; h2 odd
+	for i := 0; i < bloomK; i++ {
+		b := h1 % nbits
 		bloom[b>>6] |= 1 << (b & 63)
+		h1 += h2
 	}
 }
 func test(bloom []uint64, h uint64) bool {
-	for _, b := range twoBits(h, len(bloom)) {
+	nbits := uint64(len(bloom) * 64)
+	h1, h2 := h, (h>>32)|1
+	for i := 0; i < bloomK; i++ {
+		b := h1 % nbits
 		if bloom[b>>6]&(1<<(b&63)) == 0 {
 			return false
 		}
+		h1 += h2
 	}
 	return true
-}
-
-// twoBits derives two bit positions from one 64-bit hash (the standard
-// double-hashing bloom), bounded to the bitset.
-func twoBits(h uint64, words int) [2]int {
-	nbits := words * 64
-	h1 := int(h % uint64(nbits))
-	h2 := int((h >> 32) % uint64(nbits))
-	return [2]int{h1, h2}
 }
 
 // hashStrings hashes a batch through simd.HashUint64 over a folded key;
