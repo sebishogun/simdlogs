@@ -18,6 +18,31 @@ import (
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
+func TestServerClose(t *testing.T) {
+	dir := t.TempDir()
+	srv, err := NewServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	postBody(t, ts, `{"_time":1,"service":"a"}`+"\n")
+	ts.Close()
+	if err := srv.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Reopen the same directory: the data survived shutdown.
+	srv2, err := NewServer(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer srv2.Close()
+	ts2 := httptest.NewServer(srv2.Handler())
+	defer ts2.Close()
+	if m := statsBy(t, ts2, "service"); m["a"] != 1 {
+		t.Fatalf("after close/reopen = %v, want a:1", m)
+	}
+}
+
 func TestWebUI(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())

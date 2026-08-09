@@ -65,6 +65,28 @@ func NewServer(dir string) (*Server, error) {
 	return srv, nil
 }
 
+// Close shuts the server down cleanly: every tenant's writer is flushed and
+// its pool stopped, and every store is unmapped. Call it at process shutdown
+// after the HTTP server has stopped accepting requests. Safe to call once.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	tenants := make([]*tenant, 0, len(s.tenants))
+	for _, t := range s.tenants {
+		tenants = append(tenants, t)
+	}
+	s.mu.Unlock()
+	var firstErr error
+	for _, t := range tenants {
+		if err := t.w.Close(); err != nil && firstErr == nil { // flush buffered rows, stop the pool
+			firstErr = err
+		}
+		if err := t.store.Close(); err != nil && firstErr == nil { // unmap
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // SetStreamFields declares the fields that identify a log stream; ingested
 // records then carry a synthesized _stream label built from them. Applies to
 // existing tenants and any opened later.

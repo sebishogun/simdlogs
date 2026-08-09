@@ -4,10 +4,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sebishogun/simd"
@@ -45,6 +49,28 @@ func main() {
 		}
 		log.Printf("syslog listener on %s (UDP+TCP)", *syslogAddr)
 	}
-	log.Printf("simdlogs on %s, storage %s, simd tier %s", *addr, *dir, simd.Tier())
-	log.Fatal(http.ListenAndServe(*addr, srv.Handler()))
+	httpSrv := &http.Server{
+		Addr:              *addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second, // slowloris protection
+	}
+	go func() {
+		log.Printf("simdlogs on %s, storage %s, simd tier %s", *addr, *dir, simd.Tier())
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	// Graceful shutdown: stop accepting, drain in-flight, then flush+unmap so
+	// no buffered rows are lost and no mmap leaks.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	<-sig
+	log.Print("shutting down...")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	httpSrv.Shutdown(ctx)
+	if err := srv.Close(); err != nil {
+		log.Printf("close: %v", err)
+	}
 }
