@@ -313,6 +313,31 @@ func fold(s string) uint64 {
 	return h
 }
 
+// ColumnFootprint is one column's on-disk byte breakdown by section.
+type ColumnFootprint struct {
+	Name                                  string
+	Index, Postings, Dict, Bloom, TimeCol int
+}
+
+// ColumnBytes returns the per-column, per-section byte breakdown -- the
+// footprint profile, to target the biggest chunk before compressing.
+func (r *Reader) ColumnBytes() []ColumnFootprint {
+	out := make([]ColumnFootprint, len(r.cols))
+	for i := range r.cols {
+		m := &r.cols[i]
+		cf := ColumnFootprint{Name: m.Name, Bloom: len(m.Bloom) * 8}
+		if m.Type == ColTimestamp {
+			cf.TimeCol = m.DataLen
+		} else {
+			cf.Index = m.PostOff - m.DataOff // indices precede postings
+			cf.Postings = m.PostLen
+			cf.Dict = m.DictLen2
+		}
+		out[i] = cf
+	}
+	return out
+}
+
 // ColumnNames returns the group's column names, footer-only.
 func (r *Reader) ColumnNames() []string {
 	out := make([]string, len(r.cols))
