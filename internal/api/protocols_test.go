@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +14,28 @@ import (
 	"testing"
 	"time"
 )
+
+func TestRetention(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	old := time.Now().Add(-100 * 24 * time.Hour).UnixNano()
+	recent := time.Now().UnixNano()
+	postBody(t, ts, fmt.Sprintf(`{"_time":%d,"service":"a","_msg":"old"}`+"\n", old))
+	postBody(t, ts, fmt.Sprintf(`{"_time":%d,"service":"b","_msg":"new"}`+"\n", recent))
+	if n := srv.store.Len(); n != 2 {
+		t.Fatalf("want 2 groups before retention, got %d", n)
+	}
+	if dropped := srv.EnforceRetention(24 * time.Hour); dropped != 1 {
+		t.Fatalf("dropped %d groups, want 1", dropped)
+	}
+	if n := srv.store.Len(); n != 1 {
+		t.Fatalf("want 1 group after retention, got %d", n)
+	}
+	if st := statsBy(t, ts, "service"); st["a"] != 0 || st["b"] != 1 {
+		t.Fatalf("after retention stats by service = %v want only b:1", st)
+	}
+}
 
 func TestStreamModel(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
