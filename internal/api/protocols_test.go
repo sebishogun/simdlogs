@@ -256,6 +256,28 @@ func TestBackupRestore(t *testing.T) {
 	}
 }
 
+func TestPerStreamRetention(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	srv.SetStreamFields([]string{"app"})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	old := time.Now().Add(-100 * 24 * time.Hour).UnixNano()
+	postBody(t, ts, fmt.Sprintf(`{"_time":%d,"app":"chatty","_msg":"x"}`+"\n", old))
+	postBody(t, ts, fmt.Sprintf(`{"_time":%d,"app":"important","_msg":"y"}`+"\n", old))
+
+	// chatty: 1h (drops the old group); important: 1000d (keeps it).
+	dropped := srv.EnforceRetentionPerStream(0, map[string]time.Duration{
+		`{app="chatty"}`:    time.Hour,
+		`{app="important"}`: 1000 * 24 * time.Hour,
+	})
+	if dropped != 1 {
+		t.Fatalf("per-stream retention dropped %d, want 1 (chatty)", dropped)
+	}
+	if st := statsBy(t, ts, "app"); st["important"] != 1 || st["chatty"] != 0 {
+		t.Fatalf("after per-stream retention = %v, want only important", st)
+	}
+}
+
 func TestRetention(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())
