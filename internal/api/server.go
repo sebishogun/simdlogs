@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
@@ -41,7 +40,10 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/insert/jsonline", s.insertJSONLine)
 	mux.HandleFunc("/insert/logfmt", s.insertLogfmt)
-	mux.HandleFunc("/_bulk", s.esBulk) // Elasticsearch bulk ingest
+	mux.HandleFunc("/_bulk", s.esBulk)                // Elasticsearch bulk ingest
+	mux.HandleFunc("/loki/api/v1/push", s.insertLoki) // Grafana Loki push
+	mux.HandleFunc("/api/v2/logs", s.insertDatadog)   // Datadog logs intake
+	mux.HandleFunc("/v1/input", s.insertDatadog)      // Datadog legacy intake
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)
 	mux.HandleFunc("/select/logsql/tail", s.tail) // live tail: stream matching rows as they arrive
@@ -65,7 +67,7 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 	}
 	// Fallback timestamp for a line missing _time; atomic because the
 	// parallel path calls it from many shard goroutines.
-	fallback := func() int64 { return time.Now().UnixNano() + atomic.AddInt64(&s.mono, 1) }
+	fallback := s.fallbackTS()
 	var ing, skip int
 	if len(body) >= ingest.MinParallelBytes {
 		ing, skip = ingest.IngestJSONLinesParallel(s.store, body, fallback)
@@ -87,7 +89,7 @@ func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	fallback := func() int64 { return time.Now().UnixNano() + atomic.AddInt64(&s.mono, 1) }
+	fallback := s.fallbackTS()
 	ing, skip := ingest.IngestLogfmt(s.w, body, fallback)
 	if err := s.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
