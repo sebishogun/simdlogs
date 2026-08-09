@@ -54,14 +54,22 @@ type Store interface {
 // orders of magnitude over a whole-block scan come from.
 func Run(s Store, q *Query) []Row {
 	groups := s.Groups(q.From, q.To)
-	if len(groups) >= parallelMinGroups && q.Limit == 0 {
-		return runParallel(groups, q)
+	// Footer-prune first, then decide whether to fan out. A selective query
+	// (a rare value) survives in one or two groups; spawning a worker pool
+	// for that costs more than it saves, and it was the largest single cost
+	// in the needle profile. Pruning is a cheap bloom + dict binary search,
+	// no column decoded, so it is always worth doing before the fork.
+	survivors := groups[:0]
+	for _, g := range groups {
+		if groupCanMatch(g, q) {
+			survivors = append(survivors, g)
+		}
+	}
+	if len(survivors) >= parallelMinGroups && q.Limit == 0 {
+		return runParallel(survivors, q)
 	}
 	var out []Row
-	for _, g := range groups {
-		if !groupCanMatch(g, q) {
-			continue // footer skip: no column of this group decoded
-		}
+	for _, g := range survivors {
 		out = appendMatches(out, g, q)
 		if q.Limit > 0 && len(out) >= q.Limit {
 			return out[:q.Limit]
@@ -92,45 +100,58 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	sel := NewBitset(n)
 	sel.SetAll()
 
-	// Time predicate as a bitset over the decoded timestamps.
-	ts := g.Timestamps("_time", nil, nil)
-	tsel := NewBitset(n)
-	for i, t := range ts {
-		if t >= q.From && t < q.To {
-			tsel.Set(i)
-		}
+	// Time predicate. Skip it entirely when the whole group is inside the
+	// window (the selective and full-span cases) -- no timestamp decode at
+	// all -- and use the vectorized range mask otherwise, never the per-row
+	// scalar loop that decoded and set 128K bits to filter nothing. This is
+	// the same skip the count path already had; the row path was decoding
+	// every timestamp of a needle's group only to keep all the bits.
+	var ts []int64 // decoded at most once, reused for filter and materialize
+	if g.TimeMin < q.From || g.TimeMax >= q.To {
+		ts = g.Timestamps("_time", nil, nil)
+		sel.And(rangeMaskInto(ts, q.From, q.To))
 	}
-	sel.And(tsel)
 
 	// Decode each predicate field's indices+dict once, reused for both the
-	// filter and the materialize.
+	// filter and the materialize. Equality goes through eqPredBitset, which
+	// takes the posting path for a rare value and decodes no column at all.
 	type col struct {
 		idx  []uint32
 		dict []string
 	}
 	cols := make(map[string]col, len(q.Preds))
-	getCol := func(field string) col {
-		if c, ok := cols[field]; ok {
-			return c
-		}
-		idx, dict := g.DictIndices(field)
-		c := col{idx: idx, dict: dict}
-		cols[field] = c
-		return c
-	}
-
 	for i := range q.Preds {
 		p := &q.Preds[i]
 		if p.Kind == Eq {
 			sel.And(eqPredBitset(g, p, n))
 			continue
 		}
-		c := getCol(p.Field)
-		sel.And(predBitsetCol(g, p, c.idx, c.dict, n))
+		idx, dict := g.DictIndices(p.Field)
+		cols[p.Field] = col{idx: idx, dict: dict}
+		sel.And(predBitsetCol(g, p, idx, dict, n))
 	}
 
+	cnt := sel.Count()
+	if cnt == 0 {
+		return out // no match in this group: never decode its timestamps
+	}
+	// Timestamps for the Time field. If the time filter already decoded the
+	// column, reuse it. Otherwise, when few rows match (the selective case),
+	// point-read each match's timestamp from its checkpoint block -- O(few x
+	// block) and no whole-column allocation. Only a match set large enough
+	// that the point reads would cost more than one pass falls back to the
+	// full decode.
+	if ts == nil && cnt > g.Rows/256 {
+		ts = g.Timestamps("_time", nil, nil)
+	}
 	sel.ForEach(func(i int) {
-		row := Row{Time: ts[i], Fields: make(map[string]string, len(q.Preds))}
+		t := int64(0)
+		if ts != nil {
+			t = ts[i]
+		} else if v, ok := g.TimestampAt("_time", i); ok {
+			t = v
+		}
+		row := Row{Time: t, Fields: make(map[string]string, len(q.Preds))}
 		for _, p := range q.Preds {
 			// Prefer a decoded column if we already have one; otherwise
 			// (the posting path skipped the full decode) fetch just this
@@ -209,14 +230,17 @@ func containsSubstr(s, sub string) bool {
 // granularity turns into a real margin over a scan-and-count.
 func Count(s Store, q *Query) int {
 	groups := s.Groups(q.From, q.To)
-	if len(groups) >= parallelMinGroups {
-		return countParallel(groups, q)
+	survivors := groups[:0]
+	for _, g := range groups {
+		if groupCanMatch(g, q) {
+			survivors = append(survivors, g)
+		}
+	}
+	if len(survivors) >= parallelMinGroups {
+		return countParallel(survivors, q)
 	}
 	total := 0
-	for _, g := range groups {
-		if !groupCanMatch(g, q) {
-			continue
-		}
+	for _, g := range survivors {
 		total += matchBitset(g, q).Count()
 	}
 	return total

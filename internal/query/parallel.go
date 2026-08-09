@@ -35,11 +35,8 @@ func runParallel(groups []*storage.Reader, q *Query) []Row {
 		go func() {
 			defer wg.Done()
 			for gi := range ch {
-				g := groups[gi]
-				if !groupCanMatch(g, q) {
-					continue
-				}
-				parts[gi] = appendMatches(nil, g, q)
+				// groups are already footer-pruned by the caller.
+				parts[gi] = appendMatches(nil, groups[gi], q)
 			}
 		}()
 	}
@@ -72,11 +69,8 @@ func countParallel(groups []*storage.Reader, q *Query) int {
 			defer wg.Done()
 			local := 0
 			for gi := range ch {
-				g := groups[gi]
-				if !groupCanMatch(g, q) {
-					continue
-				}
-				local += matchBitset(g, q).Count()
+				// groups are already footer-pruned by the caller.
+				local += matchBitset(groups[gi], q).Count()
 			}
 			mu.Lock()
 			total += int64(local)

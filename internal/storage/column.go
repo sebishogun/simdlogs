@@ -107,60 +107,110 @@ func decodeIndices(b []byte, n, width int) []uint32 {
 	return out
 }
 
-// encodeTimestamps delta-encodes then zig-zag varints int64 timestamps.
-// The first value is stored raw; deltas are usually small and positive.
+// tsBlock is the timestamp checkpoint stride: every tsBlock rows the encoder
+// records the byte position in the varint stream and the running timestamp,
+// so a single row's timestamp is read by seeking to its block and decoding
+// at most tsBlock deltas -- O(tsBlock), not O(rows). Materializing a
+// selective query's handful of matches no longer decodes the whole column.
+const tsBlock = 512
+
+// encodeTimestamps delta-encodes then zig-zag varints int64 timestamps,
+// prefixed with a checkpoint header. The stream itself is unchanged (row 0
+// as a delta from zero, the rest deltas); the header adds, per block, the
+// byte offset of the block's first row and the absolute timestamp of the
+// row before it, the two things a seek needs.
+//
+//	header: numBlocks u32, blockSize u32, then per block { off u32, base i64 }
+//	stream: zig-zag varint deltas, one per row
 func encodeTimestamps(ts []int64) []byte {
-	var out []byte
+	n := len(ts)
+	if n == 0 {
+		return nil
+	}
+	numBlocks := (n + tsBlock - 1) / tsBlock
+	offs := make([]uint32, numBlocks)
+	bases := make([]int64, numBlocks)
+	var stream []byte
 	var prev int64
 	for i, t := range ts {
+		if i%tsBlock == 0 {
+			offs[i/tsBlock] = uint32(len(stream))
+			bases[i/tsBlock] = prev // timestamp of the row before this block
+		}
 		d := t
 		if i > 0 {
 			d = t - prev
 		}
 		prev = t
-		out = binary.AppendUvarint(out, zigzag(d))
+		stream = binary.AppendUvarint(stream, zigzag(d))
 	}
-	return out
+	out := make([]byte, 0, 8+numBlocks*12+len(stream))
+	out = appU32(out, uint32(numBlocks))
+	out = appU32(out, uint32(tsBlock))
+	for k := 0; k < numBlocks; k++ {
+		out = appU32(out, offs[k])
+		out = appI64(out, bases[k])
+	}
+	return append(out, stream...)
 }
 
-// decodeTimestamps reverses it through simd.VarintDecode, undoing the
-// zig-zag and the delta.
+// tsStream returns the varint stream past the checkpoint header.
+func tsStream(b []byte) []byte {
+	if len(b) < 8 {
+		return nil
+	}
+	numBlocks := int(get32(b, 0))
+	return b[8+numBlocks*12:]
+}
+
+// decodeTimestamps reverses the whole column through simd.VarintDecode,
+// undoing the zig-zag and the delta.
 func decodeTimestamps(b []byte, n int) []int64 {
 	if n == 0 {
 		return nil
 	}
 	raw := make([]uint64, n)
-	got, _ := simd.VarintDecode(raw, b)
-	out := make([]int64, got)
-	var prev int64
-	for i := 0; i < got; i++ {
-		d := unzigzag(raw[i])
-		if i == 0 {
-			prev = d
-		} else {
-			prev += d
-		}
-		out[i] = prev
-	}
-	return out
+	out := make([]int64, n)
+	got, _ := decodeInto(b, raw, out)
+	return out[:got]
 }
 
 func zigzag(v int64) uint64   { return uint64(v<<1) ^ uint64(v>>63) }
 func unzigzag(u uint64) int64 { return int64(u>>1) ^ -int64(u&1) }
 
-// decodeInto decodes timestamps reusing caller buffers raw (varint
-// scratch) and out (result); the zero-allocation query path.
+// decodeInto decodes the full timestamp column reusing caller buffers raw
+// (varint scratch) and out (result); the zero-allocation scan path. It runs
+// the stream from the front with the running sum starting at zero, so the
+// checkpoints cost nothing here -- they exist for the point read below.
 func decodeInto(b []byte, raw []uint64, out []int64) (int, error) {
-	got, _ := simd.VarintDecode(raw, b)
+	got, _ := simd.VarintDecode(raw, tsStream(b))
 	var prev int64
 	for i := 0; i < got; i++ {
-		d := unzigzag(raw[i])
-		if i == 0 {
-			prev = d
-		} else {
-			prev += d
-		}
+		prev += unzigzag(raw[i])
 		out[i] = prev
 	}
 	return got, nil
+}
+
+// decodeTsAt returns the timestamp of one row by seeking to its checkpoint
+// block and decoding at most tsBlock deltas forward -- the selective-query
+// materialize path, which needs a few rows' times, not the whole column.
+func decodeTsAt(b []byte, row int) int64 {
+	numBlocks := int(get32(b, 0))
+	bs := int(get32(b, 4))
+	k := row / bs
+	if k >= numBlocks {
+		return 0
+	}
+	hdr := 8 + k*12
+	off := int(get32(b, hdr))
+	prev := int64(binary.LittleEndian.Uint64(b[hdr+4:]))
+	stream := b[8+numBlocks*12:]
+	pos := off
+	for i := k * bs; i <= row; i++ {
+		d, n := binary.Uvarint(stream[pos:])
+		pos += n
+		prev += unzigzag(d)
+	}
+	return prev
 }

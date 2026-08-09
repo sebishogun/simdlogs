@@ -68,6 +68,18 @@ func (r *Reader) Timestamps(name string, raw []uint64, out []int64) []int64 {
 	return out[:n]
 }
 
+// TimestampAt returns one row's timestamp, decoding only its checkpoint
+// block -- O(tsBlock), so materializing a selective query's matches never
+// decodes the whole timestamp column.
+func (r *Reader) TimestampAt(name string, row int) (int64, bool) {
+	m := r.col(name)
+	if m == nil || m.Type != ColTimestamp || row < 0 || row >= r.Rows {
+		return 0, false
+	}
+	data := r.blob[m.DataOff : m.DataOff+m.DataLen]
+	return decodeTsAt(data, row), true
+}
+
 // DictIndices decodes the per-row dictionary indices of a dict column,
 // and returns them with the dict table for value lookup.
 func (r *Reader) DictIndices(name string) ([]uint32, []string) {

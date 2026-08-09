@@ -27,6 +27,21 @@ import (
 //
 // This is a report, not a gate -- the numbers land in the commit message
 // and the README, with losses shown.
+//
+// Method (the discipline the simd repos hold benchmarks to):
+//   - Deterministic corpus (fixed seed), so a run reproduces exactly and
+//     the two engines see byte-identical input.
+//   - Both engines interleaved in one process, identical wire calls, so the
+//     comparison is A-vs-B in one session, never across sessions.
+//   - Each query class is the MINIMUM of many samples after warmup
+//     (timeQuery); the minimum is the least-perturbed run. The minimum,
+//     never a mean.
+//   - Run on a quiet machine (load average < 1). The wins reported here
+//     (2x-9x) are far above the ~8% code-layout wall-clock noise floor, so
+//     wall-clock separates them cleanly; the pure-engine testing.B
+//     benchmarks (BenchmarkEngine*) are the layout-independent cross-check,
+//     runnable under perf stat -e instructions:u,cycles:u.
+//   - The corpus size is SIMDLOGS_BENCH_N (default 200K; 3M is the headline).
 
 const needle = "NEEDLEc0ffee42"
 
@@ -140,6 +155,23 @@ func TestHeadToHead(t *testing.T) {
 	vlNeedle := timeQuery(t, func() { get(t, vl+"/select/logsql/query?"+nq) })
 	t.Logf("HEAD-TO-HEAD RARE needle (full span): simdlogs %v vs VL %v = %.1fx",
 		slNeedle, vlNeedle, float64(vlNeedle)/float64(slNeedle))
+
+	// HTTP-floor baseline: an empty time window prunes every group before any
+	// column is touched, so this measures each harness's request overhead --
+	// simdlogs in-process (httptest) vs VL cross-process (TCP). It is the
+	// asymmetry to subtract before reading the needle ratio as an engine
+	// ratio; at ms-scale (selective/agg) it is negligible, at the needle's
+	// tens of us it is not.
+	eq := url.Values{"query": {"trace:=" + needle}, "start": {full}, "end": {full}}.Encode()
+	slBase := timeQuery(t, func() { get(t, sl.URL+"/select/logsql/query?"+eq) })
+	vlBase := timeQuery(t, func() { get(t, vl+"/select/logsql/query?"+eq) })
+	t.Logf("HTTP-floor baseline (empty window): simdlogs %v vs VL %v", slBase, vlBase)
+	slEng := slNeedle - slBase
+	vlEng := vlNeedle - vlBase
+	if slEng > 0 && vlEng > 0 {
+		t.Logf("needle, HTTP floor subtracted (engine-only est): simdlogs %v vs VL %v = %.1fx",
+			slEng, vlEng, float64(vlEng)/float64(slEng))
+	}
 }
 
 func post(t *testing.T, url string, body []byte) {
@@ -160,9 +192,26 @@ func get(t *testing.T, url string) {
 	r.Body.Close()
 }
 
+// timeQuery reports the minimum wall-clock of a query over many samples,
+// after discarding warmup iterations -- the same discipline the simd repos
+// use (minimum of several, never a mean; the minimum is the run least
+// perturbed by scheduling and GC). Warmup separates cold-cache and
+// connection-setup cost from the steady state both engines are compared in.
+// Sample counts come from BENCH_WARMUP / BENCH_SAMPLES so a run can be made
+// heavier without a recompile; the defaults exceed the "minimum of six" bar.
 func timeQuery(t *testing.T, fn func()) time.Duration {
+	warmup, samples := 3, 15
+	if v, err := strconv.Atoi(os.Getenv("BENCH_WARMUP")); err == nil && v >= 0 {
+		warmup = v
+	}
+	if v, err := strconv.Atoi(os.Getenv("BENCH_SAMPLES")); err == nil && v > 0 {
+		samples = v
+	}
+	for i := 0; i < warmup; i++ {
+		fn()
+	}
 	best := time.Hour
-	for i := 0; i < 5; i++ {
+	for i := 0; i < samples; i++ {
 		s := time.Now()
 		fn()
 		if d := time.Since(s); d < best {

@@ -71,3 +71,41 @@ func BenchmarkEngineFullScanCount(b *testing.B) {
 		sinkI = Count(s, q)
 	}
 }
+
+func BenchmarkEngineNeedle(b *testing.B) {
+	// 3M rows, ~23 groups; a unique value planted in one group, queried
+	// over the full span -- the selective needle, pure engine (no HTTP).
+	s, _ := storage.OpenStore(b.TempDir())
+	var ts []int64
+	var tr []string
+	i := 0
+	corpus.Gen(9, 3_000_000, func(r corpus.Record) {
+		ts = append(ts, r.Time.UnixNano())
+		v := r.TraceID
+		if i == 2_900_000 {
+			v = "NEEDLEc0ffee42"
+		}
+		tr = append(tr, v)
+		i++
+		if len(ts) >= 128*1024 {
+			sd := storage.BuildDict(tr)
+			s.AppendGroup(&storage.Group{Rows: len(ts), Columns: []storage.Column{
+				{Name: "_time", Type: storage.ColTimestamp, Ts: ts},
+				{Name: "trace", Type: storage.ColDict, Dict: &sd},
+			}})
+			ts, tr = nil, nil
+		}
+	})
+	if len(ts) > 0 {
+		sd := storage.BuildDict(tr)
+		s.AppendGroup(&storage.Group{Rows: len(ts), Columns: []storage.Column{
+			{Name: "_time", Type: storage.ColTimestamp, Ts: ts},
+			{Name: "trace", Type: storage.ColDict, Dict: &sd},
+		}})
+	}
+	q := &Query{From: 0, To: int64(1) << 62, Preds: []Pred{{Field: "trace", Kind: Eq, Value: "NEEDLEc0ffee42"}}}
+	b.ResetTimer()
+	for b.Loop() {
+		sinkRows = Run(s, q)
+	}
+}

@@ -19,7 +19,7 @@ import (
 
 const (
 	magic   = 0x736C6F67 // "slog"
-	version = 2
+	version = 3          // v3: postings carry a byte-offset table for O(1) seek
 	// MaxRows is the group ceiling; ingest flushes at or before it.
 	MaxRows = 128 * 1024
 )

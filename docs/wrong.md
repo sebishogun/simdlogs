@@ -179,3 +179,90 @@ wins the rare lookup).
 Lesson recorded: a vectorized filter is invisible when serialization
 dominates. Profile the whole path before crediting or blaming the kernel
 -- the engine was never the 5.8ms, the encoder was.
+
+## The needle gap was three engine bugs, not a missing index: 968us -> 7.2us
+
+The rare needle stayed VictoriaLogs' win, and the named lever was a global
+value->group index (Phase 9). Profiling the pure engine (no HTTP,
+BenchmarkEngineNeedle, 3M rows / 23 groups, one planted value) first said
+the index was not the bottleneck at all. The needle cost 968us -- and a
+FULL SCAN counting a common value across all 23 groups cost 460us. The
+needle, which touches one group, was 2x SLOWER than scanning everything.
+That is the signature of wasted work, not missing skip structure.
+
+Three costs, each measured, none of them the group scan a global index
+would accelerate:
+
+    runParallel fan-out   ~360us  32 goroutines + channel + merge for the
+                                  ONE group that survives the bloom
+    postingRows skip-walk ~220us  O(dict-rank) varint skips to reach a
+                                  value's list, not the O(1) the doc claimed
+    timestamp decode      ~230us  the row path decoded all 128K timestamps
+                                  (+2MB alloc -> GC) to stamp one match's Time
+
+The fixes:
+
+  - Footer-prune groups BEFORE deciding to fan out. A needle survives in
+    one group; spawning a pool for it costs more than it saves. Pre-prune,
+    then go parallel only if enough survivors remain.
+  - Postings carry a byte-offset table alongside the row-count offsets, so
+    a value's list is reached by a seek, not by walking every preceding
+    list. The row-count table still answers EqualityCount as a footer
+    subtraction; the byte table is +4 bytes per dict entry, LZ4-friendly.
+  - Timestamps carry a checkpoint header (byte offset + base timestamp
+    every 512 rows), so one row's time is a point read of <=512 deltas,
+    not a whole-column decode. appendMatches point-reads when matches are
+    few and full-decodes only when many rows match. Header is ~3KB/group.
+
+Measured, pure engine, minimum of three:
+
+    needle:          968us -> 7.2us    (~130x)
+    full-scan count: 460us  -> 450us   (unchanged; already skipped _time)
+    windowed row:    1.49ms -> 1.43ms  (unchanged)
+
+The global value->group index was NOT built: the profile said the cost was
+elsewhere, and the three fixes removed 96% of it before any new index. The
+group scan (23 dictLookups) never showed above 0.03s -- it would matter at
+thousands of groups, where a global index is the right lever; at this scale
+it was not. Fixing the measured cost beat implementing the named one.
+
+Measured three ways, the simd-repo discipline (deterministic corpus,
+warmup then minimum-of-N, the minimum never a mean; a busy machine, so the
+layout- and load-independent instruction count carries the claim the noisy
+wall-clock only corroborates):
+
+  1. Pure engine, testing.B, perf stat -e instructions:u,cycles:u,
+     setup cancelled by differencing two benchtimes:
+
+         needle:          7.2us/op    201K instructions/op
+         full-scan count: 461us/op   30.1M instructions/op
+
+     The needle retires 149x fewer instructions than a full scan -- the
+     load-independent proof it now does surgical work, not scanning. Before
+     the fix the needle was 968us: decoding 128K timestamps (~1.3M insns for
+     that step alone) and walking a ~128K-varint posting stream.
+
+  2. Wire head-to-head, 3M rows, HTTP-to-HTTP vs VictoriaLogs, warmup +
+     min of 25, three runs byte-identical (the minimum is robust to the
+     load-3.8 machine):
+
+         RARE needle, full span:  simdlogs 24.3us   VL 305us   12.6x
+         selective query (rows):  simdlogs 2.31ms   VL 10.5ms  4.5x
+         aggregation (hits):      simdlogs 1.59ms   VL 3.24ms  2.0x
+         ingest:                  384K rec/s        497K       VL 1.3x
+
+  3. HTTP floor subtracted. simdlogs runs in-process (httptest, 13.5us
+     floor); VL is a subprocess over TCP (53.9us floor). Removing each
+     harness's own overhead leaves the engine-only needle:
+
+         simdlogs 10.8us   VL 251us   23.2x
+
+     So the raw wire 12.6x is if anything conservative: VL's higher HTTP
+     floor shrinks the visible ratio, not simdlogs' lower one inflating it.
+
+The class the design was built to dominate, and the one measurement had
+refuted as a 6.4x -> 2.8x loss, is now a 12.6x wire win (23x engine-only) --
+without the global value->group index the loss entry named as the lever. The
+three engine bugs above were the whole gap. The premise entry ("VL WINS the
+rare-selective query") stands as the record of what was true then; this is
+what is true now, measured to the same standard.
