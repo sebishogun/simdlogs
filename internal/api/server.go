@@ -42,6 +42,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)
 	mux.HandleFunc("/select/logsql/hits", s.selectHits)
+	mux.HandleFunc("/select/logsql/field_names", s.fieldNames)
+	mux.HandleFunc("/select/logsql/field_values", s.fieldValues)
+	mux.HandleFunc("/select/logsql/facets", s.facets)
+	mux.HandleFunc("/select/logsql/stats_query", s.statsQuery)
+	// The Elasticsearch search surface VictoriaLogs lacks.
+	mux.HandleFunc("/_search", s.esSearch)
+	mux.HandleFunc("/_count", s.esCount)
 	return mux
 }
 
@@ -152,4 +159,54 @@ func parseTimeParam(v string) (int64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
+	from, to := timeWindow(r)
+	json.NewEncoder(w).Encode(map[string]any{"names": query.FieldNames(s.store, from, to)})
+}
+
+func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
+	from, to := timeWindow(r)
+	json.NewEncoder(w).Encode(map[string]any{"values": query.FieldValues(s.store, r.FormValue("field"), from, to)})
+}
+
+func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
+	from, to := timeWindow(r)
+	k := 10
+	if v := r.FormValue("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k = n
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]any{"facets": query.Facets(s.store, from, to, k)})
+}
+
+func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
+	q, err := parseRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	by := r.FormValue("by")
+	if by == "" {
+		json.NewEncoder(w).Encode(map[string]any{"count": query.Count(s.store, q)})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"stats": query.StatsByField(s.store, q, by)})
+}
+
+func timeWindow(r *http.Request) (int64, int64) {
+	from, to := int64(0), int64(1)<<62
+	if v := r.FormValue("start"); v != "" {
+		if n, ok := parseTimeParam(v); ok {
+			from = n
+		}
+	}
+	if v := r.FormValue("end"); v != "" {
+		if n, ok := parseTimeParam(v); ok {
+			to = n
+		}
+	}
+	return from, to
 }

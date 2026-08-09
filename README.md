@@ -54,6 +54,9 @@ what that would take. The self-relative skip works (a selective window is
 50x a forced full scan of our own store); beating a well-tuned VL by
 orders of magnitude is a larger-scale, cheaper-query-path problem.
 
-**Next:** ingest pipeline (P2), the LogsQL and Elasticsearch API surfaces
-(P4), and the head-to-head harness against VictoriaLogs (P6) -- the
-build plan is docs/plans/2026-08-07-simdlogs-full-build.md.
+**Surface:** /insert/jsonline; /select/logsql/{query,hits,field_names,
+field_values,facets,stats_query}; the Elasticsearch _search and _count
+(bool/term/range/exists, time-range mapped to the partition skip) that
+VictoriaLogs does not have; time-based retention. First-milestone scope
+per docs/plans/2026-08-07-simdlogs-full-build.md; full LogsQL, the wider
+ES DSL, and clustering are explicit later-phase non-goals.

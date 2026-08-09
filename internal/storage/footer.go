@@ -218,3 +218,41 @@ func fold(s string) uint64 {
 	}
 	return h
 }
+
+// ColumnNames returns the group's column names, footer-only.
+func (r *Reader) ColumnNames() []string {
+	out := make([]string, len(r.cols))
+	for i := range r.cols {
+		out[i] = r.cols[i].Name
+	}
+	return out
+}
+
+// ValueCount is a dict value and its row count in this group.
+type ValueCount struct {
+	Value string
+	Count int
+}
+
+// ValueCounts returns per-value row counts for a dict column, from the
+// posting offset table alone -- each value's count is the difference of
+// two prefix sums, so no per-row index or row list is decoded.
+func (r *Reader) ValueCounts(name string) []ValueCount {
+	m := r.col(name)
+	if m == nil || m.Type != ColDict || m.PostLen == 0 {
+		return nil
+	}
+	blob := r.blob[m.PostOff : m.PostOff+m.PostLen]
+	no := int(le32(blob))
+	out := make([]ValueCount, 0, len(m.DictData))
+	for id := 0; id+1 < no && id < len(m.DictData); id++ {
+		start := le32(blob[4+id*4:])
+		end := le32(blob[4+(id+1)*4:])
+		out = append(out, ValueCount{Value: m.DictData[id], Count: int(end - start)})
+	}
+	return out
+}
+
+func le32(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
