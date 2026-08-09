@@ -501,3 +501,30 @@ leaner); substring scans _msg (VL's per-block tokenized bloom prunes more).
 The footprint fix must come from the dict (40%, high-entropy text) WITHOUT
 touching the postings that power the needle -- a stronger dict codec on the
 scan-cold path, measured against both size and needle latency.
+
+## Footprint parity needs the dict codec, not the postings -- and that trades speed (2026-08)
+
+Following the query-perf fix (all classes now beat VL), footprint is the sole
+loss. Researched the two postings-side levers the plan proposed; both measured
+as NOT reaching VL:
+
+    approach                          footprint (of VL)   needle
+    default (full postings)           3.47x               27x  win
+    compact (drop near-unique post.)  2.31x  still loss    0.3x loss
+    inverse-index (rowOffsets/perm)   ~2.7x  est still loss ~kept
+
+The corrected fact: compact mode does NOT beat VL (2.31x), and it forfeits the
+needle. The reason every postings lever falls short is the **dict**: 40% of the
+file is high-entropy trace_id/uuid/_msg text that LZ4 barely compresses and that
+none of the postings work touches. VL is smaller because (a) it has no full
+inverted index and (b) it compresses column blocks harder. To get under VL we
+would need BOTH a weaker index (losing our 27-500x query wins) AND a stronger
+dict codec (zstd-class, which is not on the SIMD decode kernel -> slower scans,
+plus a new dependency the design avoided).
+
+Conclusion: there is no configuration that is simultaneously smaller than VL and
+faster than VL. The index is the speed and the size at once. Honest positions:
+(1) faster than VL on every query + ingest, 3.47x its disk [current default];
+(2) a dict-codec campaign to approach/beat VL disk at a measured scan-speed cost
+[not done -- deliberate, needs the dep/codec decision and an A/B on scan latency].
+Building compact mode was rejected: it loses on both axes.
