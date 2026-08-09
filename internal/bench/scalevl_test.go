@@ -138,11 +138,26 @@ func TestScaleVsVL(t *testing.T) {
 	t.Logf("victorialogs N=%d: ingest %v (%.2fM rec/s) | needle %v selective %v agg %v",
 		N, vlIngest.Round(time.Millisecond), float64(N)/vlIngest.Seconds()/1e6, vlNeedle, vlSel, vlAgg)
 
+	slSize := dirSize(slDir)
+	vlSize := dirSize(vlDir)
+	t.Logf("FOOTPRINT N=%d | simdlogs %.2fGB vs VL %.2fGB (%.2fx of VL)",
+		N, float64(slSize)/1e9, float64(vlSize)/1e9, float64(slSize)/float64(vlSize))
 	t.Logf("SCALE HEAD-TO-HEAD N=%d | needle %.1fx | selective %.1fx | agg %.1fx | ingest sl/vl %.2f",
 		N, ratio(vlNeedle, slNeedle), ratio(vlSel, slSel), ratio(vlAgg, slAgg),
 		vlIngest.Seconds()/slIngest.Seconds())
 }
 
 func ratio(a, b time.Duration) float64 { return float64(a) / float64(b) }
+
+func dirSize(dir string) int64 {
+	var total int64
+	filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
 
 var _ = http.MethodGet

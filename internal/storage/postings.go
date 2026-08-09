@@ -8,21 +8,21 @@ import "encoding/binary"
 // difference the head-to-head showed load-bearing on selective queries,
 // and the plan's decision #3 (postings once selective queries dominate).
 //
-// Layout: a row-count offset table of dictLen+1 uint32 prefix sums, then a
-// byte offset table of dictLen+1 uint32 positions into the varint stream,
-// then the row ids of every id's list in id order, each list
-// delta-varint-encoded so a rare value costs a handful of bytes.
+// On disk: the row-count offset table (dictLen+1 uint32 prefix sums,
+// uncompressed) then the per-id delta-varint row lists block-compressed in
+// groups of postBlock ids, each block carrying its own intra-block offsets.
+// The row-count table answers EqualityCount/ValueCounts as a footer
+// subtraction (no decompress); postingRows decompresses the one block that
+// holds an id. See marshal for the exact layout.
 //
-// Two tables, not one, because the varints are variable-length: the
-// row-count prefix sum gives a value's row count (EqualityCount, a footer
-// subtraction, no data touched), and the byte offset seeks straight to its
-// list. Lookup is genuinely O(1) to the bytes then O(list) to decode -- an
-// earlier single-table form had to walk every preceding varint to find the
-// list, which made a rare value in a high-cardinality dict O(dict), the
-// exact skip-walk that lost the needle head-to-head.
+// The struct's byteOffsets is build-time only -- marshal uses it to slice the
+// per-id lists into blocks and it is not persisted, so the ~4-byte-per-id
+// seek table (the largest raw chunk of a high-cardinality group) is gone
+// from disk. An earlier form stored it uncompressed; block offsets replace
+// it at no on-disk cost.
 type postings struct {
 	rowOffsets  []uint32 // dictLen+1 prefix sums of row counts
-	byteOffsets []uint32 // dictLen+1 byte positions of each id's list
+	byteOffsets []uint32 // build-time only: byte positions used to block the data
 	data        []byte   // per-id delta-varint row id lists, concatenated
 }
 
@@ -57,43 +57,107 @@ func buildPostings(indices []uint32, dictLen int) postings {
 	return postings{rowOffsets: rowOffsets, byteOffsets: byteOffsets, data: data}
 }
 
-// marshal appends the postings blob: dictLen+1 row offsets, dictLen+1 byte
-// offsets, then the varint data.
+// postBlock is how many ids share one compressed postings block.
+const postBlock = 64
+
+// marshal appends the postings blob: the row-count offset table
+// (uncompressed, so EqualityCount/ValueCounts stay footer-cheap), then the
+// per-id varint row lists block-compressed in groups of postBlock ids. The
+// old byte-offset table is gone -- each block carries its own intra-block
+// offsets inside the compressed bytes, so the ~4-byte-per-id seek table (the
+// biggest raw chunk of a high-cardinality group) costs nothing on disk.
+//
+//	no u32, rowOffsets[no] u32
+//	numBlocks u32, blockSize u32
+//	blockIndex[numBlocks]{compOff u32, compLen u32, rawLen u32}
+//	compLen u32, compressed blocks (each raw = [cnt+1 intra-offsets][list bytes])
 func (p postings) marshal(b []byte) []byte {
-	b = appU32(b, uint32(len(p.rowOffsets)))
+	no := len(p.rowOffsets)
+	dictLen := no - 1
+	b = appU32(b, uint32(no))
 	for _, o := range p.rowOffsets {
 		b = appU32(b, o)
 	}
-	for _, o := range p.byteOffsets {
-		b = appU32(b, o)
+	numBlocks := 0
+	if dictLen > 0 {
+		numBlocks = (dictLen + postBlock - 1) / postBlock
 	}
-	b = appU32(b, uint32(len(p.data)))
-	return append(b, p.data...)
+	type blkIdx struct{ compOff, compLen, rawLen uint32 }
+	idx := make([]blkIdx, numBlocks)
+	var comp []byte
+	for k := 0; k < numBlocks; k++ {
+		lo := k * postBlock
+		hi := lo + postBlock
+		if hi > dictLen {
+			hi = dictLen
+		}
+		cnt := hi - lo
+		dataLo := p.byteOffsets[lo]
+		raw := make([]byte, 0, 4*(cnt+1)+int(p.byteOffsets[hi]-dataLo))
+		for j := lo; j <= hi; j++ {
+			raw = appU32(raw, p.byteOffsets[j]-dataLo) // intra-block offsets
+		}
+		raw = append(raw, p.data[dataLo:p.byteOffsets[hi]]...)
+		c := lz4Compress(raw)
+		idx[k] = blkIdx{uint32(len(comp)), uint32(len(c)), uint32(len(raw))}
+		comp = append(comp, c...)
+	}
+	b = appU32(b, uint32(numBlocks))
+	b = appU32(b, uint32(postBlock))
+	for _, e := range idx {
+		b = appU32(b, e.compOff)
+		b = appU32(b, e.compLen)
+		b = appU32(b, e.rawLen)
+	}
+	b = appU32(b, uint32(len(comp)))
+	return append(b, comp...)
 }
 
-// postingRows decodes id's row list from a marshaled postings blob. The
-// byte offset table seeks straight to id's varints -- no preceding list is
-// touched -- and the row-count table bounds the decode. Both are O(1); the
-// decode is O(list).
+// postingRows decodes id's row list, decompressing the one block that holds
+// it. The row-count table bounds the decode (count = rowOffsets[id+1]-[id]);
+// the block's intra-offsets locate id's list within the decompressed bytes.
 func postingRows(blob []byte, id int) []uint32 {
 	no := int(binary.LittleEndian.Uint32(blob))
 	if id < 0 || id+1 >= no {
 		return nil
 	}
-	offBase := 4
-	start := binary.LittleEndian.Uint32(blob[offBase+id*4:])
-	end := binary.LittleEndian.Uint32(blob[offBase+(id+1)*4:])
-	byteBase := offBase + no*4
-	pos := int(binary.LittleEndian.Uint32(blob[byteBase+id*4:]))
-	dataOff := byteBase + no*4
-	dataLen := int(binary.LittleEndian.Uint32(blob[dataOff:]))
-	data := blob[dataOff+4 : dataOff+4+dataLen]
-	out := make([]uint32, 0, end-start)
+	start := binary.LittleEndian.Uint32(blob[4+id*4:])
+	end := binary.LittleEndian.Uint32(blob[4+(id+1)*4:])
+	count := int(end - start)
+	if count == 0 {
+		return nil
+	}
+	p := 4 + no*4
+	numBlocks := int(binary.LittleEndian.Uint32(blob[p:]))
+	bs := int(binary.LittleEndian.Uint32(blob[p+4:]))
+	idxBase := p + 8
+	compLenPos := idxBase + numBlocks*12
+	compTotal := int(binary.LittleEndian.Uint32(blob[compLenPos:]))
+	comp := blob[compLenPos+4 : compLenPos+4+compTotal]
+	k := id / bs
+	e := idxBase + k*12
+	compOff := int(binary.LittleEndian.Uint32(blob[e:]))
+	compLen := int(binary.LittleEndian.Uint32(blob[e+4:]))
+	rawLen := int(binary.LittleEndian.Uint32(blob[e+8:]))
+	raw := lz4Decompress(comp[compOff:compOff+compLen], rawLen)
+	lo := k * bs
+	hi := lo + bs
+	if hi > no-1 {
+		hi = no - 1
+	}
+	cnt := hi - lo
+	j := id - lo
+	off0 := binary.LittleEndian.Uint32(raw[4*j:])
+	off1 := binary.LittleEndian.Uint32(raw[4*(j+1):])
+	listBase := 4 * (cnt + 1)
+	data := raw[listBase+int(off0) : listBase+int(off1)]
+	out := make([]uint32, 0, count)
 	var prev uint32
-	for i := start; i < end; i++ {
+	pos := 0
+	for i := 0; i < count; i++ {
 		d, n := binary.Uvarint(data[pos:])
 		pos += n
-		if i == start {
+		if i == 0 {
 			prev = uint32(d)
 		} else {
 			prev += uint32(d)

@@ -49,6 +49,42 @@ func runParallel(groups []*storage.Reader, q *Query) []Row {
 	return out
 }
 
+// histogramParallel is Histogram fanned across groups: each worker buckets
+// its groups into a local map, merged at the end. The window at scale spans
+// hundreds of groups, so this is the aggregation's parallelism.
+func histogramParallel(groups []*storage.Reader, q *Query, step int64) map[int64]int {
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(groups) {
+		workers = len(groups)
+	}
+	parts := make([]map[int64]int, len(groups))
+	var wg sync.WaitGroup
+	ch := make(chan int, len(groups))
+	for i := range groups {
+		ch <- i
+	}
+	close(ch)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for gi := range ch {
+				m := map[int64]int{}
+				histoGroup(groups[gi], q, step, m)
+				parts[gi] = m
+			}
+		}()
+	}
+	wg.Wait()
+	out := map[int64]int{}
+	for _, m := range parts {
+		for k, v := range m {
+			out[k] += v
+		}
+	}
+	return out
+}
+
 // countParallel is Count fanned across groups; partials sum, no ordering.
 func countParallel(groups []*storage.Reader, q *Query) int {
 	workers := runtime.GOMAXPROCS(0)

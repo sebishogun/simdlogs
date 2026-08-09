@@ -271,27 +271,42 @@ func Count(s Store, q *Query) int {
 // Histogram buckets match counts by time at the given step (nanoseconds),
 // the /select/logsql/hits shape -- again without materializing rows.
 func Histogram(s Store, q *Query, step int64) map[int64]int {
+	groups := s.Groups(q.From, q.To)
+	survivors := groups[:0]
+	for _, g := range groups {
+		if groupCanMatch(g, q) {
+			survivors = append(survivors, g)
+		}
+	}
+	// Fan out when the window spans enough groups -- at scale a selective
+	// window covers hundreds of groups, and serial bucketing over them was
+	// the aggregation's loss to VictoriaLogs at a billion rows.
+	if len(survivors) >= parallelMinGroups {
+		return histogramParallel(survivors, q, step)
+	}
 	out := map[int64]int{}
-	for _, g := range s.Groups(q.From, q.To) {
-		if !groupCanMatch(g, q) {
-			continue
-		}
-		sel := matchBitset(g, q)
-		if sel.Count() == 0 {
-			continue
-		}
-		// Bucket only the matched rows' times, and decode only the window's
-		// block span for them, not the whole timestamp column.
-		lo, hi := g.TimeWindowSpan("_time", q.From, q.To)
-		if lo >= hi {
-			lo, hi = 0, g.Rows
-		}
-		ts := g.TimestampsRange("_time", lo, hi)
-		sel.ForEach(func(i int) {
-			out[ts[i-lo]/step*step]++
-		})
+	for _, g := range survivors {
+		histoGroup(g, q, step, out)
 	}
 	return out
+}
+
+// histoGroup buckets one group's matched rows' times into out at the given
+// step, decoding only the window's block span. Shared by the serial and
+// parallel Histogram paths.
+func histoGroup(g *storage.Reader, q *Query, step int64, out map[int64]int) {
+	sel := matchBitset(g, q)
+	if sel.Count() == 0 {
+		return
+	}
+	lo, hi := g.TimeWindowSpan("_time", q.From, q.To)
+	if lo >= hi {
+		lo, hi = 0, g.Rows
+	}
+	ts := g.TimestampsRange("_time", lo, hi)
+	sel.ForEach(func(i int) {
+		out[ts[i-lo]/step*step]++
+	})
 }
 
 // matchBitset builds the selection for a group: time window AND every

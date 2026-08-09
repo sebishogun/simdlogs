@@ -19,7 +19,7 @@ import (
 
 const (
 	magic   = 0x736C6F67 // "slog"
-	version = 6          // v6: block-compressed random-access dict (mmap + LZ4 per block)
+	version = 7          // v7: block-compressed postings (no raw byte-offset table)
 	// MaxRows is the group ceiling; ingest flushes at or before it.
 	MaxRows = 128 * 1024
 )
