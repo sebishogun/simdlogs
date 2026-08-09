@@ -17,6 +17,32 @@ import (
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
+func TestMetrics(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	postBody(t, ts, `{"_time":1,"service":"a","_msg":"x"}`+"\n")
+	statsBy(t, ts, "service") // one query request
+
+	r, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	body := string(b)
+	for _, want := range []string{
+		"simdlogs_groups 1",
+		"simdlogs_rows 1",
+		"simdlogs_insert_requests_total 1",
+		"simdlogs_query_requests_total 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, body)
+		}
+	}
+}
+
 func TestBackupRestore(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())

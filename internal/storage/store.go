@@ -155,6 +155,18 @@ func (s *Store) Len() int {
 	return len(s.groups)
 }
 
+// TotalRows sums the row counts of every group -- the stored record total,
+// for the /metrics gauge.
+func (s *Store) TotalRows() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, g := range s.groups {
+		n += g.reader.Rows
+	}
+	return n
+}
+
 // TailCursor is the live-tail watermark: the delivery boundary a tailer
 // subscribes at, so it streams only groups appended afterward. It is one past
 // the highest current id (0 on an empty store), which -- because ids start at

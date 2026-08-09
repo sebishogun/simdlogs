@@ -23,9 +23,12 @@ import (
 
 // Server holds the store and the ingest writer behind the HTTP surface.
 type Server struct {
-	store *storage.Store
-	w     *ingest.Writer
-	mono  int64
+	store      *storage.Store
+	w          *ingest.Writer
+	started    time.Time
+	mono       int64
+	nIngestReq int64 // ingest requests, bumped by the metrics middleware (atomic)
+	nQueryReq  int64 // query requests (atomic)
 }
 
 // NewServer opens (or creates) a store at dir and returns the server.
@@ -34,7 +37,7 @@ func NewServer(dir string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	srv := &Server{store: s, w: ingest.NewWriter(s)}
+	srv := &Server{store: s, w: ingest.NewWriter(s), started: time.Now()}
 	// Optional stream-field default from the environment, so a deployment can
 	// synthesize _stream without a code change.
 	if v := strings.TrimSpace(os.Getenv("SIMDLOGS_STREAM_FIELDS")); v != "" {
@@ -73,6 +76,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/insert/journald", s.insertJournald) // systemd journal export (systemd-journal-upload)
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("/admin/backup", s.backup) // tar snapshot for offline restore
+	mux.HandleFunc("/metrics", s.metrics)     // Prometheus text exposition
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)
 	mux.HandleFunc("/select/logsql/tail", s.tail) // live tail: stream matching rows as they arrive
 	mux.HandleFunc("/select/logsql/hits", s.selectHits)
@@ -83,7 +87,7 @@ func (s *Server) Handler() http.Handler {
 	// The Elasticsearch search surface VictoriaLogs lacks.
 	mux.HandleFunc("/_search", s.esSearch)
 	mux.HandleFunc("/_count", s.esCount)
-	return mux
+	return s.countRequests(mux)
 }
 
 // insertJSONLine ingests an NDJSON body and flushes it into a group.
