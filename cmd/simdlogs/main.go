@@ -26,6 +26,7 @@ func main() {
 	syslogAddr := flag.String("syslog", "", "also listen for syslog on this UDP/TCP address (e.g. :514)")
 	backends := flag.String("select-backends", "", "comma-separated peer node URLs; when set this node is a select router (vmselect role)")
 	compact := flag.Bool("compact", false, "compact mode: flate dictionaries for ~15% smaller groups, but 2-10x slower value-reading queries -- for cold archival only, not a queryable store")
+	replicas := flag.Int("replicas", 1, "replication factor for -select-backends: backends group into shards of this many replicas")
 	flag.Parse()
 
 	srv, err := api.NewServer(*dir)
@@ -37,7 +38,8 @@ func main() {
 	}
 	if *backends != "" {
 		srv.SetBackends(strings.Split(*backends, ","))
-		log.Printf("select-router mode: %s", *backends)
+		srv.SetReplicas(*replicas)
+		log.Printf("select-router mode: %s (replicas=%d)", *backends, *replicas)
 	}
 	if *compact {
 		srv.SetCompact(true)

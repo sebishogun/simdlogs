@@ -20,6 +20,65 @@ import (
 // its own store.
 func (s *Server) SetBackends(urls []string) { s.backends = urls }
 
+// SetReplicas sets the replication factor: the backends partition into shards
+// of r replicas each. A write goes to every replica of its shard; a read takes
+// one live replica per shard, so data survives a replica loss without being
+// double-counted. r<=1 is plain sharding (no replication).
+func (s *Server) SetReplicas(r int) { s.replicas = r }
+
+// shards groups the backends into replica sets of size max(1, replicas).
+func (s *Server) shards() [][]string {
+	r := s.replicas
+	if r < 1 {
+		r = 1
+	}
+	var out [][]string
+	for i := 0; i < len(s.backends); i += r {
+		hi := i + r
+		if hi > len(s.backends) {
+			hi = len(s.backends)
+		}
+		out = append(out, s.backends[i:hi])
+	}
+	return out
+}
+
+// getFromShard tries each replica in the shard in turn until one returns a
+// body, so a read tolerates a downed replica. ok is false if all replicas fail.
+func (s *Server) getFromShard(r *http.Request, shard []string, path string, post []byte) ([]byte, bool) {
+	for _, b := range shard {
+		var req *http.Request
+		var err error
+		if post != nil {
+			req, err = http.NewRequestWithContext(r.Context(), "POST", b+path, bytes.NewReader(post))
+			if req != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+		} else {
+			req, err = http.NewRequestWithContext(r.Context(), "GET", b+path+"?"+r.URL.RawQuery, nil)
+		}
+		if err != nil {
+			continue
+		}
+		for _, h := range []string{"AccountID", "ProjectID"} {
+			if v := r.Header.Get(h); v != "" {
+				req.Header.Set(h, v)
+			}
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			continue // replica down: try the next
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			continue
+		}
+		return body, true
+	}
+	return nil, false
+}
+
 // isWritePath reports whether a path ingests data (and so, in router mode,
 // should forward to a storage node rather than be served locally).
 func isWritePath(p string) bool {
@@ -46,33 +105,40 @@ func (s *Server) routeWrites(next http.Handler) http.Handler {
 
 // forwardWrite sends the ingest body to one storage node, round-robin, and
 // relays its response -- so a burst of inserts spreads across the cluster.
-// Round-robin gives one copy per record; replication (R copies) is a follow-up.
+// It round-robins over shards and writes the record to every replica in the
+// chosen shard, so a replica loss never loses data.
 func (s *Server) forwardWrite(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	idx := int(atomic.AddInt64(&s.rr, 1)-1) % len(s.backends)
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, s.backends[idx]+r.URL.Path, bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	req.Header = r.Header.Clone()
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		http.Error(w, err.Error(), 502)
-		return
-	}
-	defer resp.Body.Close()
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
+	shards := s.shards()
+	shard := shards[int(atomic.AddInt64(&s.rr, 1)-1)%len(shards)]
+	var lastResp *http.Response
+	var okAny bool
+	for _, b := range shard { // replicate to every member of the shard
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, b+r.URL.Path, bytes.NewReader(body))
+		if err != nil {
+			continue
 		}
+		req.Header = r.Header.Clone()
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			continue
+		}
+		if lastResp != nil {
+			lastResp.Body.Close()
+		}
+		lastResp, okAny = resp, true
 	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if !okAny {
+		http.Error(w, "all replicas unreachable", 502)
+		return
+	}
+	defer lastResp.Body.Close()
+	w.WriteHeader(lastResp.StatusCode)
+	io.Copy(w, lastResp.Body)
 }
 
 // federatedSelect queries every backend concurrently, merges the NDJSON rows
@@ -88,26 +154,15 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 	var mu sync.Mutex
 	var all []row
 	var wg sync.WaitGroup
-	raw := r.URL.RawQuery
-	for _, b := range s.backends {
+	for _, sh := range s.shards() { // one live replica per shard
 		wg.Add(1)
-		go func(b string) {
+		go func(sh []string) {
 			defer wg.Done()
-			req, err := http.NewRequestWithContext(r.Context(), "GET", b+"/select/logsql/query?"+raw, nil)
-			if err != nil {
+			body, ok := s.getFromShard(r, sh, "/select/logsql/query", nil)
+			if !ok {
 				return
 			}
-			for _, h := range []string{"AccountID", "ProjectID"} {
-				if v := r.Header.Get(h); v != "" {
-					req.Header.Set(h, v)
-				}
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-			sc := bufio.NewScanner(resp.Body)
+			sc := bufio.NewScanner(bytes.NewReader(body))
 			sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 			var local []row
 			for sc.Scan() {
@@ -120,7 +175,7 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			all = append(all, local...)
 			mu.Unlock()
-		}(b)
+		}(sh)
 	}
 	wg.Wait()
 
@@ -143,33 +198,20 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// fanOut sends the same GET (path + the request's raw query + tenant headers)
-// to every backend concurrently and returns the response bodies. A backend
-// that errors contributes nothing rather than failing the whole query.
+// fanOut sends the GET to one live replica of each shard concurrently and
+// returns the response bodies (one per shard), so replicated data is read once.
 func (s *Server) fanOut(r *http.Request, path string) [][]byte {
-	out := make([][]byte, len(s.backends))
+	shards := s.shards()
+	out := make([][]byte, len(shards))
 	var wg sync.WaitGroup
-	for i, b := range s.backends {
+	for i, sh := range shards {
 		wg.Add(1)
-		go func(i int, b string) {
+		go func(i int, sh []string) {
 			defer wg.Done()
-			req, err := http.NewRequestWithContext(r.Context(), "GET", b+path+"?"+r.URL.RawQuery, nil)
-			if err != nil {
-				return
+			if body, ok := s.getFromShard(r, sh, path, nil); ok {
+				out[i] = body
 			}
-			for _, h := range []string{"AccountID", "ProjectID"} {
-				if v := r.Header.Get(h); v != "" {
-					req.Header.Set(h, v)
-				}
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-			body, _ := io.ReadAll(resp.Body)
-			out[i] = body
-		}(i, b)
+		}(i, sh)
 	}
 	wg.Wait()
 	return out
@@ -179,30 +221,17 @@ func (s *Server) fanOut(r *http.Request, path string) [][]byte {
 // returns the response bodies -- the ES surface fans out this way, since its
 // query is a JSON body rather than URL params.
 func (s *Server) fanOutPost(r *http.Request, path string, body []byte) [][]byte {
-	out := make([][]byte, len(s.backends))
+	shards := s.shards()
+	out := make([][]byte, len(shards))
 	var wg sync.WaitGroup
-	for i, b := range s.backends {
+	for i, sh := range shards {
 		wg.Add(1)
-		go func(i int, b string) {
+		go func(i int, sh []string) {
 			defer wg.Done()
-			req, err := http.NewRequestWithContext(r.Context(), "POST", b+path, bytes.NewReader(body))
-			if err != nil {
-				return
+			if b, ok := s.getFromShard(r, sh, path, body); ok {
+				out[i] = b
 			}
-			req.Header.Set("Content-Type", "application/json")
-			for _, h := range []string{"AccountID", "ProjectID"} {
-				if v := r.Header.Get(h); v != "" {
-					req.Header.Set(h, v)
-				}
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-			rb, _ := io.ReadAll(resp.Body)
-			out[i] = rb
-		}(i, b)
+		}(i, sh)
 	}
 	wg.Wait()
 	return out

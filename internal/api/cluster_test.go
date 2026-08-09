@@ -53,6 +53,62 @@ func TestClusterWriteRouting(t *testing.T) {
 	}
 }
 
+// TestClusterReplication checks replicas=2: each record lands on both replicas
+// of its shard, a federated read returns each record once (not per replica),
+// and a read survives a downed primary.
+func TestClusterReplication(t *testing.T) {
+	mk := func() (*Server, *httptest.Server) {
+		srv, err := NewServer(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return srv, httptest.NewServer(srv.Handler())
+	}
+	s1, b1 := mk()
+	s2, b2 := mk()
+	s3, b3 := mk()
+	s4, b4 := mk()
+	defer b2.Close()
+	defer b3.Close()
+	defer b4.Close()
+
+	front, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	front.SetBackends([]string{b1.URL, b2.URL, b3.URL, b4.URL})
+	front.SetReplicas(2) // shards: [b1,b2], [b3,b4]
+	fs := httptest.NewServer(front.Handler())
+	defer fs.Close()
+
+	postBody(t, fs, `{"_time":1,"service":"a"}`+"\n") // -> shard0 (b1,b2)
+	postBody(t, fs, `{"_time":2,"service":"b"}`+"\n") // -> shard1 (b3,b4)
+
+	if s1.def.store.TotalRows() != 1 || s2.def.store.TotalRows() != 1 {
+		t.Fatalf("shard0 replicas = %d/%d, want 1/1 (replicated)", s1.def.store.TotalRows(), s2.def.store.TotalRows())
+	}
+	if s3.def.store.TotalRows() != 1 || s4.def.store.TotalRows() != 1 {
+		t.Fatalf("shard1 replicas = %d/%d, want 1/1", s3.def.store.TotalRows(), s4.def.store.TotalRows())
+	}
+
+	count := func() int {
+		r, err := http.Get(fs.URL + "/select/logsql/query?query=*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		return len(strings.Split(strings.TrimSpace(string(b)), "\n"))
+	}
+	if n := count(); n != 2 { // one per shard, not 4
+		t.Fatalf("federated read = %d rows, want 2 (dedup across replicas)", n)
+	}
+	b1.Close() // down the shard0 primary
+	if n := count(); n != 2 {
+		t.Fatalf("after primary loss = %d rows, want 2 (failover to replica)", n)
+	}
+}
+
 // TestClusterFederation stands up two storage nodes with different data and a
 // front router pointed at both, then queries the front and checks the rows are
 // merged newest-first across both backends.

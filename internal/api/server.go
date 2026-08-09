@@ -34,6 +34,7 @@ type Server struct {
 	strmFlds   []string
 	compact    bool     // compact mode default for new tenants (flate dict)
 	backends   []string // peer node base URLs; when set, selects fan out and merge (vmselect role)
+	replicas   int      // replication factor: backends group into shards of this many replicas
 	started    time.Time
 	nIngestReq int64 // ingest requests (atomic)
 	nQueryReq  int64 // query requests (atomic)
