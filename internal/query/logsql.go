@@ -411,6 +411,58 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, err
 			}
 			pipes = append(pipes, &FieldsPipe{Keep: fs})
+		case "uniq":
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "by") {
+				p.next()
+			}
+			fs, err := p.parseFieldGroup()
+			if err != nil {
+				return nil, err
+			}
+			up := &UniqPipe{By: fs}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "limit") {
+				p.next()
+				n, err := p.intArg()
+				if err != nil {
+					return nil, err
+				}
+				up.Limit = n
+			}
+			pipes = append(pipes, up)
+		case "top":
+			n, err := p.intArg()
+			if err != nil {
+				return nil, err
+			}
+			fs, err := p.parseFieldGroup()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &TopPipe{N: n, By: fs})
+		case "tail":
+			n, err := p.intArg()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &TailPipe{N: n})
+		case "offset":
+			n, err := p.intArg()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &OffsetPipe{N: n})
+		case "rename":
+			rp, err := p.parseRename()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, rp)
+		case "delete", "drop":
+			fs, err := p.parseBareFieldList()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &DeletePipe{Drop: fs})
 		default:
 			return nil, fmt.Errorf("simdlogs: unknown pipe %q", name.val)
 		}
@@ -560,6 +612,32 @@ func (p *lqlParser) parseBareFieldList() ([]string, error) {
 		break
 	}
 	return fs, nil
+}
+
+func (p *lqlParser) parseRename() (*RenamePipe, error) {
+	rp := &RenamePipe{}
+	for {
+		from := p.next()
+		if from.kind != tIdent && from.kind != tString {
+			return nil, fmt.Errorf("simdlogs: rename: expected a field, got %q", from.val)
+		}
+		as := p.next()
+		if !strings.EqualFold(as.val, "as") {
+			return nil, fmt.Errorf("simdlogs: rename: expected 'as', got %q", as.val)
+		}
+		to := p.next()
+		if to.kind != tIdent && to.kind != tString {
+			return nil, fmt.Errorf("simdlogs: rename: expected a name, got %q", to.val)
+		}
+		rp.From = append(rp.From, from.val)
+		rp.To = append(rp.To, to.val)
+		if p.peek().kind == tComma {
+			p.next()
+			continue
+		}
+		break
+	}
+	return rp, nil
 }
 
 func (p *lqlParser) intArg() (int, error) {

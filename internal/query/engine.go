@@ -16,11 +16,12 @@ import (
 // AND across predicates, with equality and substring the two the storage
 // footer can skip on.
 type Query struct {
-	From, To int64
-	Preds    []Pred // implicit-AND predicates (programmatic callers, ES planner)
-	Filter   *Expr  // boolean filter tree from LogsQL; takes precedence when set
-	Pipes    []Pipe // LogsQL pipe chain (stats/sort/limit/fields), applied after the filter
-	Limit    int
+	From, To    int64
+	Preds       []Pred   // implicit-AND predicates (programmatic callers, ES planner)
+	Filter      *Expr    // boolean filter tree from LogsQL; takes precedence when set
+	Pipes       []Pipe   // LogsQL pipe chain (stats/sort/limit/fields), applied after the filter
+	Materialize []string // extra fields to materialize for the pipes (beyond predicate fields)
+	Limit       int
 }
 
 // PredKind selects the comparison.
@@ -197,6 +198,9 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 			sel.And(predBitsetCol(g, p, idx, dict, n))
 		}
 	}
+	for _, f := range q.Materialize { // fields the pipe chain needs
+		addField(f)
+	}
 
 	cnt := sel.Count()
 	if cnt == 0 {
@@ -225,15 +229,15 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 		} else {
 			t = ts[i-lo]
 		}
-		row := Row{Time: t, Fields: make([]Field, 0, len(q.Preds))}
-		for _, p := range q.Preds {
+		row := Row{Time: t, Fields: make([]Field, 0, len(matFields))}
+		for _, f := range matFields {
 			// Prefer a decoded column if we already have one; otherwise
 			// (the posting path skipped the full decode) fetch just this
 			// row's value -- O(1), keeping the selective query lazy.
-			if c := cols[p.Field]; c.idx != nil {
-				row.Fields = append(row.Fields, Field{p.Field, c.dict[c.idx[i]]})
-			} else if v, ok := g.DictValueAt(p.Field, i); ok {
-				row.Fields = append(row.Fields, Field{p.Field, v})
+			if c := cols[f]; c.idx != nil {
+				row.Fields = append(row.Fields, Field{f, c.dict[c.idx[i]]})
+			} else if v, ok := g.DictValueAt(f, i); ok {
+				row.Fields = append(row.Fields, Field{f, v})
 			}
 		}
 		out = append(out, row)

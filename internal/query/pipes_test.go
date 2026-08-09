@@ -95,3 +95,31 @@ func TestRunPipelineSortLimit(t *testing.T) {
 		t.Fatalf("sort/limit got %v, want [service=a]", rows)
 	}
 }
+
+func TestMorePipes(t *testing.T) {
+	s := statsStore(t) // service a:3, b:2
+	run := func(q string) []Row {
+		pq, err := ParseLogsQL(q)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		pq.From, pq.To = 0, int64(1)<<62
+		return RunPipeline(s, pq)
+	}
+	// top over * needs field materialization; a=3 leads.
+	top := run(`* | top 5 (service)`)
+	if len(top) != 2 || rowField(top[0], "service") != "a" || rowField(top[0], "count") != "3" {
+		t.Fatalf("top = %v", top)
+	}
+	// uniq by service -> 2 distinct.
+	if u := run(`* | uniq by (service)`); len(u) != 2 {
+		t.Fatalf("uniq rows = %d want 2", len(u))
+	}
+	// rename + delete on stats output.
+	rd := run(`* | stats by (service) count() as c | rename c as total | delete service`)
+	for _, r := range rd {
+		if rowField(r, "total") == "" || rowField(r, "service") != "" {
+			t.Fatalf("rename/delete wrong: %v", r.Fields)
+		}
+	}
+}

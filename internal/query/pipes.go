@@ -3,6 +3,7 @@ package query
 import (
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // The pipe language: after the filter selects rows, pipes transform them --
@@ -57,6 +58,30 @@ type LimitPipe struct{ N int }
 // FieldsPipe is `fields a, b` -- keep only these, in that order.
 type FieldsPipe struct{ Keep []string }
 
+// UniqPipe is `uniq by (fields) [limit N]` -- distinct rows by those fields.
+type UniqPipe struct {
+	By    []string
+	Limit int
+}
+
+// TopPipe is `top N (fields)` -- the N most frequent field-tuples with counts.
+type TopPipe struct {
+	By []string
+	N  int
+}
+
+// TailPipe is `tail N` -- the last N rows.
+type TailPipe struct{ N int }
+
+// OffsetPipe is `offset N` -- skip the first N rows.
+type OffsetPipe struct{ N int }
+
+// RenamePipe is `rename a as b, c as d`.
+type RenamePipe struct{ From, To []string }
+
+// DeletePipe is `delete a, b` / `drop a, b` -- remove those fields.
+type DeletePipe struct{ Drop []string }
+
 // statSlot accumulates one aggregation for one group-by key.
 type statSlot struct {
 	sum, min, max float64
@@ -84,12 +109,44 @@ func RunPipeline(s Store, q *Query) []Row {
 		}
 	}
 	if rows == nil {
+		q.Materialize = pipeFields(pipes) // so the row pipes see their fields
 		rows = Run(s, q)
 	}
 	for _, p := range pipes {
 		rows = p.apply(rows)
 	}
 	return rows
+}
+
+// pipeFields is the set of fields the row pipes reference, so the filter's
+// materialize step includes them (a `* | top (service)` needs service on the
+// rows even though nothing filtered on it).
+func pipeFields(pipes []Pipe) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(fs ...string) {
+		for _, f := range fs {
+			if !seen[f] {
+				seen[f] = true
+				out = append(out, f)
+			}
+		}
+	}
+	for _, p := range pipes {
+		switch t := p.(type) {
+		case *SortPipe:
+			add(t.By...)
+		case *UniqPipe:
+			add(t.By...)
+		case *TopPipe:
+			add(t.By...)
+		case *RenamePipe:
+			add(t.From...)
+		case *FieldsPipe:
+			add(t.Keep...)
+		}
+	}
+	return out
 }
 
 // runStats aggregates matched rows by the group-by fields during the scan,
@@ -282,6 +339,114 @@ func (p *FieldsPipe) apply(rows []Row) []Row {
 			}
 		}
 		rows[i].Fields = nf
+	}
+	return rows
+}
+
+func rowKey(r Row, by []string) string {
+	var b strings.Builder
+	for _, f := range by {
+		b.WriteString(rowField(r, f))
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+func (p *UniqPipe) apply(rows []Row) []Row {
+	seen := make(map[string]bool, len(rows))
+	out := rows[:0]
+	for _, r := range rows {
+		k := rowKey(r, p.By)
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, r)
+		}
+	}
+	if p.Limit > 0 && len(out) > p.Limit {
+		out = out[:p.Limit]
+	}
+	return out
+}
+
+func (p *TopPipe) apply(rows []Row) []Row {
+	cnt := map[string]int{}
+	vals := map[string][]string{}
+	for _, r := range rows {
+		k := rowKey(r, p.By)
+		if cnt[k] == 0 {
+			v := make([]string, len(p.By))
+			for i, f := range p.By {
+				v[i] = rowField(r, f)
+			}
+			vals[k] = v
+		}
+		cnt[k]++
+	}
+	out := make([]Row, 0, len(cnt))
+	for k, c := range cnt {
+		fields := make([]Field, 0, len(p.By)+1)
+		for i, f := range p.By {
+			fields = append(fields, Field{f, vals[k][i]})
+		}
+		fields = append(fields, Field{"count", strconv.Itoa(c)})
+		out = append(out, Row{Fields: fields})
+	}
+	sort.SliceStable(out, func(a, b int) bool {
+		ca, _ := strconv.Atoi(rowField(out[a], "count"))
+		cb, _ := strconv.Atoi(rowField(out[b], "count"))
+		return ca > cb
+	})
+	if p.N > 0 && len(out) > p.N {
+		out = out[:p.N]
+	}
+	return out
+}
+
+func (p *TailPipe) apply(rows []Row) []Row {
+	if p.N >= 0 && len(rows) > p.N {
+		return rows[len(rows)-p.N:]
+	}
+	return rows
+}
+
+func (p *OffsetPipe) apply(rows []Row) []Row {
+	if p.N >= len(rows) {
+		return rows[:0]
+	}
+	if p.N > 0 {
+		return rows[p.N:]
+	}
+	return rows
+}
+
+func (p *RenamePipe) apply(rows []Row) []Row {
+	m := make(map[string]string, len(p.From))
+	for i := range p.From {
+		m[p.From[i]] = p.To[i]
+	}
+	for ri := range rows {
+		for fi := range rows[ri].Fields {
+			if nn, ok := m[rows[ri].Fields[fi].Key]; ok {
+				rows[ri].Fields[fi].Key = nn
+			}
+		}
+	}
+	return rows
+}
+
+func (p *DeletePipe) apply(rows []Row) []Row {
+	drop := make(map[string]bool, len(p.Drop))
+	for _, d := range p.Drop {
+		drop[d] = true
+	}
+	for ri := range rows {
+		nf := rows[ri].Fields[:0]
+		for _, f := range rows[ri].Fields {
+			if !drop[f.Key] {
+				nf = append(nf, f)
+			}
+		}
+		rows[ri].Fields = nf
 	}
 	return rows
 }
