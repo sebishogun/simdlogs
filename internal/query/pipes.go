@@ -31,6 +31,10 @@ const (
 	AggUniq
 	AggCountUniq
 	AggQuantile
+	AggValues     // values(field): JSON array of every non-empty value in the group
+	AggUniqValues // uniq_values(field): sorted JSON array of the distinct values
+	AggSumLen     // sum_len(field): sum of len(value) over the group
+	AggCountEmpty // count_empty(field): rows where the field is empty or missing
 )
 
 // Agg is one aggregation in a stats pipe.
@@ -83,7 +87,7 @@ func (p *StatsPipe) apply(rows []Row) []Row {
 func newStatEntry(by []string, aggs []Agg) *statEntry {
 	e := &statEntry{by: by, slots: make([]statSlot, len(aggs))}
 	for j := range aggs {
-		if aggs[j].Kind == AggUniq || aggs[j].Kind == AggCountUniq {
+		if aggs[j].Kind == AggUniq || aggs[j].Kind == AggCountUniq || aggs[j].Kind == AggUniqValues {
 			e.slots[j].set = map[string]struct{}{}
 		}
 	}
@@ -119,6 +123,28 @@ func accSample(e *statEntry, aggs []Agg, valOf func(j int) string) {
 				}
 				sl.set = nil
 			}
+			continue
+		}
+		if a.Kind == AggCountEmpty {
+			if val == "" {
+				sl.sum++
+			}
+			continue
+		}
+		if a.Kind == AggValues {
+			if val != "" && len(sl.strs) < valuesCap {
+				sl.strs = append(sl.strs, val)
+			}
+			continue
+		}
+		if a.Kind == AggUniqValues {
+			if val != "" {
+				sl.set[val] = struct{}{}
+			}
+			continue
+		}
+		if a.Kind == AggSumLen {
+			sl.sum += float64(len(val))
 			continue
 		}
 		f, err := strconv.ParseFloat(val, 64)
@@ -209,8 +235,14 @@ type statSlot struct {
 	set           map[string]struct{}
 	hll           *hyperLogLog // count_uniq once the set exceeds hllThreshold (bounded RAM)
 	vals          []float64    // numeric samples for quantile() (exact)
+	strs          []string     // collected values for values() (bounded by valuesCap)
 	has           bool
 }
+
+// valuesCap bounds how many values a single values() slot collects, so one
+// group-by key over a billion rows cannot OOM. uniq_values() is bounded by
+// cardinality via the set, not this.
+const valuesCap = 10000
 
 // hllThreshold is where count_uniq switches from an exact set to HyperLogLog:
 // below it the answer is exact; above it RAM is bounded at ~16KB regardless of
@@ -311,6 +343,12 @@ func pipeFields(pipes []Pipe) []string {
 			add(t.From...)
 		case *LenPipe:
 			add(t.Field)
+		case *ExtractRegexpPipe:
+			add(orDefault(t.From, "_msg"))
+		case *DecolorizePipe:
+			add(orDefault(t.Field, "_msg"))
+		case *PackPipe:
+			add(t.Fields...) // explicit fields from storage; pack-all uses whatever rows already carry
 		}
 	}
 	return out
@@ -436,8 +474,31 @@ func formatAgg(a *Agg, sl *statSlot, rows int64) string {
 		return strconv.Itoa(len(sl.set))
 	case AggQuantile:
 		return trimFloat(quantileOf(sl.vals, a.P))
+	case AggValues:
+		return jsonStrArray(sl.strs)
+	case AggUniqValues:
+		keys := make([]string, 0, len(sl.set))
+		for k := range sl.set {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		return jsonStrArray(keys)
+	case AggSumLen:
+		return trimFloat(sl.sum)
+	case AggCountEmpty:
+		return trimFloat(sl.sum)
 	}
 	return ""
+}
+
+// jsonStrArray renders values() / uniq_values() output as a JSON array string,
+// matching VictoriaLogs. An empty slot is "[]", never "null".
+func jsonStrArray(vals []string) string {
+	if len(vals) == 0 {
+		return "[]"
+	}
+	b, _ := json.Marshal(vals)
+	return string(b)
 }
 
 func trimFloat(f float64) string { return strconv.FormatFloat(f, 'f', -1, 64) }

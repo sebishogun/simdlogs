@@ -735,6 +735,67 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				mp.As = a
 			}
 			pipes = append(pipes, mp)
+		case "extract_regexp":
+			from := ""
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "from") {
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				from = f
+			}
+			pat := p.next()
+			if pat.kind != tString && pat.kind != tIdent {
+				return nil, fmt.Errorf("simdlogs: extract_regexp expects a pattern string, got %q", pat.val)
+			}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "from") {
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				from = f
+			}
+			ep, err := newExtractRegexp(pat.val, from)
+			if err != nil {
+				return nil, fmt.Errorf("simdlogs: extract_regexp: %w", err)
+			}
+			pipes = append(pipes, ep)
+		case "decolorize":
+			dp := &DecolorizePipe{}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "at") {
+				p.next()
+			}
+			if k := p.peek().kind; k == tIdent || k == tString {
+				dp.Field = p.next().val
+			}
+			pipes = append(pipes, dp)
+		case "pack_json", "pack_logfmt":
+			pp := &PackPipe{Logfmt: strings.EqualFold(name.val, "pack_logfmt")}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "fields") {
+				p.next()
+				fs, err := p.parseFieldGroup()
+				if err != nil {
+					return nil, err
+				}
+				pp.Fields = fs
+			}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
+				p.next()
+				a, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				pp.As = a
+			}
+			pipes = append(pipes, pp)
+		case "sample":
+			n, err := p.intArg()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &SamplePipe{N: n})
 		default:
 			return nil, fmt.Errorf("simdlogs: unknown pipe %q", name.val)
 		}
@@ -952,6 +1013,14 @@ func aggKind(name string) (AggKind, bool) {
 		return AggCountUniq, true
 	case "quantile", "median":
 		return AggQuantile, true
+	case "values":
+		return AggValues, true
+	case "uniq_values":
+		return AggUniqValues, true
+	case "sum_len":
+		return AggSumLen, true
+	case "count_empty":
+		return AggCountEmpty, true
 	}
 	return 0, false
 }
