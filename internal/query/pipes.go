@@ -84,7 +84,8 @@ func (p *StatsPipe) apply(rows []Row) []Row {
 		}
 		accSample(e, p.Aggs,
 			func(j int) string { return rowField(r, p.Aggs[j].Field) },
-			func(j int) string { return rowField(r, p.Aggs[j].Field2) })
+			func(j int) string { return rowField(r, p.Aggs[j].Field2) },
+			func(name string) string { return rowField(r, name) })
 	}
 	out := make([]Row, 0, len(order))
 	for _, k := range order {
@@ -107,11 +108,18 @@ func newStatEntry(by []string, aggs []Agg) *statEntry {
 // accSample folds one sample into an entry: valOf(j) is the value of
 // aggregation j's field on this sample, valOf2(j) its second field (row_min/max
 // output). Shared by the during-scan and mid-pipe stats so the two never drift.
-func accSample(e *statEntry, aggs []Agg, valOf func(j int) string, valOf2 func(j int) string) {
+func accSample(e *statEntry, aggs []Agg, valOf func(j int) string, valOf2 func(j int) string, getField func(name string) string) {
 	e.rows++
 	for j := range aggs {
 		a := &aggs[j]
 		sl := &e.slots[j]
+		if a.If != nil && !exprMatchesRow(a.If, getField) {
+			continue // conditional aggregate: this row does not qualify for agg j
+		}
+		if a.Kind == AggCount {
+			sl.n++
+			continue
+		}
 		if a.Kind == AggRowMin || a.Kind == AggRowMax {
 			f, err := strconv.ParseFloat(valOf(j), 64)
 			if err != nil {
@@ -257,6 +265,7 @@ type FilterPipe struct{ Expr *Expr }
 // statSlot accumulates one aggregation for one group-by key.
 type statSlot struct {
 	sum, min, max float64
+	n             int64 // count() for this slot (per-agg, so `count() if (...)` works)
 	cnt           int64 // numeric samples (avg denominator)
 	set           map[string]struct{}
 	hll           *hyperLogLog // count_uniq once the set exceeds hllThreshold (bounded RAM)
@@ -337,6 +346,13 @@ func pipeFields(pipes []Pipe) []string {
 				}
 				if a.Field2 != "" {
 					add(a.Field2)
+				}
+				if a.If != nil {
+					fs := map[string]bool{}
+					filterFields(a.If, fs)
+					for f := range fs {
+						add(f)
+					}
 				}
 			}
 		case *SortPipe:
@@ -427,7 +443,7 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 	// StatsByField reads them from the offset table without a per-row scan
 	// for whole-in-window groups (the 1078x trick). This is the common
 	// top-N / group-by shape.
-	if len(sp.By) == 1 && len(sp.Aggs) == 1 && sp.Aggs[0].Kind == AggCount {
+	if len(sp.By) == 1 && len(sp.Aggs) == 1 && sp.Aggs[0].Kind == AggCount && sp.Aggs[0].If == nil {
 		alias := sp.Aggs[0].Alias
 		vcs := StatsByField(s, q, sp.By[0])
 		out := make([]Row, 0, len(vcs))
@@ -435,6 +451,14 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 			out = append(out, Row{Fields: []Field{{sp.By[0], vc.Value}, {alias, strconv.Itoa(vc.Count)}}})
 		}
 		return out
+	}
+	// Fields referenced by any `if (<filter>)` on an aggregate, so they can be
+	// decoded per group and read by the conditional check.
+	ifFields := map[string]bool{}
+	for i := range sp.Aggs {
+		if sp.Aggs[i].If != nil {
+			filterFields(sp.Aggs[i].If, ifFields)
+		}
 	}
 	acc := map[string]*statEntry{}
 	var key []byte
@@ -445,6 +469,11 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 		sel := matchBitset(g, q)
 		if sel.Count() == 0 {
 			continue
+		}
+		ifCol := map[string][]uint32{}
+		ifDict := map[string][]string{}
+		for f := range ifFields {
+			ifCol[f], ifDict[f] = g.DictIndices(f)
 		}
 		byCol := make([][]uint32, len(sp.By))
 		byDict := make([][]string, len(sp.By))
@@ -492,6 +521,11 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 					return aggDict2[j][aggCol2[j][i]]
 				}
 				return ""
+			}, func(name string) string {
+				if c := ifCol[name]; c != nil {
+					return ifDict[name][c[i]]
+				}
+				return ""
 			})
 		})
 	}
@@ -505,7 +539,7 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 func formatAgg(a *Agg, sl *statSlot, rows int64) string {
 	switch a.Kind {
 	case AggCount:
-		return strconv.FormatInt(rows, 10)
+		return strconv.FormatInt(sl.n, 10)
 	case AggSum:
 		return trimFloat(sl.sum)
 	case AggAvg:

@@ -1114,6 +1114,23 @@ func (p *lqlParser) parseAgg() (Agg, error) {
 	}
 	p.next() // )
 	a := Agg{Field: field, Field2: field2, Kind: kind, P: pct}
+	// Optional conditional aggregate: `agg(...) if (<filter>)`.
+	if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "if") {
+		p.next() // if
+		if p.peek().kind != tLParen {
+			return Agg{}, fmt.Errorf("simdlogs: if expects (<filter>)")
+		}
+		p.next() // (
+		e, err := p.parseOr()
+		if err != nil {
+			return Agg{}, err
+		}
+		if p.peek().kind != tRParen {
+			return Agg{}, fmt.Errorf("simdlogs: if: expected )")
+		}
+		p.next() // )
+		a.If = e
+	}
 	if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
 		p.next()
 		al := p.next()
