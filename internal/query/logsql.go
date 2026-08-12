@@ -872,6 +872,21 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, err
 			}
 			pipes = append(pipes, &SamplePipe{N: n})
+		case "first", "last":
+			// `first N [by] (fields)` == sort by those fields, limit N; last is
+			// the descending sort. Sugar over SortPipe, which already limits.
+			n, err := p.intArg()
+			if err != nil {
+				return nil, err
+			}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "by") {
+				p.next()
+			}
+			fs, err := p.parseFieldGroup()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &SortPipe{By: fs, Limit: n, Desc: strings.EqualFold(name.val, "last")})
 		default:
 			return nil, fmt.Errorf("simdlogs: unknown pipe %q", name.val)
 		}
@@ -1097,6 +1112,10 @@ func aggKind(name string) (AggKind, bool) {
 		return AggSumLen, true
 	case "count_empty":
 		return AggCountEmpty, true
+	case "row_any":
+		return AggRowAny, true
+	case "count_uniq_hash": // VL's approximate distinct; our count_uniq already spills to HLL
+		return AggCountUniq, true
 	}
 	return 0, false
 }

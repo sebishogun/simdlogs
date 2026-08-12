@@ -35,6 +35,7 @@ const (
 	AggUniqValues // uniq_values(field): sorted JSON array of the distinct values
 	AggSumLen     // sum_len(field): sum of len(value) over the group
 	AggCountEmpty // count_empty(field): rows where the field is empty or missing
+	AggRowAny     // row_any(field): an arbitrary value of the field in the group
 )
 
 // Agg is one aggregation in a stats pipe.
@@ -133,6 +134,12 @@ func accSample(e *statEntry, aggs []Agg, valOf func(j int) string) {
 		}
 		if a.Kind == AggValues {
 			if val != "" && len(sl.strs) < valuesCap {
+				sl.strs = append(sl.strs, val)
+			}
+			continue
+		}
+		if a.Kind == AggRowAny {
+			if len(sl.strs) == 0 && val != "" {
 				sl.strs = append(sl.strs, val)
 			}
 			continue
@@ -487,6 +494,11 @@ func formatAgg(a *Agg, sl *statSlot, rows int64) string {
 		return trimFloat(sl.sum)
 	case AggCountEmpty:
 		return trimFloat(sl.sum)
+	case AggRowAny:
+		if len(sl.strs) > 0 {
+			return sl.strs[0]
+		}
+		return ""
 	}
 	return ""
 }
