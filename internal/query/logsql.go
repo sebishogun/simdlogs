@@ -465,6 +465,36 @@ func (p *lqlParser) parseMatcher(field string) (Pred, error) {
 		}
 		p.next() // )
 		return Pred{Field: field, Kind: IContains, Value: v}, nil
+	case t.kind == tIdent && strings.EqualFold(t.val, "seq") && p.peekAt(1).kind == tLParen:
+		vals, err := p.parenValueList("seq")
+		if err != nil {
+			return Pred{}, err
+		}
+		return Pred{Field: field, Kind: Seq, Values: vals}, nil
+	case t.kind == tIdent && strings.EqualFold(t.val, "ipv4_range") && p.peekAt(1).kind == tLParen:
+		lo, hi, err := p.twoStrArgs("ipv4_range")
+		if err != nil {
+			return Pred{}, err
+		}
+		loN, ok1 := ipToU32(lo)
+		hiN, ok2 := ipToU32(hi)
+		if !ok1 || !ok2 {
+			return Pred{}, fmt.Errorf("simdlogs: ipv4_range: bad IPv4 %q or %q", lo, hi)
+		}
+		return Pred{Field: field, Kind: IPv4Range, Num: float64(loN), Num2: float64(hiN)}, nil
+	case t.kind == tIdent && fieldCmpKind(t.val) != 0 && p.peekAt(1).kind == tLParen:
+		kind := fieldCmpKind(t.val)
+		p.next() // name
+		p.next() // (
+		f2, err := p.value()
+		if err != nil {
+			return Pred{}, err
+		}
+		if p.peek().kind != tRParen {
+			return Pred{}, fmt.Errorf("simdlogs: expected ) in %s()", t.val)
+		}
+		p.next() // )
+		return Pred{Field: field, Kind: kind, Field2: f2}, nil
 	default:
 		v, err := p.value()
 		if err != nil {
@@ -503,6 +533,48 @@ func (p *lqlParser) twoNumArgs(name string) (float64, float64, error) {
 	}
 	p.next() // )
 	return lo, hi, nil
+}
+
+// fieldCmpKind maps a *_field function name to its PredKind, or 0 if none.
+func fieldCmpKind(name string) PredKind {
+	switch strings.ToLower(name) {
+	case "eq_field":
+		return EqField
+	case "ne_field":
+		return NeField
+	case "lt_field":
+		return LtField
+	case "le_field":
+		return LeField
+	case "gt_field":
+		return GtField
+	case "ge_field":
+		return GeField
+	}
+	return 0
+}
+
+// parenValueList parses `name(v1, v2, ...)` as a list of string values (the
+// peeked ident is name). Shared by in()/seq().
+func (p *lqlParser) parenValueList(name string) ([]string, error) {
+	p.next() // name
+	p.next() // (
+	var vals []string
+	for p.peek().kind != tRParen && p.peek().kind != tEOF {
+		vt := p.next()
+		if vt.kind != tIdent && vt.kind != tString {
+			return nil, fmt.Errorf("simdlogs: bad %s() value %q", name, vt.val)
+		}
+		vals = append(vals, vt.val)
+		if p.peek().kind == tComma {
+			p.next()
+		}
+	}
+	if p.peek().kind != tRParen {
+		return nil, fmt.Errorf("simdlogs: expected ) in %s()", name)
+	}
+	p.next() // )
+	return vals, nil
 }
 
 // twoStrArgs parses `name(a, b)` as two string values.

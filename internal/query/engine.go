@@ -42,19 +42,32 @@ const (
 	LenRange                    // len_range(lo,hi) (value byte-length, inclusive)
 	StringRange                 // string_range(a,b)(lexicographic a <= v < b)
 	IContains                   // i(phrase)        (case-insensitive substring)
+	Seq                         // seq(a,b,..)      (phrases occurring in order)
+	IPv4Range                   // ipv4_range(lo,hi)(field IPv4 in [lo,hi])
+	EqField                     // eq_field(f)      (this field == field f, per row)
+	NeField                     // ne_field(f)      (this field != field f)
+	LtField                     // lt_field(f)      (this field <  field f)
+	LeField                     // le_field(f)      (this field <= field f)
+	GtField                     // gt_field(f)      (this field >  field f)
+	GeField                     // ge_field(f)      (this field >= field f)
 )
+
+// isFieldCmp reports whether the kind compares this field against another field
+// (Field2) per row, rather than this field's values against a constant.
+func isFieldCmp(k PredKind) bool { return k >= EqField && k <= GeField }
 
 // Pred is one field predicate. Fields ordered large-to-small (pointers and
 // strings, then float64, then the byte-sized Kind last) to avoid interior
 // padding.
 type Pred struct {
 	Field  string         // Eq/Contains/Regexp/Prefix/IContains key
+	Field2 string         // *_field: the other field to compare against
 	Value  string         // Eq/Contains/Regexp/Prefix/IContains value, StringRange lo
 	Value2 string         // StringRange hi
-	Values []string       // In
+	Values []string       // In, Seq (ordered phrases)
 	re     *regexp.Regexp // compiled Regexp
-	Num    float64        // Lt/Le/Gt/Ge bound, Range/LenRange lo
-	Num2   float64        // Range/LenRange hi
+	Num    float64        // Lt/Le/Gt/Ge bound, Range/LenRange/IPv4Range lo
+	Num2   float64        // Range/LenRange/IPv4Range hi
 	Kind   PredKind
 }
 
@@ -196,6 +209,9 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 		for i := range q.Preds {
 			p := &q.Preds[i]
 			addField(p.Field)
+			if p.Field2 != "" {
+				addField(p.Field2)
+			}
 			if p.Kind == Eq {
 				sel.And(eqPredBitset(g, p, n))
 				continue
@@ -298,6 +314,20 @@ func predBitsetCol(g *storage.Reader, p *Pred, idx []uint32, dict []string, n in
 		eqMaskInto(b, idx, uint32(id))
 		return b
 	}
+	// Field-vs-field compares two columns per row, so it cannot use the
+	// per-dict-value hit table; decode the other column and compare row by row.
+	if isFieldCmp(p.Kind) {
+		idx2, dict2 := g.DictIndices(p.Field2)
+		if idx2 == nil {
+			return b
+		}
+		for i := 0; i < n && i < len(idx) && i < len(idx2); i++ {
+			if fieldCmp(dict[idx[i]], dict2[idx2[i]], p.Kind) {
+				b.Set(i)
+			}
+		}
+		return b
+	}
 	// Every other kind marks which dict values match, then maps rows through
 	// the indices. The test runs once per distinct value, not per row, so a
 	// low-cardinality column is cheap regardless of predicate complexity.
@@ -352,6 +382,17 @@ func predBitsetCol(g *storage.Reader, p *Pred, idx []uint32, dict []string, n in
 		for di, d := range dict {
 			hit[di] = containsSubstr(strings.ToLower(d), lc)
 		}
+	case Seq:
+		for di, d := range dict {
+			hit[di] = seqMatch(d, p.Values)
+		}
+	case IPv4Range:
+		lo, hi := uint32(p.Num), uint32(p.Num2)
+		for di, d := range dict {
+			if v, ok := ipToU32(d); ok {
+				hit[di] = v >= lo && v <= hi
+			}
+		}
 	}
 	for i, v := range idx {
 		if hit[v] {
@@ -374,6 +415,67 @@ func cmpNum(f float64, kind PredKind, want float64) bool {
 		return f >= want
 	}
 	return false
+}
+
+// fieldCmp compares two field values for the *_field predicates: equality is a
+// string compare; the ordered kinds compare numerically when both values parse
+// as numbers, else lexicographically.
+func fieldCmp(a, b string, kind PredKind) bool {
+	switch kind {
+	case EqField:
+		return a == b
+	case NeField:
+		return a != b
+	}
+	fa, ea := strconv.ParseFloat(a, 64)
+	fb, eb := strconv.ParseFloat(b, 64)
+	var less, eq bool
+	if ea == nil && eb == nil {
+		less, eq = fa < fb, fa == fb
+	} else {
+		less, eq = a < b, a == b
+	}
+	switch kind {
+	case LtField:
+		return less
+	case LeField:
+		return less || eq
+	case GtField:
+		return !less && !eq
+	case GeField:
+		return !less
+	}
+	return false
+}
+
+// seqMatch reports whether every phrase occurs in s in the given order.
+func seqMatch(s string, phrases []string) bool {
+	pos := 0
+	for _, ph := range phrases {
+		i := strings.Index(s[pos:], ph)
+		if i < 0 {
+			return false
+		}
+		pos += i + len(ph)
+	}
+	return true
+}
+
+// ipToU32 parses a dotted IPv4 string to its uint32, ok=false if malformed.
+func ipToU32(s string) (uint32, bool) {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return 0, false
+	}
+	var v uint32
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 || n > 255 {
+			return 0, false
+		}
+		v = v<<8 | uint32(n)
+	}
+	return v, true
 }
 
 func containsSubstr(s, sub string) bool {

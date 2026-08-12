@@ -77,6 +77,9 @@ func filterFields(e *Expr, out map[string]bool) {
 	switch e.Op {
 	case OpLeaf:
 		out[e.Pred.Field] = true
+		if e.Pred.Field2 != "" {
+			out[e.Pred.Field2] = true
+		}
 	case OpNot:
 		filterFields(e.Child, out)
 	default:
