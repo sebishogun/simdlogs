@@ -2,6 +2,8 @@ package query
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -36,14 +38,19 @@ const (
 	AggSumLen     // sum_len(field): sum of len(value) over the group
 	AggCountEmpty // count_empty(field): rows where the field is empty or missing
 	AggRowAny     // row_any(field): an arbitrary value of the field in the group
+	AggHistogram  // histogram(field): VM-style bucketed distribution as JSON
+	AggRowMin     // row_min(sort, out): out value of the row with minimal sort
+	AggRowMax     // row_max(sort, out): out value of the row with maximal sort
 )
 
 // Agg is one aggregation in a stats pipe.
 type Agg struct {
-	Field string // "" for count()
-	Alias string
-	P     float64 // percentile for quantile() (0..1)
-	Kind  AggKind
+	Field  string // "" for count(); the sort field for row_min/row_max
+	Field2 string // the output field for row_min/row_max
+	Alias  string
+	If     *Expr   // optional `if (<filter>)`: skip a sample the row does not satisfy
+	P      float64 // percentile for quantile() (0..1)
+	Kind   AggKind
 }
 
 // StatsPipe is `stats by (fields) agg1, agg2, ...`.
@@ -75,7 +82,9 @@ func (p *StatsPipe) apply(rows []Row) []Row {
 			acc[string(key)] = e
 			order = append(order, string(key))
 		}
-		accSample(e, p.Aggs, func(j int) string { return rowField(r, p.Aggs[j].Field) })
+		accSample(e, p.Aggs,
+			func(j int) string { return rowField(r, p.Aggs[j].Field) },
+			func(j int) string { return rowField(r, p.Aggs[j].Field2) })
 	}
 	out := make([]Row, 0, len(order))
 	for _, k := range order {
@@ -95,18 +104,28 @@ func newStatEntry(by []string, aggs []Agg) *statEntry {
 	return e
 }
 
-// accSample folds one sample into an entry: valOf(j) is the value of aggregation
-// j's field on this sample. Shared by the during-scan and mid-pipe stats so the
-// two never drift.
-func accSample(e *statEntry, aggs []Agg, valOf func(j int) string) {
+// accSample folds one sample into an entry: valOf(j) is the value of
+// aggregation j's field on this sample, valOf2(j) its second field (row_min/max
+// output). Shared by the during-scan and mid-pipe stats so the two never drift.
+func accSample(e *statEntry, aggs []Agg, valOf func(j int) string, valOf2 func(j int) string) {
 	e.rows++
 	for j := range aggs {
 		a := &aggs[j]
+		sl := &e.slots[j]
+		if a.Kind == AggRowMin || a.Kind == AggRowMax {
+			f, err := strconv.ParseFloat(valOf(j), 64)
+			if err != nil {
+				continue
+			}
+			if !sl.bestSet || (a.Kind == AggRowMin && f < sl.bestF) || (a.Kind == AggRowMax && f > sl.bestF) {
+				sl.bestF, sl.bestStr, sl.bestSet = f, valOf2(j), true
+			}
+			continue
+		}
 		if a.Field == "" {
 			continue // count()
 		}
 		val := valOf(j)
-		sl := &e.slots[j]
 		if a.Kind == AggUniq { // uniq returns the values, so it stays exact
 			sl.set[val] = struct{}{}
 			continue
@@ -158,7 +177,7 @@ func accSample(e *statEntry, aggs []Agg, valOf func(j int) string) {
 		if err != nil {
 			continue
 		}
-		if a.Kind == AggQuantile {
+		if a.Kind == AggQuantile || a.Kind == AggHistogram {
 			sl.vals = append(sl.vals, f)
 			if len(sl.vals) >= quantileCap*2 { // bound RAM: thin the sorted samples by half
 				sort.Float64s(sl.vals)
@@ -241,8 +260,11 @@ type statSlot struct {
 	cnt           int64 // numeric samples (avg denominator)
 	set           map[string]struct{}
 	hll           *hyperLogLog // count_uniq once the set exceeds hllThreshold (bounded RAM)
-	vals          []float64    // numeric samples for quantile() (exact)
+	vals          []float64    // numeric samples for quantile()/histogram() (exact/bounded)
 	strs          []string     // collected values for values() (bounded by valuesCap)
+	bestF         float64      // row_min/row_max: the extremal sort value
+	bestStr       string       // row_min/row_max: the out value at the extremal row
+	bestSet       bool         // row_min/row_max: whether a sample has been seen
 	has           bool
 }
 
@@ -312,6 +334,9 @@ func pipeFields(pipes []Pipe) []string {
 			for _, a := range t.Aggs {
 				if a.Field != "" {
 					add(a.Field)
+				}
+				if a.Field2 != "" {
+					add(a.Field2)
 				}
 			}
 		case *SortPipe:
@@ -428,9 +453,14 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 		}
 		aggCol := make([][]uint32, len(sp.Aggs))
 		aggDict := make([][]string, len(sp.Aggs))
+		aggCol2 := make([][]uint32, len(sp.Aggs))
+		aggDict2 := make([][]string, len(sp.Aggs))
 		for j := range sp.Aggs {
 			if sp.Aggs[j].Field != "" {
 				aggCol[j], aggDict[j] = g.DictIndices(sp.Aggs[j].Field)
+			}
+			if sp.Aggs[j].Field2 != "" {
+				aggCol2[j], aggDict2[j] = g.DictIndices(sp.Aggs[j].Field2)
 			}
 		}
 		sel.ForEach(func(i int) {
@@ -455,6 +485,11 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 			accSample(e, sp.Aggs, func(j int) string {
 				if aggCol[j] != nil {
 					return aggDict[j][aggCol[j][i]]
+				}
+				return ""
+			}, func(j int) string {
+				if aggCol2[j] != nil {
+					return aggDict2[j][aggCol2[j][i]]
 				}
 				return ""
 			})
@@ -509,8 +544,83 @@ func formatAgg(a *Agg, sl *statSlot, rows int64) string {
 			return sl.strs[0]
 		}
 		return ""
+	case AggRowMin, AggRowMax:
+		return sl.bestStr
+	case AggHistogram:
+		return histogramJSON(sl.vals)
 	}
 	return ""
+}
+
+// VictoriaMetrics standard histogram buckets: 18 per decade from 1e-9 to 1e18.
+const (
+	histBucketsPerDecimal = 18
+	histE10Min            = -9
+	histE10Max            = 18
+	histBucketsCount      = (histE10Max - histE10Min) * histBucketsPerDecimal
+)
+
+var (
+	histBucketMultiplier = math.Pow(10, 1.0/histBucketsPerDecimal)
+	histRanges           = buildHistRanges()
+)
+
+func buildHistRanges() []string {
+	r := make([]string, histBucketsCount)
+	v := math.Pow(10, histE10Min)
+	start := fmt.Sprintf("%.3e", v)
+	for i := 0; i < histBucketsCount; i++ {
+		v *= histBucketMultiplier
+		end := fmt.Sprintf("%.3e", v)
+		r[i] = start + "..." + end
+		start = end
+	}
+	return r
+}
+
+// histBucketIdx returns the VM bucket index for v (>0), or -1.
+func histBucketIdx(v float64) int {
+	if v <= 0 {
+		return -1
+	}
+	bf := (math.Log10(v) - histE10Min) * histBucketsPerDecimal
+	idx := int(bf)
+	if bf == float64(idx) { // a lower boundary belongs to the previous bucket
+		idx--
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= histBucketsCount {
+		idx = histBucketsCount - 1
+	}
+	return idx
+}
+
+// histogramJSON buckets vals into the VM ranges and renders the non-empty ones
+// in ascending order as [{"vmrange":"lo...hi","hits":n}], matching VL.
+func histogramJSON(vals []float64) string {
+	counts := map[int]int{}
+	for _, v := range vals {
+		if idx := histBucketIdx(v); idx >= 0 {
+			counts[idx]++
+		}
+	}
+	idxs := make([]int, 0, len(counts))
+	for i := range counts {
+		idxs = append(idxs, i)
+	}
+	sort.Ints(idxs)
+	var b strings.Builder
+	b.WriteByte('[')
+	for k, i := range idxs {
+		if k > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"vmrange":%q,"hits":%d}`, histRanges[i], counts[i])
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 // jsonStrArray renders values() / uniq_values() output as a JSON array string,

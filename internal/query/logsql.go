@@ -1097,11 +1097,23 @@ func (p *lqlParser) parseAgg() (Agg, error) {
 	if k := p.peek().kind; k == tIdent || k == tString {
 		field = p.next().val
 	}
+	// row_min/row_max take (sortField, outField).
+	field2 := ""
+	if kind == AggRowMin || kind == AggRowMax {
+		if p.peek().kind == tComma {
+			p.next()
+			f2 := p.next()
+			if f2.kind != tIdent && f2.kind != tString {
+				return Agg{}, fmt.Errorf("simdlogs: %s expects (sort, out) fields", fn.val)
+			}
+			field2 = f2.val
+		}
+	}
 	if p.peek().kind != tRParen {
 		return Agg{}, fmt.Errorf("simdlogs: expected ) in %s()", fn.val)
 	}
 	p.next() // )
-	a := Agg{Field: field, Kind: kind, P: pct}
+	a := Agg{Field: field, Field2: field2, Kind: kind, P: pct}
 	if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
 		p.next()
 		al := p.next()
@@ -1261,6 +1273,12 @@ func aggKind(name string) (AggKind, bool) {
 		return AggRowAny, true
 	case "count_uniq_hash": // VL's approximate distinct; our count_uniq already spills to HLL
 		return AggCountUniq, true
+	case "histogram":
+		return AggHistogram, true
+	case "row_min":
+		return AggRowMin, true
+	case "row_max":
+		return AggRowMax, true
 	}
 	return 0, false
 }
