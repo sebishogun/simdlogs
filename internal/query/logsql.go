@@ -552,7 +552,7 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, err
 			}
 			pipes = append(pipes, sp)
-		case "sort":
+		case "sort", "order":
 			sp, err := p.parseSort()
 			if err != nil {
 				return nil, err
@@ -564,7 +564,7 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, err
 			}
 			pipes = append(pipes, &LimitPipe{N: n})
-		case "fields":
+		case "fields", "keep":
 			fs, err := p.parseBareFieldList()
 			if err != nil {
 				return nil, err
@@ -604,19 +604,19 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, err
 			}
 			pipes = append(pipes, &TailPipe{N: n})
-		case "offset":
+		case "offset", "skip":
 			n, err := p.intArg()
 			if err != nil {
 				return nil, err
 			}
 			pipes = append(pipes, &OffsetPipe{N: n})
-		case "rename":
+		case "rename", "mv":
 			rp, err := p.parseRename()
 			if err != nil {
 				return nil, err
 			}
 			pipes = append(pipes, rp)
-		case "delete", "drop":
+		case "delete", "drop", "del", "rm":
 			fs, err := p.parseBareFieldList()
 			if err != nil {
 				return nil, err
@@ -750,7 +750,7 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				rp.Field = f
 			}
 			pipes = append(pipes, rp)
-		case "copy":
+		case "copy", "cp":
 			cr, err := p.parseRename() // same "a as b, c as d" grammar as rename
 			if err != nil {
 				return nil, err
