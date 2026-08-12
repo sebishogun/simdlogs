@@ -592,3 +592,57 @@ Conclusion for "can we optimize storage more without losing speed": no. Index
 (delta+zigzag+varint, ~3B/row) and the sized bloom are near-optimal; the dict's
 only further shrink (front+lz4 20%, flate 2x) costs decode speed and belongs in
 compact mode. The fast default is already at the size floor for its codec.
+
+## The rowOffsets prefix-sum table was pure redundancy: v8 count-table, -10.5% group
+
+The prior entry concluded the fast default was "already at the size floor for
+its codec." Wrong -- it missed the postings' own header. The postings blob led
+with `rowOffsets`, a dictLen+1 uint32 prefix-sum table, UNCOMPRESSED. On a
+near-unique column (trace_id: dictLen ~= rows = 128K) that is ~512KB of the
+biggest chunk in the group.
+
+No consumer ever reads it as offsets. Grep found three readers -- EqualityCount,
+EqualityRows/postingRows, ValueCounts -- and every one uses it only for a COUNT:
+`count[id] = rowOffsets[id+1] - rowOffsets[id]`. postingRows locates a value's
+data via each block's own intra-offsets, never the prefix sum. So the whole
+table was a differenced-on-read count array stored as absolute prefix sums at
+4 bytes each.
+
+v8 stores the counts directly, bit-packed at `bitWidth(maxCount+1)` (<= 17 bits,
+usually far less), self-describing via a `postV8Magic` sentinel the v7 first word
+(dictLen+1, < 2^31) can never collide with. Measured, realistic 100K-row group,
+same corpus, interleaved:
+
+    section     v7        v8       delta
+    postings    6268KB    4700KB   -25%
+    group TOTAL 14863KB   13295KB  -10.5%   (152 -> 136 bytes/row)
+
+Hot paths unaffected (perf stat instructions:u, load-independent, min of runs):
+
+    BenchmarkEngineNeedle   v8 ~345K instr/op   v7 ~357K   (postingRows)
+    BenchmarkEngineCount    v8 ~5.1M instr/op   v7 ~5.06M  (EqualityCount)
+
+Two dead-ends the counters killed on the way, both on the count READ:
+
+1. Scalar O(width) bit-loop extractor. The first extractCountBits looped `width`
+   times per value. FieldValues (ValueCounts scan) ran 6-13% MORE instructions
+   than v7's two-le32 rowOffsets subtraction -- consistent 3/3, real, not layout
+   noise. Fix: O(1) read -- one 8-byte load, shift past the sub-byte offset,
+   mask -- the same trick DictValueAt uses (width <= 25 so the value never
+   straddles the window). Instruction bump gone on the hot paths.
+
+2. SIMD bulk decode (decodeIndices/BitUnpackInto) in ValueCounts. Intuition said
+   the kernel at 2.6 Gvals/s should beat per-value reads on the full-value scan.
+   Measured across cardinality (BenchmarkValueCounts, one 128K-row group):
+   card=131072 neutral (the per-value dictSectionAt string build is ~50ms and
+   dominates -- the count read is <1%), card=8 was ~14% SLOWER because
+   decodeIndices allocates a []uint32 + word-copies the packed bytes per call
+   for a table of 8 values, and blocks=8/32=0 so no SIMD even runs. Reverted to
+   uniform scalar O(1). The count read is never the bottleneck of a value scan;
+   the string materialization is.
+
+Residual: tiny-dict ValueCounts (card <= ~32) is ~5ns/value slower than v7's
+adjacent-le32 rowOffsets read -- an O(1) 8-byte load still costs a hair more
+than two sequential reads from a hot 32-byte array. It is sub-microsecond, cold
+(field-value introspection, not the query hot path), and dwarfed by the string
+build. Traded for -10.5% on every group on disk.

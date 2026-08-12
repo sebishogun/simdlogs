@@ -178,9 +178,9 @@ func (r *Reader) DictID(name, value string) int {
 }
 
 // EqualityCount returns a dict value's id and its row count, read from
-// the posting offset table alone (a difference of two prefix sums) -- so
-// the query planner can choose the posting path for a rare value or the
-// vectorized scan for a common one without decoding anything.
+// the posting count table alone (bit-packed in v8, a prefix-sum difference
+// in v7) -- so the query planner can choose the posting path for a rare
+// value or the vectorized scan for a common one without decoding anything.
 func (r *Reader) EqualityCount(name, value string) (id, count int, ok bool) {
 	m := r.col(name)
 	if m == nil || m.Type != ColDict || m.PostLen == 0 {
@@ -194,9 +194,7 @@ func (r *Reader) EqualityCount(name, value string) (id, count int, ok bool) {
 		return -1, 0, true
 	}
 	blob := r.blob[m.PostOff : m.PostOff+m.PostLen]
-	start := le32(blob[4+id*4:])
-	end := le32(blob[4+(id+1)*4:])
-	return id, int(end - start), true
+	return id, postCount(blob, id), true
 }
 
 // EqualityRows returns the row ids where the named dict column equals
@@ -354,17 +352,29 @@ type ValueCount struct {
 }
 
 // ValueCounts returns per-value row counts for a dict column, from the
-// posting offset table alone -- each value's count is the difference of
-// two prefix sums, so no per-row index or row list is decoded.
+// posting count table alone (bit-packed in v8, prefix-sum differences in
+// v7) -- so no per-row index or row list is decoded.
 func (r *Reader) ValueCounts(name string) []ValueCount {
 	m := r.col(name)
 	if m == nil || m.Type != ColDict || m.PostLen == 0 {
 		return nil
 	}
 	blob := r.blob[m.PostOff : m.PostOff+m.PostLen]
-	no := int(le32(blob))
 	sec := r.dictSec(m)
 	out := make([]ValueCount, 0, m.DictLen)
+	// Read each count O(1) from the bit-packed table (no alloc, no decompress);
+	// the per-value dictSectionAt string build dominates this loop anyway.
+	if dictLen, cw, cs, _, ok := postV8Header(blob); ok {
+		n := m.DictLen
+		if dictLen < n {
+			n = dictLen
+		}
+		for id := 0; id < n; id++ {
+			out = append(out, ValueCount{Value: dictSectionAt(sec, m.DictLen, id), Count: extractCountBits(cs, id, cw)})
+		}
+		return out
+	}
+	no := int(le32(blob))
 	for id := 0; id+1 < no && id < m.DictLen; id++ {
 		start := le32(blob[4+id*4:])
 		end := le32(blob[4+(id+1)*4:])
