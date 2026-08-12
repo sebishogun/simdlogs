@@ -1,6 +1,10 @@
 package storage
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	"github.com/sebishogun/simd"
+)
 
 // The count table is bit-packed with the SIMD kernel (encodeIndices), whose
 // layout is plain linear LSB-first -- so any count reads O(1) via
@@ -12,7 +16,7 @@ import "encoding/binary"
 // O(1): one 8-byte little-endian load at the byte holding the value's first
 // bit, shifted past the sub-byte offset and masked to width -- the same trick
 // DictValueAt uses. width <= 25 is required so the value never straddles the
-// 8-byte window (count widths are <= bitWidth(rows) <= 17).
+// 8-byte window (count and d-gap widths are <= bitWidth(rows) <= 17).
 func extractCountBits(b []byte, index, width int) int {
 	if width == 0 {
 		return 0
@@ -25,13 +29,15 @@ func extractCountBits(b []byte, index, width int) int {
 	return int(uint32(v>>uint(bit%8)) & (uint32(1)<<uint(width) - 1))
 }
 
-// postV8Magic is the first word of a v8 postings blob (a value the v7 layout --
-// whose first word is dictLen+1, always < 2^31 -- can never produce), so the
-// blob is self-describing: readers dispatch on it, old v7 blobs still read, and
-// no group-version plumbing is needed. v8 replaces the uncompressed rowOffsets
-// prefix-sum table with bit-packed per-value counts (the only thing any
-// consumer reads from it), ~30x smaller on near-unique columns.
-const postV8Magic = 0xFFFFFFFF
+// A v8 postings blob is self-describing via its first word, a sentinel the v7
+// layout (first word = dictLen+1, always < 2^31) can never produce. Both v8
+// variants share the same bit-packed count table header; they differ only in
+// the data block section, so postCount/ValueCounts read either. Readers dispatch
+// on the sentinel and old v7 blobs still decode -- no group-version plumbing.
+const (
+	postV8Magic    = 0xFFFFFFFF // count table + LZ4 varint data blocks (superseded)
+	postV8ForMagic = 0xFFFFFFFE // count table + FOR bit-packed data blocks (default)
+)
 
 // Postings is a per-dict-column inverted index: for each dictionary id,
 // the sorted row ids holding it. It turns an equality query from "decode
@@ -39,25 +45,27 @@ const postV8Magic = 0xFFFFFFFF
 // difference the head-to-head showed load-bearing on selective queries,
 // and the plan's decision #3 (postings once selective queries dominate).
 //
-// On disk (v8): a bit-packed per-value count table then the per-id
-// delta-varint row lists block-compressed in groups of postBlock ids, each
-// block carrying its own intra-block offsets. The count table answers
-// EqualityCount/ValueCounts from the footer (no decompress); postingRows
-// decompresses the one block that holds an id. See marshal for the layout.
+// On disk (v8, FOR): a bit-packed per-value count table, then the per-id row
+// lists as frame-of-reference bit-packed d-gaps, in blocks of postBlock ids.
+// The count table answers EqualityCount/ValueCounts from the footer and also
+// locates each id's run inside its block (a prefix sum of counts) -- so no
+// intra-block offset table is stored. postingRows reads only the one id's run:
+// a scalar O(1) bit read per value for a selective list, an aligned SIMD unpack
+// for a large one. See marshal for the layout.
 //
-// The struct's rowOffsets/byteOffsets are build-time only. rowOffsets is the
-// prefix sum marshal differences into the on-disk counts; byteOffsets slices
-// the lists into blocks. Neither is persisted -- v8 stores counts, not
-// offsets, so the fat uncompressed prefix-sum table (the biggest raw chunk of
-// a near-unique group) is gone from disk, and each block's own intra-offsets
-// replace the per-id byte seek table at no on-disk cost.
+// rowOffsets and dgaps are build-time only. rowOffsets is the prefix sum
+// marshal differences into the on-disk counts and also the run index into
+// dgaps (id i's d-gaps are dgaps[rowOffsets[i]:rowOffsets[i+1]]). Neither is
+// persisted -- v8 stores counts, not offsets, so the fat uncompressed prefix-sum
+// table (the biggest raw chunk of a near-unique group) is gone from disk.
 type postings struct {
-	rowOffsets  []uint32 // build-time only: dictLen+1 prefix sums, differenced to on-disk counts
-	byteOffsets []uint32 // build-time only: byte positions used to block the data
-	data        []byte   // per-id delta-varint row id lists, concatenated
+	rowOffsets []uint32 // build-time only: dictLen+1 prefix sums (also the dgaps run index)
+	dgaps      []uint32 // build-time only: per-id d-gaps concatenated, id i's run at rowOffsets[i]
 }
 
-// buildPostings inverts per-row indices into per-id row lists.
+// buildPostings inverts per-row indices into per-id ascending row lists and
+// d-gaps them in place: id i's run lives at rowOffsets[i], and walking rows in
+// order keeps each run ascending, so the gap is always non-negative.
 func buildPostings(indices []uint32, dictLen int) postings {
 	counts := make([]uint32, dictLen)
 	for _, id := range indices {
@@ -67,48 +75,44 @@ func buildPostings(indices []uint32, dictLen int) postings {
 	for i := 0; i < dictLen; i++ {
 		rowOffsets[i+1] = rowOffsets[i] + counts[i]
 	}
-	// Bucket row ids by id, in row order (so each list is ascending).
-	lists := make([][]uint32, dictLen)
-	for i := range lists {
-		lists[i] = make([]uint32, 0, counts[i])
-	}
+	dgaps := make([]uint32, len(indices))
+	last := make([]uint32, dictLen) // last row seen per id (0 => first gap is absolute)
+	pos := make([]uint32, dictLen)  // next write index per id
+	copy(pos, rowOffsets[:dictLen])
 	for row, id := range indices {
-		lists[id] = append(lists[id], uint32(row))
+		dgaps[pos[id]] = uint32(row) - last[id]
+		last[id] = uint32(row)
+		pos[id]++
 	}
-	byteOffsets := make([]uint32, dictLen+1)
-	var data []byte
-	for i, l := range lists {
-		var prev uint32
-		for _, row := range l {
-			data = binary.AppendUvarint(data, uint64(row-prev))
-			prev = row
-		}
-		byteOffsets[i+1] = uint32(len(data))
-	}
-	return postings{rowOffsets: rowOffsets, byteOffsets: byteOffsets, data: data}
+	return postings{rowOffsets: rowOffsets, dgaps: dgaps}
 }
 
-// postBlock is how many ids share one compressed postings block.
+// postBlock is how many ids share one postings block.
 const postBlock = 64
 
-// marshal appends the v8 postings blob: a bit-packed per-value count table
-// (self-describing via the postV8Magic sentinel, so old v7 blobs still read),
-// then the per-id varint row lists block-compressed in groups of postBlock ids.
-// Each block carries its own intra-block offsets inside the compressed bytes, so
-// the ~4-byte-per-id seek table costs nothing on disk.
+// forBulkThreshold is the run length above which an aligned SIMD unpack of id's
+// run beats a per-value scalar bit read. Below it the scalar read wins (no
+// buffer, no byte->word copy); above it the kernel's throughput dominates.
+const forBulkThreshold = 256
+
+// marshal appends the v8 FOR postings blob: a bit-packed per-value count table
+// (self-describing via the postV8ForMagic sentinel, so v7/v8-LZ4 blobs still
+// read), then the per-id row lists as FOR bit-packed d-gaps in blocks of
+// postBlock ids. Each block is packed at its own max d-gap width and padded to a
+// 32-value multiple, so a sub-range aligned SIMD unpack needs no scalar tail. No
+// intra-block offset table: id's run is located by summing the count table
+// within the block.
 //
-//	postV8Magic u32, dictLen u32, countWidth u32, countBytes u32, packedCounts
+//	postV8ForMagic u32, dictLen u32, countWidth u32, countBytes u32, packedCounts
 //	numBlocks u32, blockSize u32
-//	blockIndex[numBlocks]{compOff u32, compLen u32, rawLen u32}
-//	compLen u32, compressed blocks (each raw = [cnt+1 intra-offsets][list bytes])
+//	blockIndex[numBlocks]{byteOff u32, width u32}
+//	packedLen u32, packed FOR blocks
 func (p postings) marshal(b []byte) []byte {
-	no := len(p.rowOffsets)
-	dictLen := no - 1
-	// Per-value counts (rowOffsets deltas), bit-packed. Every consumer only ever
-	// needs count[id] = rowOffsets[id+1]-rowOffsets[id]; the absolute offset is
-	// never read (postingRows locates data via the block's own intra-offsets), so
-	// the prefix-sum table was pure waste -- on near-unique columns the identity
-	// permutation stored at 4 bytes each.
+	dictLen := len(p.rowOffsets) - 1
+	// Per-value counts (rowOffsets deltas), bit-packed. Every consumer needs only
+	// count[id] = rowOffsets[id+1]-rowOffsets[id]; the absolute offset is never
+	// read, so the prefix-sum table was pure waste -- on near-unique columns the
+	// identity permutation stored at 4 bytes each.
 	counts := make([]uint32, dictLen)
 	var maxC uint32
 	for i := 0; i < dictLen; i++ {
@@ -118,63 +122,87 @@ func (p postings) marshal(b []byte) []byte {
 		}
 	}
 	cw := bitWidth(int(maxC) + 1)
-	packed := encodeIndices(counts, cw) // SIMD-kernel layout: bulk-decodable, word-padded
-	b = appU32(b, postV8Magic)
+	packedCounts := encodeIndices(counts, cw)
+	b = appU32(b, postV8ForMagic)
 	b = appU32(b, uint32(dictLen))
 	b = appU32(b, uint32(cw))
-	b = appU32(b, uint32(len(packed)))
-	b = append(b, packed...)
+	b = appU32(b, uint32(len(packedCounts)))
+	b = append(b, packedCounts...)
+
 	numBlocks := 0
 	if dictLen > 0 {
 		numBlocks = (dictLen + postBlock - 1) / postBlock
 	}
-	type blkIdx struct{ compOff, compLen, rawLen uint32 }
-	idx := make([]blkIdx, numBlocks)
-	var comp []byte
+	type fidx struct{ byteOff, width uint32 }
+	idx := make([]fidx, numBlocks)
+	var packed []byte
 	for k := 0; k < numBlocks; k++ {
 		lo := k * postBlock
 		hi := lo + postBlock
 		if hi > dictLen {
 			hi = dictLen
 		}
-		cnt := hi - lo
-		dataLo := p.byteOffsets[lo]
-		raw := make([]byte, 0, 4*(cnt+1)+int(p.byteOffsets[hi]-dataLo))
-		for j := lo; j <= hi; j++ {
-			raw = appU32(raw, p.byteOffsets[j]-dataLo) // intra-block offsets
-		}
-		raw = append(raw, p.data[dataLo:p.byteOffsets[hi]]...)
-		c := lz4Compress(raw)
-		idx[k] = blkIdx{uint32(len(comp)), uint32(len(c)), uint32(len(raw))}
-		comp = append(comp, c...)
+		dg := p.dgaps[p.rowOffsets[lo]:p.rowOffsets[hi]]
+		w := forBlockWidth(dg)
+		idx[k] = fidx{uint32(len(packed)), uint32(w)}
+		packed = appendForBlock(packed, dg, w)
 	}
 	b = appU32(b, uint32(numBlocks))
 	b = appU32(b, uint32(postBlock))
 	for _, e := range idx {
-		b = appU32(b, e.compOff)
-		b = appU32(b, e.compLen)
-		b = appU32(b, e.rawLen)
+		b = appU32(b, e.byteOff)
+		b = appU32(b, e.width)
 	}
-	b = appU32(b, uint32(len(comp)))
-	return append(b, comp...)
+	b = appU32(b, uint32(len(packed)))
+	return append(b, packed...)
 }
 
-// postV8Header returns (dictLen, countWidth, countStream, blocksSection) for a
-// v8 postings blob, or ok=false for a legacy v7 blob.
-func postV8Header(blob []byte) (dictLen, cw int, countStream, blocks []byte, ok bool) {
-	if len(blob) < 16 || binary.LittleEndian.Uint32(blob) != postV8Magic {
-		return 0, 0, nil, nil, false
+// forBlockWidth is the bit width that holds the block's largest d-gap.
+func forBlockWidth(dg []uint32) int {
+	var max uint32
+	for _, d := range dg {
+		if d > max {
+			max = d
+		}
+	}
+	return bitWidth(int(max) + 1)
+}
+
+// appendForBlock bit-packs dg at width w via the SIMD-kernel layout, padded to a
+// 32-value multiple so no partial final block exists and a sub-range aligned
+// unpack round-trips with no scalar tail. Pad waste is <= 31 values * w bits.
+func appendForBlock(dst []byte, dg []uint32, w int) []byte {
+	if len(dg) == 0 {
+		return dst
+	}
+	padded := dg
+	if r := len(dg) % 32; r != 0 {
+		padded = make([]uint32, len(dg)+(32-r))
+		copy(padded, dg)
+	}
+	return append(dst, encodeIndices(padded, w)...)
+}
+
+// postV8Header parses the shared count-table header of either v8 variant and
+// reports which data-block form follows. ok is false for a legacy v7 blob.
+func postV8Header(blob []byte) (dictLen, cw int, countStream, blocks []byte, forData, ok bool) {
+	if len(blob) < 16 {
+		return 0, 0, nil, nil, false, false
+	}
+	w := binary.LittleEndian.Uint32(blob)
+	if w != postV8Magic && w != postV8ForMagic {
+		return 0, 0, nil, nil, false, false
 	}
 	dictLen = int(binary.LittleEndian.Uint32(blob[4:]))
 	cw = int(binary.LittleEndian.Uint32(blob[8:]))
 	clen := int(binary.LittleEndian.Uint32(blob[12:]))
-	return dictLen, cw, blob[16 : 16+clen], blob[16+clen:], true
+	return dictLen, cw, blob[16 : 16+clen], blob[16+clen:], w == postV8ForMagic, true
 }
 
 // postCount returns id's row count, from the bit-packed count table (v8) or the
 // rowOffsets prefix-sum table (legacy v7).
 func postCount(blob []byte, id int) int {
-	if dictLen, cw, cs, _, ok := postV8Header(blob); ok {
+	if dictLen, cw, cs, _, _, ok := postV8Header(blob); ok {
 		if id < 0 || id >= dictLen {
 			return 0
 		}
@@ -187,16 +215,18 @@ func postCount(blob []byte, id int) int {
 	return int(binary.LittleEndian.Uint32(blob[4+(id+1)*4:]) - binary.LittleEndian.Uint32(blob[4+id*4:]))
 }
 
-// postingRows decodes id's row list, decompressing the one block that holds it.
-// The count bounds the varint decode; the block's intra-offsets locate id's list.
+// postingRows decodes id's row list, touching only the one block that holds it.
 func postingRows(blob []byte, id int) []uint32 {
-	if dictLen, cw, cs, blocks, ok := postV8Header(blob); ok {
+	if dictLen, cw, cs, blocks, forData, ok := postV8Header(blob); ok {
 		if id < 0 || id >= dictLen {
 			return nil
 		}
 		count := extractCountBits(cs, id, cw)
 		if count == 0 {
 			return nil
+		}
+		if forData {
+			return decodeForBlock(blocks, cs, cw, id, count)
 		}
 		return decodePostingBlock(blocks, id, count, dictLen)
 	}
@@ -211,9 +241,67 @@ func postingRows(blob []byte, id int) []uint32 {
 	return decodePostingBlock(blob[4+no*4:], id, count, no-1)
 }
 
-// decodePostingBlock decodes id's `count` rows from the block section (identical
-// in v7 and v8): find id's block, decompress it, slice id's varint list via the
-// block's intra-offsets, and delta-decode.
+// decodeForBlock decodes id's `count` rows from the FOR block section. It finds
+// id's block, sums the count table across the block's earlier ids to get id's
+// value offset within the block (no offset table on disk), then decodes the run.
+func decodeForBlock(blocks, countStream []byte, cw, id, count int) []uint32 {
+	numBlocks := int(binary.LittleEndian.Uint32(blocks))
+	bs := int(binary.LittleEndian.Uint32(blocks[4:]))
+	idxBase := 8
+	packedLenPos := idxBase + numBlocks*8
+	packedLen := int(binary.LittleEndian.Uint32(blocks[packedLenPos:]))
+	packed := blocks[packedLenPos+4 : packedLenPos+4+packedLen]
+	k := id / bs
+	e := idxBase + k*8
+	byteOff := int(binary.LittleEndian.Uint32(blocks[e:]))
+	w := int(binary.LittleEndian.Uint32(blocks[e+4:]))
+	end := packedLen
+	if k+1 < numBlocks {
+		end = int(binary.LittleEndian.Uint32(blocks[idxBase+(k+1)*8:]))
+	}
+	blk := packed[byteOff:end]
+	// id's run starts at the sum of counts of the earlier ids in its block (at
+	// most postBlock-1 O(1) reads, since no offset table is stored on disk).
+	lo := 0
+	for x := k * bs; x < id; x++ {
+		lo += extractCountBits(countStream, x, cw)
+	}
+	return decodeForRun(blk, w, lo, count)
+}
+
+// decodeForRun prefix-sums cnt d-gaps starting at value lo in a FOR block. A
+// short run reads each value O(1) scalar (no buffer); a long run unpacks the
+// aligned 32-blocks covering it with the SIMD kernel (the block is padded to a
+// 32-multiple, so there is no partial-block tail to read scalar).
+func decodeForRun(blk []byte, w, lo, cnt int) []uint32 {
+	out := make([]uint32, 0, cnt)
+	var acc uint32
+	if cnt >= forBulkThreshold {
+		words := make([]uint32, len(blk)/4)
+		for i := range words {
+			words[i] = binary.LittleEndian.Uint32(blk[i*4:])
+		}
+		startBlk := lo / 32
+		startVal := lo % 32
+		nBlk := (startVal + cnt + 31) / 32
+		scratch := make([]uint32, nBlk*32)
+		simd.BitUnpackInto(scratch, words[startBlk*w:], int32(w))
+		for i := startVal; i < startVal+cnt; i++ {
+			acc += scratch[i]
+			out = append(out, acc)
+		}
+		return out
+	}
+	for i := lo; i < lo+cnt; i++ {
+		acc += uint32(extractCountBits(blk, i, w))
+		out = append(out, acc)
+	}
+	return out
+}
+
+// decodePostingBlock decodes id's `count` rows from a legacy LZ4 block section
+// (v7, and the superseded v8-LZ4): find id's block, decompress it, slice id's
+// varint list via the block's intra-offsets, and delta-decode.
 func decodePostingBlock(blocks []byte, id, count, dictLen int) []uint32 {
 	numBlocks := int(binary.LittleEndian.Uint32(blocks))
 	bs := int(binary.LittleEndian.Uint32(blocks[4:]))

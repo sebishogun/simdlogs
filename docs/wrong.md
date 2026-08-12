@@ -646,3 +646,60 @@ adjacent-le32 rowOffsets read -- an O(1) 8-byte load still costs a hair more
 than two sequential reads from a hot 32-byte array. It is sub-microsecond, cold
 (field-value introspection, not the query hot path), and dwarfed by the string
 build. Traded for -10.5% on every group on disk.
+
+## FOR bit-packing the postings data: postings -55%, decode faster on the hot path
+
+The count-table entry above left the data section -- the per-id row lists -- as
+delta-varint compressed with LZ4 in 64-id blocks, each block also carrying a
+cnt+1 uint32 intra-offset table. Frame-of-reference bit-packing (FOR) replaces
+both: bit-pack each block's d-gaps at the block's max width, drop the offset
+table entirely (id's run is located by summing the count table within its
+block), self-describing via a second sentinel (postV8ForMagic 0xFFFFFFFE)
+alongside the LZ4-data v8 and legacy v7, all three still readable.
+
+Footprint, realistic 100K-row group, same corpus:
+
+    section     v7        v8 count-table   v8 FOR    vs v7
+    postings    6268KB    4700KB           2815KB    -55%
+    group TOTAL 14863KB   13295KB          11410KB   -23%   (152 -> 116 B/row)
+
+The postings drop is bigger than the isolated 1.02-1.23x FOR-vs-LZ4 size test
+predicted, because that test measured only the packed d-gaps; dropping the
+per-block offset table (65 uint32 per 64 ids, which LZ4 compressed poorly on
+near-unique columns) is the rest.
+
+Decode, single-id retrieval through the production readers (postingRows, v7-LZ4
+blob vs v8-FOR blob, interleaved):
+
+    regime        LZ4+varint   FOR        note
+    near-unique   ~128 ns      ~167 ns    +39 ns, the count-sum cost
+    medium        ~575 ns      ~420 ns    1.4x faster
+    low-card      ~89 us       ~56 us     1.6x faster (aligned SIMD unpack)
+
+FOR reads ONLY id's run -- a scalar O(1) bit read per value for a short list, an
+aligned SIMD unpack (block padded to a 32-value multiple, no partial-block tail)
+for a long one -- while the LZ4 path must decompress the whole 64-id block to
+reach one id's varint list. That is the medium/low-card win.
+
+The near-unique +39 ns is the one cost: with no offset table, id's value offset
+inside its block is a sum of up to 63 counts (extractCountBits each), averaging
+~32 for a random id. It does NOT show end to end -- BenchmarkEngineNeedle runs
+FEWER instructions with FOR (315.3K vs 324.6K per op, fixed-iteration
+instructions:u), because the needle query is dominated by the bloom sweep and
+dict search, not the one postings read. Count queries measured faster too.
+
+Two things that do NOT help, measured:
+
+1. SIMD-summing the block's counts to get the offset. A block holds only
+   postBlock=64 ids, so the prefix summed is always < 64 values -- below any
+   threshold where a BitUnpackInto of 64 (fixed kernel cost) beats ~32 scalar
+   reads. The SIMD-sum path is unreachable dead code; removed.
+2. Re-adding a compact bit-packed intra-block offset table to make near-unique
+   O(1). It restores ~114KB (postBlock cumulative counts, ~56 B/block over ~2048
+   blocks) -- eroding a third of the FOR data saving -- to remove a +39 ns that
+   is already invisible end to end. Not worth it.
+
+Verified: TestV7BackCompat decodes a legacy LZ4 blob identically to the FOR blob
+built from the same data; the storage/query suites pass under both the SIMD
+kernels and -tags purego (the ref path other arches use); arm64, s390x
+(big-endian), ppc64le, riscv64 cross-build.

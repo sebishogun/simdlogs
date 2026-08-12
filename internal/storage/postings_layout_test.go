@@ -1,6 +1,9 @@
 package storage
 
-import "testing"
+import (
+	"encoding/binary"
+	"testing"
+)
 
 // TestCountLayoutEquiv pins the count table's two decode views: the SIMD-kernel
 // bulk decode (decodeIndices) and the scalar O(1) single read (extractCountBits,
@@ -35,13 +38,21 @@ func TestCountLayoutEquiv(t *testing.T) {
 }
 
 // marshalV7 writes the legacy v7 postings blob (uncompressed rowOffsets prefix
-// sums, then the identical block section) so the back-compat read path has a
-// fixture. New code never writes this; the readers must still decode it.
+// sums, then LZ4 delta-varint blocks) so the back-compat read path has a
+// fixture. New code never writes this; the readers must still decode it. The
+// v7 varint data is reconstructed from the d-gaps (row-prev == the gap).
 func marshalV7(p postings) []byte {
+	dictLen := len(p.rowOffsets) - 1
+	byteOffsets := make([]uint32, dictLen+1)
+	var data []byte
+	for id := 0; id < dictLen; id++ {
+		for _, g := range p.dgaps[p.rowOffsets[id]:p.rowOffsets[id+1]] {
+			data = binary.AppendUvarint(data, uint64(g))
+		}
+		byteOffsets[id+1] = uint32(len(data))
+	}
 	var b []byte
-	no := len(p.rowOffsets)
-	dictLen := no - 1
-	b = appU32(b, uint32(no))
+	b = appU32(b, uint32(dictLen+1))
 	for _, o := range p.rowOffsets {
 		b = appU32(b, o)
 	}
@@ -59,12 +70,12 @@ func marshalV7(p postings) []byte {
 			hi = dictLen
 		}
 		cnt := hi - lo
-		dataLo := p.byteOffsets[lo]
-		raw := make([]byte, 0, 4*(cnt+1)+int(p.byteOffsets[hi]-dataLo))
+		dataLo := byteOffsets[lo]
+		raw := make([]byte, 0, 4*(cnt+1)+int(byteOffsets[hi]-dataLo))
 		for j := lo; j <= hi; j++ {
-			raw = appU32(raw, p.byteOffsets[j]-dataLo)
+			raw = appU32(raw, byteOffsets[j]-dataLo)
 		}
-		raw = append(raw, p.data[dataLo:p.byteOffsets[hi]]...)
+		raw = append(raw, data[dataLo:byteOffsets[hi]]...)
 		c := lz4Compress(raw)
 		idx[k] = blkIdx{uint32(len(comp)), uint32(len(c)), uint32(len(raw))}
 		comp = append(comp, c...)
@@ -81,8 +92,8 @@ func marshalV7(p postings) []byte {
 }
 
 // TestV7BackCompat verifies the readers decode a legacy v7 blob identically to
-// a v8 blob built from the same data -- the sentinel dispatch must route old
-// files to the v7 path (first word = dictLen+1, never postV8Magic).
+// the v8 FOR blob built from the same data -- the sentinel dispatch must route
+// old files to the v7 LZ4 path (first word = dictLen+1, never a v8 sentinel).
 func TestV7BackCompat(t *testing.T) {
 	// Mixed cardinality: singletons, repeats, one empty id, and a >64-id case
 	// that spans two blocks.

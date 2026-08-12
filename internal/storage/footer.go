@@ -364,7 +364,7 @@ func (r *Reader) ValueCounts(name string) []ValueCount {
 	out := make([]ValueCount, 0, m.DictLen)
 	// Read each count O(1) from the bit-packed table (no alloc, no decompress);
 	// the per-value dictSectionAt string build dominates this loop anyway.
-	if dictLen, cw, cs, _, ok := postV8Header(blob); ok {
+	if dictLen, cw, cs, _, _, ok := postV8Header(blob); ok {
 		n := m.DictLen
 		if dictLen < n {
 			n = dictLen
