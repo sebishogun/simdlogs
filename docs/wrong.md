@@ -559,3 +559,36 @@ unchanged (fast LZ4). This is the measured confirmation that footprint parity
 with VL is not reachable without also sacrificing query speed -- the index and
 the fast codec are the speed, and they are the size. The default position
 stands: faster than VL on every query + ingest, 3.47x its disk.
+
+## Front-coding the sorted dict is NOT a free win -- size-neutral alone (2026-08)
+
+Hypothesis: the dict is stored sorted, so front-coding (shared-prefix-len +
+suffix) should shrink it losslessly AND decode faster than LZ4, since our LZ4
+gets only 1.05x on trace_id -- seemingly failing to exploit the sorted prefix.
+Measured on the realistic dict (TestCodecCeiling), per-64-value block:
+
+    column    lz4      front    front+lz4   flate
+    path      3.99x    5.60x    6.60x       7.91x
+    pod       2.74x    3.60x    4.04x       5.49x
+    _msg      4.08x    2.61x    4.90x       9.09x   <- front ALONE worse
+    trace_id  1.05x    1.12x    1.12x       1.96x   <- random hex, no prefix
+    span_id   1.13x    1.28x    1.28x       2.09x
+    TOTAL     2.05x    2.04x    2.46x       3.99x
+
+Front-coding ALONE ties LZ4 overall (2.04x vs 2.05x). It wins on structured
+columns (paths, pods share real prefixes) but LOSES on _msg -- LZ4 captures the
+internal repetition in log messages that front-coding disrupts -- and barely
+helps trace_id/span_id, because SORTED RANDOM HEX shares almost no prefix
+(adjacent 16-char random ids agree on ~1 char). The 1.05x on trace_id was not
+LZ4 failing to find a prefix; there is no prefix to find.
+
+front+lz4 is 20% smaller than lz4 (2.46x), >= lz4 on every column, but adds a
+sequential front-decode pass on top of the LZ4 decode -- so it is slower, not
+faster. That makes it another size-for-speed lever (a better-ratio compact-mode
+codec than flate, at less slowdown), not a free default win.
+
+Conclusion for "can we optimize storage more without losing speed": no. Index
+(ceil(log2 distinct) bits/row) is information-theoretically minimal; timestamps
+(delta+zigzag+varint, ~3B/row) and the sized bloom are near-optimal; the dict's
+only further shrink (front+lz4 20%, flate 2x) costs decode speed and belongs in
+compact mode. The fast default is already at the size floor for its codec.
