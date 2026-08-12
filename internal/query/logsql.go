@@ -435,6 +435,36 @@ func (p *lqlParser) parseMatcher(field string) (Pred, error) {
 		}
 		p.next() // )
 		return Pred{Field: field, Kind: In, Values: vals}, nil
+	case t.kind == tIdent && strings.EqualFold(t.val, "range") && p.peekAt(1).kind == tLParen:
+		lo, hi, err := p.twoNumArgs("range")
+		if err != nil {
+			return Pred{}, err
+		}
+		return Pred{Field: field, Kind: RangeNum, Num: lo, Num2: hi}, nil
+	case t.kind == tIdent && strings.EqualFold(t.val, "len_range") && p.peekAt(1).kind == tLParen:
+		lo, hi, err := p.twoNumArgs("len_range")
+		if err != nil {
+			return Pred{}, err
+		}
+		return Pred{Field: field, Kind: LenRange, Num: lo, Num2: hi}, nil
+	case t.kind == tIdent && strings.EqualFold(t.val, "string_range") && p.peekAt(1).kind == tLParen:
+		lo, hi, err := p.twoStrArgs("string_range")
+		if err != nil {
+			return Pred{}, err
+		}
+		return Pred{Field: field, Kind: StringRange, Value: lo, Value2: hi}, nil
+	case t.kind == tIdent && strings.EqualFold(t.val, "i") && p.peekAt(1).kind == tLParen:
+		p.next() // i
+		p.next() // (
+		v, err := p.value()
+		if err != nil {
+			return Pred{}, err
+		}
+		if p.peek().kind != tRParen {
+			return Pred{}, fmt.Errorf("simdlogs: expected ) in i()")
+		}
+		p.next() // )
+		return Pred{Field: field, Kind: IContains, Value: v}, nil
 	default:
 		v, err := p.value()
 		if err != nil {
@@ -449,6 +479,52 @@ func (p *lqlParser) parseMatcher(field string) (Pred, error) {
 			return Pred{Field: field, Kind: Eq, Value: v}, nil
 		}
 	}
+}
+
+// twoNumArgs parses `name(lo, hi)` as two float64s (the peeked ident is name).
+func (p *lqlParser) twoNumArgs(name string) (float64, float64, error) {
+	p.next() // name
+	p.next() // (
+	a := p.next()
+	lo, err := strconv.ParseFloat(a.val, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("simdlogs: %s: want number, got %q", name, a.val)
+	}
+	if p.peek().kind == tComma {
+		p.next()
+	}
+	b := p.next()
+	hi, err := strconv.ParseFloat(b.val, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("simdlogs: %s: want number, got %q", name, b.val)
+	}
+	if p.peek().kind != tRParen {
+		return 0, 0, fmt.Errorf("simdlogs: expected ) in %s()", name)
+	}
+	p.next() // )
+	return lo, hi, nil
+}
+
+// twoStrArgs parses `name(a, b)` as two string values.
+func (p *lqlParser) twoStrArgs(name string) (string, string, error) {
+	p.next() // name
+	p.next() // (
+	lo, err := p.value()
+	if err != nil {
+		return "", "", err
+	}
+	if p.peek().kind == tComma {
+		p.next()
+	}
+	hi, err := p.value()
+	if err != nil {
+		return "", "", err
+	}
+	if p.peek().kind != tRParen {
+		return "", "", fmt.Errorf("simdlogs: expected ) in %s()", name)
+	}
+	p.next() // )
+	return lo, hi, nil
 }
 
 func (p *lqlParser) value() (string, error) {

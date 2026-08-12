@@ -29,26 +29,32 @@ type Query struct {
 type PredKind uint8
 
 const (
-	Eq       PredKind = iota // field := value   (dict-id equality)
-	Contains                 // field ~ substr   (substring, bloom-skippable)
-	Regexp                   // field ~ /re/     (RE2 on survivors only)
-	Lt                       // field < num      (numeric compare over the dict)
-	Le                       // field <= num
-	Gt                       // field > num
-	Ge                       // field >= num
-	In                       // field in (a,b,c) (set membership)
-	Prefix                   // field = val*     (dict range on a prefix)
+	Eq          PredKind = iota // field := value   (dict-id equality)
+	Contains                    // field ~ substr   (substring, bloom-skippable)
+	Regexp                      // field ~ /re/     (RE2 on survivors only)
+	Lt                          // field < num      (numeric compare over the dict)
+	Le                          // field <= num
+	Gt                          // field > num
+	Ge                          // field >= num
+	In                          // field in (a,b,c) (set membership)
+	Prefix                      // field = val*     (dict range on a prefix)
+	RangeNum                    // range(lo,hi)     (numeric, inclusive both ends)
+	LenRange                    // len_range(lo,hi) (value byte-length, inclusive)
+	StringRange                 // string_range(a,b)(lexicographic a <= v < b)
+	IContains                   // i(phrase)        (case-insensitive substring)
 )
 
 // Pred is one field predicate. Fields ordered large-to-small (pointers and
 // strings, then float64, then the byte-sized Kind last) to avoid interior
 // padding.
 type Pred struct {
-	Field  string         // Eq/Contains/Regexp/Prefix key
-	Value  string         // Eq/Contains/Regexp/Prefix value
+	Field  string         // Eq/Contains/Regexp/Prefix/IContains key
+	Value  string         // Eq/Contains/Regexp/Prefix/IContains value, StringRange lo
+	Value2 string         // StringRange hi
 	Values []string       // In
 	re     *regexp.Regexp // compiled Regexp
-	Num    float64        // Lt/Le/Gt/Ge
+	Num    float64        // Lt/Le/Gt/Ge bound, Range/LenRange lo
+	Num2   float64        // Range/LenRange hi
 	Kind   PredKind
 }
 
@@ -325,6 +331,26 @@ func predBitsetCol(g *storage.Reader, p *Pred, idx []uint32, dict []string, n in
 			if f, err := strconv.ParseFloat(d, 64); err == nil {
 				hit[di] = cmpNum(f, p.Kind, p.Num)
 			}
+		}
+	case RangeNum:
+		for di, d := range dict {
+			if f, err := strconv.ParseFloat(d, 64); err == nil {
+				hit[di] = f >= p.Num && f <= p.Num2
+			}
+		}
+	case LenRange:
+		for di, d := range dict {
+			l := float64(len(d))
+			hit[di] = l >= p.Num && l <= p.Num2
+		}
+	case StringRange:
+		for di, d := range dict {
+			hit[di] = d >= p.Value && d < p.Value2 // VL: a <= v < b
+		}
+	case IContains:
+		lc := strings.ToLower(p.Value)
+		for di, d := range dict {
+			hit[di] = containsSubstr(strings.ToLower(d), lc)
 		}
 	}
 	for i, v := range idx {
