@@ -82,3 +82,30 @@ func TestUnpackSyslog(t *testing.T) {
 		}
 	}
 }
+
+func TestJSONArrayLenAndWords(t *testing.T) {
+	s, err := storage.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := storage.BuildDict([]string{`the quick brown fox the fox`})
+	arr := storage.BuildDict([]string{`[1,2,3,4]`})
+	if _, err := s.AppendGroup(&storage.Group{Rows: 1, Columns: []storage.Column{
+		{Name: "_time", Type: storage.ColTimestamp, Ts: []int64{1}},
+		{Name: "_msg", Type: storage.ColDict, Dict: &msg},
+		{Name: "arr", Type: storage.ColDict, Dict: &arr},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	run := func(q string) Row {
+		pq, _ := ParseLogsQL(q)
+		pq.From, pq.To = 0, int64(1)<<62
+		return RunPipeline(s, pq)[0]
+	}
+	if got := rowField(run(`* | json_array_len(arr) as n`), "n"); got != "4" {
+		t.Errorf("json_array_len = %q want 4", got)
+	}
+	if got := rowField(run(`* | unpack_words as w`), "w"); got != `["brown","fox","quick","the"]` {
+		t.Errorf("unpack_words = %q", got)
+	}
+}

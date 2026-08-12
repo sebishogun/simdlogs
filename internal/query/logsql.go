@@ -910,6 +910,48 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				up.From = f
 			}
 			pipes = append(pipes, up)
+		case "json_array_len":
+			if p.peek().kind != tLParen {
+				return nil, fmt.Errorf("simdlogs: json_array_len expects (field)")
+			}
+			p.next() // (
+			fld, err := p.value()
+			if err != nil {
+				return nil, err
+			}
+			if p.peek().kind != tRParen {
+				return nil, fmt.Errorf("simdlogs: json_array_len: expected )")
+			}
+			p.next() // )
+			jp := &JSONArrayLenPipe{Field: fld, As: "json_array_len"}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
+				p.next()
+				a, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				jp.As = a
+			}
+			pipes = append(pipes, jp)
+		case "unpack_words":
+			wp := &UnpackWordsPipe{}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "from") {
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				wp.From = f
+			}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
+				p.next()
+				a, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				wp.As = a
+			}
+			pipes = append(pipes, wp)
 		default:
 			return nil, fmt.Errorf("simdlogs: unknown pipe %q", name.val)
 		}

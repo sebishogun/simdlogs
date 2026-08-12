@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -268,6 +269,54 @@ func emitNonNil(emit func(k, v string), k, v string) {
 	if v != "-" && v != "" {
 		emit(k, v)
 	}
+}
+
+// JSONArrayLenPipe is `json_array_len(field) as result` -- the element count of
+// a JSON-array field (0 if the field is not a JSON array).
+type JSONArrayLenPipe struct{ Field, As string }
+
+func (p *JSONArrayLenPipe) apply(rows []Row) []Row {
+	as := orDefault(p.As, "json_array_len")
+	for ri := range rows {
+		n := 0
+		var arr []json.RawMessage
+		if json.Unmarshal([]byte(rowField(rows[ri], p.Field)), &arr) == nil {
+			n = len(arr)
+		}
+		setRowField(&rows[ri], as, strconv.Itoa(n))
+	}
+	return rows
+}
+
+// UnpackWordsPipe is `unpack_words [from field] [as result]` -- the sorted set
+// of distinct words in a field, as a JSON array. Default field _msg, result words.
+type UnpackWordsPipe struct{ From, As string }
+
+func (p *UnpackWordsPipe) apply(rows []Row) []Row {
+	from := orDefault(p.From, "_msg")
+	as := orDefault(p.As, "words")
+	for ri := range rows {
+		setRowField(&rows[ri], as, jsonStrArray(distinctWords(rowField(rows[ri], from))))
+	}
+	return rows
+}
+
+// distinctWords splits on non-alphanumeric runs and returns the sorted distinct
+// words.
+func distinctWords(s string) []string {
+	seen := map[string]struct{}{}
+	var words []string
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_')
+	})
+	for _, w := range fields {
+		if _, ok := seen[w]; !ok {
+			seen[w] = struct{}{}
+			words = append(words, w)
+		}
+	}
+	sort.Strings(words)
+	return words
 }
 
 // SamplePipe is `sample N` -- keep every Nth row (deterministic 1/N sampling).

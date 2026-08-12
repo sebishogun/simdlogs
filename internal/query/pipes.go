@@ -360,6 +360,10 @@ func pipeFields(pipes []Pipe) []string {
 			add(t.Field)
 		case *UnpackSyslogPipe:
 			add(orDefault(t.From, "_msg"))
+		case *JSONArrayLenPipe:
+			add(t.Field)
+		case *UnpackWordsPipe:
+			add(orDefault(t.From, "_msg"))
 		}
 	}
 	return out
