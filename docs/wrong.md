@@ -703,3 +703,21 @@ Verified: TestV7BackCompat decodes a legacy LZ4 blob identically to the FOR blob
 built from the same data; the storage/query suites pass under both the SIMD
 kernels and -tags purego (the ref path other arches use); arm64, s390x
 (big-endian), ppc64le, riscv64 cross-build.
+
+## StreamVByte not added: byte-granular loses to FOR's bit-granular on size (2026-08)
+
+Task #245 planned a StreamVByte SIMD codec as the postings d-gap encoding, on
+the theory it decodes faster than bit-packing (branchless, one control byte per
+four values). It was gated on "only if FOR is not fast/small enough." FOR turned
+out both smaller and faster (entry above), so #245 was closed without building
+it.
+
+StreamVByte stores each value in 1-4 whole bytes; FOR bit-packs at the block's
+exact width. On these d-gaps the widths are small and uniform (a near-unique
+column's gaps are ~log2(rows) = 17 bits, a low-card column's a handful) -- FOR
+packs 17 bits where StreamVByte would spend 24 (3 bytes) plus 2 control bits, and
+low-card gaps fit ~5 bits where StreamVByte spends a whole byte. Byte-granular is
+strictly coarser here, so StreamVByte would grow the postings section FOR just
+cut 55%. Its decode-speed edge is on large contiguous lists, which the postings
+path reaches only above the count>n/8 crossover (the non-selective case, already
+served by FOR's aligned SIMD unpack). No size win, no speed need -- not built.
