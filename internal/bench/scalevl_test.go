@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -98,9 +99,23 @@ func TestScaleVsVL(t *testing.T) {
 	nq := url.Values{"query": {"trace:=" + needle}, "start": {full}, "end": {fullEnd}}.Encode()
 	sq := url.Values{"query": {"service:=auth"}, "start": {wlo}, "end": {whi}}.Encode()
 	hq := url.Values{"query": {"service:=auth"}, "start": {wlo}, "end": {whi}, "step": {"1m"}}.Encode()
-	slNeedle := timeQuery(t, func() { get(t, sl.URL+"/select/logsql/query?"+nq) })
-	slSel := timeQuery(t, func() { get(t, sl.URL+"/select/logsql/query?"+sq) })
-	slAgg := timeQuery(t, func() { get(t, sl.URL+"/select/logsql/hits?"+hq) })
+	// Measure the three queries in a randomized order per run, so no query
+	// systematically pays first-touch costs.
+	measure := func(base string) map[string]time.Duration {
+		qs := []struct{ name, url string }{
+			{"needle", base + "/select/logsql/query?" + nq},
+			{"selective", base + "/select/logsql/query?" + sq},
+			{"agg", base + "/select/logsql/hits?" + hq},
+		}
+		rand.Shuffle(len(qs), func(i, j int) { qs[i], qs[j] = qs[j], qs[i] })
+		out := map[string]time.Duration{}
+		for _, q := range qs {
+			out[q.name] = timeQuery(t, func() { get(t, q.url) })
+		}
+		return out
+	}
+	slM := measure(sl.URL)
+	slNeedle, slSel, slAgg := slM["needle"], slM["selective"], slM["agg"]
 	t.Logf("simdlogs  N=%d: ingest %v (%.2fM rec/s) | needle %v selective %v agg %v",
 		N, slIngest.Round(time.Millisecond), float64(N)/slIngest.Seconds()/1e6, slNeedle, slSel, slAgg)
 
@@ -132,9 +147,8 @@ func TestScaleVsVL(t *testing.T) {
 	streamChunks(func(c []byte) { post(t, vl+"/insert/jsonline", c) })
 	time.Sleep(5 * time.Second) // let VL flush before querying
 	vlIngest := time.Since(t0)
-	vlNeedle := timeQuery(t, func() { get(t, vl+"/select/logsql/query?"+nq) })
-	vlSel := timeQuery(t, func() { get(t, vl+"/select/logsql/query?"+sq) })
-	vlAgg := timeQuery(t, func() { get(t, vl+"/select/logsql/hits?"+hq) })
+	vlM := measure(vl)
+	vlNeedle, vlSel, vlAgg := vlM["needle"], vlM["selective"], vlM["agg"]
 	t.Logf("victorialogs N=%d: ingest %v (%.2fM rec/s) | needle %v selective %v agg %v",
 		N, vlIngest.Round(time.Millisecond), float64(N)/vlIngest.Seconds()/1e6, vlNeedle, vlSel, vlAgg)
 

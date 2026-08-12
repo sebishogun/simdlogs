@@ -3,6 +3,7 @@ package bench
 import (
 	"bytes"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -100,6 +101,7 @@ func TestRealistic(t *testing.T) {
 	slIngest := time.Since(t0)
 
 	mix := realQueries(lo, hi, needle)
+	rand.Shuffle(len(mix), func(i, j int) { mix[i], mix[j] = mix[j], mix[i] }) // randomize query order per run
 	t.Logf("simdlogs N=%d: ingest %v (%.2fM rec/s)", N, slIngest.Round(time.Millisecond), float64(N)/slIngest.Seconds()/1e6)
 	slT := map[string]time.Duration{}
 	for _, m := range mix {
