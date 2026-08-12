@@ -303,6 +303,14 @@ func pipeFields(pipes []Pipe) []string {
 			add(orDefault(t.Field, "_msg"))
 		case *RankPipe:
 			add(orDefault(t.Field, "_msg"))
+		case *UnpackLogfmtPipe:
+			add(orDefault(t.From, "_msg"))
+		case *ReplacePipe:
+			add(orDefault(t.Field, "_msg"))
+		case *CopyPipe:
+			add(t.From...)
+		case *LenPipe:
+			add(t.Field)
 		}
 	}
 	return out

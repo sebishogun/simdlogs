@@ -625,6 +625,86 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				rp.Field = f
 			}
 			pipes = append(pipes, rp)
+		case "unpack_logfmt":
+			up := &UnpackLogfmtPipe{}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "from") {
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				up.From = f
+			}
+			if p.peek().kind == tIdent && (strings.EqualFold(p.peek().val, "prefix") || strings.EqualFold(p.peek().val, "result_prefix")) {
+				p.next()
+				pf, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				up.Prefix = pf
+			}
+			pipes = append(pipes, up)
+		case "replace", "replace_regexp":
+			if p.peek().kind != tLParen {
+				return nil, fmt.Errorf("simdlogs: %s expects (\"old\", \"new\")", name.val)
+			}
+			p.next() // (
+			oldv, err := p.value()
+			if err != nil {
+				return nil, err
+			}
+			if p.peek().kind == tComma {
+				p.next()
+			}
+			newv, err := p.value()
+			if err != nil {
+				return nil, err
+			}
+			if p.peek().kind != tRParen {
+				return nil, fmt.Errorf("simdlogs: %s: expected )", name.val)
+			}
+			p.next() // )
+			rp := &ReplacePipe{Old: oldv, New: newv, Regexp: strings.EqualFold(name.val, "replace_regexp")}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "at") {
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				rp.Field = f
+			}
+			pipes = append(pipes, rp)
+		case "copy":
+			cr, err := p.parseRename() // same "a as b, c as d" grammar as rename
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &CopyPipe{From: cr.From, To: cr.To})
+		case "len":
+			if p.peek().kind != tLParen {
+				return nil, fmt.Errorf("simdlogs: len expects (field)")
+			}
+			p.next() // (
+			fld, err := p.value()
+			if err != nil {
+				return nil, err
+			}
+			if p.peek().kind != tRParen {
+				return nil, fmt.Errorf("simdlogs: len: expected )")
+			}
+			p.next() // )
+			lp := &LenPipe{Field: fld, As: "len"}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
+				p.next()
+				a, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				lp.As = a
+			}
+			pipes = append(pipes, lp)
+		case "drop_empty_fields":
+			pipes = append(pipes, &DropEmptyPipe{})
 		case "collapse_nums", "pattern":
 			cp := &CollapseNumsPipe{Full: strings.EqualFold(name.val, "pattern")}
 			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "at") {
