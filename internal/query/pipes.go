@@ -364,6 +364,8 @@ func pipeFields(pipes []Pipe) []string {
 			add(t.Field)
 		case *UnpackWordsPipe:
 			add(orDefault(t.From, "_msg"))
+		case *HashPipe:
+			add(t.Field)
 		}
 	}
 	return out

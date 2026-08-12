@@ -3,11 +3,26 @@ package query
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 )
+
+// HashPipe is `hash(field) as result` -- a stable 64-bit FNV-1a hash of the
+// field value, hex-encoded (for grouping or anonymizing a high-cardinality key).
+type HashPipe struct{ Field, As string }
+
+func (p *HashPipe) apply(rows []Row) []Row {
+	as := orDefault(p.As, "hash")
+	for ri := range rows {
+		h := fnv.New64a()
+		h.Write([]byte(rowField(rows[ri], p.Field)))
+		setRowField(&rows[ri], as, strconv.FormatUint(h.Sum64(), 16))
+	}
+	return rows
+}
 
 // More LogsQL pipes for VictoriaLogs parity: extract_regexp, decolorize,
 // pack_json, pack_logfmt, sample. Each is a row transform in the same shape as

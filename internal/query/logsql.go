@@ -828,9 +828,9 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, err
 			}
 			pipes = append(pipes, &CopyPipe{From: cr.From, To: cr.To})
-		case "len":
+		case "len", "hash":
 			if p.peek().kind != tLParen {
-				return nil, fmt.Errorf("simdlogs: len expects (field)")
+				return nil, fmt.Errorf("simdlogs: %s expects (field)", name.val)
 			}
 			p.next() // (
 			fld, err := p.value()
@@ -838,19 +838,27 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, err
 			}
 			if p.peek().kind != tRParen {
-				return nil, fmt.Errorf("simdlogs: len: expected )")
+				return nil, fmt.Errorf("simdlogs: %s: expected )", name.val)
 			}
 			p.next() // )
-			lp := &LenPipe{Field: fld, As: "len"}
+			isHash := strings.EqualFold(name.val, "hash")
+			as := "len"
+			if isHash {
+				as = "hash"
+			}
 			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "as") {
 				p.next()
 				a, err := p.value()
 				if err != nil {
 					return nil, err
 				}
-				lp.As = a
+				as = a
 			}
-			pipes = append(pipes, lp)
+			if isHash {
+				pipes = append(pipes, &HashPipe{Field: fld, As: as})
+			} else {
+				pipes = append(pipes, &LenPipe{Field: fld, As: as})
+			}
 		case "drop_empty_fields":
 			pipes = append(pipes, &DropEmptyPipe{})
 		case "collapse_nums", "pattern":
