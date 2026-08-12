@@ -39,10 +39,6 @@ func flateDecompress(src []byte, rawLen int) []byte {
 // most of a group's bytes; compressing them is the footprint lever at
 // scale.
 
-// LZ4CompressExported exposes the in-tree LZ4 compressor for benchmarks that
-// measure codec ratios against it.
-func LZ4CompressExported(src []byte) []byte { return lz4Compress(src) }
-
 // lz4Compress produces a raw LZ4 block from src via a greedy hash-table
 // match finder. Format: LZ4 sequences (token, literal-length ext,
 // literals, offset, match-length ext), matching simd.LZ4BlockDecode.
