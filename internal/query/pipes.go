@@ -356,6 +356,10 @@ func pipeFields(pipes []Pipe) []string {
 			add(orDefault(t.Field, "_msg"))
 		case *PackPipe:
 			add(t.Fields...) // explicit fields from storage; pack-all uses whatever rows already carry
+		case *UnrollPipe:
+			add(t.Field)
+		case *UnpackSyslogPipe:
+			add(orDefault(t.From, "_msg"))
 		}
 	}
 	return out

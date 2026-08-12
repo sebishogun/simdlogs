@@ -2,6 +2,7 @@ package query
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -134,6 +135,139 @@ func packLogfmt(r Row, keys []string) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// UnrollPipe is `unroll (field)` -- explode a field holding a JSON array (or a
+// whitespace-separated list) into one row per element, the other fields copied.
+type UnrollPipe struct{ Field string }
+
+func (p *UnrollPipe) apply(rows []Row) []Row {
+	out := make([]Row, 0, len(rows))
+	for _, r := range rows {
+		elems := unrollValues(rowField(r, p.Field))
+		if len(elems) == 0 {
+			out = append(out, r) // nothing to unroll: pass the row through unchanged
+			continue
+		}
+		for _, e := range elems {
+			nr := cloneRow(r)
+			setRowField(&nr, p.Field, e)
+			out = append(out, nr)
+		}
+	}
+	return out
+}
+
+// unrollValues splits a field value into elements: a JSON array yields its
+// elements, otherwise the value is whitespace-split (empty yields none).
+func unrollValues(v string) []string {
+	v = strings.TrimSpace(v)
+	if strings.HasPrefix(v, "[") {
+		var arr []any
+		if json.Unmarshal([]byte(v), &arr) == nil {
+			out := make([]string, len(arr))
+			for i, e := range arr {
+				out[i] = fmt.Sprint(e)
+			}
+			return out
+		}
+	}
+	if v == "" {
+		return nil
+	}
+	return strings.Fields(v)
+}
+
+func cloneRow(r Row) Row {
+	f := make([]Field, len(r.Fields))
+	copy(f, r.Fields)
+	return Row{Time: r.Time, Fields: f}
+}
+
+// UnpackSyslogPipe is `unpack_syslog [from field]` -- parse an RFC5424 or
+// RFC3164 syslog line (default _msg) into fields: priority, facility, severity,
+// timestamp, hostname, app_name, proc_id, msg_id, message.
+type UnpackSyslogPipe struct{ From string }
+
+func (p *UnpackSyslogPipe) apply(rows []Row) []Row {
+	from := orDefault(p.From, "_msg")
+	for ri := range rows {
+		parseSyslog(rowField(rows[ri], from), func(k, v string) {
+			setRowField(&rows[ri], k, v)
+		})
+	}
+	return rows
+}
+
+// parseSyslog decodes a syslog line, emitting each parsed field. It handles the
+// RFC5424 header (<PRI>1 TS HOST APP PROCID MSGID SD MSG) and the RFC3164
+// header (<PRI>Mon DD HH:MM:SS HOST TAG: MSG); the priority yields facility and
+// severity. Best-effort: a line it cannot parse emits only what it recognizes.
+func parseSyslog(line string, emit func(k, v string)) {
+	s := strings.TrimSpace(line)
+	if !strings.HasPrefix(s, "<") {
+		return
+	}
+	end := strings.IndexByte(s, '>')
+	if end < 0 {
+		return
+	}
+	pri, err := strconv.Atoi(s[1:end])
+	if err != nil {
+		return
+	}
+	emit("priority", strconv.Itoa(pri))
+	emit("facility", strconv.Itoa(pri/8))
+	emit("severity", strconv.Itoa(pri%8))
+	s = s[end+1:]
+
+	if strings.HasPrefix(s, "1 ") { // RFC5424
+		f := strings.SplitN(s, " ", 7)
+		if len(f) < 7 {
+			return
+		}
+		emitNonNil(emit, "timestamp", f[1])
+		emitNonNil(emit, "hostname", f[2])
+		emitNonNil(emit, "app_name", f[3])
+		emitNonNil(emit, "proc_id", f[4])
+		emitNonNil(emit, "msg_id", f[5])
+		rest := f[6]
+		if strings.HasPrefix(rest, "- ") { // no structured data
+			emit("message", rest[2:])
+		} else if rest == "-" {
+			emit("message", "")
+		} else if strings.HasPrefix(rest, "[") { // skip the structured-data block
+			if i := strings.Index(rest, "] "); i >= 0 {
+				emit("message", rest[i+2:])
+			} else {
+				emit("message", rest)
+			}
+		} else {
+			emit("message", rest)
+		}
+		return
+	}
+	// RFC3164: Mon DD HH:MM:SS HOST TAG: MSG
+	f := strings.Fields(s)
+	if len(f) < 5 {
+		return
+	}
+	emit("timestamp", f[0]+" "+f[1]+" "+f[2])
+	emit("hostname", f[3])
+	tag := f[4]
+	if b := strings.IndexByte(tag, '['); b >= 0 { // strip [pid]
+		tag = tag[:b]
+	}
+	emit("app_name", strings.TrimSuffix(tag, ":"))
+	if len(f) > 5 { // the message is everything after the TAG token
+		emit("message", strings.Join(f[5:], " "))
+	}
+}
+
+func emitNonNil(emit func(k, v string), k, v string) {
+	if v != "-" && v != "" {
+		emit(k, v)
+	}
 }
 
 // SamplePipe is `sample N` -- keep every Nth row (deterministic 1/N sampling).

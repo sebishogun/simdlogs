@@ -887,6 +887,29 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, err
 			}
 			pipes = append(pipes, &SortPipe{By: fs, Limit: n, Desc: strings.EqualFold(name.val, "last")})
+		case "unroll":
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "by") {
+				p.next()
+			}
+			fs, err := p.parseFieldGroup()
+			if err != nil {
+				return nil, err
+			}
+			if len(fs) == 0 {
+				return nil, fmt.Errorf("simdlogs: unroll expects a field")
+			}
+			pipes = append(pipes, &UnrollPipe{Field: fs[0]})
+		case "unpack_syslog":
+			up := &UnpackSyslogPipe{}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "from") {
+				p.next()
+				f, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				up.From = f
+			}
+			pipes = append(pipes, up)
 		default:
 			return nil, fmt.Errorf("simdlogs: unknown pipe %q", name.val)
 		}
