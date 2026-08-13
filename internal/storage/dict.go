@@ -1,5 +1,7 @@
 package storage
 
+import "github.com/sebishogun/simd"
+
 // The dictionary is stored block-compressed for random access from the
 // mmap'd file: values are grouped into small sorted blocks, each block LZ4'd,
 // with an uncompressed sparse index of every block's first value. A lookup
@@ -49,6 +51,91 @@ func marshalRawBlock(vals []string) []byte {
 // block with no format-version change (old data has the bit clear = LZ4).
 const dictCodecFlate = uint32(1) << 31
 
+// dictCodecHex marks a block whose values are all lowercase hex, stored
+// nibble-packed (4 bits/char) instead of a byte per char. Random hex (trace/span
+// ids) carries 4 bits of entropy per char, so LZ4 barely dents it; nibble
+// packing halves it losslessly and decodes with a fast unpack (no entropy
+// decoder), beating even flate on hex. Self-describing per block; old blocks
+// have the bit clear. Uses bit 30 so it composes with neither codec set = LZ4.
+const dictCodecHex = uint32(1) << 30
+
+func isLowerHexByte(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f'
+}
+
+func allLowerHex(vals []string) bool {
+	total := 0
+	for _, s := range vals {
+		if s == "" {
+			return false
+		}
+		total += len(s)
+		for i := 0; i < len(s); i++ {
+			if !isLowerHexByte(s[i]) {
+				return false
+			}
+		}
+	}
+	return total > 0
+}
+
+func hexNibble(c byte) byte {
+	if c <= '9' {
+		return c - '0'
+	}
+	return c - 'a' + 10
+}
+
+func hexChar(v byte) byte {
+	if v < 10 {
+		return '0' + v
+	}
+	return 'a' + v - 10
+}
+
+// hexPackBlock nibble-packs a raw dict block ([k+1 char-offsets][hex strings])
+// into [k u32][k+1 offsets][nibbles], two hex chars per byte, high nibble = the
+// first char -- the simd.HexEncode/HexDecode convention, so the hot unpack is
+// the SIMD kernel. Pack runs once at flush, so it stays a scalar loop.
+func hexPackBlock(raw []byte, count int) []byte {
+	strBase := 4 * (count + 1)
+	strs := raw[strBase:]
+	total := len(strs)
+	nb := (total + 1) / 2
+	out := make([]byte, 0, 4+strBase+nb)
+	out = appU32(out, uint32(count))
+	out = append(out, raw[:strBase]...) // char offsets verbatim
+	base := len(out)
+	out = append(out, make([]byte, nb)...)
+	packed := out[base:]
+	for i := 0; i < total; i += 2 {
+		hi := hexNibble(strs[i]) << 4
+		var lo byte
+		if i+1 < total {
+			lo = hexNibble(strs[i+1])
+		}
+		packed[i>>1] = hi | lo
+	}
+	return out
+}
+
+// hexUnpackBlock reverses hexPackBlock, reconstructing the [k+1 offsets][strings]
+// raw block so blockValAt and the searches read it unchanged. The nibble->char
+// expansion is simd.HexEncode (SIMD): faster than the LZ4 kernel it replaces.
+func hexUnpackBlock(packed []byte) []byte {
+	count := int(get32(packed, 0))
+	strBase := 4 * (count + 1)
+	total := int(get32(packed[4:], 4*count)) // last offset = total chars
+	nb := (total + 1) / 2
+	nibBase := 4 + strBase
+	// HexEncode writes 2*nb chars; for an odd total that is one pad char past
+	// the strings, unread (offsets bound reads to total). Size raw for it.
+	raw := make([]byte, strBase+2*nb)
+	copy(raw, packed[4:4+strBase]) // offsets
+	simd.HexEncode(raw[strBase:], packed[nibBase:nibBase+nb])
+	return raw
+}
+
 // marshalDictSection block-compresses a sorted dict. compact selects the flate
 // codec (smaller, slower decode) over the default LZ4 (fast SIMD decode).
 func marshalDictSection(dict []string, compact bool) []byte {
@@ -73,10 +160,14 @@ func marshalDictSection(dict []string, compact bool) []byte {
 		raw := marshalRawBlock(dict[lo:hi])
 		var c []byte
 		rawLen := uint32(len(raw))
-		if compact {
+		switch {
+		case allLowerHex(dict[lo:hi]): // hex codec wins on size and speed, both modes
+			c = hexPackBlock(raw, hi-lo)
+			rawLen |= dictCodecHex
+		case compact:
 			c = flateCompress(raw)
 			rawLen |= dictCodecFlate
-		} else {
+		default:
 			c = lz4Compress(raw)
 		}
 		idx[k] = bi{uint32(len(comp)), uint32(len(c)), rawLen}
@@ -143,12 +234,16 @@ func (d dictSec) block(k int) []byte {
 	compOff := int(get32(d.idx, k*12))
 	compLen := int(get32(d.idx, k*12+4))
 	rawField := get32(d.idx, k*12+8)
-	rawLen := int(rawField &^ dictCodecFlate)
+	rawLen := int(rawField &^ (dictCodecFlate | dictCodecHex))
 	comp := d.comp[compOff : compOff+compLen]
-	if rawField&dictCodecFlate != 0 {
+	switch {
+	case rawField&dictCodecHex != 0:
+		return hexUnpackBlock(comp)
+	case rawField&dictCodecFlate != 0:
 		return flateDecompress(comp, rawLen)
+	default:
+		return lz4Decompress(comp, rawLen)
 	}
-	return lz4Decompress(comp, rawLen)
 }
 
 // blockValAt reads value i within a decompressed block of count vals.
