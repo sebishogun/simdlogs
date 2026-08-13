@@ -7,9 +7,9 @@ row groups with [simd.go](https://github.com/sebishogun/simd) kernels.
 
 It is built for selective queries and low-latency aggregations. That choice has
 a measured cost: its inverted indexes use more disk than VictoriaLogs — 110.08
-bytes per row on the realistic corpus, about 2.4x VictoriaLogs, or 1.55x with
-cold-tier postings dropped. On a corpus where every value is distinct the ratio
-reaches ~19x; that is the design's worst case and is published with the [scale
+bytes per row on the realistic corpus, 2.05x VictoriaLogs, or 1.55x with
+cold-tier postings dropped. On a corpus built so every value is distinct the
+ratio reaches ~19x; that is the design's worst case, published with the [scale
 curve](docs/scale-curve.md), not a footprint to plan against.
 
 ## Run it
@@ -205,66 +205,65 @@ entries 32–37:
 
 Read [`docs/vl-parity.md`](docs/vl-parity.md) for the full inventory.
 
-### Scale curve
+### Realistic corpus, 1M rows
 
-The scale harness runs both engines through HTTP on the same deterministic
-bytes and disk-backed stores. Query order is shuffled; each latency is the
-minimum of 15 samples after three warmups. These figures were measured on
-amd64/AVX-512. No wall-clock claim is made for another architecture.
+The 15-field Zipfian corpus, which is what log data looks like: values repeat,
+so the dictionary dedupes and the postings pack. Both engines take the same
+bytes over HTTP into disk-backed stores; query order is shuffled.
+`SIMDLOGS_REAL=1 go test -run TestRealistic -v ./internal/bench/` reproduces it.
 
-The corpus for this curve is **unique-hex**: every trace value distinct. That
-is the worst case the design admits, chosen to stress it, and it is not what
-log data looks like. Read the disk column as a stress result, not a footprint —
-the footprint number is the realistic corpus below.
+| | simdlogs | VictoriaLogs | ratio |
+|---|---:|---:|---:|
+| ingest | 2.12 s (0.47M rec/s) | 8.96 s (0.11M rec/s) | 4.2x |
+| footprint | 0.11 GB (110.08 bytes/row) | 0.05 GB | **2.05x of VL** |
+| groupby | 21 µs | 9.84 ms | 463x |
+| topN | 33 µs | 13.3 ms | 407x |
+| rare needle | 29 µs | 1.02 ms | 35x |
+| histogram | 589 µs | 3.10 ms | 5.3x |
+| and | 11.9 ms | 58.7 ms | 4.9x |
+| common | 98.6 ms | 171.0 ms | 1.7x |
+| or | 171.7 ms | 273.5 ms | 1.6x |
+| substring | 170.6 ms | 249.1 ms | 1.5x |
 
-| rows | rare needle | selective window | aggregation | ingest | disk, unique-hex worst case |
+Measured at `d3c0b7f` on amd64/AVX-512, two consecutive runs. The footprint
+line is deterministic and identical in both. The latencies were taken with a
+load average near 3, so read the small ratios as approximate and the ordering
+as sound; the per-operation gate above is the quiet-machine measurement.
+
+Disk is the one axis VictoriaLogs wins, by 2.05x. That gap is the inverted
+index, which is also what produces the 463x groupby and 35x needle in the same
+table. Dropping postings in the cold tier measured 1.55x of VL on the 100k
+corpus, at the cost of a decode-and-scan for those groups — which is what
+VictoriaLogs does for every query. Removing singleton postings entirely cut
+disk and made the needle 90x slower, so that change was reverted.
+
+### Scale curve, unique-hex worst case
+
+A second corpus exists to stress the design rather than describe it: every
+trace value distinct. That defeats the dictionary and gives the inverted index
+one posting list per row, so it is where footprint is worst. It is not a
+footprint to plan against — the table above is.
+
+| rows | rare needle | selective window | aggregation | ingest | disk vs VL |
 |---:|---:|---:|---:|---:|---:|
 | 1M | 12.3x | **0.8x** | 5.1x | 8.2x | unavailable; VL rounds below 0.005 GB |
 | 10M | 19.7x | 1.1x | 8.4x | 2.56x | 19.6x |
 | 100M | 25.0x | 2.0x | 19.2x | 1.11x | 20.9x |
 | 1B | 12.9x | 1.9x | 3.4x | 1.56x | 19.4x |
 
-Values above 1 mean `simdlogs` is faster. The 1M selective row is a loss, and
-it remains in the table. At one billion rows, ingest took 8m42s here and 13m34s
-in VictoriaLogs; the rare needle took 1.68 ms versus 21.7 ms; the selective
-query 350 ms versus 664 ms; and the aggregation 5.6 ms versus 19.3 ms. Disk was
-50.1 GB versus 2.58 GB.
+Values above 1 mean `simdlogs` is faster. The 1M selective row is a loss and
+remains in the table. At one billion rows, ingest took 8m42s here and 13m34s in
+VictoriaLogs; the rare needle 1.68 ms versus 21.7 ms; the selective query
+350 ms versus 664 ms; the aggregation 5.6 ms versus 19.3 ms. Disk was 50.1 GB
+versus 2.58 GB.
 
-The disk column is that large for a structural reason. Every value being
-distinct means the dictionary dedupes nothing and costs more than the raw
-values, the inverted index holds one posting list per row, and each bloom is
-sized for a cardinality equal to the row count. VictoriaLogs has no per-value
-index — it decodes and scans for every query — so its footprint barely moves
-with cardinality, while ours is almost entirely index. The same index is what
-produces the 12.9x needle and 3.4x aggregation in the same row.
-
-Both parts of this curve predate two disk changes: the FOR postings rewrite
-(`a5f9098`) and the hex nibble-pack codec (`d000ae3`), which act on exactly the
-structures that dominate this corpus. It has not been re-measured since
-2026-08-10.
-
-### Footprint on realistic data
-
-The 15-field Zipfian corpus is the one to read for footprint: values repeat, so
-the dictionary dedupes and the postings pack.
-
-| measurement | value | measured at |
-|---|---:|---|
-| bytes per row, 200k realistic rows | 110.08 | current (`50d13df`), down from 127.43 |
-| ratio to VictoriaLogs, hot groups | 2.62x | `3f5a063`, 2026-08-12 |
-| ratio after the hex nibble-pack codec | ~2.38x | estimate, not a measurement |
-| ratio with cold-tier postings dropped | 1.55x | measured on the 100k realistic corpus |
-
-The 2.62x row predates the hex codec (`d000ae3`), which measured −9.8% disk on
-this corpus in its own commit; the ~2.38x line is `docs/wrong.md`'s estimate
-from that, not a re-measurement. The 1.55x figure is the tiering trade:
-postings are about 27% of a group, and dropping them in the cold tier costs
-those groups a decode-and-scan — which is what VictoriaLogs does for every
-query — while hot groups keep the 34-490x wins.
-
-The inverted index is also what powers the large rare-value and group-by wins;
-removing singleton postings cut disk and made the needle 90x slower, so that
-change was reverted.
+VictoriaLogs has no per-value index — it decodes and scans for every query — so
+its footprint barely moves with cardinality while ours is almost entirely
+index. Each latency is the minimum of 15 samples after three warmups, on
+amd64/AVX-512; no wall-clock claim is made for another architecture. This curve
+was measured on 2026-08-10 and predates the FOR postings rewrite (`a5f9098`)
+and the hex nibble-pack codec (`d000ae3`), which act on exactly the structures
+that dominate it. It has not been re-measured since.
 
 `-compact` uses flate for dictionary blocks. On the measured realistic corpus
 it made groups about 15% smaller and value-reading queries 2-10x slower. It is
