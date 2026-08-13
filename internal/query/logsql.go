@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -453,7 +454,11 @@ func (p *lqlParser) parseMatcher(field string) (Pred, error) {
 			return Pred{}, err
 		}
 		if strings.ContainsAny(v, `.*+?()[]{}|^$\`) {
-			return Pred{Field: field, Kind: Regexp, Value: v}, nil
+			re, err := regexp.Compile(v) // validate up front -> clean 400, and cache
+			if err != nil {
+				return Pred{}, fmt.Errorf("simdlogs: invalid regex %q: %w", v, err)
+			}
+			return Pred{Field: field, Kind: Regexp, Value: v, re: re}, nil
 		}
 		return Pred{Field: field, Kind: Contains, Value: v}, nil
 	case t.kind == tOp:

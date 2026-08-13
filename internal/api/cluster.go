@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/sebishogun/simdlogs/internal/query"
 	"sync/atomic"
 	"time"
 )
@@ -278,6 +280,74 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 			"total": map[string]any{"value": total, "relation": "eq"},
 			"hits":  hits,
 		},
+	})
+}
+
+// federatedValueCounts fans a GET out to the storage nodes and merges the
+// value/hits list found under key, summing hits per value -- the cluster form
+// of streams/stream_ids/stream_field_values.
+func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, path, key string) {
+	w.Header().Set("Content-Type", "application/json")
+	counts := map[string]int{}
+	for _, b := range s.fanOut(r, path) {
+		var v map[string][]query.ValueCount
+		if json.Unmarshal(b, &v) == nil {
+			for _, vc := range v[key] {
+				counts[vc.Value] += vc.Count
+			}
+		}
+	}
+	out := make([]query.ValueCount, 0, len(counts))
+	for val, c := range counts {
+		out = append(out, query.ValueCount{Value: val, Count: c})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Value < out[j].Value
+	})
+	json.NewEncoder(w).Encode(map[string]any{key: out})
+}
+
+// federatedStrings merges a string list under key across storage nodes (union).
+func (s *Server) federatedStrings(w http.ResponseWriter, r *http.Request, path, key string) {
+	w.Header().Set("Content-Type", "application/json")
+	seen := map[string]struct{}{}
+	for _, b := range s.fanOut(r, path) {
+		var v map[string][]string
+		if json.Unmarshal(b, &v) == nil {
+			for _, x := range v[key] {
+				seen[x] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for x := range seen {
+		out = append(out, x)
+	}
+	sort.Strings(out)
+	json.NewEncoder(w).Encode(map[string]any{key: out})
+}
+
+// federatedMatrix merges stats_query_range across storage nodes by concatenating
+// each shard's series (shards hold disjoint groups, so a series is one shard's).
+func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var result []json.RawMessage
+	for _, b := range s.fanOut(r, "/select/logsql/stats_query_range") {
+		var v struct {
+			Data struct {
+				Result []json.RawMessage `json:"result"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(b, &v) == nil {
+			result = append(result, v.Data.Result...)
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"status": "success",
+		"data":   map[string]any{"resultType": "matrix", "result": result},
 	})
 }
 

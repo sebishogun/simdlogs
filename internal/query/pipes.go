@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1237,10 +1236,8 @@ func matchPredRow(r Row, p *Pred) bool {
 		}
 		return false
 	case Regexp:
-		if p.re == nil {
-			p.re = regexp.MustCompile(p.Value)
-		}
-		return p.re.MatchString(v)
+		re := p.regex()
+		return re != nil && re.MatchString(v)
 	case Lt, Le, Gt, Ge:
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {

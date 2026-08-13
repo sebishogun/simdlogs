@@ -80,7 +80,11 @@ type ReplacePipe struct {
 func (p *ReplacePipe) apply(rows []Row) []Row {
 	f := orDefault(p.Field, "_msg")
 	if p.Regexp && p.re == nil {
-		p.re = regexp.MustCompile(p.Old)
+		re, err := regexp.Compile(p.Old)
+		if err != nil {
+			return rows // invalid pattern: leave the field unchanged, never panic
+		}
+		p.re = re
 	}
 	for ri := range rows {
 		v := rowField(rows[ri], f)

@@ -61,6 +61,21 @@ const (
 // (Field2) per row, rather than this field's values against a constant.
 func isFieldCmp(k PredKind) bool { return k >= EqField && k <= GeField }
 
+// regex compiles the predicate's pattern once, tolerating an invalid pattern
+// (which then matches nothing) so a malformed user regex is never a panic --
+// the parser also validates it up front for a clean 400, this is the guard for
+// programmatic callers that set Value directly.
+func (p *Pred) regex() *regexp.Regexp {
+	if p.re == nil {
+		re, err := regexp.Compile(p.Value)
+		if err != nil {
+			return nil
+		}
+		p.re = re
+	}
+	return p.re
+}
+
 // Pred is one field predicate. Fields ordered large-to-small (pointers and
 // strings, then float64, then the byte-sized Kind last) to avoid interior
 // padding.
@@ -363,11 +378,12 @@ func predBitsetCol(g *storage.Reader, p *Pred, idx []uint32, dict []string, n in
 			hit[di] = containsSubstr(d, p.Value)
 		}
 	case Regexp:
-		if p.re == nil {
-			p.re = regexp.MustCompile(p.Value)
+		re := p.regex()
+		if re == nil {
+			break // invalid pattern: matches nothing
 		}
 		for di, d := range dict {
-			hit[di] = p.re.MatchString(d)
+			hit[di] = re.MatchString(d)
 		}
 	case Prefix:
 		for di, d := range dict {

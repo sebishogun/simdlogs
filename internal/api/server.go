@@ -491,24 +491,40 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 
 // streamsHandler lists the distinct _stream label sets in the window.
 func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/streams", "streams")
+		return
+	}
 	from, to := timeWindow(r)
 	json.NewEncoder(w).Encode(map[string]any{"streams": query.Streams(s.tn(r).store, from, to)})
 }
 
 // streamIDsHandler lists the distinct stream ids in the window.
 func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/stream_ids", "stream_ids")
+		return
+	}
 	from, to := timeWindow(r)
 	json.NewEncoder(w).Encode(map[string]any{"stream_ids": query.StreamIDs(s.tn(r).store, from, to)})
 }
 
 // streamFieldNamesHandler lists the distinct stream label names.
 func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 {
+		s.federatedStrings(w, r, "/select/logsql/stream_field_names", "names")
+		return
+	}
 	from, to := timeWindow(r)
 	json.NewEncoder(w).Encode(map[string]any{"names": query.StreamFieldNames(s.tn(r).store, from, to)})
 }
 
 // streamFieldValuesHandler lists the distinct values of one stream label.
 func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/stream_field_values", "values")
+		return
+	}
 	from, to := timeWindow(r)
 	json.NewEncoder(w).Encode(map[string]any{"values": query.StreamFieldValues(s.tn(r).store, r.FormValue("field"), from, to)})
 }
@@ -516,6 +532,10 @@ func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request
 // statsQueryRange buckets a stats query over the time range and returns a
 // Prometheus-style matrix: one series per group-by tuple, a point per step.
 func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 {
+		s.federatedMatrix(w, r)
+		return
+	}
 	from, to := timeWindow(r)
 	step := parseStepNs(r.FormValue("step"), from, to)
 	series, err := query.StatsQueryRange(s.tn(r).store, r.FormValue("query"), from, to, step, time.Now().UnixNano())

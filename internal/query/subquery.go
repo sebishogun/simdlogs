@@ -11,13 +11,20 @@ import (
 // stream; matches are located by timestamp.
 type StreamContextPipe struct{ Before, After int }
 
+// streamContextCap bounds the context scan's materialized rows.
+const streamContextCap = 2_000_000
+
 func (p *StreamContextPipe) apply(rows []Row) []Row { return rows }
 
 func (p *StreamContextPipe) run(s Store, parent *Query, matches []Row) []Row {
 	if len(matches) == 0 || (p.Before == 0 && p.After == 0) {
 		return matches
 	}
-	all := Run(s, &Query{From: parent.From, To: parent.To, Now: parent.Now, Filter: &Expr{Op: OpAnd}, MatAll: true})
+	// The N neighbors sit next to each match in time, so the context scan needs
+	// the window's rows in time order. Cap the materialize at streamContextCap
+	// rows so a huge window degrades (context over the first cap rows) instead
+	// of OOMing; real stream-context use is over a bounded slice.
+	all := Run(s, &Query{From: parent.From, To: parent.To, Now: parent.Now, Filter: &Expr{Op: OpAnd}, MatAll: true, Limit: streamContextCap})
 	sort.SliceStable(all, func(i, j int) bool { return all[i].Time < all[j].Time })
 	matchTime := map[int64]bool{}
 	for _, m := range matches {

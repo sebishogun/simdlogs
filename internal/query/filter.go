@@ -1,7 +1,6 @@
 package query
 
 import (
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -121,10 +120,8 @@ func predMatchesRow(p *Pred, get func(string) string) bool {
 	case Prefix:
 		return strings.HasPrefix(v, p.Value)
 	case Regexp:
-		if p.re == nil {
-			p.re = regexp.MustCompile(p.Value)
-		}
-		return p.re.MatchString(v)
+		re := p.regex()
+		return re != nil && re.MatchString(v)
 	case Lt, Le, Gt, Ge:
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return cmpNum(f, p.Kind, p.Num)
