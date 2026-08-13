@@ -9,11 +9,13 @@ package api
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -483,6 +485,10 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 		by = r.FormValue("fields")
 	}
 	series := query.Hits(s.tn(r).store, q, step, by)
+	// fields_limit keeps the busiest N series and folds the rest into one
+	// unlabelled remainder, so a graph of a high-cardinality field stays
+	// readable instead of returning a series per value.
+	series = foldHitsTail(series, intParam(r, "fields_limit", 0))
 
 	// The reference shape: a dense timestamp/value pair of arrays per series,
 	// not a bag of {time, count} objects. A client indexes the two arrays
@@ -510,7 +516,14 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 
 // parseRequest turns the LogsQL query and time params into a Query.
 func parseRequest(r *http.Request) (*query.Query, error) {
-	q, err := query.ParseLogsQL(r.FormValue("query"))
+	// The reference requires `query` on every select endpoint and rejects a
+	// request without one. Defaulting to match-all answered a client's bug with
+	// the entire store.
+	raw := r.FormValue("query")
+	if strings.TrimSpace(raw) == "" {
+		return nil, errMissingQuery
+	}
+	q, err := query.ParseLogsQL(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -593,18 +606,11 @@ func writeValues(w http.ResponseWriter, vcs []query.ValueCount) {
 // selectQueryOf parses the request's LogsQL and window for the introspection
 // endpoints, which scope their answer to the matching rows. A missing query
 // means every row, spelled the way LogsQL spells it.
-func selectQueryOf(r *http.Request) (*query.Query, error) {
-	if r.FormValue("query") == "" {
-		q, err := query.ParseLogsQL("*")
-		if err != nil {
-			return nil, err
-		}
-		q.From, q.To = timeWindow(r)
-		q.Now = time.Now().UnixNano()
-		return q, nil
-	}
-	return parseRequest(r)
-}
+func selectQueryOf(r *http.Request) (*query.Query, error) { return parseRequest(r) }
+
+// errMissingQuery is the empty-`query` rejection, spelled once so every select
+// endpoint answers it the same way.
+var errMissingQuery = errors.New("simdlogs: missing `query` arg")
 
 func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
@@ -720,6 +726,31 @@ type promResponse struct {
 type promData struct {
 	ResultType string           `json:"resultType"`
 	Result     []map[string]any `json:"result"`
+}
+
+// foldHitsTail keeps the n series with the most hits and merges everything
+// after them into a single series with no labels -- the "other" bucket the
+// reference returns.
+func foldHitsTail(series []query.HitsSeries, n int) []query.HitsSeries {
+	if n <= 0 || len(series) <= n {
+		return series
+	}
+	sort.SliceStable(series, func(i, j int) bool { return series[i].Total > series[j].Total })
+	rest := series[n:]
+	other := query.HitsSeries{Fields: map[string]string{}}
+	for _, se := range rest {
+		if other.Timestamps == nil {
+			other.Timestamps = append([]int64(nil), se.Timestamps...)
+			other.Values = make([]int, len(se.Values))
+		}
+		for i := range se.Values {
+			if i < len(other.Values) {
+				other.Values[i] += se.Values[i]
+			}
+		}
+		other.Total += se.Total
+	}
+	return append(series[:n:n], other)
 }
 
 // limitValues applies the request's `limit` to a values response. Every values

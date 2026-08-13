@@ -173,3 +173,68 @@ func TestValuesLimit(t *testing.T) {
 		}
 	}
 }
+
+// TestQueryArgRequired pins that `query` is required. Defaulting it to match-all
+// answered a client's bug -- a dropped parameter -- with the entire store.
+func TestQueryArgRequired(t *testing.T) {
+	ts, done := shapeServer(t)
+	defer done()
+	for _, ep := range []string{
+		"query", "hits", "facets", "field_names", "field_values",
+		"streams", "stream_ids", "stream_field_names", "stream_field_values",
+		"stats_query",
+	} {
+		for _, q := range []string{"", "?query=", "?query=%20"} {
+			r, err := http.Get(ts.URL + "/select/logsql/" + ep + q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			io.Copy(io.Discard, r.Body)
+			r.Body.Close()
+			if r.StatusCode < 400 {
+				t.Errorf("/select/logsql/%s%q -> %d, want a client error", ep, q, r.StatusCode)
+			}
+		}
+	}
+}
+
+// TestHitsFieldsLimit pins the "other" bucket: the busiest N series are kept and
+// the tail is merged into one unlabelled series, rather than a series per value.
+func TestHitsFieldsLimit(t *testing.T) {
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	var body strings.Builder
+	// four hosts with clearly different volumes: h0 x8, h1 x4, h2 x2, h3 x1
+	for i, n := range []int{8, 4, 2, 1} {
+		for j := 0; j < n; j++ {
+			body.WriteString(`{"_time":"2024-05-01T00:00:00Z","host":"h` + string(rune('0'+i)) + `"}` + "\n")
+		}
+	}
+	postTo(t, ts.URL+"/insert/jsonline", "application/x-ndjson", body.String())
+
+	var got struct {
+		Hits []struct {
+			Fields map[string]string `json:"fields"`
+			Total  int               `json:"total"`
+		} `json:"hits"`
+	}
+	getShape(t, ts.URL+"/select/logsql/hits?query=*&step=1m&field=host&fields_limit=2"+shapeWindow, &got)
+	if len(got.Hits) != 3 {
+		t.Fatalf("fields_limit=2 returned %d series, want 2 plus the remainder", len(got.Hits))
+	}
+	if got.Hits[0].Fields["host"] != "h0" || got.Hits[0].Total != 8 {
+		t.Errorf("first series = %+v, want the busiest (h0, 8)", got.Hits[0])
+	}
+	last := got.Hits[2]
+	if len(last.Fields) != 0 {
+		t.Errorf("remainder series carries labels %v, want none", last.Fields)
+	}
+	if last.Total != 3 { // h2 + h3
+		t.Errorf("remainder total = %d, want 3", last.Total)
+	}
+}

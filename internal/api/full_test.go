@@ -45,7 +45,7 @@ func TestSelectSurface(t *testing.T) {
 			Hits  int    `json:"hits"`
 		}
 	}
-	getJSON(t, ts.URL+"/select/logsql/field_names", &fn)
+	getJSON(t, ts.URL+"/select/logsql/field_names?query=*", &fn)
 	names := map[string]int{}
 	for _, v := range fn.Values {
 		names[v.Value] = v.Hits
@@ -60,7 +60,7 @@ func TestSelectSurface(t *testing.T) {
 			Hits  int    `json:"hits"`
 		}
 	}
-	getJSON(t, ts.URL+"/select/logsql/field_values?field=level", &fv)
+	getJSON(t, ts.URL+"/select/logsql/field_values?query=*&field=level", &fv)
 	got := map[string]int{}
 	for _, v := range fv.Values {
 		got[v.Value] = v.Hits
