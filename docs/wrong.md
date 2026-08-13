@@ -817,3 +817,37 @@ internal/api/cluster.go, tests green) is functional, and simdlogs already beats 
 SINGLE-NODE on the underlying metrics (needle 27.9x, groupby 481x, ingest 4.22x),
 which is VL's best available OSS configuration. A cluster-vs-cluster number would
 need the VL enterprise binary.
+
+## Where the 2.4x-of-VL disk goes (and what this session's query work bought)
+
+Re-measured the VL head-to-head this session (1M realistic rows, load ~9 so times
+are noisy but ratios hold), then optimized the weakest queries.
+
+    query        before -> after (ratio vs VL)
+    common        1.7x  -> 1.9x   (99.1 -> 89.8ms)
+    and           3.8x  -> 4.4x   (15.9 -> 13.5ms)
+    or            1.6x  -> 1.7x   (170  -> 148ms)
+    substring     1.6x  -> 1.7x   (168  -> 146ms)
+    needle 34.5x, groupby 478.8x, topN 410.2x, histogram 3.4x, ingest 3.94x
+
+The wins came from materialization, not the scan (BenchmarkCommonSelect
+15.35 -> 10.37ms, -32%): a []Field allocation PER ROW became one arena per group,
+a per-field-per-row map lookup became a positional resolve, and decoded per-row
+dict indices are now cached on the (immutable, persistent) Reader under a byte
+budget. GC was 23% of that profile.
+
+Disk is the one axis where VL wins: 0.12GB vs 0.05GB. The breakdown at 100k rows
+(105 bytes/row total) says why:
+
+    dict     4776KB  46%   LZ4-compressed strings (VL uses ZSTD)
+    postings 2815KB  27%   the inverted index -- what makes needle/groupby/topN 34-490x
+    index    1831KB  18%   per-row dict ids
+    bloom     573KB   6%
+    time      299KB   3%
+
+So a third of the footprint is index structures VL does not keep, and the largest
+section is dictionaries where our LZ4 trades ratio for decode speed. The 2.4x is
+mostly the PRICE of the 34-490x query wins, not waste -- but "better on all counts"
+means closing it, and the honest route is tiered storage (recent data with full
+postings; aged data re-compacted with stronger dictionary compression and merged
+postings), not dropping the index. Tracked as a task.
