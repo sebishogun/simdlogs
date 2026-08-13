@@ -33,3 +33,28 @@ func TestBadRegexNoPanic(t *testing.T) {
 		_ = RunPipeline(s, pq) // must not panic
 	}
 }
+
+// TestParserNoPanicOnGarbage throws malformed queries at the full parser and
+// confirms none panic -- every error must be returned, not thrown.
+func TestParserNoPanicOnGarbage(t *testing.T) {
+	bad := []string{
+		``, `|`, `| stats`, `foo:`, `foo:in(`, `foo:range(`, `foo:range(a,b)`,
+		`_time:`, `_time:[`, `_time:[a,b]`, `_time:xyz`, `_time:day_range[99:99]`,
+		`_time:week_range[Xxx,Yyy]`, `* | stats row_max(`, `* | stats quantile(x)`,
+		`* | join by (a)`, `* | join by (a) (`, `* | union (`, `* | unroll`,
+		`* | sample`, `* | first`, `* | field_values`, `foo:ipv4_range(x,y)`,
+		`foo:seq(`, `foo:eq_field(`, `* | stats count() if (`, `_stream_id:`,
+		`* | extract_regexp`, `* | pack_json fields (`, `* | stats histogram(x) if(bad`,
+		`* | replace_regexp (`, `foo:~"["`, `* | sort by (`, `* | math "`,
+	}
+	for _, q := range bad {
+		func() {
+			defer func() {
+				if v := recover(); v != nil {
+					t.Errorf("panic on %q: %v", q, v)
+				}
+			}()
+			_, _ = ParseLogsQL(q) // error is fine; panic is not
+		}()
+	}
+}
