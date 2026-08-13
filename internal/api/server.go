@@ -240,12 +240,13 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 	bareSelect := len(q.Pipes) == 0
 	if bareSelect {
 		q.MatAll = true // a bare select returns whole records, not just filter fields
-		// Bound peak memory on an unbounded select: request one past the cap so an
-		// overflow is detectable, then ERROR rather than silently truncate. Only
-		// a bare select -- a stats/pipe query's input must not be limited, and an
-		// explicit limit= param is respected.
+		// Bound peak memory on an unbounded select, then ERROR rather than silently
+		// truncate. MaxRows (not Limit) so the scan stays PARALLEL -- Limit forces
+		// the serial path because it must return the first N in time order, while
+		// MaxRows only has to detect overflow. Only a bare select: a stats/pipe
+		// query's input must not be bounded, and an explicit limit= is respected.
 		if q.Limit == 0 && s.maxRows > 0 {
-			q.Limit = s.maxRows + 1
+			q.MaxRows = s.maxRows
 		}
 	}
 	rows := query.RunPipeline(s.tn(r).store, q) // applies the pipe chain; == Run when there are none

@@ -4,6 +4,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
@@ -30,13 +31,24 @@ func runParallel(groups []*storage.Reader, q *Query) []Row {
 		ch <- i
 	}
 	close(ch)
+	var produced atomic.Int64 // only used when q.MaxRows is set
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for gi := range ch {
+				// Over the row cap: drain without scanning. The result already
+				// exceeds MaxRows, so the caller errors either way -- this just
+				// stops the remaining groups from materializing.
+				if q.MaxRows > 0 && produced.Load() > int64(q.MaxRows) {
+					continue
+				}
 				// groups are already footer-pruned by the caller.
-				parts[gi] = appendMatches(nil, groups[gi], q)
+				rows := appendMatches(nil, groups[gi], q)
+				parts[gi] = rows
+				if q.MaxRows > 0 {
+					produced.Add(int64(len(rows)))
+				}
 			}
 		}()
 	}

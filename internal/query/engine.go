@@ -23,7 +23,12 @@ type Query struct {
 	Pipes       []Pipe   // LogsQL pipe chain (stats/sort/limit/fields), applied after the filter
 	Materialize []string // extra fields to materialize for the pipes (beyond predicate fields)
 	Limit       int
-	MatAll      bool // materialize every column (full-record output: bare selects, live tail)
+	// MaxRows bounds materialization without changing result semantics: the scan
+	// stops once it has produced more than MaxRows, and the caller errors. Unlike
+	// Limit (which must return the first N in time order, and so forces the serial
+	// path) this only has to DETECT overflow, so it keeps the parallel scan.
+	MaxRows int
+	MatAll  bool // materialize every column (full-record output: bare selects, live tail)
 }
 
 // PredKind selects the comparison.
@@ -162,6 +167,9 @@ func Run(s Store, q *Query) []Row {
 		out = appendMatches(out, g, q)
 		if q.Limit > 0 && len(out) >= q.Limit {
 			return out[:q.Limit]
+		}
+		if q.MaxRows > 0 && len(out) > q.MaxRows {
+			return out // over the cap: stop scanning, the caller errors
 		}
 	}
 	return out
