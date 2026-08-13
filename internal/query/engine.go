@@ -62,6 +62,21 @@ const (
 	StreamIDEq                    // _stream_id:<id>  (_stream value whose hash == Value)
 )
 
+// numInRange applies the predicate's bounds honouring their exclusivity.
+func numInRange(f float64, p *Pred) bool {
+	if p.ExLo {
+		if f <= p.Num {
+			return false
+		}
+	} else if f < p.Num {
+		return false
+	}
+	if p.ExHi {
+		return f < p.Num2
+	}
+	return f <= p.Num2
+}
+
 // isFieldCmp reports whether the kind compares this field against another field
 // (Field2) per row, rather than this field's values against a constant.
 func isFieldCmp(k PredKind) bool { return k >= EqField && k <= GeField }
@@ -94,6 +109,10 @@ type Pred struct {
 	Num    float64        // Lt/Le/Gt/Ge bound, Range/LenRange/IPv4Range lo
 	Num2   float64        // Range/LenRange/IPv4Range hi
 	T1, T2 int64          // TimeRange bounds (nanos); day/week-range params; pre-resolve relative offsets
+	// RangeNum/LenRange bound exclusivity. LogsQL uses math-interval notation:
+	// range(a, b) excludes both ends, range[a, b] includes them. Measured against
+	// VictoriaLogs: range(100, 500) does NOT match the row whose value is 100.
+	ExLo, ExHi bool
 	Sub    *Query         // In: a subquery whose result values become the set, resolved at Run
 	Rel    bool           // TimeRange: T1/T2 are offsets before Now, resolved at Run
 	Kind   PredKind
@@ -481,7 +500,7 @@ func predBitsetCol(g *storage.Reader, p *Pred, idx []uint32, dict []string, n in
 	case RangeNum:
 		for di, d := range dict {
 			if f, err := strconv.ParseFloat(d, 64); err == nil {
-				hit[di] = f >= p.Num && f <= p.Num2
+				hit[di] = numInRange(f, p)
 			}
 		}
 	case LenRange:

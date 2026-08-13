@@ -520,7 +520,9 @@ func (p *lqlParser) parseMatcher(field string) (Pred, error) {
 		if err != nil {
 			return Pred{}, err
 		}
-		return Pred{Field: field, Kind: RangeNum, Num: lo, Num2: hi}, nil
+		// range(a, b) is an OPEN interval in LogsQL -- parentheses exclude the
+		// bounds, the way math interval notation does.
+		return Pred{Field: field, Kind: RangeNum, Num: lo, Num2: hi, ExLo: true, ExHi: true}, nil
 	case t.kind == tIdent && strings.EqualFold(t.val, "len_range") && p.peekAt(1).kind == tLParen:
 		lo, hi, err := p.twoNumArgs("len_range")
 		if err != nil {
@@ -745,6 +747,10 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 			if err != nil {
 				return nil, err
 			}
+			// VictoriaLogs spells it `top N by (f1, f2)`; `top N (f1)` also works.
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "by") {
+				p.next()
+			}
 			fs, err := p.parseFieldGroup()
 			if err != nil {
 				return nil, err
@@ -953,11 +959,31 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 			}
 			pipes = append(pipes, cp)
 		case "math", "eval":
-			ex := p.next()
-			if ex.kind != tString {
-				return nil, fmt.Errorf("simdlogs: math expects a quoted expression, got %q", ex.val)
+			// VictoriaLogs takes the expression unquoted (`math a * 2 as b`); a
+			// quoted form is also accepted. Unquoted runs to `as`, the next pipe,
+			// or the end, and the tokens are rejoined for the expression parser.
+			var expr string
+			if p.peek().kind == tString {
+				expr = p.next().val
+			} else {
+				var sb strings.Builder
+				for {
+					t := p.peek()
+					if t.kind == tEOF || t.kind == tPipe ||
+						(t.kind == tIdent && strings.EqualFold(t.val, "as")) {
+						break
+					}
+					if sb.Len() > 0 {
+						sb.WriteByte(' ')
+					}
+					sb.WriteString(p.next().val)
+				}
+				expr = sb.String()
 			}
-			node, flds, err := parseMath(ex.val)
+			if expr == "" {
+				return nil, fmt.Errorf("simdlogs: math expects an expression")
+			}
+			node, flds, err := parseMath(expr)
 			if err != nil {
 				return nil, err
 			}

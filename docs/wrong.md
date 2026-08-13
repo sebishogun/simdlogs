@@ -970,3 +970,39 @@ Reverted. The ingest profile's real weight is simdjson.Parse, BuildDict and
 Group.Marshal, not the string allocations underneath them. (Wall-clock said
 152 -> 174ms, agreeing with instructions here, but instructions are what settled
 it -- the machine was at load 3-5.)
+
+## Compatibility measured, not assumed: 17/40 -> 40/40 against the real VL binary
+
+"simdlogs implements the LogsQL pipes" was a claim backed by a list of parser
+cases. Running the same 40 queries against simdlogs AND victoria-logs over
+identical data (internal/bench/compat_test.go, SIMDLOGS_COMPAT=1) said 17/40
+identical. The gap was never the query engine -- it was result SHAPE and two
+boundary semantics, none of which any unit test caught because the unit tests
+asserted what the implementation already did:
+
+    _time on every row            stats rows carried _time=1970-01-01, and
+                                  `fields a, b` returned a, b AND _time. VL
+                                  treats _time as an ordinary projectable field.
+    MatAll cleared by any pipe    `* | limit 5` returned five TIMESTAMPS, and
+                                  `| delete x` returned only _time. Only pipes
+                                  that narrow (fields/stats/uniq/top/...) skip
+                                  the full-record materialize; the rewriters and
+                                  slicers still emit whole records.
+    quantile interpolated         p50=290.5 where VL gives 291. VL uses
+                                  nearest-rank -- the result is a real sample.
+    uniq kept the whole row       VL emits just the distinct `by` combination.
+    top named the column count    VL names it hits, and breaks ties by value asc.
+    range(a, b) inclusive         LogsQL parentheses are an OPEN interval:
+                                  range(100, 500) does NOT match 100. This cost
+                                  exactly one row per query and would never have
+                                  been noticed without a reference to diff.
+    top N by (...) rejected       `by` was being eaten as the field name.
+    math needed a quoted expr     VL takes `math a * 2 as b` unquoted.
+
+Three unit tests had to be CORRECTED against the reference: they asserted
+interpolated quantile, inclusive range, and a `count` column, i.e. they had
+frozen the implementation's assumptions rather than VictoriaLogs' behaviour. A
+test written from the implementation proves the implementation is what it is.
+
+40/40 identical now. The lesson generalizes: for a drop-in replacement, the
+compatibility suite has to run BOTH engines, or it measures nothing.

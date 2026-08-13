@@ -110,8 +110,22 @@ func TestLogsQLCompat(t *testing.T) {
 			if a == b {
 				matching = append(matching, qq.group)
 			} else {
-				differing = append(differing, fmt.Sprintf("%s (%s)\n    simdlogs: %s\n    VL      : %s",
-					qq.group, qq.q, first(a, 200), first(b, 200)))
+				la, lb := strings.Split(a, "\n"), strings.Split(b, "\n")
+				detail := fmt.Sprintf("%s (%s): simdlogs %d rows, VL %d rows", qq.group, qq.q, len(la), len(lb))
+				for i := 0; i < len(la) || i < len(lb); i++ {
+					x, y := "", ""
+					if i < len(la) {
+						x = la[i]
+					}
+					if i < len(lb) {
+						y = lb[i]
+					}
+					if x != y {
+						detail += fmt.Sprintf("\n    first diff at row %d:\n      simdlogs: %s\n      VL      : %s", i, first(x, 160), first(y, 160))
+						break
+					}
+				}
+				differing = append(differing, detail)
 			}
 		}
 	}

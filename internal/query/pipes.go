@@ -735,12 +735,14 @@ func quantileOf(vals []float64, p float64) float64 {
 	if p >= 1 {
 		return vals[len(vals)-1]
 	}
-	pos := p * float64(len(vals)-1)
-	lo := int(pos)
-	if lo+1 >= len(vals) {
-		return vals[lo]
+	// Nearest-rank, NOT linear interpolation: VictoriaLogs' quantile returns a
+	// value that is actually in the data (measured against it -- interpolation
+	// gave p50=290.5 where VL gives 291).
+	idx := int(p * float64(len(vals)))
+	if idx >= len(vals) {
+		idx = len(vals) - 1
 	}
-	return vals[lo] + (pos-float64(lo))*(vals[lo+1]-vals[lo])
+	return vals[idx]
 }
 
 // rowField returns a row's value for key.
@@ -827,10 +829,21 @@ func (p *UniqPipe) apply(rows []Row) []Row {
 	out := rows[:0]
 	for _, r := range rows {
 		k := rowKey(r, p.By)
-		if !seen[k] {
-			seen[k] = true
-			out = append(out, r)
+		if seen[k] {
+			continue
 		}
+		seen[k] = true
+		if len(p.By) == 0 {
+			out = append(out, r)
+			continue
+		}
+		// VictoriaLogs emits just the distinct combination of the `by` fields --
+		// no timestamp and none of the row's other fields.
+		f := make([]Field, 0, len(p.By))
+		for _, name := range p.By {
+			f = append(f, Field{name, rowField(r, name)})
+		}
+		out = append(out, Row{NoTime: true, Fields: f})
 	}
 	if p.Limit > 0 && len(out) > p.Limit {
 		out = out[:p.Limit]
@@ -858,13 +871,24 @@ func (p *TopPipe) apply(rows []Row) []Row {
 		for i, f := range p.By {
 			fields = append(fields, Field{f, vals[k][i]})
 		}
-		fields = append(fields, Field{"count", strconv.Itoa(c)})
+		// VictoriaLogs names the column `hits`, and breaks count ties by the
+		// grouped value ascending (measured against it).
+		fields = append(fields, Field{"hits", strconv.Itoa(c)})
 		out = append(out, Row{NoTime: true, Fields: fields})
 	}
 	sort.SliceStable(out, func(a, b int) bool {
-		ca, _ := strconv.Atoi(rowField(out[a], "count"))
-		cb, _ := strconv.Atoi(rowField(out[b], "count"))
-		return ca > cb
+		ca, _ := strconv.Atoi(rowField(out[a], "hits"))
+		cb, _ := strconv.Atoi(rowField(out[b], "hits"))
+		if ca != cb {
+			return ca > cb
+		}
+		for _, f := range p.By {
+			va, vb := rowField(out[a], f), rowField(out[b], f)
+			if va != vb {
+				return va < vb
+			}
+		}
+		return false
 	})
 	if p.N > 0 && len(out) > p.N {
 		out = out[:p.N]

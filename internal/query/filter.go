@@ -136,7 +136,7 @@ func predMatchesRow(p *Pred, get func(string) string) bool {
 		return false
 	case RangeNum:
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f >= p.Num && f <= p.Num2
+			return numInRange(f, p)
 		}
 		return false
 	case LenRange:

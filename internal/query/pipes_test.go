@@ -108,7 +108,7 @@ func TestMorePipes(t *testing.T) {
 	}
 	// top over * needs field materialization; a=3 leads.
 	top := run(`* | top 5 (service)`)
-	if len(top) != 2 || rowField(top[0], "service") != "a" || rowField(top[0], "count") != "3" {
+	if len(top) != 2 || rowField(top[0], "service") != "a" || rowField(top[0], "hits") != "3" { // VL names the column hits
 		t.Fatalf("top = %v", top)
 	}
 	// uniq by service -> 2 distinct.
@@ -305,8 +305,12 @@ func TestQuantileAgg(t *testing.T) {
 		}
 		return m
 	}
-	if m := run(`* | stats by (service) quantile(0.5, latency) as p`); m["a"] != "20" || m["b"] != "35" {
-		t.Fatalf("median latency = %v want a:20 b:35", m)
+	// Nearest-rank, matching VictoriaLogs: quantile returns a value that is
+	// actually in the data. Verified against the real VL binary by the compat
+	// differential (internal/bench/compat_test.go), where linear interpolation
+	// gave p50=290.5 and VL -- like this -- gives 291. For b's {30,40} that is 40.
+	if m := run(`* | stats by (service) quantile(0.5, latency) as p`); m["a"] != "20" || m["b"] != "40" {
+		t.Fatalf("median latency = %v want a:20 b:40", m)
 	}
 	if m := run(`* | stats by (service) quantile(1, latency) as p`); m["a"] != "60" {
 		t.Fatalf("p100 latency a = %q want 60", m["a"])

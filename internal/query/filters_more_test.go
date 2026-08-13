@@ -31,8 +31,12 @@ func TestVLParityFilters(t *testing.T) {
 		return len(RunPipeline(s, pq))
 	}
 
-	if n := count(`status:range(200, 299)`); n != 2 { // 200, 201
-		t.Errorf("range(200,299) = %d rows, want 2", n)
+	// range(a, b) is an OPEN interval, as in LogsQL: the parentheses exclude the
+	// bounds, so 200 does not match and only 201 does. Verified against the real
+	// VictoriaLogs binary by the compat differential (internal/bench/compat_test.go),
+	// where treating it as inclusive returned one row more than VL for every query.
+	if n := count(`status:range(200, 299)`); n != 1 { // 201 only; 200 is the excluded bound
+		t.Errorf("range(200,299) = %d rows, want 1", n)
 	}
 	if n := count(`level:i("error")`); n != 2 { // Error, error
 		t.Errorf(`i("error") = %d rows, want 2`, n)
