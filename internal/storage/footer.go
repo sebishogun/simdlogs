@@ -26,6 +26,30 @@ type Reader struct {
 	// lookup is on the hot path of every selective query, and the RWMutex plus map
 	// hash cost more than the decode saved on small queries (needle, stats).
 	idxCache []atomic.Pointer[[]uint32]
+
+	// How many rows hold the EMPTY value for each column, memoized: -1 means not
+	// yet asked. field_names asks this per column per group, and the answer is a
+	// dictionary lookup whose probes each decompress a dict block -- repeated on
+	// every request against an immutable group. int32 because a group's row
+	// count is bounded well below that.
+	emptyCache []atomic.Int32
+}
+
+// EmptyValueCount reports how many rows of the column hold the empty value,
+// i.e. how many did not set the field. Memoized per column: the group is
+// immutable, so the answer cannot change.
+func (r *Reader) EmptyValueCount(name string) int {
+	ci := r.colIndex(name)
+	if ci < 0 || ci >= len(r.emptyCache) {
+		_, n, _ := r.EqualityCount(name, "")
+		return n
+	}
+	if v := r.emptyCache[ci].Load(); v >= 0 {
+		return int(v)
+	}
+	_, n, _ := r.EqualityCount(name, "")
+	r.emptyCache[ci].Store(int32(n))
+	return n
 }
 
 // indexCacheBudget bounds the total bytes of decoded indices cached across all

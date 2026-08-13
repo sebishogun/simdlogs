@@ -175,6 +175,10 @@ func ReadGroup(b []byte) (*Reader, error) {
 	p := 16
 	r.cols = make([]colMeta, ncol)
 	r.idxCache = make([]atomic.Pointer[[]uint32], ncol)
+	r.emptyCache = make([]atomic.Int32, ncol)
+	for i := range r.emptyCache {
+		r.emptyCache[i].Store(-1) // -1: not yet asked
+	}
 	for i := 0; i < ncol; i++ {
 		var m colMeta
 		m.Name, p = getStr(f, p)

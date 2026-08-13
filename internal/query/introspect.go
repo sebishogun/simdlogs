@@ -136,14 +136,10 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 // one lookup that finds nothing.
 func emptyValued(g *storage.Reader, sel *Bitset, name string) int {
 	if sel == nil {
-		// Whole group selected: the COUNT is enough, and it is an O(1) read from
-		// the posting table. Asking for the row list instead decoded every empty
-		// row's id only to measure how many there were.
-		_, n, ok := g.EqualityCount(name, "")
-		if !ok {
-			return 0
-		}
-		return n
+		// Whole group selected: the COUNT is enough, and the group memoizes it --
+		// the lookup behind it probes a compressed dictionary, and field_names
+		// asks it for every column of every group on every request.
+		return g.EmptyValueCount(name)
 	}
 	rows, has := g.EqualityRows(name, "")
 	if !has || len(rows) == 0 {
