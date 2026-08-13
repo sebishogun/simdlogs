@@ -759,3 +759,46 @@ The remaining materialize cost is the string COPY (slicebytetostring) and the
 per-Row allocation. Zero-copy strings aliasing the decompressed block buffers
 would cut it further, but the buffers must outlive the response and that
 aliasing is easy to get wrong -- deferred, noted here as the next lever.
+
+## Where the remaining disk is, and the ClickHouse-style lever (measured)
+
+Post-FOR footprint, realistic 100K-row group, 11410KB total:
+
+    dict     5890KB  52%   <- the target
+    postings 2815KB  25%
+    index    1831KB  16%
+    bloom     573KB   5%
+    time      299KB   2.6%
+
+The dict is half the group, and it is dominated by high-cardinality columns.
+Per-column dict, current LZ4 vs flate (entropy) vs a hex nibble-pack
+(TestHexDictOpportunity):
+
+    column    distinct  lz4(default)  flate     nibble
+    trace_id  100000    1471KB        854KB     781KB   <- hex
+    span_id    99998     723KB        425KB     390KB   <- hex
+    _msg       78213     658KB        342KB     (text)
+    path       94129     518KB        256KB     (text)
+
+Two findings, both the ClickHouse specialized-codec idea:
+
+1. **Hex columns don't compress under LZ4** (1.05x, entry above) because a
+   random 16-char trace_id carries 4 bits of entropy per char in an 8-bit byte
+   and LZ4 has no entropy coding. Nibble-packing (4 bits/char) halves them
+   losslessly -- 1471->781KB (1.88x), 723->390KB (1.85x) -- and decodes FAST (a
+   nibble unpack, no entropy decoder), so unlike flate it can be the DEFAULT.
+   It even beats flate on hex (781 vs 854) because flate's Huffman approaches 4
+   bits with overhead; nibbles are exactly 4 bits. Saving on the two hex columns
+   ~= 1023KB, i.e. 11410 -> ~10390KB, realistic ratio 2.62x -> ~2.38x of VL.
+
+2. **Text columns (_msg, path)** compress ~2x more under flate than LZ4 (entropy
+   coding of natural-language tokens), but flate decode is slower than the SIMD
+   LZ4 kernel -- so it stays a compact-mode lever (already available), not the
+   default.
+
+Recommendation: a self-describing hex nibble codec is the next default win. The
+dict block format already carries a per-block codec flag (dictCodecFlate = the
+rawLen high bit), so a dictCodecHex bit adds it with no format-version change
+and full back-compat (old blocks read as before). It is a deliberate change to
+the dict read path (blockValAt/dictSectionAt/All/Some/Search all decode blocks),
+verified on its own, not folded into an unrelated commit.
