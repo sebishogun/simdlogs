@@ -1,5 +1,11 @@
 # SIMD Ecosystem Documentation Implementation Plan
 
+> **Status:** Superseded by
+> [`2026-08-13-simd-family-production-documentation.md`](2026-08-13-simd-family-production-documentation.md),
+> which covers the complete ten-repository architecture, LLD, roadmap,
+> verification, and agent-context documentation scope. This file remains the
+> record of the earlier README-refresh phase.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Refresh all nine SIMD-dependent repositories as source-backed technical documentation and push the verified main branches.
