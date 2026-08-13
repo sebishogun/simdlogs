@@ -315,6 +315,29 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 			cols[f] = col{idx: idx, dict: g.DictDecodeSome(f, want)}
 		}
 	}
+	// Resolve each materialize field to its decoded column ONCE, positionally --
+	// the inner loop ran a map lookup per field per row.
+	type matCol struct {
+		name string
+		idx  []uint32
+		dict []string
+	}
+	mats := make([]matCol, len(matFields))
+	for k, f := range matFields {
+		c := cols[f]
+		mats[k] = matCol{name: f, idx: c.idx, dict: c.dict}
+	}
+	// One Field arena for the whole group instead of a make() per row: a big
+	// result set was one allocation per matched row (75k allocs / 34MB on the
+	// common-select bench, and the GC to match). Sized exactly and never grown,
+	// so the sub-slices handed to rows stay valid.
+	arena := make([]Field, cnt*len(mats))
+	pos := 0
+	if need := len(out) + cnt; cap(out) < need { // one grow instead of doubling
+		grown := make([]Row, len(out), need)
+		copy(grown, out)
+		out = grown
+	}
 	sel.ForEach(func(i int) {
 		var t int64
 		if pointRead {
@@ -322,18 +345,21 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 		} else {
 			t = ts[i-lo]
 		}
-		row := Row{Time: t, Fields: make([]Field, 0, len(matFields))}
-		for _, f := range matFields {
+		start := pos
+		for k := range mats {
 			// Prefer a decoded column if we already have one; otherwise
 			// (the posting path skipped the full decode) fetch just this
 			// row's value -- O(1), keeping the selective query lazy.
-			if c := cols[f]; c.idx != nil {
-				row.Fields = append(row.Fields, Field{f, c.dict[c.idx[i]]})
-			} else if v, ok := g.DictValueAt(f, i); ok {
-				row.Fields = append(row.Fields, Field{f, v})
+			m := &mats[k]
+			if m.idx != nil {
+				arena[pos] = Field{m.name, m.dict[m.idx[i]]}
+				pos++
+			} else if v, ok := g.DictValueAt(m.name, i); ok {
+				arena[pos] = Field{m.name, v}
+				pos++
 			}
 		}
-		out = append(out, row)
+		out = append(out, Row{Time: t, Fields: arena[start:pos:pos]})
 	})
 	return out
 }
@@ -664,7 +690,9 @@ func eqPredBitset(g *storage.Reader, p *Pred, n int) *Bitset {
 		}
 		return b
 	}
-	idx, _ := g.DictIndices(p.Field)
+	// Raw indices only: the mask compares dict ids, so decoding the whole dict
+	// section into Go strings (what DictIndices also does) was pure waste.
+	idx := g.DictIndicesRaw(p.Field)
 	eqMaskInto(b, idx, uint32(id))
 	return b
 }

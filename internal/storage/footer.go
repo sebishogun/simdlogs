@@ -1,6 +1,9 @@
 package storage
 
 import (
+	"sync"
+	"sync/atomic"
+
 	"github.com/sebishogun/simd"
 )
 
@@ -13,6 +16,53 @@ type Reader struct {
 	TimeMin int64
 	TimeMax int64
 	cols    []colMeta
+
+	// Decoded per-row dictionary indices, cached per column. A group's blob is
+	// immutable once sealed and the query side only reads these, so the decode
+	// is pure derived data -- re-running it per query was ~20% of the profile on
+	// a repeated query (and alerting rules / logrules re-run on a timer). Bounded
+	// by the package budget so it cannot grow into the whole dataset.
+	idxMu    sync.RWMutex
+	idxCache map[string][]uint32
+}
+
+// indexCacheBudget bounds the total bytes of decoded indices cached across all
+// readers; indexCacheUsed tracks what is held. 0 disables caching.
+var (
+	indexCacheBudget atomic.Int64
+	indexCacheUsed   atomic.Int64
+)
+
+func init() { indexCacheBudget.Store(256 << 20) }
+
+// SetIndexCacheBudget sets the decoded-index cache budget in bytes (0 disables
+// the cache). Indices are 4 bytes per row per cached column.
+func SetIndexCacheBudget(n int64) { indexCacheBudget.Store(n) }
+
+// IndexCacheUsed reports the bytes currently held by the decoded-index cache.
+func IndexCacheUsed() int64 { return indexCacheUsed.Load() }
+
+func (r *Reader) cachedIdx(name string) []uint32 {
+	r.idxMu.RLock()
+	v := r.idxCache[name]
+	r.idxMu.RUnlock()
+	return v
+}
+
+func (r *Reader) cacheIdx(name string, idx []uint32) {
+	size := int64(len(idx)) * 4
+	if size == 0 || indexCacheUsed.Load()+size > indexCacheBudget.Load() {
+		return // over budget: serve this query, cache nothing
+	}
+	r.idxMu.Lock()
+	if r.idxCache == nil {
+		r.idxCache = make(map[string][]uint32, 4)
+	}
+	if _, dup := r.idxCache[name]; !dup {
+		r.idxCache[name] = idx
+		indexCacheUsed.Add(size)
+	}
+	r.idxMu.Unlock()
 }
 
 // TimeRangeMatches reports whether the group's time span overlaps
@@ -139,8 +189,7 @@ func (r *Reader) DictIndices(name string) ([]uint32, []string) {
 	if m == nil || m.Type != ColDict {
 		return nil, nil
 	}
-	data := r.blob[m.DataOff : m.DataOff+r.idxBytes(m)]
-	return decodeIndices(data, r.Rows, m.Width), dictSectionAll(r.dictSec(m), m.DictLen)
+	return r.DictIndicesRaw(name), dictSectionAll(r.dictSec(m), m.DictLen)
 }
 
 // DictLen is the number of distinct values in a dict column.
@@ -160,8 +209,13 @@ func (r *Reader) DictIndicesRaw(name string) []uint32 {
 	if m == nil || m.Type != ColDict {
 		return nil
 	}
+	if v := r.cachedIdx(name); v != nil {
+		return v // decoded on an earlier query; the blob is immutable
+	}
 	data := r.blob[m.DataOff : m.DataOff+r.idxBytes(m)]
-	return decodeIndices(data, r.Rows, m.Width)
+	idx := decodeIndices(data, r.Rows, m.Width)
+	r.cacheIdx(name, idx)
+	return idx
 }
 
 // DictDecodeSome decodes only the dict values whose id is marked in want,
