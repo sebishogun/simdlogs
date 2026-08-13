@@ -60,6 +60,8 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 	// of every field, which on a corpus with a 200k-value trace_id column took
 	// nine seconds to answer a question about column names.
 	counts := map[string]int{}
+	total := 0
+	var names []string // reused across groups; column sets are small and repeat
 	for _, g := range s.Groups(q.From, q.To) {
 		if !groupCanMatch(g, q) {
 			continue
@@ -74,15 +76,26 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 		if rows == 0 {
 			continue
 		}
+		total += rows
 		// A group can carry two columns of the same name -- _time is stored both
 		// as the timestamp column and, when the record spelled it out, as a
 		// value column. Counting both reported twice the rows for that field.
-		seen := make(map[string]bool, len(g.ColumnNames()))
+		// Deduplicated by scanning the names already seen: a group holds a
+		// handful of columns, and a map per group allocated more than the scan
+		// costs.
+		names = names[:0]
 		for _, name := range g.ColumnNames() {
-			if seen[name] {
+			dup := false
+			for _, prev := range names {
+				if prev == name {
+					dup = true
+					break
+				}
+			}
+			if dup {
 				continue
 			}
-			seen[name] = true
+			names = append(names, name)
 			counts[name] += rows - emptyValued(g, sel, name)
 		}
 	}
@@ -102,7 +115,10 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 			break
 		}
 	}
-	if n := Count(s, q); n > 0 {
+	// `total` is the matching row count, already summed above -- calling Count
+	// here instead ran a second full pass over every group to learn a number
+	// the first pass had.
+	if n := total; n > 0 {
 		if !hasStream {
 			out = append(out, ValueCount{Value: "_stream", Count: n})
 		}
@@ -119,12 +135,19 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 // The empty value's row list comes from the postings, so a dense column costs
 // one lookup that finds nothing.
 func emptyValued(g *storage.Reader, sel *Bitset, name string) int {
+	if sel == nil {
+		// Whole group selected: the COUNT is enough, and it is an O(1) read from
+		// the posting table. Asking for the row list instead decoded every empty
+		// row's id only to measure how many there were.
+		_, n, ok := g.EqualityCount(name, "")
+		if !ok {
+			return 0
+		}
+		return n
+	}
 	rows, has := g.EqualityRows(name, "")
 	if !has || len(rows) == 0 {
 		return 0
-	}
-	if sel == nil {
-		return len(rows)
 	}
 	n := 0
 	for _, i := range rows {
