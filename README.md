@@ -201,7 +201,10 @@ SIMDLOGS_SCALEVL=1 SIMDLOGS_SCALEVL_N=100000000 \
 The LogsQL parity plan is implemented and tested, but this repository has no
 tagged release yet. Storage format compatibility, operational upgrade policy,
 and the supported public API are therefore not under a stable-version promise.
-Pin a commit if you deploy it today.
+Pin a commit if you deploy it today. This README and the `docs/` tree describe
+the current source only; the production-hardening direction (durability,
+cluster contract, release) is planned, not shipped — see
+[`docs/roadmap.md`](docs/roadmap.md).
 
 Current open work is measured rather than implied: reduce the disk footprint
 without giving back the indexed-query wins, widen the Elasticsearch surface,
@@ -209,11 +212,28 @@ and turn the current cluster primitives into a documented production protocol.
 
 ## Documentation
 
-- [`docs/vl-parity.md`](docs/vl-parity.md): current LogsQL parity inventory.
+- [`docs/architecture.md`](docs/architecture.md): product boundary, components,
+  data flow, read order.
+- [`docs/lld/ingest.md`](docs/lld/ingest.md), [`docs/lld/storage.md`](docs/lld/storage.md),
+  [`docs/lld/query.md`](docs/lld/query.md), [`docs/lld/api.md`](docs/lld/api.md),
+  [`docs/lld/cluster.md`](docs/lld/cluster.md): current low-level design, one
+  per layer.
+- [`docs/roadmap.md`](docs/roadmap.md): planned hardening stages with
+  measurable exits; nothing there ships yet.
+- [`docs/verification.md`](docs/verification.md): gates, reports, benchmark
+  discipline, crash recovery, cross-arch.
+- [`docs/vl-parity.md`](docs/vl-parity.md): LogsQL parity inventory (status:
+  complete, tiers 0-5).
 - [`docs/scale-curve.md`](docs/scale-curve.md): disk-backed scale results.
 - [`docs/benchmark-contract.md`](docs/benchmark-contract.md): benchmark rules
   published before implementation was measured.
-- [`docs/design.md`](docs/design.md): original milestone design and hypotheses.
+- [`docs/design.md`](docs/design.md): original milestone design and hypotheses
+  (historical).
+- [`docs/plans/2026-08-07-simdlogs-full-build.md`](docs/plans/2026-08-07-simdlogs-full-build.md):
+  the completed build plan that produced the current code (historical).
+- [`docs/plans/2026-08-13-simdlogs-production-design.md`](docs/plans/2026-08-13-simdlogs-production-design.md)
+  and [`docs/plans/2026-08-13-simdlogs-production.md`](docs/plans/2026-08-13-simdlogs-production.md):
+  the approved production-hardening design and plan.
 - [`docs/wrong.md`](docs/wrong.md): measurements that changed or rejected work.
 
 The wider SIMD project inventory lives in the

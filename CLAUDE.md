@@ -6,11 +6,21 @@ where this header and AGENTS.md ever disagree, AGENTS.md wins.
 
 ## Where everything is
 
-- **Design:** docs/design.md — the architecture and the falsifiable claim.
-- **Build plan:** docs/plans/2026-08-07-simdlogs-full-build.md — phases P0-P7,
-  task by task, tests-first. Implement in order; each task ends in a commit.
+- **Boundary and status:** docs/architecture.md — what ships (and what does
+  not: no metrics ingestion, no consensus, no tagged release).
+- **Current low-level design:** docs/lld/storage.md, ingest.md, query.md,
+  api.md, cluster.md — one per layer, exact current source.
+- **Planned direction (not shipped):** docs/roadmap.md and
+  docs/plans/2026-08-13-simdlogs-production-design.md /
+  2026-08-13-simdlogs-production.md.
+- **Verification discipline:** docs/verification.md — gates, report tests,
+  benchmark contract, crash recovery, cross-arch.
+- **Design:** docs/design.md — the historical architecture and the
+  falsifiable claim; the completed build plan is
+  docs/plans/2026-08-07-simdlogs-full-build.md.
 - **Reference (read-only, never imported):** ../victorialogs-reference — the
-  spec to match and the evidence to beat; cite it file:line.
+  spec to match and the evidence to beat; cite it file:line. The staged
+  binary at internal/bench/victoria-logs powers the head-to-head reports.
 - **The record:** docs/wrong.md — every measurement that argued against a
   change, whether or not code changed.
 
@@ -112,7 +122,7 @@ there whether or not any code changed — the entry is the deliverable.
 
 ## Toolchain
 
-Go 1.26.2 now; switch to 1.27 the day it is released. Nothing in this
+Go 1.26.5 now; switch to 1.27 the day it is released. Nothing in this
 codebase may depend on a toolchain quirk that makes that switch painful.
 
 ## Sweep for unmeasured shapes before tuning measured ones
