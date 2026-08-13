@@ -178,10 +178,37 @@ func trimSpace(b []byte) []byte {
 	return b
 }
 
+// allDigits reports whether s is a non-empty run of ASCII digits (optionally
+// signed), i.e. whether ParseInt can possibly succeed.
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[0] == '-' || s[0] == '+' {
+		if len(s) == 1 {
+			return false
+		}
+		i = 1
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // parseTime accepts unix-nanos-as-digits or RFC3339; returns nanos.
 func parseTime(s string) (int64, bool) {
-	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return n, true
+	// Only call ParseInt when the value really can be an integer. An RFC3339
+	// _time -- the common case for logs -- made it fail on EVERY row, and a failed
+	// ParseInt allocates a syntaxError plus a copy of the string: ~36% of all
+	// ingest allocations were errors that were built and immediately discarded.
+	if allDigits(s) {
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return n, true
+		}
 	}
 	for _, layout := range timeLayouts {
 		if t, err := parseLayout(layout, s); err == nil {

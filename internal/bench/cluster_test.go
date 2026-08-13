@@ -81,6 +81,9 @@ func TestClusterScaling(t *testing.T) {
 	}
 }
 
+// clusterCorpusB is the benchmark-callable form (no *testing.T needed).
+func clusterCorpusB(n int) []byte { return clusterCorpus(n, "NEEDLEbench") }
+
 func clusterCorpus(n int, needle string) []byte {
 	var buf bytes.Buffer
 	buf.Grow(n * 220)
