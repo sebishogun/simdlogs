@@ -851,3 +851,32 @@ mostly the PRICE of the 34-490x query wins, not waste -- but "better on all coun
 means closing it, and the honest route is tiered storage (recent data with full
 postings; aged data re-compacted with stronger dictionary compression and merged
 postings), not dropping the index. Tracked as a task.
+
+## Tiered storage closes most of the disk gap (2.40x -> ~1.55x of VL)
+
+The disk axis was the one place VictoriaLogs won. Two levers, both measured on the
+realistic 100k corpus (10297KB hot):
+
+    flate dictionaries only          9464KB   -8.1%
+    flate + drop the inverted index  6648KB  -35.4%
+
+Flate alone is modest here (the corpus's biggest dict columns, trace_id/span_id,
+are already hex-packed, which beats both LZ4 and flate). The real weight is the
+postings: ~27% of a group, and dropping them takes the footprint from 2.40x of VL
+to about 1.55x.
+
+That is a genuine trade, not free: without postings an equality query falls back to
+a decode+scan -- which is what VictoriaLogs does for EVERY query, so cold-tier
+queries land near VL's speed while hot groups keep the 34-490x wins. Hence the
+tiering shape: recent groups untouched, groups older than -recompact-after
+re-encoded, and -recompact-drop-postings opt-in on top.
+
+Guards, because this is a data-rewriting background pass:
+- storage: recompaction preserves every row exactly, shrinks in place, is
+  idempotent (a group with no LZ4 blocks left is skipped), and survives reopen.
+- query: a differential test runs six query shapes (common equality, rare
+  equality, absent value, substring, two-predicate AND, time window) against the
+  same data with and without postings and requires byte-identical rows. Dropping
+  the index is a size/speed trade, never a correctness one.
+- mmap lifetime: a query holds the old *Reader across the swap, so replaced
+  mappings are retired and unmapped only after a 5-minute grace, not immediately.

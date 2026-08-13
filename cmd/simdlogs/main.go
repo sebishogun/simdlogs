@@ -22,6 +22,8 @@ func main() {
 	addr := flag.String("addr", ":9428", "listen address (VL's default port)")
 	dir := flag.String("storage", "./simdlogs-data", "storage directory")
 	retention := flag.Duration("retention", 0, "drop data older than this (e.g. 720h); 0 disables")
+	tierDropPost := flag.Bool("recompact-drop-postings", false, "when recompacting, also drop the per-column inverted index (35% smaller total vs 8% for flate alone, but cold equality queries fall back to a scan -- what VictoriaLogs does for every query)")
+	tierAfter := flag.Duration("recompact-after", 0, "re-encode groups older than this with flate dictionaries (~17% smaller, slower value reads on cold data); 0 disables")
 	streamFields := flag.String("stream-fields", "", "comma-separated fields that identify a log stream (synthesizes _stream)")
 	syslogAddr := flag.String("syslog", "", "also listen for syslog on this UDP/TCP address (e.g. :514)")
 	backends := flag.String("select-backends", "", "comma-separated peer node URLs; when set this node is a select router (vmselect role)")
@@ -46,6 +48,11 @@ func main() {
 	if *compact {
 		srv.SetCompact(true)
 		log.Print("compact mode: flate dictionaries (smaller, slower queries)")
+	}
+	if *tierAfter > 0 {
+		stopTier := srv.StartTiering(*tierAfter, time.Hour, *tierDropPost)
+		defer stopTier()
+		log.Printf("tiering: recompacting groups older than %s", *tierAfter)
 	}
 	if *retention > 0 {
 		stop := srv.StartRetention(*retention, time.Hour)

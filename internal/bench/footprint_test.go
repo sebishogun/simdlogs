@@ -34,7 +34,19 @@ func TestFootprintBreakdown(t *testing.T) {
 		gcols = append(gcols, storage.Column{Name: k, Type: storage.ColDict, Dict: &d})
 	}
 	g := &storage.Group{Rows: n, Columns: gcols}
-	r, err := storage.ReadGroup(g.Marshal())
+	hot := g.Marshal()
+	// What the tiering pass (-recompact-after) achieves on this corpus: the same
+	// group re-encoded with flate dictionaries. Hex-coded columns (trace_id,
+	// span_id) already use the hex codec and do not change.
+	g.Compact = true
+	cold := g.Marshal()
+	g.NoPostings = true
+	coldNP := g.Marshal()
+	g.Compact, g.NoPostings = false, false
+	t.Logf("TIERING hot %dKB -> cold(flate) %dKB (%.1f%%) -> cold(flate,no-postings) %dKB (%.1f%%)",
+		len(hot)/1024, len(cold)/1024, 100*(1-float64(len(cold))/float64(len(hot))),
+		len(coldNP)/1024, 100*(1-float64(len(coldNP))/float64(len(hot))))
+	r, err := storage.ReadGroup(hot)
 	if err != nil {
 		t.Fatal(err)
 	}

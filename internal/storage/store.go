@@ -17,6 +17,7 @@ type Store struct {
 	groups   []*groupEntry
 	nextID   uint64
 	openHook func(uint64)
+	retired  []retiredMap // mappings replaced by Recompact, unmapped after a grace period
 }
 
 type groupEntry struct {

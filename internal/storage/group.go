@@ -39,6 +39,10 @@ type Group struct {
 	Rows    int
 	Columns []Column
 	Compact bool // compact mode: flate the dict (smaller, slower decode); opt-in
+	// NoPostings drops the per-column inverted index (~27% of a group). Equality
+	// queries then fall back to a decode+scan, which is what VictoriaLogs does
+	// for every query -- the tiering pass uses it on cold groups only.
+	NoPostings bool
 }
 
 // colMeta is the footer's per-column skip record.
@@ -89,7 +93,12 @@ func (g *Group) Marshal() []byte {
 			m.MinIdx, m.MaxIdx = mn, mx
 			m.Bloom = buildDictBloom(c.Dict.Dict)
 			m.PostOff = len(b)
-			b = buildPostings(c.Dict.Indices, len(c.Dict.Dict)).marshal(b)
+			// Postings are ~27% of a group and buy the 34-490x equality wins. A
+			// cold group can drop them (PostLen 0, which the query path already
+			// falls back from to a decode+scan) to trade that speed for size.
+			if !g.NoPostings {
+				b = buildPostings(c.Dict.Indices, len(c.Dict.Dict)).marshal(b)
+			}
 			m.PostLen = len(b) - m.PostOff
 			m.DictOff = len(b)
 			b = append(b, marshalDictSection(c.Dict.Dict, g.Compact)...)
