@@ -229,6 +229,9 @@ and turn the current cluster primitives into a documented production protocol.
 
 ## Documentation
 
+- [`AGENTS.md`](AGENTS.md) and [`CLAUDE.md`](CLAUDE.md): the working rules —
+  boundary, read order, gates, benchmark discipline. CLAUDE.md embeds
+  AGENTS.md's rules verbatim so Claude Code runs are self-contained.
 - [`docs/architecture.md`](docs/architecture.md): product boundary, components,
   data flow, read order.
 - [`docs/lld/ingest.md`](docs/lld/ingest.md), [`docs/lld/storage.md`](docs/lld/storage.md),

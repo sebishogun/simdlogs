@@ -33,8 +33,13 @@ parser in `internal/query/logsql.go`, the flags in `cmd/simdlogs/main.go`).
 Before touching anything: `README.md`, then `docs/architecture.md`, then the
 layer LLD you are about to change (`docs/lld/storage.md`, `ingest.md`,
 `query.md`, `api.md`, `cluster.md`), then `docs/verification.md` for how a
-claim gets trusted. `docs/wrong.md` is read before proposing any change that
-repeats a measured idea.
+claim gets trusted and `docs/roadmap.md` so planned work is never presented
+as shipped. `docs/wrong.md` is read before proposing any change that repeats
+a measured idea. Work on the production-hardening track reads the approved
+design and its task plan first — `docs/plans/2026-08-13-simdlogs-production-design.md`
+and `docs/plans/2026-08-13-simdlogs-production.md`. The historical records —
+`docs/design.md` and `docs/plans/2026-08-07-simdlogs-full-build.md` — are read
+as relevant when a claim or assumption traces back to them.
 
 ## Package ownership
 
@@ -125,6 +130,22 @@ The head-to-head harness runs both engines as servers on the same wire API,
 same corpus, same machine — VictoriaLogs from the reference clone as a
 subprocess. The benchmark contract is published before the implementation is
 measured.
+
+## Gates
+
+Every change runs the three core gates bare (or under `set -o pipefail`)
+before commit:
+
+    go test ./...
+    go test -race ./...
+    go vet ./...
+
+Release gates add a clean `gofmt -l` and the quiet-machine (load < 1)
+discipline for anything published as a measurement. The gofmt gate is
+currently red on pre-existing formatting in `internal/storage/group.go`; the
+blocker is documented (`docs/verification.md`, `docs/roadmap.md`) and is a
+code task, not a docs one — no source edit comes from a documentation
+session.
 
 ## The record
 
