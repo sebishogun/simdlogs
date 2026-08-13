@@ -118,6 +118,78 @@ speed rather than API availability.
 
 ## Measured against VictoriaLogs
 
+### Per-operation gate
+
+Every operation both engines expose runs through HTTP against the same 200k-row
+deterministic corpus. Query order is shuffled; each latency is the minimum of
+the samples for that operation, taken with the load average under 1. The gate
+was run twice in succession and a figure is reported only where both runs
+agree. These figures were measured on amd64/AVX-512. No wall-clock claim is
+made for another architecture.
+
+| operation | simdlogs | VictoriaLogs | ratio |
+|---|---:|---:|---:|
+| stats/groupby | 628µs | 14.2ms | 22.6x |
+| field_values | 598µs | 11.8ms | 19.8x |
+| stats_query_range | 315µs | 2.5ms | 7.8x |
+| stats/uniq | 601µs | 3.9ms | 6.5x |
+| facets | 13.0ms | 56.3ms | 4.3x |
+| insert/jsonline | 153ms | 538ms | 3.5x |
+| insert/elasticsearch | 172ms | 538ms | 3.1x |
+| stats_query | 215µs | 592µs | 2.8x |
+| query/windowed | 10.1ms | 25.9ms | 2.6x |
+| stats/count | 262µs | 601µs | 2.3x |
+| query/and | 40ms | 74ms | 1.9x |
+| query/limit | 992µs | 1.8ms | 1.9x |
+| stats/topk | 7.1ms | 12.7ms | 1.8x |
+| query/common | 300ms | 508ms | 1.7x |
+| query/or | 599ms | 1.01s | 1.7x |
+| query/range | 233ms | 392ms | 1.7x |
+| query/substring | 511ms | 822ms | 1.6x |
+| field_names | 433µs | 656µs | 1.5x |
+| stream_field_names | 473µs | 613µs | 1.3x |
+| hits | 2.3ms | 2.8ms | 1.2x |
+
+Values above 1 mean `simdlogs` is faster; all 20 rows are above 1 in both runs.
+[`internal/bench/perops_test.go`](internal/bench/perops_test.go) fails the build
+if any row falls below 1. On the 3M-row harness ingest ran at 3.17M rec/s here
+and 0.49M rec/s in VictoriaLogs, and the selective window took 7.0 ms versus
+11.1 ms; that window was below 1 until the bounded-decode change (`5419c80`)
+landed. Disk on the realistic corpus is 110.08 bytes/row, down from 127.4.
+VictoriaLogs still writes fewer bytes per row there, and the paragraphs below
+say by how much.
+
+### Parity gate
+
+Three separate checks, because only the last two see a `200` whose content is
+wrong. A status-code probe once reported zero gaps while 27 behaviors differed;
+that probe and its failure are in [`docs/wrong.md`](docs/wrong.md).
+
+| check | result |
+|---|---|
+| LogsQL responses, byte for byte, against the reference binary | 40 of 40 identical |
+| routes the reference answers and this does not | 0 of 24 (20 shared, 4 here only) |
+| response bodies — field names, nesting, types | match; pinned by shape tests |
+| documented query arguments that change the answer | every one, on both engines |
+| ingest formats accepting the reference's payloads | 8 of 8 |
+| write, reopen, query | no row lost |
+
+The argument check is what found `extra_label`, `match[]`, `limit`,
+`keep_const_fields` and twelve more being accepted and ignored.
+
+| category | implemented |
+|---|---|
+| ingest | NDJSON, logfmt, Elasticsearch `_bulk`, Loki push, Datadog logs, OpenTelemetry logs in JSON and protobuf, journald export, syslog over HTTP, UDP and TCP |
+| pipes | stats, sort, limit/head, fields, uniq, top, tail, offset, rename, delete, filter, unpack_json, unpack_logfmt, unpack_syslog, unpack_words, extract, extract_regexp, format, rank, replace, replace_regexp, copy, len, drop_empty_fields, collapse_nums, math/eval, decolorize, pack_json, pack_logfmt, sample, first, last, unroll, json_array_len, join, union, stream_context, blocks_count, block_stats |
+| stats | count, sum, avg, min, max, uniq, count_uniq, count_uniq_hash, quantile/median, values, uniq_values, sum_len, count_empty, row_any, histogram, row_min, row_max, rate, rate_sum |
+| filters | exact, phrase, prefix, substring, regex, numeric comparison, `in()`, `range()`, `len_range()`, `string_range()`, `i()`, `seq`, `ipv4_range`, `{eq,ne,lt,le,gt,ge}_field`, `_time:` relative, absolute, `day_range` and `week_range`, `_stream_id:` |
+| select endpoints | `query`, `hits`, `facets`, `field_names`, `field_values`, `stats_query`, `stats_query_range`, `streams`, `stream_ids`, `stream_field_names`, `stream_field_values`, `tail`, `/_search` |
+| not in VictoriaLogs | SQL over logs (`/select/sql`), HLL cardinality, alerting rules (`/alerts`), vector search (`/select/vector`) |
+
+Read [`docs/vl-parity.md`](docs/vl-parity.md) for the full inventory.
+
+### Scale curve
+
 The scale harness runs both engines through HTTP on the same deterministic
 bytes and disk-backed stores. Query order is shuffled; each latency is the
 minimum of 15 samples after three warmups. These figures were measured on
