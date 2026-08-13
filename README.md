@@ -50,7 +50,7 @@ readers mmap immutable groups and reopen them after restart.
 | Elasticsearch bulk NDJSON | `/_bulk` |
 | Loki push JSON | `/loki/api/v1/push` |
 | Datadog logs JSON | `/api/v2/logs`, `/v1/input` |
-| OpenTelemetry logs JSON | `/v1/logs` |
+| OpenTelemetry logs, JSON and protobuf | `/v1/logs` |
 | journald export | `/insert/journald` |
 | syslog | `/insert/syslog`, or UDP and TCP with `-syslog` |
 
@@ -154,16 +154,18 @@ Values above 1 mean `simdlogs` is faster; all 20 rows are above 1 in both runs.
 [`internal/bench/perops_test.go`](internal/bench/perops_test.go) fails the build
 if any row falls below 1. On the 3M-row harness ingest ran at 3.17M rec/s here
 and 0.49M rec/s in VictoriaLogs, and the selective window took 7.0 ms versus
-11.1 ms; that window was below 1 until the bounded-decode change (`5419c80`)
-landed. Disk on the realistic corpus is 110.08 bytes/row, down from 127.4.
-VictoriaLogs still writes fewer bytes per row there, and the paragraphs below
-say by how much.
+11.1 ms; the window figure was 20.6 ms before the bounded-decode change
+(`5419c80`). Disk on the realistic corpus is 110.08 bytes/row, down from 127.4.
+VictoriaLogs still writes fewer bytes per row there; the paragraphs below give
+the magnitude.
 
 ### Parity gate
 
-Three separate checks, because only the last two see a `200` whose content is
-wrong. A status-code probe once reported zero gaps while 27 behaviors differed;
-that probe and its failure are in [`docs/wrong.md`](docs/wrong.md).
+Six checks run against the reference binary on identical bytes: a response
+differential, a route inventory, a body-shape comparison, a per-argument
+sensitivity check, an ingest-format check, and a persistence round-trip. Status
+codes alone do not distinguish a correct response from a `200` carrying
+different content, so the last four compare bodies.
 
 | check | result |
 |---|---|
@@ -174,8 +176,20 @@ that probe and its failure are in [`docs/wrong.md`](docs/wrong.md).
 | ingest formats accepting the reference's payloads | 8 of 8 |
 | write, reopen, query | no row lost |
 
-The argument check is what found `extra_label`, `match[]`, `limit`,
-`keep_const_fields` and twelve more being accepted and ignored.
+Findings from these checks, recorded in [`docs/wrong.md`](docs/wrong.md)
+entries 32–37:
+
+- A status-code probe reported 0 route gaps while 27 behaviors differed.
+- The argument-sensitivity check found 16 arguments accepted without effect,
+  among them `extra_label`, `match[]`, `limit` and `keep_const_fields`.
+- `field_names` counted `_time` twice; a row group carries two columns of that
+  name.
+- A bounded query decoded the entire timestamp column; the fix bounds the
+  decode span to the matched rows (`1a85d8a`, `5419c80`).
+- The point-read threshold was expressed as a fraction of the group when the
+  cost is absolute.
+- The Elasticsearch `exists` clause is accepted and changes no answer; it is
+  decoded but not mapped to a predicate.
 
 | category | implemented |
 |---|---|
