@@ -31,8 +31,8 @@ Exits:
 - `go test -race ./...` clean; `go vet ./...` clean.
 - A status-code probe plus a response-shape probe plus an answer-changes
   probe pass on every select and ingest endpoint, against the staged VL
-  binary when present (skipped cleanly when absent — the suite is honest
-  about what it did not run).
+  binary when present (skipped cleanly when absent — the suite records what
+  it did not run).
 - The ES surface documents its DSL subset as a fixed contract with a
   conformance test per clause.
 
@@ -148,6 +148,11 @@ session):
 - `docs/wrong.md` entry 37 and the gofmt blocker on
   `internal/storage/group.go` are likewise implementation-side work queued
   from documentation sessions.
+
+The production plan maps them: `es.go`'s comment drift is owned by Task B.2
+(the exists work rewrites those comments and lands entry 37), and the
+scale-test comment, the recompact help, and the gofmt blocker are Task G.1 —
+see `docs/plans/2026-08-13-simdlogs-production.md`.
 
 ## Stage 5 — Release
 
