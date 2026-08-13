@@ -802,3 +802,18 @@ rawLen high bit), so a dictCodecHex bit adds it with no format-version change
 and full back-compat (old blocks read as before). It is a deliberate change to
 the dict read path (blockValAt/dictSectionAt/All/Some/Search all decode blocks),
 verified on its own, not folded into an unrelated commit.
+
+## VictoriaLogs clustering is enterprise-only -- no OSS cluster head-to-head
+
+Attempted the simdlogs-cluster vs VictoriaLogs-cluster head-to-head (the metrics
+analog beat VM cluster on all three axes). Blocked: VictoriaLogs releases ship only
+the single-node binary and an -enterprise.tar.gz; there are no OSS vlinsert /
+vlselect / vlstorage binaries (checked v1.50-1.52 release assets). VL clustering is
+an enterprise feature, so a fair OSS cluster-vs-cluster comparison is not possible
+without a license.
+
+What holds: simdlogs' own cluster (write-routing + replication + federation,
+internal/api/cluster.go, tests green) is functional, and simdlogs already beats VL
+SINGLE-NODE on the underlying metrics (needle 27.9x, groupby 481x, ingest 4.22x),
+which is VL's best available OSS configuration. A cluster-vs-cluster number would
+need the VL enterprise binary.
