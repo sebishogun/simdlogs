@@ -59,13 +59,15 @@ Six introspection endpoints share one envelope —
 `{"values":[{"value":..,"hits":..}]}` — so a client decodes them all
 with one type; that is why they must not each invent a key.
 
-In router mode only `field_names`, `field_values`, `stream_field_names` and
-`stream_field_values` have a working federated merge; the `streams` and
-`stream_ids` merges decode the wrong key and answer empty. Everything else
-is router-local or not merged — `facets`, `tail`, `/select/sql`,
-`/select/vector`, `/admin/backup`, `/metrics`, `/alerts` and others all
-answer from the router's own store and state. The enumeration here is
-representative, not complete: the per-endpoint status table in
+In router mode `/select/logsql/query`, `stats_query_range`, `/_search` and
+`/_count`, and the `field_names`/`field_values`/`stream_field_names`/
+`stream_field_values` value-count merges are wired (the `streams` and
+`stream_ids` merges decode the wrong key and answer empty). The rest of the
+introspection surface — `facets` and anything beyond the four value-count
+endpoints — plus `tail`, `/select/sql`, `/select/vector`, `/admin/backup`,
+`/metrics`, `/alerts` and others is router-local or not merged: those
+endpoints answer from the router's own store and state. The enumeration
+here is representative, not complete: the per-endpoint status table in
 [`cluster.md`](cluster.md) is authoritative, and an endpoint's absence from
 either list must not be read as federation. The cluster surface is
 experimental, not production-safe.
