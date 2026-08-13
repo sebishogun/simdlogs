@@ -2,8 +2,11 @@ package api
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -72,5 +75,44 @@ func TestServerInsertAndQuery(t *testing.T) {
 	h.Body.Close()
 	if h.StatusCode != 200 {
 		t.Fatalf("hits status %d", h.StatusCode)
+	}
+}
+
+func TestMaxRowsCap(t *testing.T) {
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.SetMaxRows(5)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	// ingest 20 records
+	var body strings.Builder
+	for i := 0; i < 20; i++ {
+		body.WriteString(`{"_msg":"line ` + strconv.Itoa(i) + `","app":"x"}` + "\n")
+	}
+	post, _ := http.Post(ts.URL+"/insert/jsonline", "application/x-ndjson", strings.NewReader(body.String()))
+	if post != nil {
+		post.Body.Close()
+	}
+	// a bare select of all 20 exceeds the cap of 5 -> 400, not a truncated 200
+	resp, err := http.Get(ts.URL + `/select/logsql/query?query=` + url.QueryEscape("*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("over-cap bare select = %d (want 400): %s", resp.StatusCode, b)
+	}
+	// an explicit limit within the cap succeeds
+	r2, err := http.Get(ts.URL + `/select/logsql/query?query=` + url.QueryEscape("* | limit 3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Body.Close()
+	if r2.StatusCode != 200 {
+		t.Errorf("| limit 3 = %d want 200", r2.StatusCode)
 	}
 }

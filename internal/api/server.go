@@ -9,6 +9,7 @@ package api
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -35,6 +36,7 @@ type Server struct {
 	compact    bool     // compact mode default for new tenants (flate dict)
 	backends   []string // peer node base URLs; when set, selects fan out and merge (vmselect role)
 	replicas   int      // replication factor: backends group into shards of this many replicas
+	maxRows    int      // cap on a bare (no-pipe) select's rows; 0 = unlimited. Errors, never truncates.
 	started    time.Time
 	nIngestReq int64 // ingest requests (atomic)
 	nQueryReq  int64 // query requests (atomic)
@@ -235,10 +237,22 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	if len(q.Pipes) == 0 {
+	bareSelect := len(q.Pipes) == 0
+	if bareSelect {
 		q.MatAll = true // a bare select returns whole records, not just filter fields
+		// Bound peak memory on an unbounded select: request one past the cap so an
+		// overflow is detectable, then ERROR rather than silently truncate. Only
+		// a bare select -- a stats/pipe query's input must not be limited, and an
+		// explicit limit= param is respected.
+		if q.Limit == 0 && s.maxRows > 0 {
+			q.Limit = s.maxRows + 1
+		}
 	}
 	rows := query.RunPipeline(s.tn(r).store, q) // applies the pipe chain; == Run when there are none
+	if bareSelect && s.maxRows > 0 && len(rows) > s.maxRows {
+		http.Error(w, fmt.Sprintf("simdlogs: result exceeds -search.maxRows=%d; add a `| limit N`, a stats pipe, or narrow the query", s.maxRows), 400)
+		return
+	}
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	// Hand-built NDJSON: no map[string]any, no reflection. The engine

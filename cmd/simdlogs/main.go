@@ -27,6 +27,7 @@ func main() {
 	backends := flag.String("select-backends", "", "comma-separated peer node URLs; when set this node is a select router (vmselect role)")
 	compact := flag.Bool("compact", false, "compact mode: flate dictionaries for ~15% smaller groups, but 2-10x slower value-reading queries -- for cold archival only, not a queryable store")
 	replicas := flag.Int("replicas", 1, "replication factor for -select-backends: backends group into shards of this many replicas")
+	maxRows := flag.Int("search.maxRows", 0, "cap on rows a bare (no-pipe) select may return; 0 = unlimited. Over the cap the query errors (never silently truncates); add a `| limit N` or a stats pipe.")
 	flag.Parse()
 
 	srv, err := api.NewServer(*dir)
@@ -36,6 +37,7 @@ func main() {
 	if *streamFields != "" {
 		srv.SetStreamFields(strings.Split(*streamFields, ","))
 	}
+	srv.SetMaxRows(*maxRows)
 	if *backends != "" {
 		srv.SetBackends(strings.Split(*backends, ","))
 		srv.SetReplicas(*replicas)

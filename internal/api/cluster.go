@@ -28,6 +28,10 @@ func (s *Server) SetBackends(urls []string) { s.backends = urls }
 // double-counted. r<=1 is plain sharding (no replication).
 func (s *Server) SetReplicas(r int) { s.replicas = r }
 
+// SetMaxRows caps how many rows a bare (no-pipe) select may return; 0 = unlimited.
+// Over the cap the query errors rather than truncating silently.
+func (s *Server) SetMaxRows(n int) { s.maxRows = n }
+
 // shards groups the backends into replica sets of size max(1, replicas).
 func (s *Server) shards() [][]string {
 	r := s.replicas
