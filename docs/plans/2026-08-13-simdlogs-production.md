@@ -29,7 +29,8 @@ noise floor 8.3% with `perf stat -e instructions:u,cycles:u` for smaller
 deltas, quiet machine (load < 1), interleaved A/B minimums.
 
 **Phases:** A crash recovery, B compatibility as gates, C ops contracts,
-D cluster wire contract, E scale proofs, F release.
+D cluster wire contract, E scale proofs, F release, G implementation-doc
+cleanup.
 
 ---
 
@@ -344,6 +345,43 @@ commit.
 
 **Step 3:** Flip the README status section from "no tagged release; pin a
 commit" to the tagged version; retire the pin-commit guidance. Commit.
+
+---
+
+## Phase G: Implementation-doc cleanup (bounded)
+
+Maps the roadmap's "Known implementation-doc defects" section
+([`../roadmap.md`](../roadmap.md)) to one scoped code task. The `es.go`
+comment drift is already owned by Task B.2 — the exists work rewrites those
+comments and lands `docs/wrong.md` entry 37. This phase owns the rest: the
+stale `scale_test.go` no-mmap comment, the `-recompact-after` help's 17%
+discrepancy, and the gofmt blocker on `internal/storage/group.go`. No source
+edit happens from a documentation session; this is the first source-touching
+task for these defects.
+
+### Task G.1: Scale-test comment, recompact help, gofmt blocker
+
+**Files:**
+- Create: `cmd/simdlogs/flags_test.go`
+- Modify: `internal/bench/scale_test.go`, `cmd/simdlogs/main.go`,
+  `internal/storage/group.go`
+
+**Step 1 (test first):** Pin the recompact help strings so the two flags
+cannot drift again: a `cmd/simdlogs` flags test asserts `-recompact-after`'s
+help states the measured -8.1% (the `docs/wrong.md` tiering entry) and agrees
+with `-recompact-drop-postings`'s 8% for flate alone. The stale ~17% claim is
+replaced by this task, not merely edited.
+
+**Step 2:** Fix the stale comment in `internal/bench/scale_test.go`: the
+header claims "there is no mmap yet" — mmap shipped long ago; the test builds
+readers in RAM and the comment must say what the test actually does.
+
+**Step 3:** Reformat `internal/storage/group.go` so `gofmt -l` is clean and
+the gofmt release gate goes green; the file is untouched by all documentation
+work until this task.
+
+**Step 4:** Gates bare: `go test ./...`, `go test -race ./...`,
+`go vet ./...`, and `gofmt -l` empty; commit.
 
 ---
 
