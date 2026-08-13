@@ -906,3 +906,40 @@ Two real router costs were found and fixed while measuring:
   the caller falls back rather than mis-ordering. needle 0.28x -> 0.45x.
 - the merge copied a string per row (Scanner.Text()); rows are now slices into
   the shard's response body, no copy. cluster common 58.8ms -> 53.5ms.
+
+## The wall-clock gate lied; instructions retired settled it
+
+Ran the full benchmark set interleaved against the pre-session baseline (33b4b12),
+min of 3 rounds, on a machine at load 3-5. The wall-clock table reported NINE
+regressions, including +94.9% on BenchmarkDictBlockDecode/lz4 -- a pure storage
+decode this session never touched. That was the tell. The same benchmarks also
+contradicted themselves across runs: BenchmarkEngineNeedle came out +47%, then
++10.4%, then +3.5%, then -2.0%; BenchmarkEngineCount +13.2%, then -1.9%, then
++57.0%.
+
+Instructions retired (deterministic, load- and layout-independent) on the same
+binaries:
+
+    DictBlockDecode/lz4   627.6M -> 634.0M   +1.0%   (wall-clock said +94.9%)
+    EngineCount            19.94B -> 19.82B  -0.6%   (said +57.0%)
+    StatsByField           20.09B -> 20.28B  +0.9%   (said +33.1%)
+    EngineNeedle           27.11B -> 27.12B  +0.05%  (said -2.0%)
+
+So there is no regression -- the "regressions" were load noise on microsecond
+benchmarks. And the wins are real, not noise in the other direction:
+
+    CommonSelect           18.34B -> 14.50B  -20.9%
+    EngineFullScanCount    28.17B -> 25.00B  -11.2%
+    EngineWindowed         29.14B -> 27.39B   -6.0%
+    SelectiveSkip/select   16.20B -> 15.68B   -3.2%
+
+(The wall-clock wins are larger than the instruction wins -- -30% to -59% -- which
+is the reduced allocation and GC pressure showing up in time but not proportionally
+in instruction count.)
+
+The 8.3% figure in CLAUDE.md is the LAYOUT noise floor for a quiet machine. Under
+load, microsecond wall-clock benchmarks swing far past it in both directions, and
+a gate run that way manufactures both false alarms and false wins. On a busy box,
+gate on instructions:u. Three REAL regressions were still found this session, and
+they were found because the first A/B pointed at them consistently across rounds
+and instructions confirmed them -- not because one wall-clock run looked bad.
