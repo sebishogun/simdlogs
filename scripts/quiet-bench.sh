@@ -29,7 +29,23 @@ while ! quiet; do
 done
 
 echo "machine quiet after ${waited}m (loadavg: $(cat /proc/loadavg)) -- measuring"
-cd "$(dirname "$0")/.." || exit 1
+
+# Measure a FIXED commit in its own worktree. The working tree is being edited
+# while this waits, and a benchmark that races an edit measures neither state.
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+REV=$(git -C "$REPO" rev-parse HEAD)
+WT=${QUIET_BENCH_WT:-/tmp/simdlogs-bench-wt}
+rm -rf "$WT"
+git -C "$REPO" worktree prune
+git -C "$REPO" worktree add --detach "$WT" "$REV" >/dev/null 2>&1 || {
+	echo "could not create the worktree; refusing to measure a moving tree"
+	exit 4
+}
+# The staged reference binary is untracked, so the worktree has no copy.
+cp "$REPO/internal/bench/victoria-logs" "$WT/internal/bench/" 2>/dev/null
+echo "measuring $REV in $WT"
+cd "$WT" || exit 1
+trap 'cd /; git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1' EXIT
 
 # Two runs. Only what both agree on is real: one run on this box has produced
 # a 94.9% "regression" in code nothing touched.
