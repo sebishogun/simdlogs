@@ -220,6 +220,31 @@ func FacetList(s Store, q *Query, limit, maxPerField int, keepConst bool) []Fiel
 		}
 		out = append(out, FieldFacet{FieldName: name, Values: vals})
 	}
+	// _stream and _stream_id are synthesized onto every record, so they are
+	// facetable like any other field. With no stream fields configured they hold
+	// one value for every row -- constant, and therefore only shown when
+	// keep_const_fields asks, which is exactly what the reference does.
+	for _, sf := range []struct {
+		name string
+		vals []ValueCount
+	}{
+		{"_stream", Streams(s, q)},
+		{"_stream_id", StreamIDs(s, q)},
+	} {
+		if !facetKeep(len(sf.vals), maxPerField, keepConst) {
+			continue
+		}
+		sortValueCounts(sf.vals)
+		if limit > 0 && len(sf.vals) > limit {
+			sf.vals = sf.vals[:limit]
+		}
+		vals := make([]FacetValue, 0, len(sf.vals))
+		for _, v := range sf.vals {
+			vals = append(vals, FacetValue{FieldValue: v.Value, Hits: v.Count})
+		}
+		out = append(out, FieldFacet{FieldName: sf.name, Values: vals})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FieldName < out[j].FieldName })
 	return out
 }
 
