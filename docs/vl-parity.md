@@ -31,9 +31,12 @@ the earlier 21 features:
   quantile/median, values, uniq_values, sum_len, count_empty, row_any.
 - **Filters**: `=` exact, phrase, `*` prefix/substring, `~` regex, `<,<=,>,>=`
   numeric, `in(a,b,c)`, `range()`, `len_range()`, `string_range()`, `i()`.
-- **Beyond VL** (VL has none of these): SQL over logs, ranked full-text index,
-  HLL/t-digest/top-k sketches, tiered object storage, pattern mining, alerting,
-  Grafana datasource, semantic/vector search.
+- **Beyond VL** (VL has none of these, shipped source only): SQL over logs
+  (`/select/sql`), HLL cardinality (`count_uniq_hash`, `internal/query/hll.go`),
+  alerting rules (`/alerts`), semantic/vector search (`/select/vector`).
+  `storage.ColdStore` tiering (`internal/storage/cold.go`) is a library-only
+  interface — `Demote`/`Promote` exist on `Store`, but no endpoint or flag
+  wires it, so it is not a shipped feature.
 
 ## Remaining, tiered by cost
 
@@ -163,6 +166,12 @@ side index).
   stream ids), confirm against the staged `internal/bench/victoria-logs` binary
   before locking the expected value.
 - `go test ./...` green, `gofmt` clean, before each commit.
+
+  **Blocker (documented, not fixed from a docs session):** a `gofmt` release
+  gate currently fails on pre-existing formatting — `gofmt -l` flags
+  `internal/storage/group.go`. The desired gate stays as stated here; it
+  cannot go green until that file is reformatted in a code session. See
+  `docs/verification.md`.
 
 ## Not gaps (documented so they are not re-audited)
 

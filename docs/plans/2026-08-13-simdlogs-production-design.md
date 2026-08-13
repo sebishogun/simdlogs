@@ -1,6 +1,6 @@
 # simdlogs — production hardening design
 
-Status: draft. This design describes the direction documented in
+Status: approved. This design describes the direction documented in
 [`../roadmap.md`](../roadmap.md); it is a plan for future work, not a
 description of the current code. The current product is documented in
 [`../architecture.md`](../architecture.md) and the LLDs. Claims below are
@@ -34,7 +34,12 @@ can pin, back up, upgrade, and trust to survive a crash without losing data.
 4. **A documented cluster protocol.** Application-level sharding and
    replication with no consensus stays the model (it is a feature: simple,
    statically configured, inspectable); the router's merge rules and failure
-   behavior become a tested wire contract, and the avg/quantile merge gap is
+   behavior become a tested wire contract. The starting point is a defect
+   list, not a clean slate: the `streams`, `stream_ids`, plain `stats_query`,
+   and `hits` merges decode stale envelopes and answer empty/bogus results
+   (exact mismatches in [`../lld/cluster.md`](../lld/cluster.md)), several
+   select surfaces (`facets`, `tail`, SQL, vector, backup, metrics) are not
+   federated, and the avg/quantile merge gap is
    closed or removed from the claims.
 5. **Scale with numbers attached.** The 1B-row point reproducible from a
    documented command, with peak-memory bounds measured; the 1M
@@ -55,7 +60,8 @@ can pin, back up, upgrade, and trust to survive a crash without losing data.
   index, and recompaction retires replaced mmaps for 5 minutes. The recovery
   test must pin these invariants (a SIGKILL at any phase, reopen, verify).
 - **The router merges stay exact where counts are involved.** Select merge
-  is concatenate-sort-limit (exact). Sums are exact. The avg/quantile gap is
+  is concatenate-sort-limit (exact). Sums are exact once the stale-envelope
+  defects are fixed. The avg/quantile gap is
   either closed with sum+count/sketch merge or documented as out of scope —
   the design prefers closing it, because a stats endpoint that answers wrong
   on a cluster and right on one node is a trap for operators who scale out.

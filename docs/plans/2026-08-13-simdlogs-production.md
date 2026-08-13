@@ -110,10 +110,13 @@ skip is a failure only if the binary was staged but not found).
 - Create: `internal/api/es_contract_test.go`
 - Modify: `docs/lld/api.md`
 
-**Step 1 (test first):** One conformance test per ES clause (`bool` must /
-filter, `term`, `terms`, `range` incl. time-range feeding the group skip,
-`exists`), asserting the response envelope (`hits.total.relation: "eq"`) and
-the rows.
+**Step 1 (test first):** One conformance test per committed ES clause
+(`bool` must / filter, `term`, `range` incl. time-range feeding the group
+skip, `exists`), asserting the response envelope (`hits.total.relation:
+"eq"`) and the rows. `terms` is NOT committed — the DSL decoder handles
+`bool`/`term`/`range`/`exists` only; adding it is a measurement-first
+decision (a conformance fixture against the reference's behavior first,
+then implementation), never a silent extension.
 
 **Step 2:** Document the subset as the fixed contract in `docs/lld/api.md` —
 the LLD becomes the spec the tests pin.
@@ -126,8 +129,13 @@ the LLD becomes the spec the tests pin.
 - Modify: `internal/bench/apisurface_test.go`
 
 **Step 1 (test first):** Extend the answer-changes probe to every select and
-ingest endpoint (it already proved `keep_const_fields` changed nothing on the
-stored-columns-only facets path — that finding stays in `docs/wrong.md`).
+ingest endpoint. `keep_const_fields` is NOT a no-op: `facetKeep` materially
+includes constant/single-distinct fields (`internal/query/introspect.go`),
+so a fixture with a constant field (or no stream fields, which makes the
+synthesized `_stream`/`_stream_id` constant) must change the answer. The
+probe on the committed corpus found no constant-field candidate, which is
+corpus-specific and recorded in the commit message of the probe work — not
+in `docs/wrong.md`, which has no entry for it.
 
 **Step 2:** A status-code probe plus a response-shape probe per endpoint
 (catch the class of defect where a 200 answers a body no client can read).
@@ -180,6 +188,42 @@ unmap, and `/health` + `/-/healthy` + `/-/ready` answer during and after.
 ---
 
 ## Phase D: Cluster wire contract
+
+The router surface is experimental, not production-safe: four merges decode
+stale envelopes and answer empty/bogus results, and several select surfaces
+are not federated. The exact mismatches are recorded in
+`docs/lld/cluster.md`. Phase D fixes them tests-first, in order of urgency.
+
+### Task D.0: Fix the stale-envelope merges, fixture-first
+
+**Files:**
+- Create: `internal/api/cluster_envelope_test.go`
+- Modify: `internal/api/cluster.go`
+
+**Step 1 (test first, failing on today's code):** One shard-shape fixture
+per broken merge. Each fixture is an in-process backend answering the
+CURRENT envelope of its endpoint, plus a router pointed at it:
+
+- `streams` / `stream_ids`: the backend answers the shared
+  `{"values":[{"value":..,"hits":..}]}` envelope (what the local handlers
+  send today); the test asserts the router's merged answer equals the
+  single-node answer for identical data. Today the router reads the
+  `"streams"`/`"stream_ids"` keys that do not exist and answers
+  `{"streams":[]}` / `{"stream_ids":[]}`.
+- plain `stats_query`: the backend answers the Prometheus vector envelope
+  `{"status":"success","data":{"resultType":"vector","result":[...]}}`;
+  the router must sum the sample values and answer the same envelope. Today
+  it decodes a nonexistent `count` field and always answers `{"count":0}`.
+- `hits`: the backend answers the dense series shape
+  `{"hits":[{"fields":..,"timestamps":[..],"values":[..],"total":N}]}`;
+  the router must sum per bucket across shards and return the same dense
+  shape. Today it decodes the old `{"_time":..,"hits":..}` object shape and
+  answers `{"hits":[]}`.
+
+**Step 2:** Fix each merge so its fixture passes; keep the single-node
+byte-identical cross-check.
+
+**Step 3:** Gates bare; commit per merge (four commits).
 
 ### Task D.1: Multi-node integration test
 

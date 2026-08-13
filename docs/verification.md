@@ -15,8 +15,18 @@ go vet ./...
 The suite covers storage round trips and backward-compatible posting formats,
 crash-safe append, retention, backup/restore, tenant isolation, ingest
 protocols, LogsQL parsing and execution, SQL/vector surfaces, Elasticsearch
-search, live tail, replication/federation, parser and regex panic-safety, and
-serial-versus-parallel query agreement.
+search, live tail, the replication/federation code paths, parser and regex
+panic-safety, and serial-versus-parallel query agreement. It does NOT cover
+router-merge ANSWER correctness: the `streams`/`stream_ids`/plain
+`stats_query`/`hits` merges are defective and untested today — the defects
+are documented in `docs/lld/cluster.md`, and fixture tests for them are
+planned, not shipped.
+
+A formatting gate is desired but currently fails on pre-existing
+formatting: `gofmt -l` flags `internal/storage/group.go` (untouched by this
+documentation work). Until that file is reformatted, a `gofmt` release gate
+cannot go green; the blocker is recorded here and in `docs/vl-parity.md` —
+no source edit is made from a documentation session.
 
 **Never pipe a gate through `tail`** (or anything else) without `pipefail`:
 the pipe reports the last command's status and the failure vanishes. This has
@@ -74,9 +84,12 @@ Method, the discipline:
 - Both engines interleaved in one session — never an A/B across sessions.
 - Each query class is the **minimum** of many samples after warmup (never a
   mean; the minimum is the least-perturbed run).
-- Run the machine quiet: wait for load average under 1
-  (`scripts/quiet-bench.sh` waits bounded — 180 minutes by default — and
-  exits 3, never hangs).
+- Run the machine quiet. The release policy is **load average under 1**
+  (the AGENTS rules and the benchmark contract say the same).
+  `scripts/quiet-bench.sh` defaults to a looser **threshold of 1.5** as a
+  convenience helper for routine runs — it waits bounded (180 minutes by
+  default) and exits 3 rather than hanging; the strict <1 policy applies to
+  anything published as a measurement.
 - The instruction-set tier is named in every snapshot (the scale numbers were
   measured on amd64/AVX-512; **no wall-clock claim is made for another
   architecture**).

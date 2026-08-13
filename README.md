@@ -171,6 +171,12 @@ The cluster layer is application-level sharding and replication, not a
 consensus system. There is no automatic membership, leader election, or
 cross-node transaction protocol.
 
+The router surface is **experimental, not production-safe**: the `streams`,
+`stream_ids`, plain `stats_query`, and `hits` merges decode stale envelopes
+and answer empty/bogus results, and `facets`, `tail`, `/select/sql`,
+`/select/vector`, `/admin/backup`, and `/metrics` are not federated at all.
+See [`docs/lld/cluster.md`](docs/lld/cluster.md) for the exact defects.
+
 ## Verification
 
 ```sh

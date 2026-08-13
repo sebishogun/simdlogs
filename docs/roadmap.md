@@ -72,12 +72,29 @@ Exits:
 
 ## Stage 3 — Cluster protocol
 
+The current router surface is experimental and not production-safe: the
+`streams`, `stream_ids`, plain `stats_query`, and `hits` merges decode stale
+envelopes and answer empty/bogus results, and `facets`, `tail`, `/select/sql`,
+`/select/vector`, `/admin/backup`, `/metrics`, and `/alerts` are not
+federated (router-local). The exact envelope mismatches are recorded in
+[`lld/cluster.md`](lld/cluster.md); this stage fixes them tests-first.
+
 Exits:
 
+- Shard-shape fixture tests, written before the fixes: for each broken merge,
+  a fixture shard answers the CURRENT backend envelope — the shared
+  `{"values":[...]}` envelope for `streams`/`stream_ids`, the Prometheus
+  stats vector for plain `stats_query`, the dense `timestamps`/`values` hits
+  series for `hits` — and the test asserts the router's merged answer matches
+  a single-node store with identical data. These tests fail on today's code;
+  the fixes land only when the fixtures pass.
 - The select-router behavior (LLD: cluster) becomes a documented wire
   contract with a multi-node integration test: N storage nodes + 1 router,
   writes replicated per shard, reads merged exactly (counts and value counts
   cross-checked against a single-node store with identical data).
+- The non-federated endpoints (`facets`, `tail`, SQL, vector, backup,
+  metrics) are either federated with the same fixture discipline or
+  documented to error loudly in router mode — never a silent local answer.
 - Failure injection: kill one replica mid-query and mid-write; assert reads
   still answer (next replica), writes still land (other replica), and the
   router never returns a partial write as success.

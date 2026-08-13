@@ -33,13 +33,16 @@ What it is not (current, unambiguously):
   ingest exists.
 - **Not a consensus system.** The cluster layer has no leader election, no
   automatic membership, no cross-node transactions, no consensus protocol.
-  Shards and replicas are configured statically.
+  Shards and replicas are configured statically. The router surface is
+  **experimental, not production-safe**: four merges are stale and answer
+  bogus/empty results, and several select surfaces are not federated at all
+  (see [`lld/cluster.md`](lld/cluster.md)).
 - **Not released.** There is no tag and no stable-version promise; the storage
   format and HTTP surface may change. Pin a commit to deploy.
 - **Not full Elasticsearch.** `/_search` and `/_count` cover a log-relevant
-  DSL subset (`bool`/`term`/`terms`/`range`/`exists`); `_msearch`, the
-  complete Query DSL, and ES aggregation-response compatibility are out of
-  scope.
+  DSL subset (`bool`/`term`/`range`/`exists`); `_msearch`, the
+  complete Query DSL, ES aggregation-response compatibility, and `terms` are
+  out of scope.
 
 ## Components
 
@@ -96,8 +99,15 @@ committed assembly; every kernel has a portable fallback) and
 5. Pipes transform the row set (`stats` aggregates during the scan without
    materializing rows); results serialize as NDJSON by hand (no reflection).
 6. In router mode, queries fan out to one live replica per shard and the
-   router merges (select: sort by `_time` descending, apply `limit`; hits:
-   sum buckets; stats: sum; values: sum per value).
+   router merges — where a merge exists. Only `/select/logsql/query` (sort by
+   `_time` descending, apply `limit`), `stats_query_range`, `field_names`,
+   `field_values`, `stream_field_names`, `stream_field_values`, `/_search`
+   and `/_count` merge correctly today. The `streams`, `stream_ids`, plain
+   `stats_query`, and `hits` merges decode stale envelopes and answer
+   empty/bogus results; `facets`, `tail`, `/select/sql`, `/select/vector`,
+   `/admin/backup`, `/metrics`, and `/alerts` are not federated at all.
+   See [`lld/cluster.md`](lld/cluster.md); the cluster surface is
+   experimental, not production-safe.
 
 ### Ops loops
 

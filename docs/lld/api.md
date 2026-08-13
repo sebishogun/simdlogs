@@ -56,9 +56,15 @@ VictoriaLogs' layout work unchanged.
 | `/select/vector` | cosine k-NN, `{"field","vector","k"}` body |
 
 Six introspection endpoints share one envelope —
-`{"values":[{"value":..,"hits":..}]}` (`streams`/`stream_ids` use
-`{"streams":...}`/`{"stream_ids":...}` keys) — so a client decodes them all
+`{"values":[{"value":..,"hits":..}]}` — so a client decodes them all
 with one type; that is why they must not each invent a key.
+
+In router mode only `field_names`, `field_values`, `stream_field_names` and
+`stream_field_values` have a working federated merge; the `streams` and
+`stream_ids` merges decode the wrong key and answer empty, and `facets`,
+`tail`, `/select/sql` and `/select/vector` are not federated at all (they
+run against the router's local store). See [`cluster.md`](cluster.md) —
+the cluster surface is experimental, not production-safe.
 
 ### Ops
 
@@ -67,16 +73,23 @@ with one type; that is why they must not each invent a key.
 `-name="value"` line form), `/vmui`, `/select/vmui`, and `/` (the UI,
 catch-all).
 
+All of these are router-local in router mode: backup covers the router's own
+tenant stores, metrics/alerts count the router's own requests and rules, and
+the health/flags/UI endpoints describe the router process — none is
+cluster-wide.
+
 ### ES
 
 `/_search`, `/_count` — a log-relevant Query DSL subset: `bool`
-(`must`/`filter`), `term`, `terms`, timestamp `range`, `exists`. Range on a
+(`must`/`filter`), `term`, timestamp `range`, `exists`. Range on a
 time field feeds the group skip directly. `_bulk` on the ingest side; the
 response gives per-document `{"create":{"status":201}}` items (the shape ES
 clients parse to decide retry).
 
 Not implemented (documented, not accidental): `_msearch`, the complete Query
-DSL, ES aggregation-response compatibility.
+DSL, ES aggregation-response compatibility — and `terms`, which the source
+does not support (the DSL decoder handles `bool`, `term`, `range`, `exists`
+only; see `internal/api/es.go`).
 
 ## Query parameters
 
@@ -95,9 +108,13 @@ DSL, ES aggregation-response compatibility.
 - `step` (hits/range), `field`/`fields` (hits split, one field), `fields_limit`
   (busiest N series, the rest folded into one unlabelled "other"), `time`
   (stats instant window end), `by` (stats group-by extension), `start_offset`
-  (tail replay window, default 5 s), `keep_const_fields` (facets; measured
-  against the reference: this implementation has no stored constant fields,
-  so the argument is accepted and changes nothing).
+  (tail replay window, default 5 s), `keep_const_fields` (facets; when set,
+  materially includes constant/single-distinct fields: `facetKeep` keeps a
+  field with one distinct value, including the synthesized `_stream` /
+  `_stream_id` and a single-timestamp `_time` facet — `internal/query/introspect.go`).
+  The API-surface probe found it changed nothing on the committed corpus,
+  which has no constant-field candidate; that is corpus-specific, not a
+  no-op claim — a fixture with a constant field changes the answer.
 
 `Now` is stamped from the request for relative `_time:<dur>` filters.
 
@@ -180,3 +197,6 @@ after the cursor and runs the LogsQL filter over only the new groups
 (`readerStore` adapts them to the query surface). Headers flush before the
 first payload; `X-Accel-Buffering: no` keeps proxies from buffering. The
 connection lives until the client disconnects.
+
+`tail` is not federated: in router mode it tails the router's local store
+(empty when nothing was written locally).
