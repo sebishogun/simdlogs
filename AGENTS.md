@@ -18,8 +18,10 @@ layer is application-level sharding/replication with no consensus, no leader
 election, no transactions, no automatic membership — and it is experimental,
 not production-safe: the `streams`, `stream_ids`, plain `stats_query`, and
 `hits` router merges are stale and answer empty/bogus results, and `facets`,
-`tail`, `/select/sql`, `/select/vector`, `/admin/backup`, and `/metrics` are
-not federated (exact defects: `docs/lld/cluster.md`). Planned direction lives in
+`tail`, `/alerts` and other endpoints are router-local, not federated. The
+enumeration is representative, not complete — the per-endpoint status lives
+in `docs/lld/cluster.md`; do not read an endpoint's absence from this list
+as federation. Planned direction lives in
 `docs/roadmap.md` and the `docs/plans/2026-08-13-simdlogs-production*.md`
 files; never present planned work as shipped behavior. `README.md` and the
 `docs/` tree describe the current source; the authoritative "done" sets are

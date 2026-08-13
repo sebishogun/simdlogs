@@ -1120,3 +1120,22 @@ measures:
     BuildDict highcard        15.9ms -> 12.5ms   -21.3%
     IngestParallel            162.6ms -> 145.9ms -10.3%
     Ingest                    685ms  -> 640ms     -6.6%
+
+## 37. Accepted `exists` changes no answer -- decoded, not shipped (source reading)
+
+`internal/api/es.go` decodes an `exists` clause (the `esClause.Exists` JSON
+field) but `esToQuery` never walks it: only `Bool`, `Term`, and time
+`Range` become predicates, so a search whose only clause is
+`{"exists":{"field":"x"}}` matches the whole window, exactly as an empty
+query would. It is not a probe result -- no committed test exercises it
+(the ES contract tests cover bool/term/range only) -- so nothing measures
+the gap. The wire accepts the clause; the answer ignores it, which is the
+worst class of defect for a drop-in client: a 200 that reads as success.
+
+The source comments disagree with the code: `es.go`'s package comment lists
+"terms/range/exists" as part of the mapped DSL, and the exists handler's
+own comment says exists "become predicates". Both are stale
+implementation-doc defects (recorded in `docs/roadmap.md`); a future TDD
+task either implements exists as a real predicate or rejects the clause
+with an explicit error -- acceptance-without-effect is not a supported
+state.

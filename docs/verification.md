@@ -28,6 +28,18 @@ documentation work). Until that file is reformatted, a `gofmt` release gate
 cannot go green; the blocker is recorded here and in `docs/vl-parity.md` —
 no source edit is made from a documentation session.
 
+Stale source comments that contradict shipped code are known
+implementation-doc defects, listed in `docs/roadmap.md` ("Known
+implementation-doc defects"): `es.go`'s terms/range/exists comments,
+`scale_test.go`'s "no mmap yet", and the `-recompact-after` help's 17% vs
+the measured -8.1%. They are a code task, not a docs task.
+
+**AGENTS/CLAUDE body-sync check:** `CLAUDE.md` reproduces the body of
+`AGENTS.md` in full so Claude Code runs are self-contained, and its header
+declares AGENTS.md the source of truth (the headers agree on that). Any
+change to `AGENTS.md`'s body must be mirrored into `CLAUDE.md`'s embedded
+copy in the same commit, and `diff <(sed -n '/^# Working on simdlogs/,$p' AGENTS.md) <(sed -n '/^# Working on simdlogs/,$p' CLAUDE.md)` must be empty.
+
 **Never pipe a gate through `tail`** (or anything else) without `pipefail`:
 the pipe reports the last command's status and the failure vanishes. This has
 laundered a red fuzz run, a red README gate, and two red bench-check runs
@@ -37,7 +49,10 @@ into green exits in this family of repositories. Run gates bare, or
 ## Report tests (env-gated, not unit gates)
 
 These are reports: they print numbers and land in commit messages and the
-README, and they are never CI gates.
+README, and they are never CI gates. The committed tables are historical
+baselines (code-state stamps in `docs/scale-curve.md`); a re-run is what
+produces a current measurement, and the roadmap requires fresh realistic +
+scale-vs-VL runs before any current footprint claim.
 
 ```sh
 # realistic 1M-row query mix (default N; SIMDLOGS_REAL_N for the curve points)

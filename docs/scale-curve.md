@@ -1,5 +1,16 @@
 # Scale curve: simdlogs vs VictoriaLogs
 
+> **Code-state stamp (historical baseline, not current footprint):** the
+> table below was measured on **2026-08-10** (commits `baf9734`/`e93eeb9`),
+> before the FOR postings rewrite (`a5f9098`, 2026-08-12) and the hex
+> nibble-pack codec (`d000ae3`, 2026-08-13, measured -9.8% disk) shipped.
+> The realistic 2.62x figure is from `3f5a063` (2026-08-12): post-FOR,
+> pre-hex. Nothing current-facing may cite these numbers as the current
+> footprint; `docs/wrong.md`'s hex nibble-pack entry estimates ~2.38x for
+> the realistic ratio, and that is an estimate, not a measurement. The
+> roadmap requires fresh realistic and scale-vs-VL measurements before any
+> current-footprint claim.
+
 Head-to-head, both engines ingested and queried from disk on the same machine,
 interleaved, so the **ratios are load-robust** even when absolute numbers are
 not (both run under identical conditions). Corpus is the synthetic

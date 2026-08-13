@@ -81,7 +81,11 @@ materializes the matched rows. `runCountFast`, `runTopFast`, `runUniqFast`
      every other kind marks which dict values match (the test runs once per
      distinct value, not per row) and maps rows through the indices;
    - `cnt == 0` → never decode the timestamps; bounded queries trim the
-     bitset (`KeepFirst`/`KeepLast`) so decodes stay within the returned set;
+     bitset (`KeepFirst`/`KeepLast`) so decodes stay within the returned
+     set, and the timestamp decode span is narrowed to the first and last
+     surviving row — a bounded query decodes only the rows it keeps (the
+     facets path used to decode a whole 131072-row group to materialize a
+     thousand; `1a85d8a`, wrong.md entry 35);
    - timestamps: point-read via checkpoint blocks when matches are sparse
      (`cnt*512 < span`), else span-decode;
    - materialization decodes each referenced column once (only the dict

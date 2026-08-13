@@ -18,8 +18,12 @@ What simdlogs is:
   queries out, data persisted as immutable group files on local disk.
 - Built for selective queries and low-latency aggregations. That choice has a
   measured cost: the per-column inverted indexes use more disk than
-  VictoriaLogs (realistic corpus 2.62x of VL; unique-hex 19.4x at 1B rows).
-  Both sides are published in [`scale-curve.md`](scale-curve.md).
+  VictoriaLogs. The committed numbers are historical baselines, not the
+  current footprint — the unique-hex 19.4x table dates from 2026-08-10
+  (before the FOR postings and hex codec shipped) and the realistic 2.62x
+  from 2026-08-12 (`3f5a063`, after FOR, before hex) — see
+  [`scale-curve.md`](scale-curve.md) and
+  [`lld/storage.md`](lld/storage.md).
 - Multi-tenant by directory: `AccountID`/`ProjectID` headers select an
   isolated store per tenant.
 - Clusterable at the application layer: a node with `-select-backends` becomes
@@ -34,15 +38,18 @@ What it is not (current, unambiguously):
 - **Not a consensus system.** The cluster layer has no leader election, no
   automatic membership, no cross-node transactions, no consensus protocol.
   Shards and replicas are configured statically. The router surface is
-  **experimental, not production-safe**: four merges are stale and answer
-  bogus/empty results, and several select surfaces are not federated at all
-  (see [`lld/cluster.md`](lld/cluster.md)).
+  **experimental, not production-safe**: the `streams`, `stream_ids`, plain
+  `stats_query`, and `hits` merges are stale and answer bogus/empty results,
+  and `facets`, `tail`, `/alerts` and other endpoints are router-local —
+  representative, not complete (see [`lld/cluster.md`](lld/cluster.md)).
 - **Not released.** There is no tag and no stable-version promise; the storage
   format and HTTP surface may change. Pin a commit to deploy.
 - **Not full Elasticsearch.** `/_search` and `/_count` cover a log-relevant
-  DSL subset (`bool`/`term`/`range`/`exists`); `_msearch`, the
-  complete Query DSL, ES aggregation-response compatibility, and `terms` are
-  out of scope.
+  DSL subset: `bool` (`must`/`filter`), `term`, and timestamp `range`.
+  `exists` is accepted on the wire but changes no answer (decoded, never
+  mapped to a predicate — `docs/wrong.md` entry 37); `terms`, `_msearch`,
+  the complete Query DSL, and ES aggregation-response compatibility are out
+  of scope.
 
 ## Components
 
@@ -104,9 +111,10 @@ committed assembly; every kernel has a portable fallback) and
    `field_values`, `stream_field_names`, `stream_field_values`, `/_search`
    and `/_count` merge correctly today. The `streams`, `stream_ids`, plain
    `stats_query`, and `hits` merges decode stale envelopes and answer
-   empty/bogus results; `facets`, `tail`, `/select/sql`, `/select/vector`,
-   `/admin/backup`, `/metrics`, and `/alerts` are not federated at all.
-   See [`lld/cluster.md`](lld/cluster.md); the cluster surface is
+   empty/bogus results, and `facets`, `tail`, `/alerts` and other endpoints
+   are router-local, not federated. The enumeration here is representative,
+   not complete — the per-endpoint status is in
+   [`lld/cluster.md`](lld/cluster.md); the cluster surface is
    experimental, not production-safe.
 
 ### Ops loops

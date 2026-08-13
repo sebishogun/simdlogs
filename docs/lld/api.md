@@ -81,15 +81,16 @@ cluster-wide.
 ### ES
 
 `/_search`, `/_count` — a log-relevant Query DSL subset: `bool`
-(`must`/`filter`), `term`, timestamp `range`, `exists`. Range on a
+(`must`/`filter`), `term`, and timestamp `range`. Range on a
 time field feeds the group skip directly. `_bulk` on the ingest side; the
 response gives per-document `{"create":{"status":201}}` items (the shape ES
 clients parse to decide retry).
 
 Not implemented (documented, not accidental): `_msearch`, the complete Query
-DSL, ES aggregation-response compatibility — and `terms`, which the source
-does not support (the DSL decoder handles `bool`, `term`, `range`, `exists`
-only; see `internal/api/es.go`).
+DSL, and ES aggregation-response compatibility. `exists` is decoded but
+ignored — `esToQuery` walks `Bool`, `Term`, and time `Range` only
+(`internal/api/es.go`), so an exists-only search matches the whole window;
+recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
 
 ## Query parameters
 
@@ -109,10 +110,10 @@ only; see `internal/api/es.go`).
   (busiest N series, the rest folded into one unlabelled "other"), `time`
   (stats instant window end), `by` (stats group-by extension), `start_offset`
   (tail replay window, default 5 s), `keep_const_fields` (facets; when set,
-  materially includes constant/single-distinct fields: `facetKeep` keeps a
-  field with one distinct value, including the synthesized `_stream` /
-  `_stream_id` — which, with no stream fields configured, hold the single
-  constant values `{}` and its id — and a single-timestamp `_time` facet —
+  includes constant/single-distinct fields: `facetKeep` keeps a field with
+  one distinct value, including the synthesized `_stream` / `_stream_id` —
+  which, with no stream fields configured, hold the single constant values
+  `{}` and its id — and a single-timestamp `_time` facet —
   `internal/query/introspect.go`). On the current committed corpus (no stream
   fields, so the constant fallback is a candidate), `keep_const_fields=1`
   therefore changes the facets answer. The 2026-08-13 answer-changes probe

@@ -112,11 +112,14 @@ skip is a failure only if the binary was staged but not found).
 
 **Step 1 (test first):** One conformance test per committed ES clause
 (`bool` must / filter, `term`, `range` incl. time-range feeding the group
-skip, `exists`), asserting the response envelope (`hits.total.relation:
-"eq"`) and the rows. `terms` is NOT committed — the DSL decoder handles
-`bool`/`term`/`range`/`exists` only; adding it is a measurement-first
-decision (a conformance fixture against the reference's behavior first,
-then implementation), never a silent extension.
+skip), asserting the response envelope (`hits.total.relation:
+"eq"`) and the rows. `exists` is a known adverse case, not a committed
+clause: the wire accepts it but `esToQuery` never maps it to a predicate
+(`docs/wrong.md` entry 37, no existing test). This task implements it as a
+real predicate or rejects it with an explicit error — acceptance-without-
+effect is not a supported state. `terms` is NOT committed either; adding it
+is a measurement-first decision (a conformance fixture against the
+reference's behavior first, then implementation), never a silent extension.
 
 **Step 2:** Document the subset as the fixed contract in `docs/lld/api.md` —
 the LLD becomes the spec the tests pin.
@@ -282,12 +285,14 @@ tests cite.
 ### Task E.1: Reproducible 1B point
 
 **Files:**
-- Modify: `docs/scale-curve.md`, `internal/bench/scale_test.go`
+- Modify: `docs/scale-curve.md`, `internal/bench/scalevl_test.go`
 
-**Step 1:** Parameterize the scale test so the 1B unique-hex point runs from
-the documented command (`SIMDLOGS_SCALE=1 SIMDLOGS_SCALE_SIZES=1000000000
-SIMDLOGS_SCALE_DIR=/big/disk go test -run TestScale -v -timeout 0
-./internal/bench/`).
+**Step 1:** Reproduce the published head-to-head 1B point with the
+comparison harness, the same command shape the curve's numbers came from
+(`SIMDLOGS_SCALEVL=1 SIMDLOGS_SCALEVL_N=1000000000 go test -run
+TestScaleVsVL -v -timeout 0 ./internal/bench/`, with the staged VL binary).
+`TestScale` (`SIMDLOGS_SCALE=1`, simdlogs-only group-count scaling) is a
+separate local scaling gate, not a substitute for the published comparison.
 
 **Step 2 (measure):** Reproduce the 1B numbers on a quiet machine; publish
 with machine + SIMD tier. Measure peak RSS during the run.

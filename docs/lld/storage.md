@@ -144,13 +144,23 @@ still sees valid mmap'd bytes. The server loop runs hourly (`-retention`,
 
 ### Tiering / recompaction (`recompact.go`)
 
-`-recompact-after` re-encodes old groups' dict blocks with flate (~17%
-smaller, slower value reads on cold data); `-recompact-drop-postings` also
-drops the per-column inverted index (flag help: 35% smaller total vs 8% for
-flate alone, but cold equality queries fall back to a decode+scan — what
+`-recompact-after` re-encodes old groups' dict blocks with flate (smaller,
+slower value reads on cold data); `-recompact-drop-postings` also drops the
+per-column inverted index (flag help: 35% smaller total vs 8% for flate
+alone, but cold equality queries fall back to a decode+scan — what
 VictoriaLogs does for every query). The per-block codec flag makes the store
 hold both kinds at once; `needsRecompact` makes the pass idempotent across
 restarts with no marker file.
+
+The size figures in the flag help are not one truth — they disagree with
+each other and with the measurement. `docs/wrong.md`'s tiering entry
+measured flate-only at **-8.1%** (consistent with the "8% for flate alone"
+in the `-recompact-drop-postings` help), while the `-recompact-after` help
+claims **~17%** for the same flate-only operation; the measured full
+`-compact` mode (flate dict at flush time, not recompaction) is **~15%**
+smaller. Distinguish them: flate-only recompaction ~8%, full compact ~15%,
+and treat the help's 17% as an unmeasured source claim (a stale source
+comment, recorded in `docs/roadmap.md`).
 
 The subtlety is mmap lifetime: a query started before a swap still holds the
 old reader, so replaced mappings are retired and unmapped only after
@@ -175,11 +185,15 @@ a crafted archive cannot escape. The HTTP surface is `/admin/backup`
 
 ## Disk
 
-Footprint is published in `docs/scale-curve.md` and `README.md`: realistic
-15-field Zipfian corpus 2.62x of VictoriaLogs after the v8 FOR postings
-(down from 3.47x); the deliberate unique-hex worst case 19.4x of VL at 1B
-rows. Postings are roughly 27% of a group; dropping near-unique postings
-shrinks disk and made the needle 90x slower, so that change was reverted
-(`docs/wrong.md`). Tiered storage measured 2.40x → ~1.55x of VL on the
-realistic corpus (flate on old groups), the closest the current format gets
-to parity — at the cost of cold-query speed.
+The published footprint numbers are **historical baselines, not the current
+footprint**: the unique-hex scale table (`docs/scale-curve.md`) was measured
+on 2026-08-10, before the FOR postings rewrite (`a5f9098`) and the hex
+nibble-pack codec (`d000ae3`, measured -9.8% disk on the realistic corpus in
+its commit) shipped; the realistic 2.62x figure dates from `3f5a063`
+(2026-08-12, after FOR, before hex). Postings are roughly 27% of a group;
+dropping near-unique postings shrinks disk and made the needle 90x slower,
+so that change was reverted (`docs/wrong.md`). Tiered storage measured
+2.40x → ~1.55x of VL on the realistic corpus (flate on old groups) — also a
+pre-hex historical baseline. No current-footprint claim is committed; the
+roadmap requires fresh realistic and scale-vs-VL measurements before any
+current-facing footprint statement.

@@ -29,7 +29,14 @@ latency percentiles, resident memory, allocations per operation.
 
 Both engines as servers on the same wire API, on the same machine, same
 corpus; VictoriaLogs built from `../victorialogs-reference` and run as a
-subprocess. One process per benchmark, shuffled order, minimum of eight,
-idle machine (load < 1), the instruction-set tier named in every snapshot.
-Losses are published alongside wins — the transparency rule from the
-sibling repos.
+subprocess. One process per benchmark, shuffled order, each latency the
+**minimum of 15 samples after three warmups** (the current harness rule,
+`internal/bench/harness_test.go` and the README), idle machine (load < 1),
+the instruction-set tier named in every snapshot. Losses are published
+alongside wins — the transparency rule from the sibling repos.
+
+> Supersession note: this contract's earlier text said "minimum of eight";
+> the current harness takes three warmups then the minimum of fifteen, which
+> is the operative rule. The contract is historical in form and current in
+> substance — the corpus, classes, metrics, and discipline above are the
+> ones the committed harness implements.

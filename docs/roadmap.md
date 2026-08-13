@@ -105,17 +105,49 @@ Exits:
 
 ## Stage 4 — Scale
 
+The committed scale tables are historical baselines, not the current
+footprint: the unique-hex curve predates the FOR postings and hex codecs,
+and the realistic 2.62x predates hex (see `docs/scale-curve.md` for the
+code-state stamps; `docs/wrong.md`'s hex nibble-pack entry is an estimate,
+not a measurement). This stage re-measures before anything current-facing
+claims a footprint number.
+
 Exits:
 
-- The 1B-row single-node point reproducible from a documented command
-  (`SIMDLOGS_SCALE=1 ...`) with the committed unique-hex corpus and the
-  realistic corpus; numbers published in the scale curve with the machine and
-  SIMD tier named.
+- The 1B-row head-to-head point reproducible with the comparison harness
+  (`SIMDLOGS_SCALEVL=1 SIMDLOGS_SCALEVL_N=1000000000 ...`, staged VL
+  binary) plus a fresh realistic-corpus measurement
+  (`SIMDLOGS_REAL=1 ...`), both published in the scale curve with the
+  machine and SIMD tier named; `TestScale` (`SIMDLOGS_SCALE=1`) is a
+  separate local scaling gate, not a substitute.
 - Memory bounded: a documented peak-memory measurement at 1B rows (mmap keeps
   only the working set resident; the measurement is the exit).
 - The selective-window 1M loss (0.8x in the curve) investigated: either fixed
   with a measured win published, or explained in `docs/wrong.md` with the
   measurement that says why it stays.
+- Any current-facing footprint statement (README, storage LLD, scale curve
+  headline) is rewritten from the fresh measurements — never from the
+  historical tables.
+
+## Known implementation-doc defects (source comments; code task, not docs)
+
+Stale source comments contradict the shipped code and are recorded here for
+a later code task that fixes the comments (no source edit comes from a docs
+session):
+
+- `internal/api/es.go`: the package comment lists "terms/range/exists" as
+  part of the mapped DSL and the exists handler comment says exists clauses
+  "become predicates" — neither is true (see `docs/wrong.md` entry 37).
+- `internal/bench/scale_test.go`: the header comment says "there is no mmap
+  yet" — mmap shipped long ago; the test builds readers in RAM, but the
+  comment is stale.
+- `cmd/simdlogs/main.go`: the `-recompact-after` help claims ~17% smaller
+  for flate-only recompaction, disagreeing with the 8% in the
+  `-recompact-drop-postings` help and the measured -8.1%
+  (`docs/wrong.md` tiering entry).
+- `docs/wrong.md` entry 37 and the gofmt blocker on
+  `internal/storage/group.go` are likewise implementation-side work queued
+  from documentation sessions.
 
 ## Stage 5 — Release
 
@@ -128,3 +160,7 @@ Exits:
   with the pin-commit guidance retired.
 - Binary artifacts build reproducibly from the tag (the committed
   `go.mod`/`go.sum`; no cgo).
+- Stage 4's fresh realistic and scale-vs-VL measurements are in the curve
+  and the README's footprint claims are rewritten from them — a release
+  never ships with the historical tables standing in for the current
+  footprint.

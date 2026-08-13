@@ -14,8 +14,10 @@ The current codebase is fast and measurably compatible (LogsQL 40/40 against
 the real VictoriaLogs binary; scale curve published through 1B rows) but it
 is not a product yet: there is no tag, no storage-format stability promise,
 no crash-recovery test suite, no documented cluster wire contract, and the
-disk footprint of the inverted indexes is a known cost (2.62x of VL on the
-realistic corpus; the unique-hex worst case is 19.4x at 1B). Production
+disk footprint of the inverted indexes is a known cost — the committed
+numbers (realistic 2.62x of VL at `3f5a063`, unique-hex 19.4x at 1B measured
+2026-08-10) are historical baselines predating the shipped hex codec, not
+the current footprint. Production
 hardening is the work of turning a measured engine into something an operator
 can pin, back up, upgrade, and trust to survive a crash without losing data.
 
@@ -67,11 +69,11 @@ can pin, back up, upgrade, and trust to survive a crash without losing data.
   on a cluster and right on one node is a trap for operators who scale out.
 - **Disk footprint stays the known trade, not a hidden one.** The inverted
   index is the source of the selective-query wins and roughly 27% of a
-  group. Roadmap work on footprint (tiering already measured 2.40x → ~1.55x
-  of VL) must publish speed-vs-disk with both sides, and any change that
-  shrinks disk at the cost of the needle (measured 90x slower when singleton
-  postings were dropped) must be gated on the full curve, not on footprint
-  alone.
+  group. Roadmap work on footprint (tiering measured 2.40x → ~1.55x on a
+  pre-hex baseline) must publish speed-vs-disk with both sides, and any
+  change that shrinks disk at the cost of the needle (measured 90x slower
+  when singleton postings were dropped) must be gated on a FRESH full
+  curve, not on the historical numbers or on footprint alone.
 - **Scale-out is measured against scale-up.** The cluster is statically
   configured; a multi-node point must be published against the single-node
   curve before the roadmap claims it (the one-node cluster measured as pure

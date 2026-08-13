@@ -82,7 +82,9 @@ materialize only fields needed by their predicates and transforms.
 ### Additional surfaces
 
 - `/_search` and `/_count` support a log-oriented Elasticsearch subset:
-  `bool` with `must`/`filter`, `term`, timestamp `range`, and `exists`.
+  `bool` with `must`/`filter`, `term`, and timestamp `range`. An `exists`
+  clause is accepted on the wire but currently changes no answer (decoded,
+  not mapped to a predicate — see `docs/wrong.md` entry 37).
 - `/select/sql` translates a SQL `SELECT` subset into the same LogsQL engine.
 - `/select/vector` performs cosine k-nearest-neighbor search over an embedding
   field supplied by the ingested logs.
@@ -122,7 +124,10 @@ minimum of 15 samples after three warmups. These figures were measured on
 amd64/AVX-512. No wall-clock claim is made for another architecture.
 
 The committed unique-hex scale curve is deliberately hostile to compression:
-every trace value is distinct.
+every trace value is distinct. **It is a historical baseline, not the current
+footprint**: the numbers were measured on 2026-08-10, before the FOR postings
+rewrite (`a5f9098`) and the hex nibble-pack codec (`d000ae3`) shipped, and no
+current-facing claim should be drawn from its disk column.
 
 | rows | rare needle | selective window | aggregation | ingest | disk vs VL |
 |---:|---:|---:|---:|---:|---:|
@@ -137,11 +142,15 @@ in VictoriaLogs; the rare needle took 1.68 ms versus 21.7 ms; the selective
 query 350 ms versus 664 ms; and the aggregation 5.6 ms versus 19.3 ms. Disk was
 50.1 GB versus 2.58 GB.
 
-The realistic 15-field Zipfian corpus is less extreme on disk. After the v8
-count-table and frame-of-reference postings changes, it measures 2.62x the
-VictoriaLogs footprint, down from 3.47x. The inverted index is also what powers
-the large rare-value and group-by wins; removing singleton postings cut disk
-and made the needle 90x slower, so that change was reverted.
+The realistic 15-field Zipfian corpus is less extreme on disk, and the 2.62x
+figure is likewise a **historical baseline, not the current footprint**: it
+was measured at commit `3f5a063` (2026-08-12), after the v8 count-table and
+frame-of-reference postings changes and before the hex codec (`d000ae3`)
+shipped — which measured -9.8% disk on the realistic corpus in its commit.
+`docs/wrong.md`'s hex nibble-pack entry estimates ~2.38x for the realistic
+ratio; that is an estimate, not a measurement. The inverted index is also what
+powers the large rare-value and group-by wins; removing singleton postings cut
+disk and made the needle 90x slower, so that change was reverted.
 
 `-compact` uses flate for dictionary blocks. On the measured realistic corpus
 it made groups about 15% smaller and value-reading queries 2-10x slower. It is
@@ -173,9 +182,11 @@ cross-node transaction protocol.
 
 The router surface is **experimental, not production-safe**: the `streams`,
 `stream_ids`, plain `stats_query`, and `hits` merges decode stale envelopes
-and answer empty/bogus results, and `facets`, `tail`, `/select/sql`,
-`/select/vector`, `/admin/backup`, and `/metrics` are not federated at all.
-See [`docs/lld/cluster.md`](docs/lld/cluster.md) for the exact defects.
+and answer empty/bogus results, and `facets`, `tail`, `/alerts` and other
+endpoints are router-local, not federated. The enumeration here is
+representative, not complete — the full per-endpoint status is in
+[`docs/lld/cluster.md`](docs/lld/cluster.md); do not read an endpoint's
+absence from this list as federation.
 
 ## Verification
 
