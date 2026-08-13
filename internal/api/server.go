@@ -408,6 +408,7 @@ func parseRequest(r *http.Request) (*query.Query, error) {
 	if err != nil {
 		return nil, err
 	}
+	q.Now = time.Now().UnixNano() // request time, for relative _time:<dur> filters
 	if v := r.FormValue("start"); v != "" {
 		if n, ok := parseTimeParam(v); ok {
 			q.From = n
