@@ -1,10 +1,24 @@
 # VictoriaLogs LogsQL parity — full inventory and plan
 
-Source of truth for closing the LogsQL gap. Every VL LogsQL surface element is
-listed as **[done]** or **[todo]** with its design. Authoritative "done" set is
-the parser: `parsePipes` and `aggKind` in `internal/query/logsql.go`, `PredKind`
-in `internal/query/engine.go`, the `mux.HandleFunc` table in
-`internal/api/server.go`. Update this file as items land.
+**Status: complete.** Every tier below (0–5) has landed and is tested. The
+authoritative "done" set is the parser: `parsePipes` and `aggKind` in
+`internal/query/logsql.go`, `PredKind` in `internal/query/engine.go`, the
+`mux.HandleFunc` table in `internal/api/server.go`.
+
+Everything under "Remaining, tiered by cost" below is now implemented; the
+sections are kept as the design record of how each was built. What shipped, over
+the earlier 21 features:
+
+- **Tier 0** aliases: keep, order, mv, cp, del/rm, skip.
+- **Tier 1** filters seq, ipv4_range, {eq,ne,lt,le,gt,ge}_field; stats
+  histogram, row_min, row_max; conditional `if (<filter>)`; hash pipe.
+- **Tier 2** in-query `_time:` (relative/absolute/ranges/day_range/week_range);
+  rate/rate_sum; `/select/logsql/stats_query_range`; bare stats aliases.
+- **Tier 3** field_names/field_values/facets pipes; join/union/in(subquery)/
+  stream_context.
+- **Tier 4** stream-id model, `_stream_id:` filter, streams/stream_ids/
+  stream_field_names/stream_field_values endpoints.
+- **Tier 5** blocks_count, block_stats.
 
 ## Implemented
 
