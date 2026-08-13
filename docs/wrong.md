@@ -943,3 +943,30 @@ a gate run that way manufactures both false alarms and false wins. On a busy box
 gate on instructions:u. Three REAL regressions were still found this session, and
 they were found because the first A/B pointed at them consistently across rounds
 and instructions confirmed them -- not because one wall-clock run looked bad.
+
+## Interning ingest field values -- reverted, +5.3% instructions
+
+simdjson's alloc profile put unquote at 44.6% of simdlogs' ingest allocations (one
+string per field value). Log fields repeat heavily -- `level` has four distinct
+values across 200k rows -- so interning looked obvious: take simdjson's
+StringNoCopy (a view into the line, no allocation), use it as a map key (Go
+compiles a non-escaping map lookup without copying the key), and store one owned
+copy per DISTINCT value. Repeated values would then cost a hash and nothing else.
+
+It cut allocations 8.70M -> 6.85M per 200k rows (-21%) and made ingest SLOWER:
+
+    instructions:u, BenchmarkIngestParallel, min of 2
+    baseline (val.String())           153.4B
+    intern every value                161.6B   +5.3%
+    intern only values <= 32 bytes    162.1B   +5.7%
+
+The map hash on every value costs more than Go's allocator does for a short
+string, and restricting it to short values did not help -- most values in the
+corpus are short, so almost nothing skipped the hash. Allocation count is not
+the same thing as time: the allocator is fast and these strings die young, so the
+GC never charged for them.
+
+Reverted. The ingest profile's real weight is simdjson.Parse, BuildDict and
+Group.Marshal, not the string allocations underneath them. (Wall-clock said
+152 -> 174ms, agreeing with instructions here, but instructions are what settled
+it -- the machine was at load 3-5.)
