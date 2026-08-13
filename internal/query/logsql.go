@@ -1007,6 +1007,10 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, fmt.Errorf("simdlogs: unroll expects a field")
 			}
 			pipes = append(pipes, &UnrollPipe{Field: fs[0]})
+		case "blocks_count":
+			pipes = append(pipes, &BlocksCountPipe{})
+		case "block_stats":
+			pipes = append(pipes, &BlockStatsPipe{})
 		case "field_names":
 			pipes = append(pipes, &FieldNamesPipe{})
 		case "field_values":

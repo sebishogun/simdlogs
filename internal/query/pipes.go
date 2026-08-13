@@ -330,6 +330,12 @@ func RunPipeline(s Store, q *Query) []Row {
 		case *FacetsPipe:
 			rows = runFacets(s, q, p0)
 			pipes = pipes[1:]
+		case *BlocksCountPipe:
+			rows = runBlocksCount(s, q)
+			pipes = pipes[1:]
+		case *BlockStatsPipe:
+			rows = runBlockStats(s, q)
+			pipes = pipes[1:]
 		}
 	}
 	if rows == nil {

@@ -99,7 +99,49 @@ func (p *FacetsPipe) apply(rows []Row) []Row {
 	return out
 }
 
+// BlocksCountPipe is `blocks_count` -- how many storage blocks (row-groups) the
+// query scans. One row.
+type BlocksCountPipe struct{}
+
+func (p *BlocksCountPipe) apply(rows []Row) []Row {
+	return []Row{{Fields: []Field{{"blocks_count", strconv.Itoa(len(rows))}}}}
+}
+
+// BlockStatsPipe is `block_stats` -- per-block rows, bytes and column count.
+type BlockStatsPipe struct{}
+
+func (p *BlockStatsPipe) apply(rows []Row) []Row { return rows }
+
 // ---- source-pipe (leading) fast paths, over the footer counts ----
+
+func runBlocksCount(s Store, q *Query) []Row {
+	n := 0
+	for _, g := range s.Groups(q.From, q.To) {
+		if groupCanMatch(g, q) {
+			n++
+		}
+	}
+	return []Row{{Fields: []Field{{"blocks_count", strconv.Itoa(n)}}}}
+}
+
+func runBlockStats(s Store, q *Query) []Row {
+	var out []Row
+	for _, g := range s.Groups(q.From, q.To) {
+		if !groupCanMatch(g, q) {
+			continue
+		}
+		bytes := 0
+		for _, c := range g.ColumnBytes() {
+			bytes += c.Index + c.Postings + c.Dict + c.Bloom + c.TimeCol
+		}
+		out = append(out, Row{Fields: []Field{
+			{"rows", strconv.Itoa(g.Rows)},
+			{"bytes", strconv.Itoa(bytes)},
+			{"columns", strconv.Itoa(len(g.ColumnNames()))},
+		}})
+	}
+	return out
+}
 
 func runFieldValues(s Store, q *Query, p *FieldValuesPipe) []Row {
 	return valueCountRows(StatsByField(s, q, p.Field), p.Limit)
