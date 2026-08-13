@@ -1075,3 +1075,48 @@ Instructions retired, min of three interleaved runs, same machine, same minute:
 
 The change is a plain win. The wall clock was reading the user's own workload.
 This is entry 12's rule restated: on a busy box, gate on instructions.
+
+## 35. A bounded query decoded the whole timestamp column
+
+`| limit N` and the endpoint's `limit` both trim the match bitset to the rows
+they will return, and then `appendMatches` decoded the group's ENTIRE
+timestamp column to read them, because the decode span was chosen before the
+bound was applied. On the facets path -- which materializes at most a
+thousand rows to decide whether `_time` is a facet -- that was a thousand
+rows kept out of 131072 decoded:
+
+    BenchmarkFacets   956us -> 220us   4.3x
+
+Narrowing the span to the first and last surviving row fixes it for every
+bounded query, not just that one. It was found by timing the PARTS of a
+request rather than the request: the whole call was 956us and the piece
+responsible was 860us of it, which no profile of the benchmark showed
+because the benchmark's own 3M-row setup dominated every profile taken.
+
+## 36. Four "regressions" and three more, all of them the machine
+
+The full A/B against the pre-campaign commit, interleaved, minimum of two
+rounds, flagged seven benchmarks outside the 8.3% floor. Instructions
+retired, minimum of three interleaved runs, on the same benchmarks:
+
+    EngineCount              wall +16.3%   instructions -0.84%
+    EngineFullScanCount      wall +30.0%   instructions -0.85%
+    EngineNeedle             wall +30.0%   instructions -0.28%
+    Facets                   wall +470%    instructions +1.20%
+    DictBlockDecode/hex      wall +39.7%   instructions +2.1%
+    Postings medium/lz4      wall +12.3%   instructions -0.3%
+    Postings near-uniq/lz4   wall +75.5%   instructions +1.0%
+
+The last three are codec microbenchmarks this campaign never touched.
+EngineNeedle read -19.7% in one round and +30.0% in the next, on the same
+two binaries, twenty minutes apart -- the machine's load moved from 2.0 to
+6.6 between them.
+
+What the same A/B found that was real, and in the same direction on both
+measures:
+
+    ValueCounts card=131072   50.3ms -> 3.8ms    -92.4%
+    ValueCounts card=1000     217us  -> 17.9us   -91.8%
+    BuildDict highcard        15.9ms -> 12.5ms   -21.3%
+    IngestParallel            162.6ms -> 145.9ms -10.3%
+    Ingest                    685ms  -> 640ms     -6.6%

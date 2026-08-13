@@ -2,7 +2,6 @@ package query
 
 import (
 	"sort"
-	"time"
 
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
@@ -268,24 +267,36 @@ func timeFacet(s Store, q *Query, limit, maxPerField int, keepConst bool) (Field
 	if len(rows) > bound {
 		return FieldFacet{}, false
 	}
-	counts := map[string]int{}
+	// Counted as integers, and formatted only for the values that survive the
+	// limit: rendering a thousand RFC3339 strings to rank them and keep ten was
+	// most of what a facets request cost.
+	counts := make(map[int64]int, len(rows))
 	for _, r := range rows {
-		counts[time.Unix(0, r.Time).UTC().Format(time.RFC3339Nano)]++
+		counts[r.Time]++
 	}
 	if !facetKeep(len(counts), maxPerField, keepConst) {
 		return FieldFacet{}, false
 	}
-	vc := make([]ValueCount, 0, len(counts))
-	for v, c := range counts {
-		vc = append(vc, ValueCount{Value: v, Count: c})
+	type timeCount struct {
+		t int64
+		n int
 	}
-	sortValueCounts(vc)
-	if limit > 0 && len(vc) > limit {
-		vc = vc[:limit]
+	all := make([]timeCount, 0, len(counts))
+	for t, n := range counts {
+		all = append(all, timeCount{t, n})
 	}
-	vals := make([]FacetValue, 0, len(vc))
-	for _, v := range vc {
-		vals = append(vals, FacetValue{FieldValue: v.Value, Hits: v.Count})
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].n != all[j].n {
+			return all[i].n > all[j].n
+		}
+		return all[i].t < all[j].t
+	})
+	if limit > 0 && len(all) > limit {
+		all = all[:limit]
+	}
+	vals := make([]FacetValue, 0, len(all))
+	for _, e := range all {
+		vals = append(vals, FacetValue{FieldValue: formatTime(e.t), Hits: e.n})
 	}
 	return FieldFacet{FieldName: "_time", Values: vals}, true
 }

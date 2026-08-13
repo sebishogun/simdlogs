@@ -374,6 +374,19 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 			lo, hi = 0, n
 		}
 	}
+	// A bounded query kept a handful of rows; decoding the group's whole
+	// timestamp column to read them was most of its cost -- 860us of a 956us
+	// facets request, where the bound was a thousand rows out of 131072.
+	if q.Limit > 0 || q.LastN > 0 {
+		if first, last := sel.FirstLast(); first >= 0 {
+			if first > lo {
+				lo = first
+			}
+			if last+1 < hi {
+				hi = last + 1
+			}
+		}
+	}
 	var ts []int64
 	pointRead := cnt*tsBlockGuess < hi-lo
 	if !pointRead {

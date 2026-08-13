@@ -112,6 +112,22 @@ func (b *Bitset) KeepLast(n int) {
 	}
 }
 
+// FirstLast returns the lowest and highest set row, or (-1,-1) when empty. A
+// bounded query uses it to decode only the span it actually kept.
+func (b *Bitset) FirstLast() (int, int) {
+	first, last := -1, -1
+	for wi, w := range b.words {
+		if w == 0 {
+			continue
+		}
+		if first < 0 {
+			first = wi<<6 + bits.TrailingZeros64(w)
+		}
+		last = wi<<6 + 63 - bits.LeadingZeros64(w)
+	}
+	return first, last
+}
+
 // And/Or/AndNot compose filters through simd's byte bit-ops over a byte
 // view of the words -- bitwise AND is the same operation at any element
 // width, so the u64 words alias as bytes without a copy.
