@@ -129,13 +129,20 @@ the LLD becomes the spec the tests pin.
 - Modify: `internal/bench/apisurface_test.go`
 
 **Step 1 (test first):** Extend the answer-changes probe to every select and
-ingest endpoint. `keep_const_fields` is NOT a no-op: `facetKeep` materially
-includes constant/single-distinct fields (`internal/query/introspect.go`),
-so a fixture with a constant field (or no stream fields, which makes the
-synthesized `_stream`/`_stream_id` constant) must change the answer. The
-probe on the committed corpus found no constant-field candidate, which is
-corpus-specific and recorded in the commit message of the probe work — not
-in `docs/wrong.md`, which has no entry for it.
+ingest endpoint, and add the missing `keep_const_fields` case. `facetKeep`
+materially includes constant/single-distinct fields
+(`internal/query/introspect.go`), and with no stream fields configured the
+synthesized `_stream`/`_stream_id` hold single constant values, so
+`keep_const_fields=1` must change the committed-corpus facets answer. No
+committed probe currently varies or asserts this argument: the
+`TestParamsHonoured` keep_const case is gated on the staged VL binary and
+reports inconclusive when the reference's own answer does not change — which
+is what the 2026-08-13 probe (commit f42cc8e) recorded, against the then
+pre-facetable-synthesized-fields code (facets from stored columns alone);
+the same commit made the synthesized fields facetable. The new probe must
+assert the answer changes without depending on the VL binary, and the
+finding's history (not in `docs/wrong.md`, which has no entry for it) goes
+in the commit message.
 
 **Step 2:** A status-code probe plus a response-shape probe per endpoint
 (catch the class of defect where a 200 answers a body no client can read).
@@ -217,8 +224,9 @@ CURRENT envelope of its endpoint, plus a router pointed at it:
 - `hits`: the backend answers the dense series shape
   `{"hits":[{"fields":..,"timestamps":[..],"values":[..],"total":N}]}`;
   the router must sum per bucket across shards and return the same dense
-  shape. Today it decodes the old `{"_time":..,"hits":..}` object shape and
-  answers `{"hits":[]}`.
+  shape. Today it decodes the old `{"_time":..,"hits":..}` object shape, so
+  every dense series object lands as one bogus zero entry and the router
+  answers exactly `{"hits":[{"_time":"","hits":0}]}`.
 
 **Step 2:** Fix each merge so its fixture passes; keep the single-node
 byte-identical cross-check.

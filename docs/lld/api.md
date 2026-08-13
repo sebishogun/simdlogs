@@ -111,10 +111,18 @@ only; see `internal/api/es.go`).
   (tail replay window, default 5 s), `keep_const_fields` (facets; when set,
   materially includes constant/single-distinct fields: `facetKeep` keeps a
   field with one distinct value, including the synthesized `_stream` /
-  `_stream_id` and a single-timestamp `_time` facet — `internal/query/introspect.go`).
-  The API-surface probe found it changed nothing on the committed corpus,
-  which has no constant-field candidate; that is corpus-specific, not a
-  no-op claim — a fixture with a constant field changes the answer.
+  `_stream_id` — which, with no stream fields configured, hold the single
+  constant values `{}` and its id — and a single-timestamp `_time` facet —
+  `internal/query/introspect.go`). On the current committed corpus (no stream
+  fields, so the constant fallback is a candidate), `keep_const_fields=1`
+  therefore changes the facets answer. The 2026-08-13 answer-changes probe
+  (commit f42cc8e) recorded this argument changing nothing, but that finding
+  is historical: it was measured against the code before the synthesized
+  fields were made facetable (facets from stored columns alone); the same
+  commit added them as candidates. No committed probe currently varies or
+  asserts this argument — the `TestParamsHonoured` keep_const case requires
+  the staged VL binary and reports inconclusive when the reference's own
+  answer does not change. The production plan (B.3) adds one.
 
 `Now` is stamped from the request for relative `_time:<dur>` filters.
 
