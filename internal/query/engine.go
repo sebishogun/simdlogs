@@ -152,6 +152,12 @@ type Expr struct {
 // query, and setting them up measured as a needle regression.
 const smallResultRows = 64
 
+// bulkDecodeRows is the match count above which materialization decodes each
+// column once (DictDecodeSome) rather than point-reading per row. Point reads
+// decompress a dict block per call, so their cost scales with rows*fields;
+// the bulk decode's scales with the blocks the matches touch.
+const bulkDecodeRows = 512
+
 // Field is one decoded key/value of a matched row.
 type Field struct {
 	Key   string
@@ -395,9 +401,16 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	// Many matches: decode each materialize column once and index into it,
 	// rather than a per-row DictValueAt point read (which decompresses a dict
 	// block per field per row). Bulk-decoding every materialize column only
-	// pays when the match set is a large fraction of the group; below n/8 the
-	// point reads win (the needle and selective AND stay lazy).
-	if cnt >= n/16 {
+	// pays when the match set is a large fraction of the group; for a HANDFUL
+	// of rows the point reads win (the needle and selective AND stay lazy).
+	//
+	// The bound is absolute, not a fraction of the group: at 4k matched rows in
+	// a 128K group the old n/16 guard chose point reads, and each one
+	// decompresses the dict block its value lives in -- 37k block inflations to
+	// materialize 7.5k rows, which is the same pathology docs/wrong.md entry 33
+	// records for ValueCounts. Bulk DictDecodeSome inflates each needed block
+	// once.
+	if cnt >= n/16 || cnt >= bulkDecodeRows {
 		for _, f := range matFields {
 			if _, ok := cols[f]; ok {
 				continue

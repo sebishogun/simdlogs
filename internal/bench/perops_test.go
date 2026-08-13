@@ -77,6 +77,11 @@ func TestPerOperation(t *testing.T) {
 		{"query/substring", q(`_msg:~"timed out"`)},
 		{"query/limit", q(`* | limit 100`)},
 		{"query/range", q(`latency_ms:>100 AND latency_ms:<200`)},
+		// A NARROW window plus an equality, materializing thousands of full
+		// records: the shape the 3M harness caught losing while every
+		// full-window query here won. The window is 2% of the corpus's span.
+		{"query/windowed", "/select/logsql/query?query=" + url.QueryEscape("service:=api") +
+			"&start=1700000010&end=1700000012"},
 		{"stats/count", q(`* | stats count() n`)},
 		{"stats/groupby", q(`* | stats by (service) count() n`)},
 		{"stats/topk", q(`* | top 10 by (host)`)},

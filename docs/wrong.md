@@ -1141,3 +1141,27 @@ implementation-doc defects (recorded in `docs/roadmap.md`); a future TDD
 task either implements exists as a real predicate or rejects the clause
 with an explicit error -- acceptance-without-effect is not a supported
 state.
+
+## 37. The point-read threshold was a fraction when the cost is absolute
+
+The materialize path point-reads a row's fields below n/16 matches and
+bulk-decodes above it. The guard is right at its edges -- one needle row
+must not decode whole columns -- but a fraction of the group is the wrong
+shape for it: at 4k matched rows in a 128K group it chose point reads, and
+each point read decompresses the dict block its value lives in. Entry 33's
+pathology again, on a different path: ~37k block inflations to materialize
+7.5k rows.
+
+Found by the agreed 3M harness, whose narrow-window selective query was
+the one shape still losing to the reference (20.6ms vs 11.2ms, stable
+across four runs, and NOT a campaign regression -- the pre-campaign
+baseline measured the same 20ms). No full-window gate could see it: the
+full-window queries take the bulk path already.
+
+An absolute bound (512 rows) beside the fractional one:
+
+    windowed selective, 3M corpus   21.8ms -> 7.0ms   VL 11.1ms   loss -> 1.6x
+    per-op gate, new windowed shape           10.1ms   VL 25.9ms   2.56x
+    needle                                     ~10us   unchanged
+
+The shape is in the per-op gate now, so it cannot quietly regress again.
