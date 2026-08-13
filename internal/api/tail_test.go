@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -55,4 +56,66 @@ func postBody(t *testing.T, ts *httptest.Server, body string) {
 		t.Fatal(err)
 	}
 	r.Body.Close()
+}
+
+// TestTailReplaysRecentWindow covers what the reference does when a client
+// opens a live tail: the last few seconds are replayed immediately, so the pane
+// is not blank until the next record happens to arrive. start_offset names the
+// window; records older than it are not replayed.
+func TestTailReplaysRecentWindow(t *testing.T) {
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	now := time.Now()
+	postBody(t, ts, `{"_time":`+itoa64(now.Add(-time.Second).UnixNano())+`,"service":"auth","_msg":"recent"}`+"\n")
+	postBody(t, ts, `{"_time":`+itoa64(now.Add(-time.Hour).UnixNano())+`,"service":"auth","_msg":"ancient"}`+"\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/select/logsql/tail?query=service:=auth", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	seen := map[string]bool{}
+	sc := bufio.NewScanner(resp.Body)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for sc.Scan() {
+			line := sc.Text()
+			if strings.Contains(line, "recent") {
+				seen["recent"] = true
+			}
+			if strings.Contains(line, "ancient") {
+				seen["ancient"] = true
+			}
+			if seen["recent"] {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+	}
+	cancel()
+
+	if !seen["recent"] {
+		t.Error("tail did not replay the recent window: a live tail opened on a busy stream showed nothing")
+	}
+	if seen["ancient"] {
+		t.Error("tail replayed a record from an hour ago; the window is start_offset, not everything")
+	}
+}
+
+func itoa64(n int64) string {
+	return strconv.FormatInt(n, 10)
 }

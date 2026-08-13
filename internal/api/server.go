@@ -392,6 +392,26 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 	bw := bufio.NewWriter(w)
 	ctx := r.Context()
 	var buf []byte
+
+	// Replay the recent window before streaming, the way the reference does: a
+	// client that opens a live tail expects to see the last few seconds of the
+	// stream immediately, not a blank pane until the next record happens to
+	// arrive. start_offset names how far back to begin.
+	offset := 5 * time.Second
+	if v := r.FormValue("start_offset"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			offset = d
+		}
+	}
+	backlog := *q
+	backlog.From = time.Now().Add(-offset).UnixNano()
+	backlog.To = int64(1) << 62
+	for _, row := range query.RunPipeline(store, &backlog) {
+		buf = appendRowJSON(buf[:0], row, backlog.MatAll)
+		bw.Write(buf)
+	}
+	bw.Flush()
+	flusher.Flush()
 	for {
 		readers, nc := store.GroupsAfterID(cursor)
 		if len(readers) > 0 {
