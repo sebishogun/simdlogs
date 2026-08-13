@@ -225,7 +225,7 @@ bytes over HTTP into disk-backed stores; query order is shuffled.
 | or | 171.7 ms | 273.5 ms | 1.6x |
 | substring | 170.6 ms | 249.1 ms | 1.5x |
 
-Measured at `d3c0b7f` on amd64/AVX-512, two consecutive runs. The footprint
+Measured at `50d13df` on amd64/AVX-512, two consecutive runs. The footprint
 line is deterministic and identical in both. The latencies were taken with a
 load average near 3, so read the small ratios as approximate and the ordering
 as sound; the per-operation gate above is the quiet-machine measurement.
