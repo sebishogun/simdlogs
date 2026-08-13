@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/binary"
+	"sync/atomic"
 	"errors"
 	"math"
 )
@@ -173,6 +174,7 @@ func ReadGroup(b []byte) (*Reader, error) {
 	r.TimeMax = int64(binary.LittleEndian.Uint64(f[8:]))
 	p := 16
 	r.cols = make([]colMeta, ncol)
+	r.idxCache = make([]atomic.Pointer[[]uint32], ncol)
 	for i := 0; i < ncol; i++ {
 		var m colMeta
 		m.Name, p = getStr(f, p)

@@ -120,6 +120,11 @@ type Expr struct {
 	Op    ExprOp
 }
 
+// smallResultRows is the match count below which appendMatches uses the direct
+// per-row path: the arena and positional resolve do not amortize on a selective
+// query, and setting them up measured as a needle regression.
+const smallResultRows = 64
+
 // Field is one decoded key/value of a matched row.
 type Field struct {
 	Key   string
@@ -315,6 +320,31 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 			cols[f] = col{idx: idx, dict: g.DictDecodeSome(f, want)}
 		}
 	}
+	// A selective query (the needle: one or a few matches) does not amortize the
+	// arena and the positional column resolve below -- their setup costs more than
+	// the per-row work they remove, which measured as a needle regression. Keep the
+	// direct path for small result sets; the arena is for the big ones.
+	if cnt <= smallResultRows {
+		sel.ForEach(func(i int) {
+			var t int64
+			if pointRead {
+				t, _ = g.TimestampAt("_time", i)
+			} else {
+				t = ts[i-lo]
+			}
+			row := Row{Time: t, Fields: make([]Field, 0, len(matFields))}
+			for _, f := range matFields {
+				if c := cols[f]; c.idx != nil {
+					row.Fields = append(row.Fields, Field{f, c.dict[c.idx[i]]})
+				} else if v, ok := g.DictValueAt(f, i); ok {
+					row.Fields = append(row.Fields, Field{f, v})
+				}
+			}
+			out = append(out, row)
+		})
+		return out
+	}
+
 	// Resolve each materialize field to its decoded column ONCE, positionally --
 	// the inner loop ran a map lookup per field per row.
 	type matCol struct {
@@ -333,7 +363,13 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	// so the sub-slices handed to rows stay valid.
 	arena := make([]Field, cnt*len(mats))
 	pos := 0
-	if need := len(out) + cnt; cap(out) < need { // one grow instead of doubling
+	// Reserve room for this group's matches, but keep append's amortized doubling:
+	// growing to the exact size reallocated once PER GROUP, which cost a selective
+	// query touching many groups more than the doubling it replaced (needle +47%).
+	if need := len(out) + cnt; cap(out) < need {
+		if grow := 2 * cap(out); grow > need {
+			need = grow
+		}
 		grown := make([]Row, len(out), need)
 		copy(grown, out)
 		out = grown
