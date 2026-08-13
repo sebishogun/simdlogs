@@ -880,3 +880,29 @@ Guards, because this is a data-rewriting background pass:
   the index is a size/speed trade, never a correctness one.
 - mmap lifetime: a query holds the old *Reader across the swap, so replaced
   mappings are retired and unmapped only after a 5-minute grace, not immediately.
+
+## Cluster scaling: at one-node scale the cluster is pure overhead (measured)
+
+Built the cluster benchmark (internal/bench/cluster_test.go, SIMDLOGS_CLUSTER=1):
+400k realistic rows through a single node and through 3 storage nodes behind a
+router, same queries both sides.
+
+    ingest   single 1.06M/s  cluster-3 0.86M/s  0.82x
+    needle   single  88.9us  cluster-3  134.2us 0.66x
+    common   single  41.1ms  cluster-3   53.5ms 0.77x
+    groupby  single  62.8us  cluster-3  120.3us 0.52x
+
+The cluster is SLOWER on every axis at this size, and that is the correct result,
+not a defect: 400k rows fit one node, so sharding only adds an HTTP hop plus a
+merge. The sub-millisecond queries are dominated by fan-out RTT (~50us per hop),
+which no merge optimization can recover. Clustering buys capacity past one node
+and replica fault tolerance -- it does not buy latency on data that already fits.
+Anyone quoting cluster numbers has to say at what scale.
+
+Two real router costs were found and fixed while measuring:
+- the merge parsed a timestamp per row with time.Parse (RFC3339Nano); a
+  hand-rolled parser for the exact shape simdlogs emits replaced it, with a test
+  asserting it agrees with time.Parse on every shape and REFUSES anything else so
+  the caller falls back rather than mis-ordering. needle 0.28x -> 0.45x.
+- the merge copied a string per row (Scanner.Text()); rows are now slices into
+  the shard's response body, no copy. cluster common 58.8ms -> 53.5ms.

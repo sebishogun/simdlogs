@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/sebishogun/simdlogs/internal/query"
 	"sync/atomic"
@@ -153,9 +154,12 @@ func (s *Server) forwardWrite(w http.ResponseWriter, r *http.Request) {
 // correct distributed answer. Tenant headers propagate so each backend answers
 // for the same tenant.
 func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
+	// Rows are kept as slices into each shard's response body, not strings: the
+	// merge touches every row of every shard, and a string per row was the
+	// router's cost on a big result (a Scanner's Text() copies each line).
 	type row struct {
 		t    int64
-		line string
+		line []byte
 	}
 	var mu sync.Mutex
 	var all []row
@@ -168,15 +172,19 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			sc := bufio.NewScanner(bytes.NewReader(body))
-			sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-			var local []row
-			for sc.Scan() {
-				line := sc.Text()
-				if line == "" {
+			local := make([]row, 0, bytes.Count(body, []byte{'\n'}))
+			for start := 0; start < len(body); {
+				e := bytes.IndexByte(body[start:], '\n')
+				var line []byte
+				if e < 0 {
+					line, start = body[start:], len(body)
+				} else {
+					line, start = body[start:start+e], start+e+1
+				}
+				if len(line) == 0 {
 					continue
 				}
-				local = append(local, row{t: rowLineTime(line), line: line})
+				local = append(local, row{t: rowLineTime(bytesToString(line)), line: line})
 			}
 			mu.Lock()
 			all = append(all, local...)
@@ -199,7 +207,7 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 		if limit > 0 && i >= limit {
 			break
 		}
-		bw.WriteString(rw.line)
+		bw.Write(rw.line)
 		bw.WriteByte('\n')
 	}
 }
@@ -436,8 +444,80 @@ func rowLineTime(line string) int64 {
 	if j < 0 {
 		return 0
 	}
+	if ns, ok := fastRFC3339Nano(line[i : i+j]); ok {
+		return ns
+	}
 	if t, err := time.Parse(time.RFC3339Nano, line[i:i+j]); err == nil {
 		return t.UnixNano()
 	}
 	return 0
+}
+
+// bytesToString views b as a string without copying. Safe here: the bytes are a
+// slice of an already-read response body that is never mutated.
+func bytesToString(b []byte) string { return unsafe.String(unsafe.SliceData(b), len(b)) }
+
+// fastRFC3339Nano parses the exact shape simdlogs emits --
+// 2006-01-02T15:04:05[.fraction]Z -- without time.Parse, which showed up as the
+// federated merge's dominant cost (the router parses a timestamp for EVERY row
+// returned by every shard, just to order the merge). Anything else returns
+// ok=false and the caller falls back to the general parser.
+func fastRFC3339Nano(s string) (int64, bool) {
+	if len(s) < 20 || s[len(s)-1] != 'Z' || s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':' {
+		return 0, false
+	}
+	d2 := func(at int) (int, bool) {
+		a, b := s[at], s[at+1]
+		if a < '0' || a > '9' || b < '0' || b > '9' {
+			return 0, false
+		}
+		return int(a-'0')*10 + int(b-'0'), true
+	}
+	y1, ok1 := d2(0)
+	y2, ok2 := d2(2)
+	mo, ok3 := d2(5)
+	dy, ok4 := d2(8)
+	hh, ok5 := d2(11)
+	mi, ok6 := d2(14)
+	ss, ok7 := d2(17)
+	if !(ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7) || mo < 1 || mo > 12 {
+		return 0, false
+	}
+	year := y1*100 + y2
+	// Days from the civil epoch (Howard Hinnant's algorithm): exact, no tables.
+	yy := year
+	if mo <= 2 {
+		yy--
+	}
+	era := yy / 400
+	if yy < 0 {
+		era = (yy - 399) / 400
+	}
+	yoe := yy - era*400
+	mp := (mo + 9) % 12
+	doy := (153*mp+2)/5 + dy - 1
+	doe := yoe*365 + yoe/4 - yoe/100 + doy
+	days := int64(era)*146097 + int64(doe) - 719468
+
+	ns := (days*86400 + int64(hh)*3600 + int64(mi)*60 + int64(ss)) * 1e9
+	if len(s) > 20 { // fractional seconds: ".123456789Z"
+		if s[19] != '.' {
+			return 0, false
+		}
+		frac, scale := int64(0), int64(100_000_000)
+		for k := 20; k < len(s)-1; k++ {
+			c := s[k]
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			if scale > 0 {
+				frac += int64(c-'0') * scale
+				scale /= 10
+			}
+		}
+		ns += frac
+	} else if len(s) != 20 {
+		return 0, false
+	}
+	return ns, true
 }
