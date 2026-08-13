@@ -1006,3 +1006,72 @@ test written from the implementation proves the implementation is what it is.
 
 40/40 identical now. The lesson generalizes: for a drop-in replacement, the
 compatibility suite has to run BOTH engines, or it measures nothing.
+
+## 32. A status-code probe is not a compatibility test
+
+The API-surface probe compared `resp.StatusCode < 400` on both engines and
+reported 0 gaps. On that basis the surface was called complete. Then the same
+endpoints were compared by BODY, and seven of them were answering 200 with
+something no VictoriaLogs client can read:
+
+    field_names        {"names":[...]}          VL: {"values":[{"value","hits"}]}
+    streams            {"streams":[]}           VL: one entry for the empty stream
+    stream_ids         {"stream_ids":[]}        VL: {"values":[{"value","hits"}]}
+    stream_field_names {"names":[]}             VL: {"values":[...]}
+    stats_query        {"count":500}            VL: a Prometheus vector
+    hits               [{_time,hits}] unordered VL: dense parallel arrays, zeros kept
+    facets             object keyed by field    VL: array of {field_name,values}
+
+Five ingest paths 404'd outright, because VictoriaLogs prefixes every vendor
+protocol (`/insert/elasticsearch/_bulk`, `/insert/loki/api/v1/push`,
+`/insert/datadog/api/v2/logs`) and we served only the bare vendor path. A
+Filebeat or Promtail configured against VictoriaLogs got a 404 on every write.
+
+And `start=1700000000` was read as NANOSECONDS. VictoriaLogs infers the unit
+from the magnitude, so a Grafana datasource's epoch-seconds window landed in
+1970 and every query answered empty. The status-code probe saw 200 and a
+well-formed empty result.
+
+The lesson is the same as entry 31 and cost the same twice: compare the ANSWER.
+A probe that compares status codes tests that the server is running.
+
+## 33. Two defects the benchmarks could not see
+
+Found while fixing the above, both older than it.
+
+`ValueCounts` asked `dictSectionAt` for one value at a time. That function
+decompresses the whole dict block the value lives in, so each block was
+inflated once per value it held -- 47% of a `top N by (host)`, and the same
+tax on facets, field_values, uniq and stats-by. Decoding each block once:
+
+    top N by (host), 200k rows, 1024 hosts:  12.35ms -> 1.32ms   9.3x
+
+No benchmark measured it because every benchmark that would have exercised it
+was measuring something else's total.
+
+Ingest stored a parsed `_time` twice: once in the timestamp column and again as
+a near-unique RFC3339 string in a dictionary, which is the worst thing a
+dictionary can hold. Nothing read it back -- the wire format prints the row's
+timestamp and skips a `_time` field, and whole-record materialization skips the
+column by name.
+
+    200k realistic rows:  127.43 -> 110.08 bytes/row   13.6% smaller
+
+Disk was the one axis VictoriaLogs led on, and this was sitting in the writer
+the whole time.
+
+## 34. The wall clock called an 11% win a regression
+
+`field_names` was the last operation the reference beat. Two costs were removed
+-- a second full pass over every group for a row count the first pass had
+summed, and asking for the empty value's ROW LIST when only its length was
+used. Wall clock, on a box at load 11:
+
+    before  38.9us/op        after  48.4us/op    "a 24% regression"
+
+Instructions retired, min of three interleaved runs, same machine, same minute:
+
+    before  837M             after  744M        -11.2%
+
+The change is a plain win. The wall clock was reading the user's own workload.
+This is entry 12's rule restated: on a busy box, gate on instructions.
