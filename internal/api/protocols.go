@@ -3,6 +3,7 @@ package api
 import (
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
 )
@@ -80,10 +81,28 @@ func (s *Server) insertOTLPLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	tn := s.tn(r)
 	otlpOpts := ingestOptions(r)
-	oing, oskip := ingest.IngestOTLPLogsOpts(tn.w, body, tn.fallbackTS(), &otlpOpts)
+	// The collector's otlphttp exporter sends protobuf unless configured
+	// otherwise, so the Content-Type decides the parser. Feeding protobuf to
+	// the JSON decoder stored nothing while answering 200 -- silent data loss
+	// for the DEFAULT client configuration.
+	proto := strings.Contains(r.Header.Get("Content-Type"), "protobuf")
+	var oing, oskip int
+	if proto {
+		oing, oskip = ingest.IngestOTLPLogsProto(tn.w, body, tn.fallbackTS(), &otlpOpts)
+	} else {
+		oing, oskip = ingest.IngestOTLPLogsOpts(tn.w, body, tn.fallbackTS(), &otlpOpts)
+	}
 	s.countRows(oing, oskip, len(body))
 	if err := tn.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
+		return
+	}
+	// The response mirrors the request's encoding, as the OTLP/HTTP spec
+	// requires: an empty ExportLogsServiceResponse is zero bytes in protobuf
+	// and {} in JSON, both meaning full success.
+	if proto {
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

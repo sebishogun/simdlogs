@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/sebishogun/simdlogs/internal/ingest"
 )
 
 // A shipper -- Filebeat, Vector, Fluent Bit, Promtail -- is configured against
@@ -293,5 +295,57 @@ func TestVLMetricNames(t *testing.T) {
 		if strings.Contains(body, "\n"+name+" 0\n") {
 			t.Errorf("%s reported 0, which is not a measurement", name)
 		}
+	}
+}
+
+// TestOTLPProtobufOverHTTP covers the collector's DEFAULT configuration:
+// protobuf posted to the OTLP path must store, and the response must mirror the
+// request's encoding. The JSON parser fed this body stored nothing and answered
+// 200, which is data loss a client cannot see.
+func TestOTLPProtobufOverHTTP(t *testing.T) {
+	ts, done := optServer(t)
+	defer done()
+
+	body := ingest.BuildTestOTLPProtoExport()
+	req, _ := http.NewRequest("POST", ts.URL+"/insert/opentelemetry/v1/logs", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("protobuf OTLP -> %d: %s", resp.StatusCode, b)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "protobuf") {
+		t.Errorf("response Content-Type = %q, want the request's encoding mirrored", ct)
+	}
+	if len(b) != 0 {
+		t.Errorf("protobuf success body = %d bytes, want an empty ExportLogsServiceResponse", len(b))
+	}
+
+	rows := ndjsonRows(t, ts.URL+"/select/logsql/query?query=*&start=2023-11-14T00:00:00Z&end=2023-11-15T00:00:00Z")
+	if len(rows) != 2 {
+		t.Fatalf("stored %d records from the protobuf export, want 2", len(rows))
+	}
+	byMsg := map[string]map[string]string{}
+	for _, r := range rows {
+		byMsg[r["_msg"]] = r
+	}
+	first := byMsg["boom happened"]
+	if first == nil {
+		t.Fatalf("the first record's body did not arrive: %v", rows)
+	}
+	for k, want := range map[string]string{
+		"severity": "ERROR", "service.name": "api", "host": "h1",
+		"code": "500", "ratio": "0.5", "retry": "true",
+	} {
+		if first[k] != want {
+			t.Errorf("record field %s = %q want %q", k, first[k], want)
+		}
+	}
+	if byMsg["second"] == nil {
+		t.Errorf("the record timed by observed_time_unix_nano did not arrive")
 	}
 }
