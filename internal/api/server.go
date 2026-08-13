@@ -542,8 +542,12 @@ func parseRequest(r *http.Request) (*query.Query, error) {
 		q.To = int64(1) << 62
 	}
 	if v := r.FormValue("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			q.Limit = n
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			// The endpoint's `limit` is the most RECENT n, newest first -- what a
+			// log viewer shows. The `| limit n` pipe is the other one, the first
+			// n, and sets q.Limit; conflating them returned the oldest rows in
+			// the store to a client asking for the tail of the stream.
+			q.LastN = n
 		}
 	}
 	return q, nil

@@ -334,3 +334,110 @@ func TestTimeFieldFromTimestampColumn(t *testing.T) {
 		}
 	}
 }
+
+// TestKeepLast is the mirror of TestKeepFirst: a tail query keeps the LAST n
+// set bits, and an off-by-one there returns the wrong rows silently.
+func TestKeepLast(t *testing.T) {
+	for _, tc := range []struct{ n, keep int }{
+		{n: 10, keep: 3}, {n: 64, keep: 64}, {n: 65, keep: 64}, {n: 200, keep: 70},
+		{n: 200, keep: 0}, {n: 200, keep: 999}, {n: 129, keep: 65},
+	} {
+		b := NewBitset(tc.n)
+		b.SetAll()
+		want := tc.keep
+		if want > tc.n {
+			want = tc.n
+		}
+		b.KeepLast(tc.keep)
+		if got := b.Count(); got != want {
+			t.Errorf("n=%d keep=%d: count = %d want %d", tc.n, tc.keep, got, want)
+		}
+		first := -1
+		b.ForEach(func(i int) {
+			if first < 0 {
+				first = i
+			}
+		})
+		if want > 0 && first != tc.n-want {
+			t.Errorf("n=%d keep=%d: first set bit = %d want %d", tc.n, tc.keep, first, tc.n-want)
+		}
+	}
+	// Sparse: every third row set, keep 3 -> the last three of those.
+	b := NewBitset(100)
+	for i := 0; i < 100; i += 3 {
+		b.Set(i)
+	}
+	b.KeepLast(3)
+	var got []int
+	b.ForEach(func(i int) { got = append(got, i) })
+	want := []int{93, 96, 99}
+	if len(got) != len(want) {
+		t.Fatalf("sparse KeepLast = %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sparse KeepLast = %v want %v", got, want)
+		}
+	}
+}
+
+// TestLastNIsNewestFirst pins the endpoint's `limit`: the most recent n rows,
+// newest first. The pipe's `| limit n` keeps the FIRST n, and the two must not
+// be conflated -- a viewer asking for the tail was shown the oldest rows.
+func TestLastNIsNewestFirst(t *testing.T) {
+	s := fastPipeStore(t)
+	q, err := ParseLogsQL(`*`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.From, q.To, q.LastN = 0, int64(1)<<62, 5
+	rows := Run(s, q)
+	if len(rows) != 5 {
+		t.Fatalf("LastN=5 returned %d rows", len(rows))
+	}
+	// fastPipeStore timestamps run 1..200, so the newest five are 200..196.
+	for i, want := range []int64{200, 199, 198, 197, 196} {
+		if rows[i].Time != want {
+			t.Fatalf("LastN rows = %v..., want newest first (200,199,...)", rows[0].Time)
+		}
+	}
+	// The pipe still means the first n.
+	first := runRaw(t, s, `* | limit 5`)
+	if len(first) != 5 || first[0].Time != 1 {
+		t.Fatalf("`| limit 5` first row time = %d, want 1 (the FIRST rows)", first[0].Time)
+	}
+}
+
+// TestLastNAcrossOverlappingGroups covers the cutoff: with out-of-order arrivals
+// an older group can still hold a newer row, so the scan must not stop at the
+// first group that fills the bound.
+func TestLastNAcrossOverlappingGroups(t *testing.T) {
+	st, err := storage.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// group 0 holds times 1..3 AND 100 (a late arrival); group 1 holds 4..6.
+	for _, times := range [][]int64{{1, 2, 3, 100}, {4, 5, 6}} {
+		vals := make([]string, len(times))
+		for i := range vals {
+			vals[i] = "v"
+		}
+		d := storage.BuildDict(vals)
+		if _, err := st.AppendGroup(&storage.Group{Rows: len(times), Columns: []storage.Column{
+			{Name: "_time", Type: storage.ColTimestamp, Ts: times},
+			{Name: "f", Type: storage.ColDict, Dict: &d},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q, _ := ParseLogsQL(`*`)
+	q.From, q.To, q.LastN = 0, int64(1)<<62, 2
+	rows := Run(st, q)
+	if len(rows) != 2 || rows[0].Time != 100 || rows[1].Time != 6 {
+		var got []int64
+		for _, r := range rows {
+			got = append(got, r.Time)
+		}
+		t.Fatalf("LastN over overlapping groups = %v, want [100 6]", got)
+	}
+}

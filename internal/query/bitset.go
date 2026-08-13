@@ -75,6 +75,43 @@ func (b *Bitset) KeepFirst(n int) {
 	}
 }
 
+// KeepLast clears every set bit before the last n, in row order -- the mirror
+// of KeepFirst, for a query that wants the most recent rows rather than the
+// first ones.
+func (b *Bitset) KeepLast(n int) {
+	if n <= 0 {
+		for i := range b.words {
+			b.words[i] = 0
+		}
+		return
+	}
+	seen := 0
+	for wi := len(b.words) - 1; wi >= 0; wi-- {
+		w := b.words[wi]
+		if w == 0 {
+			continue
+		}
+		c := bits.OnesCount64(w)
+		if seen+c <= n {
+			seen += c
+			continue
+		}
+		// This word crosses the bound: keep its highest (n-seen) set bits, the
+		// latest rows, and drop everything before it.
+		keep := uint64(0)
+		for need := n - seen; need > 0; need-- {
+			msb := uint64(1) << (63 - bits.LeadingZeros64(w))
+			keep |= msb
+			w &^= msb
+		}
+		b.words[wi] = keep
+		for j := wi - 1; j >= 0; j-- {
+			b.words[j] = 0
+		}
+		return
+	}
+}
+
 // And/Or/AndNot compose filters through simd's byte bit-ops over a byte
 // view of the words -- bitwise AND is the same operation at any element
 // width, so the u64 words alias as bytes without a copy.

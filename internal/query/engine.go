@@ -2,6 +2,7 @@ package query
 
 import (
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,7 +30,13 @@ type Query struct {
 	// Limit (which must return the first N in time order, and so forces the serial
 	// path) this only has to DETECT overflow, so it keeps the parallel scan.
 	MaxRows int
-	MatAll  bool // materialize every column (full-record output: bare selects, live tail)
+	// LastN returns the n most RECENT matching rows, newest first -- the select
+	// endpoint's `limit` argument, which is how a log viewer shows the tail of a
+	// stream. Deliberately not Limit: the `| limit N` pipe returns the FIRST n,
+	// and the reference draws the same distinction (measured against it: the
+	// parameter answers m19,m18,m17 where the pipe answers m0,m1,m2).
+	LastN  int
+	MatAll bool // materialize every column (full-record output: bare selects, live tail)
 }
 
 // PredKind selects the comparison.
@@ -189,6 +196,9 @@ func Run(s Store, q *Query) []Row {
 			survivors = append(survivors, g)
 		}
 	}
+	if q.LastN > 0 {
+		return runNewest(survivors, q)
+	}
 	if len(survivors) >= parallelMinGroups && q.Limit == 0 {
 		return runParallel(survivors, q)
 	}
@@ -203,6 +213,38 @@ func Run(s Store, q *Query) []Row {
 		}
 	}
 	return out
+}
+
+// runNewest answers the endpoint's `limit`: the n most recent matching rows,
+// newest first. It walks the groups from the newest backwards and keeps only
+// each one's last n matches, so a bounded tail query never materializes a
+// group's whole match set -- and stops as soon as no older group can hold a row
+// newer than the oldest one kept.
+func runNewest(survivors []*storage.Reader, q *Query) []Row {
+	var out []Row
+	for i := len(survivors) - 1; i >= 0; i-- {
+		out = appendMatches(out, survivors[i], q)
+		if len(out) < q.LastN {
+			continue
+		}
+		sortByTimeDesc(out)
+		out = out[:q.LastN]
+		// Groups are stored in ingest order, which is time order up to the
+		// out-of-order arrivals every real log stream has -- so the cutoff is
+		// checked against the next group's actual TimeMax, not assumed.
+		if i == 0 || survivors[i-1].TimeMax < out[len(out)-1].Time {
+			return out
+		}
+	}
+	sortByTimeDesc(out)
+	if len(out) > q.LastN {
+		out = out[:q.LastN]
+	}
+	return out
+}
+
+func sortByTimeDesc(rows []Row) {
+	sort.SliceStable(rows, func(a, b int) bool { return rows[a].Time > rows[b].Time })
 }
 
 // groupCanMatch rejects a group whose footer proves a required equality
@@ -305,7 +347,13 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	// A bounded query stops inside the group, not after it. Trimming the bitset
 	// here bounds every decode below -- without it `| limit 100` still decoded
 	// every matching row of the first group and discarded all but a hundred.
-	if q.Limit > 0 {
+	if q.LastN > 0 {
+		// Newest-first: the rows that can survive are this group's LAST n.
+		if cnt > q.LastN {
+			sel.KeepLast(q.LastN)
+			cnt = q.LastN
+		}
+	} else if q.Limit > 0 {
 		remaining := q.Limit - len(out)
 		if remaining <= 0 {
 			return out

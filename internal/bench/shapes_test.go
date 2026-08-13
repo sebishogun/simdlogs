@@ -49,6 +49,7 @@ func TestEndpointShapes(t *testing.T) {
 	all := url.QueryEscape("*")
 	eps := []struct{ name, path string }{
 		{"query", "/select/logsql/query?query=" + all + "&limit=2" + win},
+		{"query-limit-order", "/select/logsql/query?query=" + all + "&limit=3" + win},
 		{"hits", "/select/logsql/hits?query=" + all + "&step=1m" + win},
 		{"facets", "/select/logsql/facets?query=" + all + win},
 		{"field_names", "/select/logsql/field_names?query=" + all + win},
