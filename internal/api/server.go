@@ -213,12 +213,13 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 	// parallel path calls it from many shard goroutines.
 	tn := s.tn(r)
 	fallback := tn.fallbackTS()
+	opts := ingestOptions(r)
 	var ing, skip int
 	if len(body) >= ingest.MinParallelBytes {
-		ing, skip = ingest.IngestJSONLinesParallel(tn.store, body, fallback, s.compact)
+		ing, skip = ingest.IngestJSONLinesParallelOpts(tn.store, body, fallback, s.compact, &opts)
 	} else {
 		// Small body: reuse the persistent writer, no per-request pool churn.
-		ing, skip = ingest.IngestJSONLines(tn.w, body, fallback)
+		ing, skip = ingest.IngestJSONLinesOpts(tn.w, body, fallback, &opts)
 		if err := tn.w.Flush(); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -235,7 +236,8 @@ func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tn := s.tn(r)
-	ing, skip := ingest.IngestLogfmt(tn.w, body, tn.fallbackTS())
+	lfOpts := ingestOptions(r)
+	ing, skip := ingest.IngestLogfmtOpts(tn.w, body, tn.fallbackTS(), &lfOpts)
 	if err := tn.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -614,7 +616,7 @@ func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, query.FieldNameCounts(s.tn(r).store, q))
+	writeValues(w, limitValues(query.FieldNameCounts(s.tn(r).store, q), r))
 }
 
 func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
@@ -660,6 +662,14 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	from, to := timeWindow(r)
+	// The reference's stats_query is an INSTANT query: `time` names the end of
+	// the window, and start/end are the extension. A client that sends only
+	// `time` got the whole store here before.
+	if v := r.FormValue("time"); v != "" {
+		if n, ok := parseTimeParam(v); ok {
+			to = n
+		}
+	}
 	if to == int64(1)<<62 {
 		to = time.Now().UnixNano()
 	}
@@ -712,6 +722,16 @@ type promData struct {
 	Result     []map[string]any `json:"result"`
 }
 
+// limitValues applies the request's `limit` to a values response. Every values
+// endpoint in the reference honours it, and a dashboard that asks for ten
+// values should not be sent ten thousand.
+func limitValues(vcs []query.ValueCount, r *http.Request) []query.ValueCount {
+	if n := intParam(r, "limit", 0); n > 0 && len(vcs) > n {
+		return vcs[:n]
+	}
+	return vcs
+}
+
 // intParam reads a non-negative integer form value, or def when absent or bad.
 func intParam(r *http.Request, name string, def int) int {
 	if v := r.FormValue(name); v != "" {
@@ -733,7 +753,7 @@ func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, query.Streams(s.tn(r).store, q))
+	writeValues(w, limitValues(query.Streams(s.tn(r).store, q), r))
 }
 
 // streamIDsHandler lists the distinct stream ids in the window.
@@ -747,7 +767,7 @@ func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, query.StreamIDs(s.tn(r).store, q))
+	writeValues(w, limitValues(query.StreamIDs(s.tn(r).store, q), r))
 }
 
 // streamFieldNamesHandler lists the distinct stream label names.
@@ -761,7 +781,7 @@ func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, query.StreamFieldNames(s.tn(r).store, q))
+	writeValues(w, limitValues(query.StreamFieldNames(s.tn(r).store, q), r))
 }
 
 // streamFieldValuesHandler lists the distinct values of one stream label.
@@ -775,7 +795,7 @@ func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, query.StreamFieldValues(s.tn(r).store, q, r.FormValue("field")))
+	writeValues(w, limitValues(query.StreamFieldValues(s.tn(r).store, q, r.FormValue("field")), r))
 }
 
 // statsQueryRange buckets a stats query over the time range and returns a

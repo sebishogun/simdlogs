@@ -23,11 +23,17 @@ const MinParallelBytes = 1 << 20
 // pool are sized so the total goroutines stay near the core count rather
 // than oversubscribing. Falls back to serial for a small body.
 func IngestJSONLinesParallel(store *storage.Store, data []byte, fallback func() int64, compact bool) (ingested, skipped int) {
+	return IngestJSONLinesParallelOpts(store, data, fallback, compact, nil)
+}
+
+// IngestJSONLinesParallelOpts is IngestJSONLinesParallel with the request's
+// field mappings applied.
+func IngestJSONLinesParallelOpts(store *storage.Store, data []byte, fallback func() int64, compact bool, opts *Options) (ingested, skipped int) {
 	shards := runtime.NumCPU() / 3
 	if shards < 2 || len(data) < MinParallelBytes {
 		w := NewWriter(store)
 		w.SetCompact(compact)
-		i, s := IngestJSONLines(w, data, fallback)
+		i, s := IngestJSONLinesOpts(w, data, fallback, opts)
 		w.Close()
 		return i, s
 	}
@@ -43,7 +49,7 @@ func IngestJSONLinesParallel(store *storage.Store, data []byte, fallback func() 
 			defer wg.Done()
 			w := NewWriterWorkers(store, 2)
 			w.SetCompact(compact)
-			i, s := IngestJSONLines(w, chunk, fallback)
+			i, s := IngestJSONLinesOpts(w, chunk, fallback, opts)
 			w.Close()
 			atomic.AddInt64(&ing, int64(i))
 			atomic.AddInt64(&skp, int64(s))
@@ -92,6 +98,14 @@ func splitLines(data []byte, n int) [][]byte {
 // unescaped) and interned by the writer's per-column dictionaries; a
 // number keeps its source text, which is what a log store round-trips.
 func IngestJSONLines(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+	return IngestJSONLinesOpts(w, data, fallback, nil)
+}
+
+// IngestJSONLinesOpts is IngestJSONLines with the request's field mappings
+// applied: a shipper configured against the reference sends them as query args
+// and expects its message, timestamp and stream read from the fields it names.
+func IngestJSONLinesOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+	mapped := !opts.Empty()
 	fields := map[string]string{}
 	for len(data) > 0 {
 		// Split one line; lenient ingest parses each independently so a
@@ -126,7 +140,7 @@ func IngestJSONLines(w *Writer, data []byte, fallback func() int64) (ingested, s
 			switch val.Kind() {
 			case simdjson.String:
 				s := val.String()
-				if isTimeKey(key) {
+				if opts.isTime(key) {
 					if t, ok := parseTime(s); ok {
 						// The timestamp column holds it now, so keeping the field
 						// as well stored every record's time twice -- and as a
@@ -141,7 +155,7 @@ func IngestJSONLines(w *Writer, data []byte, fallback func() int64) (ingested, s
 				}
 				fields[key] = s
 			case simdjson.Number:
-				if isTimeKey(key) {
+				if opts.isTime(key) {
 					ts, haveTS = val.Int(), true
 					return true
 				}
@@ -158,7 +172,10 @@ func IngestJSONLines(w *Writer, data []byte, fallback func() int64) (ingested, s
 		if !haveTS {
 			ts = fallback()
 		}
-		w.Add(ts, fields)
+		if mapped {
+			opts.apply(fields)
+		}
+		addWithStream(w, ts, fields, opts)
 		ingested++
 	}
 	return ingested, skipped

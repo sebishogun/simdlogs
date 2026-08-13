@@ -12,6 +12,12 @@ import (
 // become fields and the free text becomes _msg. A line that is not syslog at
 // all is stored whole as _msg so nothing is dropped.
 func IngestSyslog(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+	return IngestSyslogOpts(w, data, fallback, nil)
+}
+
+// IngestSyslogOpts is IngestSyslog with the request's field mappings applied.
+func IngestSyslogOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+	mapped := !opts.Empty()
 	fields := map[string]string{}
 	for len(data) > 0 {
 		nl := indexByte(data, '\n')
@@ -31,7 +37,10 @@ func IngestSyslog(w *Writer, data []byte, fallback func() int64) (ingested, skip
 		if !ok {
 			ts = fallback()
 		}
-		w.Add(ts, fields)
+		if mapped {
+			opts.apply(fields)
+		}
+		addWithStream(w, ts, fields, opts)
 		ingested++
 	}
 	return ingested, skipped

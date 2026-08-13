@@ -15,13 +15,13 @@ func TestParseTimeShapes(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := []struct {
-		in   string
-		ns   int64
-		ok   bool
+		in string
+		ns int64
+		ok bool
 	}{
 		{"1700000000000000000", 1_700_000_000_000_000_000, true}, // unix nanos
-		{"-1000", -1000, true},                                   // signed
-		{rfc, want.UnixNano(), true},                             // RFC3339Nano
+		{"-1000", -1000, true},       // signed
+		{rfc, want.UnixNano(), true}, // RFC3339Nano
 		{"2024-05-17T03:21:09Z", time.Date(2024, 5, 17, 3, 21, 9, 0, time.UTC).UnixNano(), true},
 		{"", 0, false},
 		{"not-a-time", 0, false},

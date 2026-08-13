@@ -11,6 +11,12 @@ import (
 // epoch as a number, or an RFC3339/ns string), and every other attribute
 // becomes a field. https://docs.datadoghq.com/api/latest/logs/ (/api/v2/logs).
 func IngestDatadog(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+	return IngestDatadogOpts(w, data, fallback, nil)
+}
+
+// IngestDatadogOpts is IngestDatadog with the request's field mappings applied.
+func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+	mapped := !opts.Empty()
 	trim := trimSpace(data)
 	var entries []map[string]json.RawMessage
 	if len(trim) > 0 && trim[0] == '[' {
@@ -56,7 +62,10 @@ func IngestDatadog(w *Writer, data []byte, fallback func() int64) (ingested, ski
 		if !haveTS {
 			ts = fallback()
 		}
-		w.Add(ts, fields)
+		if mapped {
+			opts.apply(fields)
+		}
+		addWithStream(w, ts, fields, opts)
 		ingested++
 	}
 	return ingested, skipped

@@ -8,6 +8,12 @@ import "strings"
 // present-but-empty field. Timestamp comes from _time/@timestamp or the
 // fallback. Malformed nothing here -- every line yields a record.
 func IngestLogfmt(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+	return IngestLogfmtOpts(w, data, fallback, nil)
+}
+
+// IngestLogfmtOpts is IngestLogfmt with the request's field mappings applied.
+func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+	mapped := !opts.Empty()
 	fields := map[string]string{}
 	for len(data) > 0 {
 		nl := indexByte(data, '\n')
@@ -42,7 +48,10 @@ func IngestLogfmt(w *Writer, data []byte, fallback func() int64) (ingested, skip
 		if !haveTS {
 			ts = fallback()
 		}
-		w.Add(ts, fields)
+		if mapped {
+			opts.apply(fields)
+		}
+		addWithStream(w, ts, fields, opts)
 		ingested++
 	}
 	return ingested, skipped

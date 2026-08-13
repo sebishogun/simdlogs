@@ -17,18 +17,29 @@ func (s *Server) backup(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ingestOptions reads the per-request field mappings a shipper sends as query
+// args (_time_field, _msg_field, _stream_fields, ignore_fields, extra_fields).
+// Read from the URL, never r.FormValue: FormValue parses the BODY for a
+// form-encoded content type, and a line-protocol write then stored nothing
+// while still answering 204.
+func ingestOptions(r *http.Request) ingest.Options {
+	q := r.URL.Query()
+	return ingest.ParseOptions(func(k string) string { return q.Get(k) })
+}
+
 // ingestBody reads the request body and hands it to one of the protocol
 // parsers against the request's tenant writer, then flushes. status is the
 // success code the protocol's clients expect.
 func (s *Server) ingestBody(w http.ResponseWriter, r *http.Request, status int,
-	parse func(*ingest.Writer, []byte, func() int64) (int, int)) {
+	parse func(*ingest.Writer, []byte, func() int64, *ingest.Options) (int, int)) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
 	tn := s.tn(r)
-	parse(tn.w, body, tn.fallbackTS())
+	opts := ingestOptions(r)
+	parse(tn.w, body, tn.fallbackTS(), &opts)
 	if err := tn.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -38,24 +49,24 @@ func (s *Server) ingestBody(w http.ResponseWriter, r *http.Request, status int,
 
 // insertLoki ingests a Grafana Loki push body (JSON); clients expect 204.
 func (s *Server) insertLoki(w http.ResponseWriter, r *http.Request) {
-	s.ingestBody(w, r, http.StatusNoContent, ingest.IngestLoki)
+	s.ingestBody(w, r, http.StatusNoContent, ingest.IngestLokiOpts)
 }
 
 // insertJournald ingests the systemd journal export (systemd-journal-upload).
 func (s *Server) insertJournald(w http.ResponseWriter, r *http.Request) {
-	s.ingestBody(w, r, http.StatusAccepted, ingest.IngestJournald)
+	s.ingestBody(w, r, http.StatusAccepted, ingest.IngestJournaldOpts)
 }
 
 // insertSyslog ingests syslog lines over HTTP (one per line). The native
 // transport is UDP/TCP via ListenSyslog; this is for HTTP forwarders.
 func (s *Server) insertSyslog(w http.ResponseWriter, r *http.Request) {
-	s.ingestBody(w, r, http.StatusNoContent, ingest.IngestSyslog)
+	s.ingestBody(w, r, http.StatusNoContent, ingest.IngestSyslogOpts)
 }
 
 // insertDatadog ingests a Datadog logs-intake body (JSON array or object);
 // Datadog's intake returns 202 Accepted.
 func (s *Server) insertDatadog(w http.ResponseWriter, r *http.Request) {
-	s.ingestBody(w, r, http.StatusAccepted, ingest.IngestDatadog)
+	s.ingestBody(w, r, http.StatusAccepted, ingest.IngestDatadogOpts)
 }
 
 // insertOTLPLogs ingests an OpenTelemetry logs export (OTLP/HTTP, JSON). The
@@ -67,7 +78,8 @@ func (s *Server) insertOTLPLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tn := s.tn(r)
-	ingest.IngestOTLPLogs(tn.w, body, tn.fallbackTS())
+	otlpOpts := ingestOptions(r)
+	ingest.IngestOTLPLogsOpts(tn.w, body, tn.fallbackTS(), &otlpOpts)
 	if err := tn.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return

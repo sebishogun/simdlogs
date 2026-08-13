@@ -15,6 +15,12 @@ import (
 // becomes _msg, and other names are lowercased with a leading underscore
 // stripped (_HOSTNAME -> hostname).
 func IngestJournald(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+	return IngestJournaldOpts(w, data, fallback, nil)
+}
+
+// IngestJournaldOpts is IngestJournald with the request's field mappings applied.
+func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+	mapped := !opts.Empty()
 	fields := map[string]string{}
 	var ts int64
 	haveTS := false
@@ -31,7 +37,10 @@ func IngestJournald(w *Writer, data []byte, fallback func() int64) (ingested, sk
 		if !haveTS {
 			ts = fallback()
 		}
-		w.Add(ts, fields)
+		if mapped {
+			opts.apply(fields)
+		}
+		addWithStream(w, ts, fields, opts)
 		ingested++
 		reset()
 	}

@@ -16,6 +16,12 @@ type lokiPush struct {
 // log line becomes _msg, and the nanosecond timestamp is taken from the pair
 // (fallback when absent or unparseable). One record per value entry.
 func IngestLoki(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+	return IngestLokiOpts(w, data, fallback, nil)
+}
+
+// IngestLokiOpts is IngestLoki with the request's field mappings applied.
+func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+	mapped := !opts.Empty()
 	var p lokiPush
 	if err := json.Unmarshal(data, &p); err != nil {
 		return 0, 0
@@ -41,7 +47,10 @@ func IngestLoki(w *Writer, data []byte, fallback func() int64) (ingested, skippe
 			if !ok {
 				ts = fallback()
 			}
-			w.Add(ts, fields)
+			if mapped {
+				opts.apply(fields)
+			}
+			addWithStream(w, ts, fields, opts)
 			ingested++
 		}
 	}

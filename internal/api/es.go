@@ -152,12 +152,6 @@ func toStr(v any) string {
 	return ""
 }
 
-// esBulk ingests the Elasticsearch _bulk NDJSON: alternating action and
-// document lines. The action ({"index":{...}} / "create" / "update" /
-// "delete") is dropped -- delete carries no document, the rest are followed
-// by the doc line, which is ingested like jsonline (@timestamp counts as the
-// timestamp). So Filebeat/Logstash/Fluentd/OTel-ES exporters point here
-// unchanged.
 // stripBulkActions compacts an Elasticsearch _bulk body down to just its
 // documents, in place. Actions alternate with documents (except "delete",
 // which carries none), so the write cursor always trails the read cursor and
@@ -192,6 +186,12 @@ func stripBulkActions(body []byte) []byte {
 	return body[:w]
 }
 
+// esBulk ingests the Elasticsearch _bulk NDJSON: alternating action and
+// document lines. The action ({"index":{...}} / "create" / "update" /
+// "delete") is dropped -- delete carries no document, the rest are followed
+// by the doc line, which is ingested like jsonline (@timestamp counts as the
+// timestamp). So Filebeat/Logstash/Fluentd/OTel-ES exporters point here
+// unchanged.
 func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -205,11 +205,12 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 
 	tn := s.tn(r)
 	fallback := tn.fallbackTS()
+	opts := ingestOptions(r)
 	var ing, skip int
 	if len(docs) >= ingest.MinParallelBytes {
-		ing, skip = ingest.IngestJSONLinesParallel(tn.store, docs, fallback, s.compact)
+		ing, skip = ingest.IngestJSONLinesParallelOpts(tn.store, docs, fallback, s.compact, &opts)
 	} else {
-		ing, skip = ingest.IngestJSONLines(tn.w, docs, fallback)
+		ing, skip = ingest.IngestJSONLinesOpts(tn.w, docs, fallback, &opts)
 		if err := tn.w.Flush(); err != nil {
 			http.Error(w, err.Error(), 500)
 			return

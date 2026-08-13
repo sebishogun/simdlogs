@@ -57,6 +57,12 @@ type otlpLogs struct {
 // the record's own attributes, with severityText -> severity, body -> _msg,
 // and timeUnixNano (or observedTimeUnixNano) -> time.
 func IngestOTLPLogs(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+	return IngestOTLPLogsOpts(w, data, fallback, nil)
+}
+
+// IngestOTLPLogsOpts is IngestOTLPLogs with the request's field mappings applied.
+func IngestOTLPLogsOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+	mapped := !opts.Empty()
 	var p otlpLogs
 	if err := json.Unmarshal(data, &p); err != nil {
 		return 0, 0
@@ -92,7 +98,10 @@ func IngestOTLPLogs(w *Writer, data []byte, fallback func() int64) (ingested, sk
 				if !ok {
 					ts = fallback()
 				}
-				w.Add(ts, fields)
+				if mapped {
+					opts.apply(fields)
+				}
+				addWithStream(w, ts, fields, opts)
 				ingested++
 			}
 		}
