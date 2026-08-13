@@ -96,8 +96,9 @@ const (
 	tAnd
 	tOr
 	tNot
-	tLBrace // { -- opens a _stream selector
-	tRBrace // }
+	tLBrace  // { -- opens a _stream selector
+	tRBrace  // }
+	tTimeVal // the raw value of a _time:<expr> filter, captured whole
 )
 
 type token struct {
@@ -196,6 +197,29 @@ func lexLogsQL(s string) ([]token, error) {
 				i++
 			}
 			w := s[start:i]
+			// _time:<expr> -- the time value can contain ':' (HH:MM, RFC3339),
+			// brackets and commas, which the generic lexer would split. Capture
+			// the whole expression as one tTimeVal token: from just past the
+			// colon to the next top-level whitespace/pipe (commas inside [] stay).
+			if w == "_time" && i < len(s) && s[i] == ':' {
+				out = append(out, token{w, tIdent}, token{":", tColon})
+				i++ // past ':'
+				vs := i
+				depth := 0
+				for i < len(s) {
+					ch := s[i]
+					if ch == '[' || ch == '(' {
+						depth++
+					} else if ch == ']' || ch == ')' {
+						depth--
+					} else if depth <= 0 && (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '|' || ch == ')') {
+						break
+					}
+					i++
+				}
+				out = append(out, token{s[vs:i], tTimeVal})
+				continue
+			}
 			switch strings.ToLower(w) {
 			case "and":
 				out = append(out, token{w, tAnd})
@@ -382,6 +406,10 @@ func (p *lqlParser) parseStreamSelector() (*Expr, error) {
 
 func (p *lqlParser) parseMatcher(field string) (Pred, error) {
 	t := p.peek()
+	if t.kind == tTimeVal { // _time:<expr>, captured whole by the lexer
+		p.next()
+		return parseTimeExpr(t.val)
+	}
 	switch {
 	case t.kind == tOp && t.val == "=":
 		p.next()

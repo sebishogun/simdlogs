@@ -17,6 +17,7 @@ import (
 // footer can skip on.
 type Query struct {
 	From, To    int64
+	Now         int64    // request time (nanos) for relative _time filters; 0 => fall back to To
 	Preds       []Pred   // implicit-AND predicates (programmatic callers, ES planner)
 	Filter      *Expr    // boolean filter tree from LogsQL; takes precedence when set
 	Pipes       []Pipe   // LogsQL pipe chain (stats/sort/limit/fields), applied after the filter
@@ -29,27 +30,30 @@ type Query struct {
 type PredKind uint8
 
 const (
-	Eq          PredKind = iota // field := value   (dict-id equality)
-	Contains                    // field ~ substr   (substring, bloom-skippable)
-	Regexp                      // field ~ /re/     (RE2 on survivors only)
-	Lt                          // field < num      (numeric compare over the dict)
-	Le                          // field <= num
-	Gt                          // field > num
-	Ge                          // field >= num
-	In                          // field in (a,b,c) (set membership)
-	Prefix                      // field = val*     (dict range on a prefix)
-	RangeNum                    // range(lo,hi)     (numeric, inclusive both ends)
-	LenRange                    // len_range(lo,hi) (value byte-length, inclusive)
-	StringRange                 // string_range(a,b)(lexicographic a <= v < b)
-	IContains                   // i(phrase)        (case-insensitive substring)
-	Seq                         // seq(a,b,..)      (phrases occurring in order)
-	IPv4Range                   // ipv4_range(lo,hi)(field IPv4 in [lo,hi])
-	EqField                     // eq_field(f)      (this field == field f, per row)
-	NeField                     // ne_field(f)      (this field != field f)
-	LtField                     // lt_field(f)      (this field <  field f)
-	LeField                     // le_field(f)      (this field <= field f)
-	GtField                     // gt_field(f)      (this field >  field f)
-	GeField                     // ge_field(f)      (this field >= field f)
+	Eq            PredKind = iota // field := value   (dict-id equality)
+	Contains                      // field ~ substr   (substring, bloom-skippable)
+	Regexp                        // field ~ /re/     (RE2 on survivors only)
+	Lt                            // field < num      (numeric compare over the dict)
+	Le                            // field <= num
+	Gt                            // field > num
+	Ge                            // field >= num
+	In                            // field in (a,b,c) (set membership)
+	Prefix                        // field = val*     (dict range on a prefix)
+	RangeNum                      // range(lo,hi)     (numeric, inclusive both ends)
+	LenRange                      // len_range(lo,hi) (value byte-length, inclusive)
+	StringRange                   // string_range(a,b)(lexicographic a <= v < b)
+	IContains                     // i(phrase)        (case-insensitive substring)
+	Seq                           // seq(a,b,..)      (phrases occurring in order)
+	IPv4Range                     // ipv4_range(lo,hi)(field IPv4 in [lo,hi])
+	EqField                       // eq_field(f)      (this field == field f, per row)
+	NeField                       // ne_field(f)      (this field != field f)
+	LtField                       // lt_field(f)      (this field <  field f)
+	LeField                       // le_field(f)      (this field <= field f)
+	GtField                       // gt_field(f)      (this field >  field f)
+	GeField                       // ge_field(f)      (this field >= field f)
+	TimeRange                     // _time:[a,b]      (timestamp in [T1,T2), resolved absolute)
+	TimeDayRange                  // _time:day_range  (minute-of-day in [T1,T2], UTC)
+	TimeWeekRange                 // _time:week_range (weekday in T1 bitmask, UTC)
 )
 
 // isFieldCmp reports whether the kind compares this field against another field
@@ -68,6 +72,8 @@ type Pred struct {
 	re     *regexp.Regexp // compiled Regexp
 	Num    float64        // Lt/Le/Gt/Ge bound, Range/LenRange/IPv4Range lo
 	Num2   float64        // Range/LenRange/IPv4Range hi
+	T1, T2 int64          // TimeRange bounds (nanos); day/week-range params; pre-resolve relative offsets
+	Rel    bool           // TimeRange: T1/T2 are offsets before Now, resolved at Run
 	Kind   PredKind
 }
 
@@ -118,6 +124,7 @@ type Store interface {
 // only survivors are decoded and scanned. This layered skip is where the
 // orders of magnitude over a whole-block scan come from.
 func Run(s Store, q *Query) []Row {
+	resolveTimePreds(q)
 	groups := s.Groups(q.From, q.To)
 	// Footer-prune first, then decide whether to fan out. A selective query
 	// (a rare value) survives in one or two groups; spawning a worker pool
@@ -208,6 +215,10 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	} else {
 		for i := range q.Preds {
 			p := &q.Preds[i]
+			if isTimePred(p.Kind) {
+				sel.And(timePredBitset(g, p, n))
+				continue // _time is the timestamp column, not a materialized field
+			}
 			addField(p.Field)
 			if p.Field2 != "" {
 				addField(p.Field2)

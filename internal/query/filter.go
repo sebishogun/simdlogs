@@ -43,6 +43,9 @@ func evalExpr(g *storage.Reader, e *Expr, n int) *Bitset {
 // (rare value -> postings, common -> vectorized scan); every other kind scans
 // the decoded dict indices against a per-dict-value hit mask.
 func leafBitset(g *storage.Reader, p *Pred, n int) *Bitset {
+	if isTimePred(p.Kind) {
+		return timePredBitset(g, p, n)
+	}
 	if p.Kind == Eq {
 		return eqPredBitset(g, p, n)
 	}

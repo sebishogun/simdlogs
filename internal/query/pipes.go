@@ -303,6 +303,7 @@ type statEntry struct {
 // RunPipeline runs q's filter and pipes. A leading stats pipe aggregates
 // during the scan; otherwise the filter's rows feed the pipe chain.
 func RunPipeline(s Store, q *Query) []Row {
+	resolveTimePreds(q) // relative _time -> absolute before stats or Run see the window
 	var rows []Row
 	pipes := q.Pipes
 	if len(pipes) > 0 {
