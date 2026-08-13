@@ -28,7 +28,9 @@ func IngestLogfmt(w *Writer, data []byte, fallback func() int64) (ingested, skip
 		parseLogfmtLine(line, func(k, v string) {
 			if isTimeKey(k) {
 				if t, ok := parseTime(v); ok {
+					// Stored once, in the timestamp column -- see jsonline.
 					ts, haveTS = t, true
+					return
 				}
 			}
 			fields[k] = v

@@ -305,3 +305,32 @@ func TestKeepFirst(t *testing.T) {
 		}
 	}
 }
+
+// TestTimeFieldFromTimestampColumn covers _time read as a VALUE by a pipe. It
+// is stored once, in the timestamp column; a pipe that names it must still see
+// it, or dropping the duplicate string column would silently empty these.
+func TestTimeFieldFromTimestampColumn(t *testing.T) {
+	s := fastPipeStore(t)
+	for _, tc := range []struct{ raw, want string }{
+		{`* | fields _time, host | limit 1`, "1970-01-01T00:00:00.000000001Z"},
+		{`* | limit 1 | fields _time`, "1970-01-01T00:00:00.000000001Z"},
+	} {
+		rows := runRaw(t, s, tc.raw)
+		if len(rows) == 0 {
+			t.Fatalf("%s: no rows", tc.raw)
+		}
+		if got := rowField(rows[0], "_time"); got != tc.want {
+			t.Errorf("%s: _time = %q want %q", tc.raw, got, tc.want)
+		}
+	}
+	// Grouping by _time sees one distinct timestamp per row, not one empty group.
+	rows := runRaw(t, s, `* | stats by (_time) count() n`)
+	if len(rows) != 200 {
+		t.Errorf("stats by (_time) = %d groups, want 200 (one per row)", len(rows))
+	}
+	for _, r := range rows[:1] {
+		if rowField(r, "_time") == "" {
+			t.Errorf("stats by (_time) produced an empty group key: %v", r.Fields)
+		}
+	}
+}

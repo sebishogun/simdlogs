@@ -376,6 +376,11 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 					row.Fields = append(row.Fields, Field{f, c.dict[c.idx[i]]})
 				} else if v, ok := g.DictValueAt(f, i); ok {
 					row.Fields = append(row.Fields, Field{f, v})
+				} else if f == "_time" {
+					// _time is stored once, in the timestamp column; a pipe that
+					// asks for it by name gets it formatted from there rather
+					// than from a second copy of every record's time on disk.
+					row.Fields = append(row.Fields, Field{f, formatTime(t)})
 				}
 			}
 			out = append(out, row)
@@ -430,6 +435,9 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 				pos++
 			} else if v, ok := g.DictValueAt(m.name, i); ok {
 				arena[pos] = Field{m.name, v}
+				pos++
+			} else if m.name == "_time" {
+				arena[pos] = Field{m.name, formatTime(t)}
 				pos++
 			}
 		}
@@ -725,6 +733,12 @@ func fillHits(buckets map[int64]int, q *Query, step int64, fields map[string]str
 		hs.Total += c
 	}
 	return hs
+}
+
+// formatTime renders a row timestamp the way the wire format does, for the
+// pipes that read _time as a value.
+func formatTime(t int64) string {
+	return time.Unix(0, t).UTC().Format(time.RFC3339Nano)
 }
 
 // maxHitsBuckets caps a hits response so a one-second step over a year cannot

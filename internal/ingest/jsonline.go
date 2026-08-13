@@ -128,13 +128,22 @@ func IngestJSONLines(w *Writer, data []byte, fallback func() int64) (ingested, s
 				s := val.String()
 				if isTimeKey(key) {
 					if t, ok := parseTime(s); ok {
+						// The timestamp column holds it now, so keeping the field
+						// as well stored every record's time twice -- and as a
+						// nearly unique string, the worst thing a dictionary can
+						// hold. Nothing read it back: output prints the row's
+						// timestamp, and a pipe asking for _time is served from
+						// the timestamp column. A time we could NOT parse is kept
+						// as an ordinary field, since then it is just data.
 						ts, haveTS = t, true
+						return true
 					}
 				}
 				fields[key] = s
 			case simdjson.Number:
 				if isTimeKey(key) {
 					ts, haveTS = val.Int(), true
+					return true
 				}
 				fields[key] = strconv.FormatFloat(val.Float(), 'f', -1, 64)
 			case simdjson.Bool:

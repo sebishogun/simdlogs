@@ -70,6 +70,10 @@ func NewServer(dir string) (*Server, error) {
 	return srv, nil
 }
 
+// Dir is the data directory the server was opened on -- what a caller measures
+// to report the store's footprint.
+func (s *Server) Dir() string { return s.dir }
+
 // Close shuts the server down cleanly: every tenant's writer is flushed and
 // its pool stopped, and every store is unmapped. Call it at process shutdown
 // after the HTTP server has stopped accepting requests. Safe to call once.

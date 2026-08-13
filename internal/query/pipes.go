@@ -533,12 +533,12 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 		ifCol := map[string][]uint32{}
 		ifDict := map[string][]string{}
 		for f := range ifFields {
-			ifCol[f], ifDict[f] = g.DictIndices(f)
+			ifCol[f], ifDict[f] = dictOrTime(g, f)
 		}
 		byCol := make([][]uint32, len(sp.By))
 		byDict := make([][]string, len(sp.By))
 		for j, f := range sp.By {
-			byCol[j], byDict[j] = g.DictIndices(f)
+			byCol[j], byDict[j] = dictOrTime(g, f)
 		}
 		aggCol := make([][]uint32, len(sp.Aggs))
 		aggDict := make([][]string, len(sp.Aggs))
@@ -546,10 +546,10 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 		aggDict2 := make([][]string, len(sp.Aggs))
 		for j := range sp.Aggs {
 			if sp.Aggs[j].Field != "" {
-				aggCol[j], aggDict[j] = g.DictIndices(sp.Aggs[j].Field)
+				aggCol[j], aggDict[j] = dictOrTime(g, sp.Aggs[j].Field)
 			}
 			if sp.Aggs[j].Field2 != "" {
-				aggCol2[j], aggDict2[j] = g.DictIndices(sp.Aggs[j].Field2)
+				aggCol2[j], aggDict2[j] = dictOrTime(g, sp.Aggs[j].Field2)
 			}
 		}
 		sel.ForEach(func(i int) {

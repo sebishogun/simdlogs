@@ -267,7 +267,9 @@ func StatsByField(s Store, q *Query, field string) []ValueCount {
 		// `stats by (field) count()` is exactly the posting offset table's
 		// per-value counts -- a footer read, no column decode, no per-row
 		// loop. Only a predicate or a boundary group needs the scan.
-		if len(q.Preds) == 0 && g.TimeMin >= q.From && g.TimeMax < q.To {
+		// _time has no dictionary to read counts from -- it is stored as
+		// timestamps -- so it takes the scan below, which synthesizes one.
+		if len(q.Preds) == 0 && field != "_time" && g.TimeMin >= q.From && g.TimeMax < q.To {
 			for _, vc := range g.ValueCounts(field) {
 				counts[vc.Value] += vc.Count
 			}
@@ -277,7 +279,7 @@ func StatsByField(s Store, q *Query, field string) []ValueCount {
 		if sel.Count() == 0 {
 			continue
 		}
-		idx, dict := g.DictIndices(field)
+		idx, dict := dictOrTime(g, field)
 		if idx == nil {
 			continue
 		}
@@ -308,3 +310,25 @@ func sortedKeys(m map[string]struct{}) []string {
 
 // ensure storage import used
 var _ = storage.ColDict
+
+// dictOrTime returns a column's dict indices and values, synthesizing them for
+// _time from the timestamp column. _time is stored once, as timestamps, so a
+// query that GROUPS or aggregates by it finds no dictionary there; this builds
+// the one it would have had, and only for the group being read.
+func dictOrTime(g *storage.Reader, field string) ([]uint32, []string) {
+	idx, dict := g.DictIndices(field)
+	if idx != nil || field != "_time" {
+		return idx, dict
+	}
+	ts := g.TimestampsRange("_time", 0, g.Rows)
+	if len(ts) == 0 {
+		return nil, nil
+	}
+	idx = make([]uint32, len(ts))
+	dict = make([]string, len(ts))
+	for i, t := range ts {
+		idx[i] = uint32(i)
+		dict[i] = formatTime(t)
+	}
+	return idx, dict
+}
