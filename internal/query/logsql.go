@@ -1166,6 +1166,11 @@ func (p *lqlParser) parseAgg() (Agg, error) {
 			return Agg{}, fmt.Errorf("simdlogs: expected an alias after 'as'")
 		}
 		a.Alias = al.val
+	} else if p.peek().kind == tIdent {
+		// Bare alias, VL-style: `count() errors` == `count() as errors`. Only an
+		// ident here can be an alias (a following agg comes after a comma, and a
+		// following pipe after `|`), so this is unambiguous.
+		a.Alias = p.next().val
 	}
 	if a.Alias == "" {
 		if field == "" {
@@ -1324,6 +1329,10 @@ func aggKind(name string) (AggKind, bool) {
 		return AggRowMin, true
 	case "row_max":
 		return AggRowMax, true
+	case "rate":
+		return AggRate, true
+	case "rate_sum":
+		return AggRateSum, true
 	}
 	return 0, false
 }

@@ -154,6 +154,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/select/logsql/field_values", s.fieldValues)
 	mux.HandleFunc("/select/logsql/facets", s.facets)
 	mux.HandleFunc("/select/logsql/stats_query", s.statsQuery)
+	mux.HandleFunc("/select/logsql/stats_query_range", s.statsQueryRange)
 	// The Elasticsearch search surface VictoriaLogs lacks.
 	mux.HandleFunc("/_search", s.esSearch)
 	mux.HandleFunc("/_count", s.esCount)
@@ -482,6 +483,49 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{"stats": query.StatsByField(s.tn(r).store, q, by)})
+}
+
+// statsQueryRange buckets a stats query over the time range and returns a
+// Prometheus-style matrix: one series per group-by tuple, a point per step.
+func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
+	from, to := timeWindow(r)
+	step := parseStepNs(r.FormValue("step"), from, to)
+	series, err := query.StatsQueryRange(s.tn(r).store, r.FormValue("query"), from, to, step, time.Now().UnixNano())
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	result := make([]map[string]any, 0, len(series))
+	for _, se := range series {
+		vals := make([][2]any, 0, len(se.Values))
+		for _, v := range se.Values {
+			ts, _ := strconv.ParseInt(v[0], 10, 64)
+			vals = append(vals, [2]any{ts, v[1]})
+		}
+		result = append(result, map[string]any{"metric": se.Metric, "values": vals})
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"status": "success",
+		"data":   map[string]any{"resultType": "matrix", "result": result},
+	})
+}
+
+// parseStepNs reads the `step` param (a duration like "5m" or bare seconds),
+// defaulting to 1/30th of the range so a graph gets ~30 points.
+func parseStepNs(s string, from, to int64) int64 {
+	if s == "" {
+		if to > from {
+			return (to - from) / 30
+		}
+		return int64(time.Minute)
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return int64(d)
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return int64(n) * int64(time.Second)
+	}
+	return int64(time.Minute)
 }
 
 func timeWindow(r *http.Request) (int64, int64) {

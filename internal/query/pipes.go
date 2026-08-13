@@ -41,6 +41,8 @@ const (
 	AggHistogram  // histogram(field): VM-style bucketed distribution as JSON
 	AggRowMin     // row_min(sort, out): out value of the row with minimal sort
 	AggRowMax     // row_max(sort, out): out value of the row with maximal sort
+	AggRate       // rate(): group count per second over the query window
+	AggRateSum    // rate_sum(field): group sum per second over the query window
 )
 
 // Agg is one aggregation in a stats pipe.
@@ -55,8 +57,9 @@ type Agg struct {
 
 // StatsPipe is `stats by (fields) agg1, agg2, ...`.
 type StatsPipe struct {
-	By   []string
-	Aggs []Agg
+	By       []string
+	Aggs     []Agg
+	rangeSec float64 // query-window seconds, stamped at run for rate()/rate_sum()
 }
 
 // apply aggregates a materialized row stream -- stats used mid-pipe (e.g. after
@@ -116,7 +119,7 @@ func accSample(e *statEntry, aggs []Agg, valOf func(j int) string, valOf2 func(j
 		if a.If != nil && !exprMatchesRow(a.If, getField) {
 			continue // conditional aggregate: this row does not qualify for agg j
 		}
-		if a.Kind == AggCount {
+		if a.Kind == AggCount || a.Kind == AggRate {
 			sl.n++
 			continue
 		}
@@ -216,7 +219,7 @@ func statEntryRow(sp *StatsPipe, e *statEntry) Row {
 		fields = append(fields, Field{f, e.by[j]})
 	}
 	for j := range sp.Aggs {
-		fields = append(fields, Field{sp.Aggs[j].Alias, formatAgg(&sp.Aggs[j], &e.slots[j], e.rows)})
+		fields = append(fields, Field{sp.Aggs[j].Alias, formatAgg(&sp.Aggs[j], &e.slots[j], e.rows, sp.rangeSec)})
 	}
 	return Row{Fields: fields}
 }
@@ -304,6 +307,12 @@ type statEntry struct {
 // during the scan; otherwise the filter's rows feed the pipe chain.
 func RunPipeline(s Store, q *Query) []Row {
 	resolveTimePreds(q) // relative _time -> absolute before stats or Run see the window
+	rangeSec := float64(q.To-q.From) / 1e9
+	for _, p := range q.Pipes { // stamp the window on stats pipes for rate()/rate_sum()
+		if sp, ok := p.(*StatsPipe); ok {
+			sp.rangeSec = rangeSec
+		}
+	}
 	var rows []Row
 	pipes := q.Pipes
 	if len(pipes) > 0 {
@@ -537,10 +546,20 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 	return out
 }
 
-func formatAgg(a *Agg, sl *statSlot, rows int64) string {
+func formatAgg(a *Agg, sl *statSlot, rows int64, rangeSec float64) string {
 	switch a.Kind {
 	case AggCount:
 		return strconv.FormatInt(sl.n, 10)
+	case AggRate:
+		if rangeSec <= 0 {
+			return "0"
+		}
+		return trimFloat(float64(sl.n) / rangeSec)
+	case AggRateSum:
+		if rangeSec <= 0 {
+			return "0"
+		}
+		return trimFloat(sl.sum / rangeSec)
 	case AggSum:
 		return trimFloat(sl.sum)
 	case AggAvg:
