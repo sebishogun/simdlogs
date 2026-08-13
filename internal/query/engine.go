@@ -73,6 +73,7 @@ type Pred struct {
 	Num    float64        // Lt/Le/Gt/Ge bound, Range/LenRange/IPv4Range lo
 	Num2   float64        // Range/LenRange/IPv4Range hi
 	T1, T2 int64          // TimeRange bounds (nanos); day/week-range params; pre-resolve relative offsets
+	Sub    *Query         // In: a subquery whose result values become the set, resolved at Run
 	Rel    bool           // TimeRange: T1/T2 are offsets before Now, resolved at Run
 	Kind   PredKind
 }

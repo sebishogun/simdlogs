@@ -404,6 +404,27 @@ func (p *lqlParser) parseStreamSelector() (*Expr, error) {
 	return &Expr{Op: OpAnd, Kids: kids}, nil
 }
 
+// parseSubqueryParen parses a parenthesized sub-LogsQL query: (filter | pipes).
+func (p *lqlParser) parseSubqueryParen() (*Query, error) {
+	if p.peek().kind != tLParen {
+		return nil, fmt.Errorf("simdlogs: expected ( for subquery")
+	}
+	p.next() // (
+	e, err := p.parseOr()
+	if err != nil {
+		return nil, err
+	}
+	pipes, err := p.parsePipes()
+	if err != nil {
+		return nil, err
+	}
+	if p.peek().kind != tRParen {
+		return nil, fmt.Errorf("simdlogs: expected ) closing subquery")
+	}
+	p.next() // )
+	return &Query{Filter: e, Pipes: pipes}, nil
+}
+
 func (p *lqlParser) parseMatcher(field string) (Pred, error) {
 	t := p.peek()
 	if t.kind == tTimeVal { // _time:<expr>, captured whole by the lexer
@@ -445,6 +466,22 @@ func (p *lqlParser) parseMatcher(field string) (Pred, error) {
 		}
 		return Pred{Field: field, Kind: k, Num: f}, nil
 	case t.kind == tIdent && strings.EqualFold(t.val, "in") && p.peekAt(1).kind == tLParen:
+		// A ':' or '|' before the matching ) means the argument is a subquery,
+		// not a value list: field:in(other:x | fields id).
+		for k := 2; ; k++ {
+			tk := p.peekAt(k)
+			if tk.kind == tRParen || tk.kind == tEOF {
+				break
+			}
+			if tk.kind == tColon || tk.kind == tPipe {
+				p.next() // in
+				sub, err := p.parseSubqueryParen()
+				if err != nil {
+					return Pred{}, err
+				}
+				return Pred{Field: field, Kind: In, Sub: sub}, nil
+			}
+		}
 		p.next() // in
 		p.next() // (
 		var vals []string
@@ -1007,6 +1044,49 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, fmt.Errorf("simdlogs: unroll expects a field")
 			}
 			pipes = append(pipes, &UnrollPipe{Field: fs[0]})
+		case "join":
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "by") {
+				p.next()
+			}
+			fs, err := p.parseFieldGroup()
+			if err != nil {
+				return nil, err
+			}
+			sub, err := p.parseSubqueryParen()
+			if err != nil {
+				return nil, err
+			}
+			jp := &JoinPipe{By: fs, Sub: sub}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "prefix") {
+				p.next()
+				pf, err := p.value()
+				if err != nil {
+					return nil, err
+				}
+				jp.Prefix = pf
+			}
+			pipes = append(pipes, jp)
+		case "union":
+			sub, err := p.parseSubqueryParen()
+			if err != nil {
+				return nil, err
+			}
+			pipes = append(pipes, &UnionPipe{Sub: sub})
+		case "stream_context":
+			sc := &StreamContextPipe{}
+			for p.peek().kind == tIdent && (strings.EqualFold(p.peek().val, "before") || strings.EqualFold(p.peek().val, "after")) {
+				which := p.next().val
+				n, err := p.intArg()
+				if err != nil {
+					return nil, err
+				}
+				if strings.EqualFold(which, "before") {
+					sc.Before = n
+				} else {
+					sc.After = n
+				}
+			}
+			pipes = append(pipes, sc)
 		case "blocks_count":
 			pipes = append(pipes, &BlocksCountPipe{})
 		case "block_stats":

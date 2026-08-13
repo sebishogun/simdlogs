@@ -306,7 +306,8 @@ type statEntry struct {
 // RunPipeline runs q's filter and pipes. A leading stats pipe aggregates
 // during the scan; otherwise the filter's rows feed the pipe chain.
 func RunPipeline(s Store, q *Query) []Row {
-	resolveTimePreds(q) // relative _time -> absolute before stats or Run see the window
+	resolveTimePreds(q)     // relative _time -> absolute before stats or Run see the window
+	resolveSubqueries(s, q) // in(<subquery>) -> value set, before the filter evaluates
 	rangeSec := float64(q.To-q.From) / 1e9
 	for _, p := range q.Pipes { // stamp the window on stats pipes for rate()/rate_sum()
 		if sp, ok := p.(*StatsPipe); ok {
@@ -343,7 +344,16 @@ func RunPipeline(s Store, q *Query) []Row {
 		rows = Run(s, q)
 	}
 	for _, p := range pipes {
-		rows = p.apply(rows)
+		switch pp := p.(type) {
+		case *JoinPipe: // store-aware pipes run a subquery, so they cannot use apply(rows)
+			rows = pp.run(s, q, rows)
+		case *UnionPipe:
+			rows = pp.run(s, q, rows)
+		case *StreamContextPipe:
+			rows = pp.run(s, q, rows)
+		default:
+			rows = p.apply(rows)
+		}
 	}
 	return rows
 }
@@ -433,6 +443,8 @@ func pipeFields(pipes []Pipe) []string {
 			add(orDefault(t.From, "_msg"))
 		case *HashPipe:
 			add(t.Field)
+		case *JoinPipe:
+			add(t.By...) // join keys must be on the outer rows
 		}
 	}
 	return out
