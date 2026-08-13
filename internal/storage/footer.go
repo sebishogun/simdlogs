@@ -469,25 +469,30 @@ func (r *Reader) ValueCounts(name string) []ValueCount {
 		return nil
 	}
 	blob := r.blob[m.PostOff : m.PostOff+m.PostLen]
-	sec := r.dictSec(m)
 	out := make([]ValueCount, 0, m.DictLen)
-	// Read each count O(1) from the bit-packed table (no alloc, no decompress);
-	// the per-value dictSectionAt string build dominates this loop anyway.
+	// The whole dictionary in one pass: dictSectionAt decompresses the block a
+	// value lives in on EVERY call, so asking it for each id in turn re-inflated
+	// each block once per value it holds. That was 47% of a `top N by (host)`.
+	vals := dictSectionAll(r.dictSec(m), m.DictLen)
+	// Each count is then an O(1) read from the bit-packed table.
 	if dictLen, cw, cs, _, _, ok := postV8Header(blob); ok {
 		n := m.DictLen
 		if dictLen < n {
 			n = dictLen
 		}
+		if n > len(vals) {
+			n = len(vals)
+		}
 		for id := 0; id < n; id++ {
-			out = append(out, ValueCount{Value: dictSectionAt(sec, m.DictLen, id), Count: extractCountBits(cs, id, cw)})
+			out = append(out, ValueCount{Value: vals[id], Count: extractCountBits(cs, id, cw)})
 		}
 		return out
 	}
 	no := int(le32(blob))
-	for id := 0; id+1 < no && id < m.DictLen; id++ {
+	for id := 0; id+1 < no && id < m.DictLen && id < len(vals); id++ {
 		start := le32(blob[4+id*4:])
 		end := le32(blob[4+(id+1)*4:])
-		out = append(out, ValueCount{Value: dictSectionAt(sec, m.DictLen, id), Count: int(end - start)})
+		out = append(out, ValueCount{Value: vals[id], Count: int(end - start)})
 	}
 	return out
 }

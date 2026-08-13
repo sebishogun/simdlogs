@@ -37,11 +37,21 @@ func TestSelectSurface(t *testing.T) {
 	defer ts.Close()
 	errs := ingestCorpus(t, ts, 30_000)
 
-	// field_names includes the ingested columns.
-	var fn struct{ Names []string }
+	// field_names includes the ingested columns, each with its hit count -- the
+	// {"values":[{"value","hits"}]} envelope every values endpoint returns.
+	var fn struct {
+		Values []struct {
+			Value string `json:"value"`
+			Hits  int    `json:"hits"`
+		}
+	}
 	getJSON(t, ts.URL+"/select/logsql/field_names", &fn)
-	if !contains(fn.Names, "level") || !contains(fn.Names, "service") {
-		t.Fatalf("field_names missing columns: %v", fn.Names)
+	names := map[string]int{}
+	for _, v := range fn.Values {
+		names[v.Value] = v.Hits
+	}
+	if names["level"] != 30_000 || names["service"] != 30_000 {
+		t.Fatalf("field_names = %v, want level and service at 30000 hits", names)
 	}
 	// field_values for level has info+error.
 	var fv struct {

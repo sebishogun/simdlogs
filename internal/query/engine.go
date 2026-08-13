@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/sebishogun/simd"
@@ -113,9 +114,9 @@ type Pred struct {
 	// range(a, b) excludes both ends, range[a, b] includes them. Measured against
 	// VictoriaLogs: range(100, 500) does NOT match the row whose value is 100.
 	ExLo, ExHi bool
-	Sub    *Query         // In: a subquery whose result values become the set, resolved at Run
-	Rel    bool           // TimeRange: T1/T2 are offsets before Now, resolved at Run
-	Kind   PredKind
+	Sub        *Query // In: a subquery whose result values become the set, resolved at Run
+	Rel        bool   // TimeRange: T1/T2 are offsets before Now, resolved at Run
+	Kind       PredKind
 }
 
 // ExprOp is the node kind of a boolean filter tree.
@@ -300,6 +301,19 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	cnt := sel.Count()
 	if cnt == 0 {
 		return out // no match in this group: never decode its timestamps
+	}
+	// A bounded query stops inside the group, not after it. Trimming the bitset
+	// here bounds every decode below -- without it `| limit 100` still decoded
+	// every matching row of the first group and discarded all but a hundred.
+	if q.Limit > 0 {
+		remaining := q.Limit - len(out)
+		if remaining <= 0 {
+			return out
+		}
+		if cnt > remaining {
+			sel.KeepFirst(remaining)
+			cnt = remaining
+		}
 	}
 	// Timestamps for the Time field. Restrict the decode to the window's
 	// block span; when matches are sparse enough that the span decode would
@@ -651,6 +665,71 @@ func Count(s Store, q *Query) int {
 	}
 	return total
 }
+
+// HitsSeries is the /select/logsql/hits answer for one group: the bucket start
+// times covering the whole requested window and the count in each. Empty
+// buckets are present with a zero count -- a graph needs the gap drawn, not
+// skipped, and the reference returns them.
+type HitsSeries struct {
+	Fields     map[string]string
+	Timestamps []int64 // bucket starts, nanoseconds, ascending
+	Values     []int
+	Total      int
+}
+
+// Hits buckets matching rows into step-sized buckets across [q.From,q.To),
+// optionally split by the values of one field. Buckets are aligned to multiples
+// of step, the alignment the reference uses, so two engines asked for the same
+// window agree on the bucket boundaries.
+func Hits(s Store, q *Query, step int64, by string) []HitsSeries {
+	if step <= 0 {
+		step = int64(time.Minute)
+	}
+	if by == "" {
+		return []HitsSeries{fillHits(Histogram(s, q, step), q, step, map[string]string{})}
+	}
+	// Split by a field: one series per distinct value. Each value is counted
+	// with its own predicate so the per-bucket work stays in the bitset path.
+	out := make([]HitsSeries, 0, 8)
+	for _, vc := range StatsByField(s, q, by) {
+		sub := *q
+		sub.Preds = append(append([]Pred{}, q.Preds...), Pred{Kind: Eq, Field: by, Value: vc.Value})
+		hs := fillHits(Histogram(s, &sub, step), &sub, step, map[string]string{by: vc.Value})
+		out = append(out, hs)
+	}
+	return out
+}
+
+// fillHits turns the sparse bucket map into the dense, ascending series the
+// hits API returns.
+func fillHits(buckets map[int64]int, q *Query, step int64, fields map[string]string) HitsSeries {
+	from, to := q.From, q.To
+	if to <= from {
+		return HitsSeries{Fields: fields}
+	}
+	start := from - from%step
+	n := int((to - start + step - 1) / step)
+	if n < 0 || n > maxHitsBuckets {
+		n = maxHitsBuckets
+	}
+	hs := HitsSeries{
+		Fields:     fields,
+		Timestamps: make([]int64, 0, n),
+		Values:     make([]int, 0, n),
+	}
+	for i := 0; i < n; i++ {
+		t := start + int64(i)*step
+		c := buckets[t]
+		hs.Timestamps = append(hs.Timestamps, t)
+		hs.Values = append(hs.Values, c)
+		hs.Total += c
+	}
+	return hs
+}
+
+// maxHitsBuckets caps a hits response so a one-second step over a year cannot
+// be asked to allocate 31 million buckets.
+const maxHitsBuckets = 100_000
 
 // Histogram buckets match counts by time at the given step (nanoseconds),
 // the /select/logsql/hits shape -- again without materializing rows.

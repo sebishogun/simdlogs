@@ -1,8 +1,8 @@
 package query
 
 import (
+	"encoding/hex"
 	"hash/fnv"
-	"strconv"
 	"strings"
 )
 
@@ -10,28 +10,51 @@ import (
 // label set {k="v",...} (keys sorted). Its id is a stable hash of that string.
 // These back the /select/logsql/stream* endpoints and the _stream_id filter.
 
-// StreamID is the stable id of a _stream label-set value.
+// StreamID is the stable id of a _stream label-set value: a 128-bit hash in the
+// 48-hex-character form the reference uses, so a client that validates the id's
+// shape (or round-trips it into a _stream_id: filter) sees what it expects. The
+// leading 16 zeros are the tenant half of that form; ids are computed inside one
+// tenant's store, which is the scope they are compared in.
 func StreamID(streamValue string) string {
-	h := fnv.New64a()
+	h := fnv.New128a()
 	h.Write([]byte(streamValue))
-	return strconv.FormatUint(h.Sum64(), 16)
+	var buf [16]byte
+	return streamIDTenantPrefix + hex.EncodeToString(h.Sum(buf[:0]))
 }
 
-// Streams lists the distinct _stream label sets in the window, with hit counts.
-func Streams(s Store, from, to int64) []ValueCount {
-	out := FieldValues(s, "_stream", from, to)
-	filtered := out[:0]
-	for _, vc := range out {
+const streamIDTenantPrefix = "0000000000000000"
+
+// EmptyStream is the label set of rows that belong to no configured stream.
+// With no stream fields set, every row is in this one stream -- which is what
+// the reference reports, rather than reporting no streams at all.
+const EmptyStream = "{}"
+
+// Streams lists the distinct _stream label sets among the rows matching q, with
+// hit counts.
+func Streams(s Store, q *Query) []ValueCount {
+	all := StatsByField(s, q, "_stream")
+	out := all[:0]
+	for _, vc := range all {
 		if vc.Value != "" {
-			filtered = append(filtered, vc)
+			out = append(out, vc)
 		}
 	}
-	return filtered
+	if len(out) == 0 {
+		// No _stream column: the rows are not streamless, they are all in the
+		// empty stream. Reporting nothing here made /streams and /stream_ids
+		// answer [] against a store a client could plainly query.
+		if n := Count(s, q); n > 0 {
+			return []ValueCount{{Value: EmptyStream, Count: n}}
+		}
+		return nil
+	}
+	sortValueCounts(out)
+	return out
 }
 
-// StreamIDs lists the distinct stream ids in the window, with hit counts.
-func StreamIDs(s Store, from, to int64) []ValueCount {
-	streams := Streams(s, from, to)
+// StreamIDs lists the distinct stream ids among the rows matching q.
+func StreamIDs(s Store, q *Query) []ValueCount {
+	streams := Streams(s, q)
 	out := make([]ValueCount, 0, len(streams))
 	for _, vc := range streams {
 		out = append(out, ValueCount{Value: StreamID(vc.Value), Count: vc.Count})
@@ -39,21 +62,27 @@ func StreamIDs(s Store, from, to int64) []ValueCount {
 	return out
 }
 
-// StreamFieldNames lists the distinct label names across all streams.
-func StreamFieldNames(s Store, from, to int64) []string {
-	seen := map[string]struct{}{}
-	for _, vc := range Streams(s, from, to) {
+// StreamFieldNames lists the distinct label names across matching streams, with
+// the number of rows each label covers.
+func StreamFieldNames(s Store, q *Query) []ValueCount {
+	counts := map[string]int{}
+	for _, vc := range Streams(s, q) {
 		for k := range parseStreamLabels(vc.Value) {
-			seen[k] = struct{}{}
+			counts[k] += vc.Count
 		}
 	}
-	return sortedKeys(seen)
+	out := make([]ValueCount, 0, len(counts))
+	for v, c := range counts {
+		out = append(out, ValueCount{Value: v, Count: c})
+	}
+	sortValueCounts(out)
+	return out
 }
 
 // StreamFieldValues lists the distinct values of one stream label, with hits.
-func StreamFieldValues(s Store, field string, from, to int64) []ValueCount {
+func StreamFieldValues(s Store, q *Query, field string) []ValueCount {
 	counts := map[string]int{}
-	for _, vc := range Streams(s, from, to) {
+	for _, vc := range Streams(s, q) {
 		if v, ok := parseStreamLabels(vc.Value)[field]; ok {
 			counts[v] += vc.Count
 		}

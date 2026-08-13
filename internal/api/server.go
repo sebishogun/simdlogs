@@ -141,10 +141,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/logs", s.insertOTLPLogs)         // OpenTelemetry OTLP/HTTP logs (JSON)
 	mux.HandleFunc("/insert/journald", s.insertJournald) // systemd journal export (systemd-journal-upload)
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	// VictoriaLogs serves every third-party ingest protocol under /insert/<vendor>/.
+	// An agent whose config was written against VictoriaLogs sends the prefixed
+	// path, so serving only the vendor-native path 404s a drop-in client. Both
+	// spellings are registered; the unprefixed ones are what the vendors' own
+	// agents use when pointed at a bare host.
+	mux.HandleFunc("/insert/elasticsearch/_bulk", s.esBulk)
+	mux.HandleFunc("/insert/loki/api/v1/push", s.insertLoki)
+	mux.HandleFunc("/insert/datadog/api/v2/logs", s.insertDatadog)
+	mux.HandleFunc("/insert/datadog/api/v1/validate", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	mux.HandleFunc("/insert/opentelemetry/v1/logs", s.insertOTLPLogs)
 	mux.HandleFunc("/admin/backup", s.backup)  // tar snapshot for offline restore
 	mux.HandleFunc("/metrics", s.metrics)      // Prometheus text exposition
 	mux.HandleFunc("/alerts", s.alertsHandler) // alerting rule state
-	mux.HandleFunc("/vmui", s.ui)              // web UI (vmui equivalent)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
+	mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
+	mux.HandleFunc("/-/ready", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
+	mux.HandleFunc("/flags", s.flagsHandler)
+	mux.HandleFunc("/vmui", s.ui) // web UI (vmui equivalent)
 	mux.HandleFunc("/select/vmui", s.ui)
 	mux.HandleFunc("/", s.ui) // catch-all: serve the UI at the root
 	mux.HandleFunc("/select/logsql/query", s.selectQuery)
@@ -265,7 +279,7 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 	// wire time, so the result bytes are appended directly here.
 	var buf []byte
 	for _, row := range rows {
-		buf = appendRowJSON(buf[:0], row)
+		buf = appendRowJSON(buf[:0], row, q.MatAll)
 		bw.Write(buf)
 	}
 }
@@ -273,7 +287,7 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 // appendRowJSON serializes one result row as an NDJSON object (trailing
 // newline). Shared by the batch select and the live tail so both emit the
 // identical wire shape.
-func appendRowJSON(buf []byte, row query.Row) []byte {
+func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 	buf = append(buf, '{')
 	first := true
 	if !row.NoTime { // a stats row or a projection without _time carries no timestamp
@@ -282,9 +296,13 @@ func appendRowJSON(buf []byte, row query.Row) []byte {
 		buf = append(buf, '"')
 		first = false
 	}
+	stream := ""
 	for _, f := range row.Fields {
 		if f.Key == "_time" {
 			continue
+		}
+		if f.Key == "_stream" {
+			stream = f.Value
 		}
 		if !first {
 			buf = append(buf, ',')
@@ -296,9 +314,38 @@ func appendRowJSON(buf []byte, row query.Row) []byte {
 		buf = appendJSONString(buf, f.Value)
 		buf = append(buf, '"')
 	}
+	// A full record carries its stream membership, which is what a client groups
+	// and colours by. With no stream fields configured every row is in the empty
+	// stream -- that is still a stream, and omitting the pair left a client's
+	// stream column blank rather than uniform.
+	if withStream {
+		if stream == "" {
+			stream = query.EmptyStream
+			if !first {
+				buf = append(buf, ',')
+			}
+			first = false
+			buf = append(buf, `"_stream":"`...)
+			buf = appendJSONString(buf, stream)
+			buf = append(buf, '"')
+		}
+		if !first {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, `"_stream_id":"`...)
+		if stream == query.EmptyStream {
+			buf = append(buf, emptyStreamID...) // hashed once, not per row
+		} else {
+			buf = append(buf, query.StreamID(stream)...)
+		}
+		buf = append(buf, '"')
+	}
 	buf = append(buf, '}', '\n')
 	return buf
 }
+
+// emptyStreamID is the id of the empty stream, the value nearly every row gets.
+var emptyStreamID = query.StreamID(query.EmptyStream)
 
 // readerStore adapts a fixed set of group readers to the query.Store
 // interface, so the live tail can run the ordinary filter/materialize path
@@ -342,7 +389,7 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 		if len(readers) > 0 {
 			cursor = nc
 			for _, row := range query.RunPipeline(readerStore(readers), q) {
-				buf = appendRowJSON(buf[:0], row)
+				buf = appendRowJSON(buf[:0], row, q.MatAll)
 				bw.Write(buf)
 			}
 			bw.Flush()
@@ -373,7 +420,7 @@ func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
 	defer bw.Flush()
 	var buf []byte
 	for _, row := range query.RunPipeline(s.tn(r).store, q) {
-		buf = appendRowJSON(buf[:0], row)
+		buf = appendRowJSON(buf[:0], row, q.MatAll)
 		bw.Write(buf)
 	}
 }
@@ -400,7 +447,7 @@ func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
 	defer bw.Flush()
 	var buf []byte
 	for _, row := range query.VectorSearch(s.tn(r).store, from, to, body.Field, body.Vector, body.K) {
-		buf = appendRowJSON(buf[:0], row)
+		buf = appendRowJSON(buf[:0], row, false)
 		bw.Write(buf)
 	}
 }
@@ -419,19 +466,39 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 	}
 	step := int64(60_000_000_000) // 1 minute default
 	if v := r.FormValue("step"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			step = int64(d)
 		}
 	}
-	buckets := query.Histogram(s.tn(r).store, q, step)
-	type hit struct {
-		Time  string `json:"_time"`
-		Count int    `json:"hits"`
+	// `field` (repeatable in the reference, one here) splits the histogram into
+	// a series per value, which is how a dashboard draws a stacked graph.
+	by := r.FormValue("field")
+	if by == "" {
+		by = r.FormValue("fields")
 	}
-	out := make([]hit, 0, len(buckets))
-	for t, c := range buckets {
-		out = append(out, hit{Time: time.Unix(0, t).UTC().Format(time.RFC3339Nano), Count: c})
+	series := query.Hits(s.tn(r).store, q, step, by)
+
+	// The reference shape: a dense timestamp/value pair of arrays per series,
+	// not a bag of {time, count} objects. A client indexes the two arrays
+	// together, so the buckets must be ascending and gap-free.
+	type hitSeries struct {
+		Fields     map[string]string `json:"fields"`
+		Timestamps []string          `json:"timestamps"`
+		Values     []int             `json:"values"`
+		Total      int               `json:"total"`
 	}
+	out := make([]hitSeries, 0, len(series))
+	for _, se := range series {
+		ts := make([]string, 0, len(se.Timestamps))
+		for _, t := range se.Timestamps {
+			ts = append(ts, time.Unix(0, t).UTC().Format(time.RFC3339Nano))
+		}
+		if se.Fields == nil {
+			se.Fields = map[string]string{}
+		}
+		out = append(out, hitSeries{Fields: se.Fields, Timestamps: ts, Values: se.Values, Total: se.Total})
+	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"hits": out})
 }
 
@@ -468,9 +535,15 @@ func parseRequest(r *http.Request) (*query.Query, error) {
 // lets the head-to-head hand both engines the identical window string.
 func parseTimeParam(v string) (int64, bool) {
 	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-		return n, true
+		return unixToNanos(n), true
 	}
-	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+	if f, err := strconv.ParseFloat(v, 64); err == nil { // seconds with a fractional part
+		return int64(f * 1e9), true
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano, time.RFC3339,
+		"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02", "2006-01", "2006",
+	} {
 		if t, err := time.Parse(layout, v); err == nil {
 			return t.UnixNano(), true
 		}
@@ -478,43 +551,171 @@ func parseTimeParam(v string) (int64, bool) {
 	return 0, false
 }
 
+// unixToNanos infers the unit of a bare unix timestamp from its magnitude, the
+// way VictoriaLogs does: seconds, milliseconds, microseconds or nanoseconds.
+// Each boundary is around the year 5138 in the smaller unit, so no realistic
+// timestamp is misread. Reading every bare integer as nanoseconds -- which this
+// did -- put a Grafana datasource's epoch-seconds window in 1970 and answered
+// every query empty.
+func unixToNanos(n int64) int64 {
+	switch {
+	case n < 0:
+		return n
+	case n < 1e11:
+		return n * int64(time.Second)
+	case n < 1e14:
+		return n * int64(time.Millisecond)
+	case n < 1e17:
+		return n * int64(time.Microsecond)
+	default:
+		return n
+	}
+}
+
+// writeValues emits the {"values":[{"value":..,"hits":..}]} envelope. Six
+// endpoints share it -- field_names, field_values, stream_field_names,
+// stream_field_values, stream_ids and streams -- so a client decodes them all
+// with one type, which is why they must not each invent a key.
+func writeValues(w http.ResponseWriter, vcs []query.ValueCount) {
+	if vcs == nil {
+		vcs = []query.ValueCount{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"values": vcs})
+}
+
+// selectQueryOf parses the request's LogsQL and window for the introspection
+// endpoints, which scope their answer to the matching rows. A missing query
+// means every row, spelled the way LogsQL spells it.
+func selectQueryOf(r *http.Request) (*query.Query, error) {
+	if r.FormValue("query") == "" {
+		q, err := query.ParseLogsQL("*")
+		if err != nil {
+			return nil, err
+		}
+		q.From, q.To = timeWindow(r)
+		q.Now = time.Now().UnixNano()
+		return q, nil
+	}
+	return parseRequest(r)
+}
+
 func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
-	from, to := timeWindow(r)
-	json.NewEncoder(w).Encode(map[string]any{"names": query.FieldNames(s.tn(r).store, from, to)})
+	if len(s.backends) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/field_names", "values")
+		return
+	}
+	q, err := selectQueryOf(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeValues(w, query.FieldNameCounts(s.tn(r).store, q))
 }
 
 func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
-	from, to := timeWindow(r)
-	json.NewEncoder(w).Encode(map[string]any{"values": query.FieldValues(s.tn(r).store, r.FormValue("field"), from, to)})
+	if len(s.backends) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/field_values", "values")
+		return
+	}
+	q, err := selectQueryOf(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	vcs := query.StatsByField(s.tn(r).store, q, r.FormValue("field"))
+	query.SortValueCounts(vcs)
+	if n := intParam(r, "limit", 0); n > 0 && len(vcs) > n {
+		vcs = vcs[:n]
+	}
+	writeValues(w, vcs)
 }
 
 func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
-	from, to := timeWindow(r)
-	k := 10
-	if v := r.FormValue("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k = n
-		}
+	q, err := selectQueryOf(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
 	}
-	json.NewEncoder(w).Encode(map[string]any{"facets": query.Facets(s.tn(r).store, from, to, k)})
+	facets := query.FacetList(s.tn(r).store, q,
+		intParam(r, "limit", query.DefaultFacetLimit),
+		intParam(r, "max_values_per_field", query.DefaultFacetMaxValues),
+		r.FormValue("keep_const_fields") == "1")
+	if facets == nil {
+		facets = []query.FieldFacet{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"facets": facets})
 }
 
+// statsQuery answers a stats query at a single instant: the Prometheus vector
+// envelope, so the same dashboard panel that graphs a range can read a value.
 func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
 		s.federatedStatsQuery(w, r)
 		return
 	}
-	q, err := parseRequest(r)
+	from, to := timeWindow(r)
+	if to == int64(1)<<62 {
+		to = time.Now().UnixNano()
+	}
+	samples, err := query.StatsQueryInstant(s.tn(r).store, r.FormValue("query"), from, to, time.Now().UnixNano())
 	if err != nil {
+		// A query with no stats pipe has no series; the group-by form below is
+		// the older shape and still answers it.
+		if by := r.FormValue("by"); by != "" {
+			q, perr := selectQueryOf(r)
+			if perr != nil {
+				http.Error(w, perr.Error(), 400)
+				return
+			}
+			// `by=` is an extension the reference has no equivalent for, so it
+			// keeps its own key rather than pretending to be a Prometheus vector.
+			vcs := query.StatsByField(s.tn(r).store, q, by)
+			query.SortValueCounts(vcs)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"stats": vcs})
+			return
+		}
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	by := r.FormValue("by")
-	if by == "" {
-		json.NewEncoder(w).Encode(map[string]any{"count": query.Count(s.tn(r).store, q)})
-		return
+	result := make([]map[string]any, 0, len(samples))
+	for _, sm := range samples {
+		result = append(result, map[string]any{
+			"metric": sm.Metric,
+			"value":  [2]any{to / 1e9, sm.Value},
+		})
 	}
-	json.NewEncoder(w).Encode(map[string]any{"stats": query.StatsByField(s.tn(r).store, q, by)})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(promResponse{
+		Status: "success",
+		Data:   promData{ResultType: "vector", Result: result},
+	})
+}
+
+// promResponse is the Prometheus query envelope both stats endpoints return.
+// A struct rather than a map so the fields keep the reference's order on the
+// wire; JSON object order carries no meaning, but a byte-comparable body makes
+// a difference visible in the diff instead of hiding in it.
+type promResponse struct {
+	Status string   `json:"status"`
+	Data   promData `json:"data"`
+}
+
+type promData struct {
+	ResultType string           `json:"resultType"`
+	Result     []map[string]any `json:"result"`
+}
+
+// intParam reads a non-negative integer form value, or def when absent or bad.
+func intParam(r *http.Request, name string, def int) int {
+	if v := r.FormValue(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return def
 }
 
 // streamsHandler lists the distinct _stream label sets in the window.
@@ -523,8 +724,12 @@ func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
 		s.federatedValueCounts(w, r, "/select/logsql/streams", "streams")
 		return
 	}
-	from, to := timeWindow(r)
-	json.NewEncoder(w).Encode(map[string]any{"streams": query.Streams(s.tn(r).store, from, to)})
+	q, err := selectQueryOf(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeValues(w, query.Streams(s.tn(r).store, q))
 }
 
 // streamIDsHandler lists the distinct stream ids in the window.
@@ -533,18 +738,26 @@ func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
 		s.federatedValueCounts(w, r, "/select/logsql/stream_ids", "stream_ids")
 		return
 	}
-	from, to := timeWindow(r)
-	json.NewEncoder(w).Encode(map[string]any{"stream_ids": query.StreamIDs(s.tn(r).store, from, to)})
+	q, err := selectQueryOf(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeValues(w, query.StreamIDs(s.tn(r).store, q))
 }
 
 // streamFieldNamesHandler lists the distinct stream label names.
 func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
-		s.federatedStrings(w, r, "/select/logsql/stream_field_names", "names")
+		s.federatedValueCounts(w, r, "/select/logsql/stream_field_names", "values")
 		return
 	}
-	from, to := timeWindow(r)
-	json.NewEncoder(w).Encode(map[string]any{"names": query.StreamFieldNames(s.tn(r).store, from, to)})
+	q, err := selectQueryOf(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeValues(w, query.StreamFieldNames(s.tn(r).store, q))
 }
 
 // streamFieldValuesHandler lists the distinct values of one stream label.
@@ -553,8 +766,12 @@ func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request
 		s.federatedValueCounts(w, r, "/select/logsql/stream_field_values", "values")
 		return
 	}
-	from, to := timeWindow(r)
-	json.NewEncoder(w).Encode(map[string]any{"values": query.StreamFieldValues(s.tn(r).store, r.FormValue("field"), from, to)})
+	q, err := selectQueryOf(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeValues(w, query.StreamFieldValues(s.tn(r).store, q, r.FormValue("field")))
 }
 
 // statsQueryRange buckets a stats query over the time range and returns a
@@ -580,9 +797,9 @@ func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
 		}
 		result = append(result, map[string]any{"metric": se.Metric, "values": vals})
 	}
-	json.NewEncoder(w).Encode(map[string]any{
-		"status": "success",
-		"data":   map[string]any{"resultType": "matrix", "result": result},
+	json.NewEncoder(w).Encode(promResponse{
+		Status: "success",
+		Data:   promData{ResultType: "matrix", Result: result},
 	})
 }
 

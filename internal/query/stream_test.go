@@ -21,19 +21,20 @@ func TestStreamModel(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	streams := Streams(s, 0, int64(1)<<62)
+	all := &Query{From: 0, To: int64(1) << 62}
+	streams := Streams(s, all)
 	if len(streams) != 2 {
 		t.Fatalf("streams = %d want 2", len(streams))
 	}
-	ids := StreamIDs(s, 0, int64(1)<<62)
+	ids := StreamIDs(s, all)
 	if len(ids) != 2 || ids[0].Value == "" {
 		t.Errorf("stream_ids = %v", ids)
 	}
-	names := StreamFieldNames(s, 0, int64(1)<<62)
-	if len(names) != 2 || names[0] != "app" || names[1] != "env" {
+	names := StreamFieldNames(s, all)
+	if len(names) != 2 || names[0].Value != "app" || names[1].Value != "env" {
 		t.Errorf("stream_field_names = %v want [app env]", names)
 	}
-	if apps := StreamFieldValues(s, "app", 0, int64(1)<<62); len(apps) != 2 {
+	if apps := StreamFieldValues(s, all, "app"); len(apps) != 2 {
 		t.Errorf("stream_field_values app = %v want 2", apps)
 	}
 	// _stream_id filter: match rows of stream sa by its id.

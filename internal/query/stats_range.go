@@ -1,6 +1,13 @@
 package query
 
-import "strconv"
+import (
+	"errors"
+	"strconv"
+)
+
+// errNotStats is returned when a query has no stats pipe, so it has no series
+// to report -- the caller answers with an empty result, not a wrong one.
+var errNotStats = errors.New("simdlogs: query has no stats pipe")
 
 // RangeSeries is one output series of a stats_query_range: the group-by label
 // set and its (unix-seconds, value) points across the time buckets.
@@ -22,6 +29,60 @@ func statsShape(q *Query) (by []string, alias string, ok bool) {
 		}
 	}
 	return nil, "", false
+}
+
+// statsAliases returns the group-by fields and EVERY aggregate's alias. A stats
+// pipe with several aggregates produces one series per aggregate, each named by
+// its alias in __name__, so returning only the first would silently drop the
+// rest of a `count() n, sum(x) s` query.
+func statsAliases(q *Query) (by []string, aliases []string, ok bool) {
+	for _, p := range q.Pipes {
+		if sp, is := p.(*StatsPipe); is {
+			for i := range sp.Aggs {
+				aliases = append(aliases, sp.Aggs[i].Alias)
+			}
+			return sp.By, aliases, true
+		}
+	}
+	return nil, nil, false
+}
+
+// InstantSample is one sample of a stats_query: the group-by labels plus
+// __name__ (the aggregate's alias), and the value at the window's end.
+type InstantSample struct {
+	Metric map[string]string
+	Value  string
+}
+
+// StatsQueryInstant runs raw as a stats query over the whole [from,to) window
+// and returns one sample per (group, aggregate) -- the instant counterpart of
+// StatsQueryRange, which is what /select/logsql/stats_query answers.
+func StatsQueryInstant(s Store, raw string, from, to, now int64) ([]InstantSample, error) {
+	q, err := ParseLogsQL(raw)
+	if err != nil {
+		return nil, err
+	}
+	q.From, q.To, q.Now = from, to, now
+	by, aliases, ok := statsAliases(q)
+	if !ok {
+		return nil, errNotStats
+	}
+	rows := RunPipeline(s, q)
+	out := make([]InstantSample, 0, len(rows)*len(aliases))
+	for _, row := range rows {
+		for _, alias := range aliases {
+			if alias == "" {
+				continue
+			}
+			metric := make(map[string]string, len(by)+1)
+			for _, f := range by {
+				metric[f] = rowField(row, f)
+			}
+			metric["__name__"] = alias
+			out = append(out, InstantSample{Metric: metric, Value: rowField(row, alias)})
+		}
+	}
+	return out, nil
 }
 
 // StatsQueryRange runs raw as a stats query over [from,to) in `step`-sized
@@ -64,6 +125,12 @@ func StatsQueryRange(s Store, raw string, from, to, step, now int64) ([]RangeSer
 			}
 			se := acc[key]
 			if se == nil {
+				// __name__ carries the aggregate's alias, the way a Prometheus
+				// series carries its metric name -- without it a graph has no
+				// legend and two aggregates are indistinguishable.
+				if alias != "" {
+					metric["__name__"] = alias
+				}
 				se = &RangeSeries{Metric: metric}
 				acc[key] = se
 				order = append(order, key)

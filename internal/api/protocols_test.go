@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sebishogun/simdlogs/internal/ingest"
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
@@ -581,6 +582,64 @@ func TestOTLPLogsIngest(t *testing.T) {
 	}
 	if s := statsBy(t, ts, "code"); s["500"] != 1 { // record attribute, int encoded as string
 		t.Fatalf("otlp record attr code = %v want 500:1", s)
+	}
+}
+
+// TestStripBulkActions guards the in-place compaction: it aliases the caller's
+// buffer, so an off-by-one writes a document over one not yet read.
+func TestStripBulkActions(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"pairs", "{\"create\":{}}\n{\"a\":1}\n{\"index\":{}}\n{\"b\":2}\n", "{\"a\":1}\n{\"b\":2}\n"},
+		{"delete carries no doc", "{\"delete\":{\"_id\":\"1\"}}\n{\"create\":{}}\n{\"a\":1}\n", "{\"a\":1}\n"},
+		{"no trailing newline", "{\"create\":{}}\n{\"a\":1}", "{\"a\":1}\n"},
+		{"blank lines", "{\"create\":{}}\n\n{\"a\":1}\n\n", "{\"a\":1}\n"},
+		{"action with no doc", "{\"create\":{}}\n", ""},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		got := string(stripBulkActions([]byte(c.in)))
+		if got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestESBulkParallelPath drives a body over MinParallelBytes so the sharded
+// ingest branch is covered, not just the small-body writer.
+func TestESBulkParallelPath(t *testing.T) {
+	srv, _ := NewServer(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	var sb strings.Builder
+	const n = 20000
+	for i := 0; i < n; i++ {
+		sb.WriteString("{\"create\":{\"_index\":\"logs\"}}\n")
+		fmt.Fprintf(&sb, "{\"@timestamp\":\"2023-11-14T22:13:20Z\",\"level\":\"error\",\"seq\":\"%d\"}\n", i)
+	}
+	if sb.Len() < ingest.MinParallelBytes {
+		t.Fatalf("body %d bytes is under MinParallelBytes %d -- test would not cover the parallel path",
+			sb.Len(), ingest.MinParallelBytes)
+	}
+	r, err := http.Post(ts.URL+"/insert/elasticsearch/_bulk", "application/x-ndjson", strings.NewReader(sb.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Items  []any `json:"items"`
+		Errors bool  `json:"errors"`
+	}
+	json.NewDecoder(r.Body).Decode(&resp)
+	r.Body.Close()
+	if len(resp.Items) != n || resp.Errors {
+		t.Fatalf("bulk items = %d errors = %v, want %d false", len(resp.Items), resp.Errors, n)
+	}
+	cbody := `{"query":{"bool":{"filter":[{"term":{"level":"error"}}]}}}`
+	r, _ = http.Post(ts.URL+"/_count", "application/json", strings.NewReader(cbody))
+	var cnt struct{ Count int }
+	json.NewDecoder(r.Body).Decode(&cnt)
+	r.Body.Close()
+	if cnt.Count != n {
+		t.Fatalf("bulk _count = %d want %d", cnt.Count, n)
 	}
 }
 

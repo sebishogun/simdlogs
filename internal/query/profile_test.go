@@ -86,11 +86,11 @@ func BenchmarkFacets(b *testing.B) {
 	s, lo, hi := benchStore(b, 3_000_000, 128*1024)
 	b.ResetTimer()
 	for b.Loop() {
-		sinkF = Facets(s, lo, hi+1, 10)
+		sinkF = FacetList(s, &Query{From: lo, To: hi + 1}, 10, DefaultFacetMaxValues, false)
 	}
 }
 
-var sinkF map[string][]ValueCount
+var sinkF []FieldFacet
 
 func BenchmarkEngineHistogram(b *testing.B) {
 	s, lo, hi := benchStore(b, 3_000_000, 128*1024)

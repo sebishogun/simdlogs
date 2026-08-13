@@ -37,6 +37,44 @@ func (b *Bitset) SetAll() {
 func (b *Bitset) Set(i int)       { b.words[i>>6] |= 1 << (i & 63) }
 func (b *Bitset) Test(i int) bool { return b.words[i>>6]&(1<<(i&63)) != 0 }
 
+// KeepFirst clears every set bit past the first n, in row order. A bounded
+// query (`| limit N`) then materializes only the rows it will return: without
+// it a whole group's matches were decoded and the surplus thrown away, which is
+// most of a scan's cost paid for nothing.
+func (b *Bitset) KeepFirst(n int) {
+	if n <= 0 {
+		for i := range b.words {
+			b.words[i] = 0
+		}
+		return
+	}
+	seen := 0
+	for wi := range b.words {
+		w := b.words[wi]
+		if w == 0 {
+			continue
+		}
+		c := bits.OnesCount64(w)
+		if seen+c <= n {
+			seen += c
+			continue
+		}
+		// This word crosses the bound: keep its lowest (n-seen) set bits, which
+		// are the earliest rows, and drop everything after it.
+		keep := uint64(0)
+		for need := n - seen; need > 0; need-- {
+			lsb := w & -w
+			keep |= lsb
+			w &^= lsb
+		}
+		b.words[wi] = keep
+		for j := wi + 1; j < len(b.words); j++ {
+			b.words[j] = 0
+		}
+		return
+	}
+}
+
 // And/Or/AndNot compose filters through simd's byte bit-ops over a byte
 // view of the words -- bitwise AND is the same operation at any element
 // width, so the u64 words alias as bytes without a copy.

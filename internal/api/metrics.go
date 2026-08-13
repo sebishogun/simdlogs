@@ -1,6 +1,7 @@
 package api
 
 import (
+	"flag"
 	"fmt"
 	"net/http"
 	"strings"
@@ -18,6 +19,18 @@ func (s *Server) countRequest(p string) {
 	case strings.HasPrefix(p, "/select"), p == "/_search", p == "/_count":
 		atomic.AddInt64(&s.nQueryReq, 1)
 	}
+}
+
+// flagsHandler serves the non-default command-line flags in the plain-text form
+// VictoriaLogs uses for /flags: one -name="value" per line. Only flags that were
+// actually set are listed, which is what makes the output useful in a bug report.
+func (s *Server) flagsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	flag.VisitAll(func(f *flag.Flag) {
+		if f.Value.String() != f.DefValue {
+			fmt.Fprintf(w, "-%s=%q\n", f.Name, f.Value.String())
+		}
+	})
 }
 
 // metrics serves Prometheus text-format gauges and counters -- the /metrics

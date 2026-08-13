@@ -14,7 +14,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
 )
 
 // TestLogsQLCompat is the compatibility proof: the same LogsQL query run against
@@ -154,8 +153,13 @@ func normalizeNDJSON(b []byte) string {
 			lines = append(lines, string(ln))
 			continue
 		}
-		delete(m, "_stream_id") // engine-internal
-		delete(m, "_stream")    // VL synthesizes this, simdlogs only with -stream-fields
+		// _stream_id is a hash, so the two engines' values cannot agree; its
+		// PRESENCE is compared instead, because a client that reads it must find
+		// it there. _stream itself is no longer dropped -- both engines
+		// synthesize it, so both must report the same label set.
+		if _, ok := m["_stream_id"]; ok {
+			m["_stream_id"] = "present"
+		}
 		keys := make([]string, 0, len(m))
 		for k := range m {
 			keys = append(keys, k)
@@ -231,4 +235,3 @@ func compatCorpus() []byte {
 	}
 	return buf.Bytes()
 }
-

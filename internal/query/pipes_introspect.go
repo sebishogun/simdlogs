@@ -17,6 +17,10 @@ func isNumber(s string) bool {
 	return true
 }
 
+// SortValueCounts orders a value list the way every values endpoint returns it:
+// most hits first, ties broken by value ascending so the order is stable.
+func SortValueCounts(vcs []ValueCount) { sortValueCounts(vcs) }
+
 func sortValueCounts(vcs []ValueCount) {
 	sort.Slice(vcs, func(i, j int) bool {
 		if vcs[i].Count != vcs[j].Count {

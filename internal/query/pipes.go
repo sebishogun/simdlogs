@@ -326,6 +326,21 @@ func RunPipeline(s Store, q *Query) []Row {
 		case *StatsPipe:
 			rows = runStats(s, q, p0)
 			pipes = pipes[1:]
+		case *TopPipe:
+			if r, ok := runTopFast(s, q, p0); ok {
+				rows, pipes = r, pipes[1:]
+			}
+		case *UniqPipe:
+			if r, ok := runUniqFast(s, q, p0); ok {
+				rows, pipes = r, pipes[1:]
+			}
+		case *LimitPipe:
+			// Push the bound into the scan so it stops after N rows instead of
+			// materializing the whole match set and slicing it. Limit (not
+			// MaxRows) because the rows are kept, not just counted.
+			if p0.N >= 0 && (q.Limit == 0 || p0.N < q.Limit) {
+				q.Limit = p0.N
+			}
 		case *FieldValuesPipe:
 			rows = runFieldValues(s, q, p0)
 			pipes = pipes[1:]
@@ -485,6 +500,9 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 	// StatsByField reads them from the offset table without a per-row scan
 	// for whole-in-window groups (the 1078x trick). This is the common
 	// top-N / group-by shape.
+	if r, ok := runCountFast(s, q, sp); ok {
+		return r
+	}
 	if len(sp.By) == 1 && len(sp.Aggs) == 1 && sp.Aggs[0].Kind == AggCount && sp.Aggs[0].If == nil {
 		alias := sp.Aggs[0].Alias
 		vcs := StatsByField(s, q, sp.By[0])
