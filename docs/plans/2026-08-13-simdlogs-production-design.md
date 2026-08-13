@@ -69,11 +69,14 @@ can pin, back up, upgrade, and trust to survive a crash without losing data.
   on a cluster and right on one node is a trap for operators who scale out.
 - **Disk footprint stays the known trade, not a hidden one.** The inverted
   index is the source of the selective-query wins and roughly 27% of a
-  group. Roadmap work on footprint (tiering measured 2.40x → ~1.55x on a
-  pre-hex baseline) must publish speed-vs-disk with both sides, and any
-  change that shrinks disk at the cost of the needle (measured 90x slower
-  when singleton postings were dropped) must be gated on a FRESH full
-  curve, not on the historical numbers or on footprint alone.
+  group. Roadmap work on footprint (the tiered-storage session `d846429`
+  measured 2.40x → ~1.55x on the realistic 100K-row corpus, post-hex — the
+  most recent realistic-corpus footprint measurement on record, still not a
+  fresh scale/current-release number) must publish speed-vs-disk with both
+  sides, and any change that shrinks disk at the cost of the needle
+  (measured 90x slower when singleton postings were dropped) must be gated
+  on a FRESH full curve, not on the historical numbers or on footprint
+  alone.
 - **Scale-out is measured against scale-up.** The cluster is statically
   configured; a multi-node point must be published against the single-node
   curve before the roadmap claims it (the one-node cluster measured as pure

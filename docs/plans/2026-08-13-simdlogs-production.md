@@ -290,7 +290,8 @@ tests cite.
 **Step 1:** Reproduce the published head-to-head 1B point with the
 comparison harness, the same command shape the curve's numbers came from
 (`SIMDLOGS_SCALEVL=1 SIMDLOGS_SCALEVL_N=1000000000 go test -run
-TestScaleVsVL -v -timeout 0 ./internal/bench/`, with the staged VL binary).
+TestScaleVsVL -v -timeout 60m ./internal/bench/`, with the staged VL
+binary — the 60m timeout is the published reproduction's).
 `TestScale` (`SIMDLOGS_SCALE=1`, simdlogs-only group-count scaling) is a
 separate local scaling gate, not a substitute for the published comparison.
 

@@ -1032,8 +1032,9 @@ from the magnitude, so a Grafana datasource's epoch-seconds window landed in
 1970 and every query answered empty. The status-code probe saw 200 and a
 well-formed empty result.
 
-The lesson is the same as entry 31 and cost the same twice: compare the ANSWER.
-A probe that compares status codes tests that the server is running.
+The lesson is the same as the "Compatibility measured, not assumed" entry
+(the 17/40 -> 40/40 run) and cost the same twice: compare the ANSWER. A
+probe that compares status codes tests that the server is running.
 
 ## 33. Two defects the benchmarks could not see
 
@@ -1074,7 +1075,8 @@ Instructions retired, min of three interleaved runs, same machine, same minute:
     before  837M             after  744M        -11.2%
 
 The change is a plain win. The wall clock was reading the user's own workload.
-This is entry 12's rule restated: on a busy box, gate on instructions.
+This is the "The wall-clock gate lied; instructions retired settled it" entry's
+rule restated: on a busy box, gate on instructions.
 
 ## 35. A bounded query decoded the whole timestamp column
 

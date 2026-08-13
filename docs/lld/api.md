@@ -61,10 +61,14 @@ with one type; that is why they must not each invent a key.
 
 In router mode only `field_names`, `field_values`, `stream_field_names` and
 `stream_field_values` have a working federated merge; the `streams` and
-`stream_ids` merges decode the wrong key and answer empty, and `facets`,
-`tail`, `/select/sql` and `/select/vector` are not federated at all (they
-run against the router's local store). See [`cluster.md`](cluster.md) —
-the cluster surface is experimental, not production-safe.
+`stream_ids` merges decode the wrong key and answer empty. Everything else
+is router-local or not merged — `facets`, `tail`, `/select/sql`,
+`/select/vector`, `/admin/backup`, `/metrics`, `/alerts` and others all
+answer from the router's own store and state. The enumeration here is
+representative, not complete: the per-endpoint status table in
+[`cluster.md`](cluster.md) is authoritative, and an endpoint's absence from
+either list must not be read as federation. The cluster surface is
+experimental, not production-safe.
 
 ### Ops
 

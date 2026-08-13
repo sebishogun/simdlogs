@@ -45,12 +45,14 @@ At 1B: simdlogs ingest 8m42s (1.92M rec/s) vs VL 13m34s (1.23M rec/s); needle
   O(1) — the endgame noted in `docs/wrong.md`.
 - **Ingest advantage narrows then holds** (8.2→2.6→1.1→1.56×): VL parallelizes
   ingest well at scale; simdlogs stays ahead throughout.
-- **Footprint is the tradeoff, worst-case ~20×** on the unique-hex corpus (2.62×
-  realistic, down from 3.47× after v8 FOR bit-packed the postings, -55% on that
-  section). This is by construction: our inverted index is exactly what wins the
-  query columns above, and VL has no such index. Measured, not a bug — see
-  `docs/wrong.md`. Opt-in compact mode narrows it further at a query-speed cost;
-  the default keeps the speed.
+- **Footprint was the tradeoff, worst-case ~20×** on the unique-hex corpus
+  (2.62× realistic, down from 3.47× after v8 FOR bit-packed the postings,
+  -55% on that section). That was by construction: the inverted index was
+  exactly what won the query columns above, and VL has no such index.
+  Measured, not a bug — see `docs/wrong.md`. Opt-in compact mode narrowed it
+  further at a query-speed cost; the default kept the speed. These are
+  historical-baseline statements (see the stamp at the top of this file),
+  not the current footprint.
 
 ## Reproduce
 

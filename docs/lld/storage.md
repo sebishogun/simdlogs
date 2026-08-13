@@ -192,8 +192,13 @@ nibble-pack codec (`d000ae3`, measured -9.8% disk on the realistic corpus in
 its commit) shipped; the realistic 2.62x figure dates from `3f5a063`
 (2026-08-12, after FOR, before hex). Postings are roughly 27% of a group;
 dropping near-unique postings shrinks disk and made the needle 90x slower,
-so that change was reverted (`docs/wrong.md`). Tiered storage measured
-2.40x → ~1.55x of VL on the realistic corpus (flate on old groups) — also a
-pre-hex historical baseline. No current-footprint claim is committed; the
-roadmap requires fresh realistic and scale-vs-VL measurements before any
-current-facing footprint statement.
+so that change was reverted (`docs/wrong.md`).
+
+The most recent realistic-corpus footprint measurement on record is the
+tiered-storage session (`d846429`, 2026-08-13, POST-hex): 2.40x → ~1.55x of
+VL on the realistic 100K-row corpus (10297KB hot, trace_id/span_id already
+hex-packed), flate alone -8.1%, dropping postings -35.4%. It is a 100K-row
+session measurement, not a fresh scale/current-release measurement — no
+current-footprint claim exists beyond it, and the roadmap requires fresh
+realistic and scale-vs-VL measurements before any current-facing footprint
+statement.
