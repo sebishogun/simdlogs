@@ -156,6 +156,8 @@ func predMatchesRow(p *Pred, get func(string) string) bool {
 			return u >= uint32(p.Num) && u <= uint32(p.Num2)
 		}
 		return false
+	case StreamIDEq:
+		return StreamID(v) == p.Value
 	}
 	return false
 }

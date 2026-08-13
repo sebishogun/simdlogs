@@ -431,6 +431,16 @@ func (p *lqlParser) parseMatcher(field string) (Pred, error) {
 		p.next()
 		return parseTimeExpr(t.val)
 	}
+	if field == "_stream_id" { // _stream_id:<id> -- match the _stream value by hash
+		if p.peek().kind == tOp && p.peek().val == "=" {
+			p.next()
+		}
+		v, err := p.value()
+		if err != nil {
+			return Pred{}, err
+		}
+		return Pred{Field: "_stream", Kind: StreamIDEq, Value: v}, nil
+	}
 	switch {
 	case t.kind == tOp && t.val == "=":
 		p.next()

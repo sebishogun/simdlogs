@@ -6,42 +6,40 @@ import (
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
-func TestStreamSelector(t *testing.T) {
+func TestStreamModel(t *testing.T) {
 	s, err := storage.OpenStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := storage.BuildDict([]string{"nginx", "nginx", "redis", "nginx"})
-	env := storage.BuildDict([]string{"prod", "dev", "prod", "prod"})
+	// two streams: {app="api",env="prod"} x3, {app="db",env="prod"} x1
+	sa := `{app="api",env="prod"}`
+	sb := `{app="db",env="prod"}`
+	str := storage.BuildDict([]string{sa, sa, sa, sb})
 	if _, err := s.AppendGroup(&storage.Group{Rows: 4, Columns: []storage.Column{
 		{Name: "_time", Type: storage.ColTimestamp, Ts: []int64{1, 2, 3, 4}},
-		{Name: "app", Type: storage.ColDict, Dict: &app},
-		{Name: "env", Type: storage.ColDict, Dict: &env},
+		{Name: "_stream", Type: storage.ColDict, Dict: &str},
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	run := func(q string) int {
-		pq, err := ParseLogsQL(q)
-		if err != nil {
-			t.Fatalf("parse %q: %v", q, err)
-		}
-		pq.From, pq.To = 0, int64(1)<<62
-		return len(Run(s, pq))
+	streams := Streams(s, 0, int64(1)<<62)
+	if len(streams) != 2 {
+		t.Fatalf("streams = %d want 2", len(streams))
 	}
-	cases := []struct {
-		q    string
-		want int
-	}{
-		{`_stream:{app="nginx"}`, 3},             // equality (lowers to a flat pred)
-		{`_stream:{app="nginx",env!="prod"}`, 1}, // AND with a != (NOT) -> the dev row
-		{`_stream:{app=~"ng.*"}`, 3},             // regexp label match
-		{`_stream:{env!~"pr.*"}`, 1},             // regexp not-match -> only dev
-		{`_stream:{}`, 4},                        // empty selector matches all
-		{`!app:redis`, 3},                        // bare ! NOT prefix
+	ids := StreamIDs(s, 0, int64(1)<<62)
+	if len(ids) != 2 || ids[0].Value == "" {
+		t.Errorf("stream_ids = %v", ids)
 	}
-	for _, c := range cases {
-		if got := run(c.q); got != c.want {
-			t.Errorf("%s = %d rows, want %d", c.q, got, c.want)
-		}
+	names := StreamFieldNames(s, 0, int64(1)<<62)
+	if len(names) != 2 || names[0] != "app" || names[1] != "env" {
+		t.Errorf("stream_field_names = %v want [app env]", names)
+	}
+	if apps := StreamFieldValues(s, "app", 0, int64(1)<<62); len(apps) != 2 {
+		t.Errorf("stream_field_values app = %v want 2", apps)
+	}
+	// _stream_id filter: match rows of stream sa by its id.
+	pq, _ := ParseLogsQL(`_stream_id:` + StreamID(sa))
+	pq.From, pq.To = 0, int64(1)<<62
+	if n := len(RunPipeline(s, pq)); n != 3 {
+		t.Errorf("_stream_id filter = %d rows want 3", n)
 	}
 }

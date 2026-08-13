@@ -155,6 +155,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/select/logsql/facets", s.facets)
 	mux.HandleFunc("/select/logsql/stats_query", s.statsQuery)
 	mux.HandleFunc("/select/logsql/stats_query_range", s.statsQueryRange)
+	mux.HandleFunc("/select/logsql/streams", s.streamsHandler)
+	mux.HandleFunc("/select/logsql/stream_ids", s.streamIDsHandler)
+	mux.HandleFunc("/select/logsql/stream_field_names", s.streamFieldNamesHandler)
+	mux.HandleFunc("/select/logsql/stream_field_values", s.streamFieldValuesHandler)
 	// The Elasticsearch search surface VictoriaLogs lacks.
 	mux.HandleFunc("/_search", s.esSearch)
 	mux.HandleFunc("/_count", s.esCount)
@@ -483,6 +487,30 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{"stats": query.StatsByField(s.tn(r).store, q, by)})
+}
+
+// streamsHandler lists the distinct _stream label sets in the window.
+func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
+	from, to := timeWindow(r)
+	json.NewEncoder(w).Encode(map[string]any{"streams": query.Streams(s.tn(r).store, from, to)})
+}
+
+// streamIDsHandler lists the distinct stream ids in the window.
+func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
+	from, to := timeWindow(r)
+	json.NewEncoder(w).Encode(map[string]any{"stream_ids": query.StreamIDs(s.tn(r).store, from, to)})
+}
+
+// streamFieldNamesHandler lists the distinct stream label names.
+func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request) {
+	from, to := timeWindow(r)
+	json.NewEncoder(w).Encode(map[string]any{"names": query.StreamFieldNames(s.tn(r).store, from, to)})
+}
+
+// streamFieldValuesHandler lists the distinct values of one stream label.
+func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request) {
+	from, to := timeWindow(r)
+	json.NewEncoder(w).Encode(map[string]any{"values": query.StreamFieldValues(s.tn(r).store, r.FormValue("field"), from, to)})
 }
 
 // statsQueryRange buckets a stats query over the time range and returns a

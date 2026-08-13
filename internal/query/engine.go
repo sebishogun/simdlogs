@@ -54,6 +54,7 @@ const (
 	TimeRange                     // _time:[a,b]      (timestamp in [T1,T2), resolved absolute)
 	TimeDayRange                  // _time:day_range  (minute-of-day in [T1,T2], UTC)
 	TimeWeekRange                 // _time:week_range (weekday in T1 bitmask, UTC)
+	StreamIDEq                    // _stream_id:<id>  (_stream value whose hash == Value)
 )
 
 // isFieldCmp reports whether the kind compares this field against another field
@@ -404,6 +405,10 @@ func predBitsetCol(g *storage.Reader, p *Pred, idx []uint32, dict []string, n in
 			if v, ok := ipToU32(d); ok {
 				hit[di] = v >= lo && v <= hi
 			}
+		}
+	case StreamIDEq:
+		for di, d := range dict {
+			hit[di] = StreamID(d) == p.Value
 		}
 	}
 	for i, v := range idx {
