@@ -128,19 +128,21 @@ the LLD becomes the spec the tests pin.
 **Files:**
 - Modify: `internal/bench/apisurface_test.go`
 
-**Step 1 (test first):** Extend the answer-changes probe to every select and
-ingest endpoint, and add the missing `keep_const_fields` case. `facetKeep`
-materially includes constant/single-distinct fields
-(`internal/query/introspect.go`), and with no stream fields configured the
-synthesized `_stream`/`_stream_id` hold single constant values, so
-`keep_const_fields=1` must change the committed-corpus facets answer. No
-committed probe currently varies or asserts this argument: the
-`TestParamsHonoured` keep_const case is gated on the staged VL binary and
-reports inconclusive when the reference's own answer does not change — which
-is what the 2026-08-13 probe (commit f42cc8e) recorded, against the then
-pre-facetable-synthesized-fields code (facets from stored columns alone);
-the same commit made the synthesized fields facetable. The new probe must
-assert the answer changes without depending on the VL binary, and the
+**Step 1 (test first):** Extend the current keep_const coverage — which pins
+stored constant columns only — to the synthesized `_stream`/`_stream_id`
+constant fallback and to both `keep_const` polarities, without requiring the
+staged VL binary. Today: `TestFacetsFieldSelection`
+(`internal/api/shapes_test.go`) unconditionally asserts that
+`keep_const_fields=1` brings a constant stored field (`env`) back into the
+facets, and `TestParamsHonoured` (`internal/bench/shapes_test.go`) varies
+the argument in the VL-gated comparative probe (inconclusive when the
+reference's own answer does not change — what the 2026-08-13 probe, commit
+f42cc8e, recorded against the then pre-facetable-synthesized-fields code;
+the same commit made the synthesized fields facetable). Extend
+`TestFacetsFieldSelection` (no VL dependency) to assert both polarities of
+the fallback: with no stream fields configured, `_stream` and `_stream_id`
+hold single constant values that appear only under `keep_const_fields=1`;
+keep the `TestParamsHonoured` case as the comparative cross-check. The
 finding's history (not in `docs/wrong.md`, which has no entry for it) goes
 in the commit message.
 

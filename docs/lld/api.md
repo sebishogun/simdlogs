@@ -119,10 +119,15 @@ only; see `internal/api/es.go`).
   (commit f42cc8e) recorded this argument changing nothing, but that finding
   is historical: it was measured against the code before the synthesized
   fields were made facetable (facets from stored columns alone); the same
-  commit added them as candidates. No committed probe currently varies or
-  asserts this argument — the `TestParamsHonoured` keep_const case requires
-  the staged VL binary and reports inconclusive when the reference's own
-  answer does not change. The production plan (B.3) adds one.
+  commit added them as candidates. Committed tests pin the current behavior
+  two ways: `TestFacetsFieldSelection` (`internal/api/shapes_test.go`)
+  unconditionally asserts that `keep_const_fields=1` brings a constant
+  stored field (`env`) back into the facets, and `TestParamsHonoured`
+  (`internal/bench/shapes_test.go`) varies the argument in the
+  VL-gated comparative probe, logging INCONCLUSIVE when the reference's own
+  answer does not change. Neither pin is on the synthesized
+  `_stream`/`_stream_id` constant fallback; the production plan (B.3)
+  extends them.
 
 `Now` is stamped from the request for relative `_time:<dur>` filters.
 
