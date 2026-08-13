@@ -24,7 +24,9 @@ At 1B: simdlogs ingest 8m42s (1.92M rec/s) vs VL 13m34s (1.23M rec/s); needle
 
 ## What the curve shows
 
-- **simdlogs wins every query dimension + ingest at every scale, 1M→1B.**
+- **The rare needle, aggregation, and ingest win at every measured scale.** The
+  selective window loses at 1M (0.8x), crosses by 10M (1.1x), and reaches 2.0x
+  at 100M.
 - **Query wins peak mid-curve then ease at 1B.** needle 12→20→25→13×,
   aggregation 5→8→19→3.4×. The needle is O(groups) (a bloom check per group);
   at a billion rows that per-group cost shows, so the lead narrows but stays a

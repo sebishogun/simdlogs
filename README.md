@@ -1,101 +1,220 @@
 # simdlogs
 
-A log management database in Go, built on the simd library: VictoriaLogs'
-API surface, plus the Elasticsearch search surface they do not have, at
-orders-of-magnitude better numbers on the same machine.
+`simdlogs` is a disk-backed log database in Go. It implements the VictoriaLogs
+ingest and LogsQL surfaces used by the repository's compatibility suite, adds
+an Elasticsearch-compatible search subset, and executes filters over columnar
+row groups with [simd.go](https://github.com/sebishogun/simd) kernels.
 
-Design: [docs/design.md](docs/design.md).
+It is built for selective queries and low-latency aggregations. That choice has
+a measured cost: its inverted indexes use more disk than VictoriaLogs. The
+[scale curve](docs/scale-curve.md) publishes both sides.
 
-## The claim, and what measurement did to it
+## Run it
 
-![simdlogs vs VictoriaLogs](docs/bench.svg)
+Go 1.26.5 or later is required. The server uses published `simd v1.20.0` and
+`simdjson v0.6.0`; neither dependency requires cgo.
 
+```sh
+go run ./cmd/simdlogs -storage ./simdlogs-data -addr :9428
+```
 
-The design aimed for orders of magnitude over VictoriaLogs on selective
-scan-heavy queries. Measured at 3M rows, both engines on one machine,
-identical wire calls:
+The default port matches VictoriaLogs. On startup the server prints the SIMD
+tier selected for the current CPU.
 
-| query class (3M rows) | result |
+Ingest newline-delimited JSON:
+
+```sh
+curl -sS -X POST http://localhost:9428/insert/jsonline \
+  --data-binary $'{"_time":"2026-08-13T00:00:00Z","service":"api","level":"error","_msg":"timeout"}\n'
+```
+
+Query it through LogsQL:
+
+```sh
+curl -G http://localhost:9428/select/logsql/query \
+  --data-urlencode 'query=service:=api AND level:=error | fields _time, _msg'
+```
+
+Each successful ingest request is flushed before its response is returned.
+Group files are written to a temporary file, synced, and atomically renamed;
+readers mmap immutable groups and reopen them after restart.
+
+## Query and ingest surfaces
+
+### Ingest
+
+| Workload | Endpoint or transport |
 |---|---|
-| rare-value needle (full span) | simdlogs **12.6x** faster (23x engine-only) |
-| selective query (returns rows) | simdlogs **8.5x** faster |
-| aggregation (hits) | simdlogs **6.7x** faster |
-| windowed count (engine) | **13x** (block-skip, 839us -> 65us) |
-| group-by (stats by field, engine) | **1078x** (footer postings, 3.56ms -> 3.3us) |
-| ingest (synchronous, durable) | **2.81M rec/s** (was 384K), ~5.7x VL |
+| NDJSON | `/insert/jsonline` |
+| logfmt | `/insert/logfmt` |
+| Elasticsearch bulk NDJSON | `/_bulk` |
+| Loki push JSON | `/loki/api/v1/push` |
+| Datadog logs JSON | `/api/v2/logs`, `/v1/input` |
+| OpenTelemetry logs JSON | `/v1/logs` |
+| journald export | `/insert/journald` |
+| syslog | `/insert/syslog`, or UDP and TCP with `-syslog` |
 
-Method, the discipline the simd repos hold to: deterministic corpus, both
-engines interleaved in one process with identical wire calls, each class
-the minimum of 25 samples after warmup (never a mean), three runs
-byte-identical. The wins are 2-23x, far above the ~8% code-layout
-wall-clock noise floor; the pure-engine `BenchmarkEngine*` benchmarks under
-`perf stat -e instructions:u,cycles:u` are the layout- and load-independent
-cross-check (the needle retires 149x fewer instructions than a full scan).
+Large NDJSON bodies split at line boundaries and parse across workers. Smaller
+bodies reuse the tenant's persistent writer. Records without `_time` receive a
+monotonic wall-clock timestamp.
 
-The design's whole vectorized-execution half was built after an external
-review found it missing: the residual scan is now vpcmpeqd + pack over
-encoded indices (equality) and vector range compares (time), not the
-scalar per-row loop that was VictoriaLogs' own anti-pattern; query
-execution fans across cores over groups; and the result path is
-hand-built NDJSON, no reflection. That took the selective row query from
-1.9x to 4.5x.
+### LogsQL
 
-The rare needle -- one value in three million, over the full time span --
-was VictoriaLogs' by 2.8x, and closing it did not need the global
-value->group index the loss analysis named. Profiling found the needle was
-2x slower than a full scan of every group, the signature of wasted work:
-32 goroutines spawned for the one group that survives the bloom, a posting
-lookup that walked the varint stream instead of seeking, and a whole-column
-timestamp decode to stamp one match's time. Footer-pruning before the fork,
-a byte-offset table in the postings, and a checkpoint header for O(block)
-timestamp reads took the needle from a 2.8x loss to a 12.6x wire win
-(24.3us vs 305us). Subtracting each harness's HTTP floor -- simdlogs
-in-process at 13.5us, VL cross-process at 53.9us -- the engine-only needle
-is 23x (10.8us vs 251us), and the pure-engine benchmark is 7.2us doing 149x
-fewer instructions than a full scan. Ingest was rebuilt in three steps:
-flushing went to a worker pool (dictionary build and marshal overlap the
-parser); BuildDict dropped from two hash maps to one (3.8x on a
-high-cardinality column); and the parser -- the bottleneck once flush went
-async -- was sharded across cores, each shard its own writer over the
-shared store. Together they took 3M rows from 384K to 2.78M rec/s,
-synchronous and durable when the POST returns (VictoriaLogs accepts
-asynchronously, queryable only after a flush; even against its raw ~3s
-accept this is ~2.8x). LZ4 compression (1.43x here) is the footprint lever
-for the 100M+ scale where groups stop being cache-resident.
+The compatibility inventory in [`docs/vl-parity.md`](docs/vl-parity.md) is
+complete through tiers 0-5. It covers boolean and field-to-field filters,
+numeric, string, sequence, IPv4 and time predicates; stats and conditional
+aggregates; row transforms; subqueries and joins; stream context and stream-id
+queries; field/facet introspection; rate series; and block introspection.
 
-Windowed queries got a second lever: the timestamp checkpoints carry each
-block's min and max, so a query skips every block whose range misses the
-window without decoding it and restricts its predicate scan to the window's
-block span. A windowed count went from 839us to 65us in the engine (13x),
-and the aggregation head-to-head from 2.1x to 6.0x.
+The main HTTP endpoints are:
 
-Standing at 3M rows: faster on every class measured -- 6.7x at the
-aggregation, 8.5x at the selective row query, 12.6x (23x engine-only) at
-the needle, 5.7x at ingest. docs/wrong.md carries the full arc: the
-premise that measurement first refuted, and the engine work that turned the
-needle class from a loss into the widest win.
+- `/select/logsql/query`, `/select/logsql/tail`, `/select/logsql/hits`,
+  `/select/logsql/stats_query`, and `/select/logsql/stats_query_range`;
+- `/select/logsql/field_names`, `/select/logsql/field_values`, and
+  `/select/logsql/facets`;
+- `/select/logsql/streams`, `/select/logsql/stream_ids`,
+  `/select/logsql/stream_field_names`, and
+  `/select/logsql/stream_field_values`.
+
+Queries return NDJSON. A bare select materializes whole records; pipe chains
+materialize only fields needed by their predicates and transforms.
+
+### Additional surfaces
+
+- `/_search` and `/_count` support a log-oriented Elasticsearch subset:
+  `bool` with `must`/`filter`, `term`, timestamp `range`, and `exists`.
+- `/select/sql` translates a SQL `SELECT` subset into the same LogsQL engine.
+- `/select/vector` performs cosine k-nearest-neighbor search over an embedding
+  field supplied by the ingested logs.
+- `/metrics`, `/alerts`, `/admin/backup`, and `/vmui` provide operational
+  endpoints. The backup endpoint streams immutable group files as a tar; the
+  Go storage API restores that tar into a new store.
+
+This is not full Elasticsearch compatibility. In particular, `_msearch`, the
+complete Query DSL, and Elasticsearch aggregation response compatibility are
+outside the implemented surface.
+
+## Storage and execution
+
+Rows are grouped into immutable, time-ordered files. Each group carries:
+
+- delta/varint timestamps with block min/max checkpoints;
+- sorted per-column dictionaries and bit-packed row ids;
+- cardinality-sized bloom filters and exact dictionary checks;
+- frame-of-reference bit-packed postings for value-to-row lookup;
+- a footer used to reject groups and blocks before value decode.
+
+The query path narrows work in layers: time range, footer bloom and dictionary,
+posting rows or vector predicate scan, bitset algebra, then selected-field
+materialization. Groups execute in parallel only after footer pruning; a rare
+needle that survives in one group does not pay for a worker pool.
+
+The SIMD dependency supplies the bit unpack, varint decode, hash, bitset,
+compare, compression, formatting, and data-movement primitives. Every operation
+also has a portable path through `simd`, so missing architecture kernels affect
+speed rather than API availability.
+
+## Measured against VictoriaLogs
+
+The scale harness runs both engines through HTTP on the same deterministic
+bytes and disk-backed stores. Query order is shuffled; each latency is the
+minimum of 15 samples after three warmups. These figures were measured on
+amd64/AVX-512. No wall-clock claim is made for another architecture.
+
+The committed unique-hex scale curve is deliberately hostile to compression:
+every trace value is distinct.
+
+| rows | rare needle | selective window | aggregation | ingest | disk vs VL |
+|---:|---:|---:|---:|---:|---:|
+| 1M | 12.3x | **0.8x** | 5.1x | 8.2x | unavailable; VL rounds below 0.005 GB |
+| 10M | 19.7x | 1.1x | 8.4x | 2.56x | 19.6x |
+| 100M | 25.0x | 2.0x | 19.2x | 1.11x | 20.9x |
+| 1B | 12.9x | 1.9x | 3.4x | 1.56x | 19.4x |
+
+Values above 1 mean `simdlogs` is faster. The 1M selective row is a loss, and
+it remains in the table. At one billion rows, ingest took 8m42s here and 13m34s
+in VictoriaLogs; the rare needle took 1.68 ms versus 21.7 ms; the selective
+query 350 ms versus 664 ms; and the aggregation 5.6 ms versus 19.3 ms. Disk was
+50.1 GB versus 2.58 GB.
+
+The realistic 15-field Zipfian corpus is less extreme on disk. After the v8
+count-table and frame-of-reference postings changes, it measures 2.62x the
+VictoriaLogs footprint, down from 3.47x. The inverted index is also what powers
+the large rare-value and group-by wins; removing singleton postings cut disk
+and made the needle 90x slower, so that change was reverted.
+
+`-compact` uses flate for dictionary blocks. On the measured realistic corpus
+it made groups about 15% smaller and value-reading queries 2-10x slower. It is
+an opt-in cold-archive trade, not the default. The current default remains the
+SIMD-backed LZ4 path.
+
+Read [`docs/scale-curve.md`](docs/scale-curve.md) for the full curve and
+reproduction commands. [`docs/wrong.md`](docs/wrong.md) records the earlier
+losses, retracted claims, and rejected storage variants rather than presenting
+only the final wins.
+
+## Deployment behavior
+
+- `AccountID` and `ProjectID` headers select isolated tenant directories;
+  absent or invalid identifiers use tenant `0:0`.
+- `-stream-fields` synthesizes `_stream` from selected fields and enables the
+  stream-id and per-stream retention model.
+- `-retention` removes groups whose complete time span is older than the
+  configured age. Removal drops the group from the index before unlinking it.
+- `-select-backends` turns a node into a query router. Backends are grouped by
+  `-replicas`; writes replicate within one selected shard and reads use one
+  available replica per shard before merging results.
+- SIGINT and SIGTERM stop HTTP intake, drain in-flight requests, flush writers,
+  and unmap stores.
+
+The cluster layer is application-level sharding and replication, not a
+consensus system. There is no automatic membership, leader election, or
+cross-node transaction protocol.
+
+## Verification
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+The suite covers storage round trips and backward-compatible posting formats,
+crash-safe append, retention, backup/restore, tenant isolation, ingest
+protocols, LogsQL parsing and execution, SQL/vector surfaces, Elasticsearch
+search, live tail, replication/federation, and serial-versus-parallel query
+agreement.
+
+The VictoriaLogs comparisons are reports rather than unit-test gates:
+
+```sh
+# realistic 1M-row query mix
+SIMDLOGS_REAL=1 go test -run TestRealistic -v -timeout 90m ./internal/bench/
+
+# disk-backed scale point; stage internal/bench/victoria-logs first
+SIMDLOGS_SCALEVL=1 SIMDLOGS_SCALEVL_N=100000000 \
+  go test -run TestScaleVsVL -v -timeout 60m ./internal/bench/
+```
 
 ## Status
 
-Under construction, phase by phase against the build plan.
+The LogsQL parity plan is implemented and tested, but this repository has no
+tagged release yet. Storage format compatibility, operational upgrade policy,
+and the supported public API are therefore not under a stable-version promise.
+Pin a commit if you deploy it today.
 
-**Landed:** the storage core (columnar row groups with dict+bitpacked
-columns and delta+varint timestamps on the simd kernels; per-group skip
-footers with time min/max and value blooms), the crash-safe group store,
-and the selective query engine (bitset algebra, footer group-skip, dict-id
-equality scans). All four "new kernels" the design called for -- varint
-decode, bitpacked decode, SIMD hash, bitshuffle -- shipped in simd
-v1.18-v1.20 and are consumed directly.
+Current open work is measured rather than implied: reduce the disk footprint
+without giving back the indexed-query wins, widen the Elasticsearch surface,
+and turn the current cluster primitives into a documented production protocol.
 
-**Head-to-head vs VictoriaLogs** (the reference clone as a subprocess), 3M
-rows: 13.2x on the rare needle (23x engine-only), 5.4x on the selective row
-query, 6.0x on aggregation, 2.81M rec/s ingest (~5.7x VL). The arc from a refuted
-premise (VL first won the needle by 6.4x) through the vectorized-execution
-build and the three needle-path fixes is in docs/wrong.md, entries in order.
+## Documentation
 
-**Surface:** /insert/jsonline; /select/logsql/{query,hits,field_names,
-field_values,facets,stats_query}; the Elasticsearch _search and _count
-(bool/term/range/exists, time-range mapped to the partition skip) that
-VictoriaLogs does not have; time-based retention. First-milestone scope
-per docs/plans/2026-08-07-simdlogs-full-build.md; full LogsQL, the wider
-ES DSL, and clustering are explicit later-phase non-goals.
+- [`docs/vl-parity.md`](docs/vl-parity.md): current LogsQL parity inventory.
+- [`docs/scale-curve.md`](docs/scale-curve.md): disk-backed scale results.
+- [`docs/benchmark-contract.md`](docs/benchmark-contract.md): benchmark rules
+  published before implementation was measured.
+- [`docs/design.md`](docs/design.md): original milestone design and hypotheses.
+- [`docs/wrong.md`](docs/wrong.md): measurements that changed or rejected work.
+
+The wider SIMD project inventory lives in the
+[`simd` README](https://github.com/sebishogun/simd#built-on-this).
