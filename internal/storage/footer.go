@@ -143,6 +143,40 @@ func (r *Reader) DictIndices(name string) ([]uint32, []string) {
 	return decodeIndices(data, r.Rows, m.Width), dictSectionAll(r.dictSec(m), m.DictLen)
 }
 
+// DictLen is the number of distinct values in a dict column.
+func (r *Reader) DictLen(name string) int {
+	m := r.col(name)
+	if m == nil || m.Type != ColDict {
+		return 0
+	}
+	return m.DictLen
+}
+
+// DictIndicesRaw decodes only the per-row dictionary indices of a dict column,
+// not the dict values -- for the materialize path that needs a subset of values
+// (DictDecodeSome), avoiding a full-dict string decode of unreferenced values.
+func (r *Reader) DictIndicesRaw(name string) []uint32 {
+	m := r.col(name)
+	if m == nil || m.Type != ColDict {
+		return nil
+	}
+	data := r.blob[m.DataOff : m.DataOff+r.idxBytes(m)]
+	return decodeIndices(data, r.Rows, m.Width)
+}
+
+// DictDecodeSome decodes only the dict values whose id is marked in want,
+// returning a DictLen-sized slice with just those filled. Blocks holding no
+// wanted value are not decompressed. This is the big-result materialize path:
+// a whole-record select over a fraction of a high-cardinality column decodes
+// only the referenced values, not every distinct string.
+func (r *Reader) DictDecodeSome(name string, want []bool) []string {
+	m := r.col(name)
+	if m == nil || m.Type != ColDict {
+		return nil
+	}
+	return dictSectionSome(r.dictSec(m), m.DictLen, want)
+}
+
 // DictValueAt returns the value of a dict column at one row, decoding
 // only that row's index bits -- O(1), so materializing a handful of
 // matched rows never decodes the whole column. The selective path's

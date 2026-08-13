@@ -216,6 +216,35 @@ func dictSectionAt(sec []byte, n, i int) string {
 	return blockValAt(raw, d.blockCount(k, n), i%dictBlock)
 }
 
+// dictSectionSome materializes only the values whose id is marked in want,
+// decompressing a block only if it holds a wanted value. out[id] is set for
+// wanted ids, "" elsewhere -- the materialize path for a subset of a dict.
+func dictSectionSome(sec []byte, n int, want []bool) []string {
+	d := parseDictSec(sec)
+	out := make([]string, n)
+	for k := 0; k < d.numBlocks; k++ {
+		base := k * dictBlock
+		cnt := d.blockCount(k, n)
+		any := false
+		for i := 0; i < cnt; i++ {
+			if want[base+i] {
+				any = true
+				break
+			}
+		}
+		if !any {
+			continue // no wanted value in this block: skip the decompress
+		}
+		raw := d.block(k)
+		for i := 0; i < cnt; i++ {
+			if want[base+i] {
+				out[base+i] = blockValAt(raw, cnt, i)
+			}
+		}
+	}
+	return out
+}
+
 // dictSectionAll materializes the whole dict -- the scan path, decompressing
 // every block once.
 func dictSectionAll(sec []byte, n int) []string {

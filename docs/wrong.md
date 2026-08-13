@@ -721,3 +721,41 @@ strictly coarser here, so StreamVByte would grow the postings section FOR just
 cut 55%. Its decode-speed edge is on large contiguous lists, which the postings
 path reaches only above the count>n/8 crossover (the non-selective case, already
 served by FOR's aligned SIMD unpack). No size win, no speed need -- not built.
+
+## The common query was allocation-bound in materialize: decode only referenced dict values
+
+The realistic `common` query (level:=error, whole-record select, ~1/5 of the
+corpus returned) sat at 1.0x vs VL -- the one class we did not beat. Profiled
+(cpuprofile, query-dominated, BenchmarkCommonSelect): the filter is nothing; the
+time is materialize, and it is allocation-bound:
+
+    lz4BlockDecodeAVX512   15%   dict block decompress (unavoidable)
+    dictSectionAll         26%   (slicebytetostring 17%) whole-dict -> []string
+    scanObject/mallocgc   ~40%   GC driven by those string allocations
+    appendMatches.func2    17%   building Row.Fields per match
+
+The waste: the bulk-materialize path (cnt >= n/16) decoded the WHOLE dict of
+every materialize column to Go strings -- including a high-cardinality column
+like trace_id (100K distinct), where a select over 20% of rows references only
+~20K values but 100K strings were allocated. The other 80% became garbage
+immediately.
+
+Fix: decode only the referenced values. DictIndicesRaw returns the per-row ids
+without the dict; the matched rows mark a `want` bitset; DictDecodeSome
+decompresses only blocks holding a wanted id and stringifies only wanted values.
+Predicate columns keep the full dict (the filter needs every value); only the
+pure-materialize columns take the subset path.
+
+Interleaved A/B, BenchmarkCommonSelect, load 2.7, min of 3:
+
+    baseline (full dict)        22.5 ms/op
+    decode-only-referenced      17.2 ms/op    -24%
+
+No regression on needle/selective: those have cnt < n/16 and never enter the
+bulk path (they point-read). Full suite green; storage format unchanged (this is
+a read path). It closes the common gap -- ~1.0x -> ~1.3x of VL.
+
+The remaining materialize cost is the string COPY (slicebytetostring) and the
+per-Row allocation. Zero-copy strings aliasing the decompressed block buffers
+would cut it further, but the buffers must outlive the response and that
+aliasing is easy to get wrong -- deferred, noted here as the next lever.

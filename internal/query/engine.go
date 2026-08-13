@@ -275,9 +275,21 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 			if _, ok := cols[f]; ok {
 				continue
 			}
-			if idx, dict := g.DictIndices(f); idx != nil {
-				cols[f] = col{idx: idx, dict: dict}
+			// Decode only the dict values the matched rows reference, not every
+			// distinct string: on a whole-record select over a fraction of a
+			// high-cardinality column, the unreferenced 80% never become Go
+			// strings (the profile's slicebytetostring + the GC it drove).
+			idx := g.DictIndicesRaw(f)
+			if idx == nil {
+				continue
 			}
+			want := make([]bool, g.DictLen(f))
+			sel.ForEach(func(i int) {
+				if i < len(idx) {
+					want[idx[i]] = true
+				}
+			})
+			cols[f] = col{idx: idx, dict: g.DictDecodeSome(f, want)}
 		}
 	}
 	sel.ForEach(func(i int) {
