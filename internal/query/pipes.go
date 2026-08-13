@@ -317,8 +317,18 @@ func RunPipeline(s Store, q *Query) []Row {
 	pipes := q.Pipes
 	if len(pipes) > 0 {
 		q.MatAll = false // pipes project their own fields; skip full-record materialize
-		if sp, ok := pipes[0].(*StatsPipe); ok {
-			rows = runStats(s, q, sp)
+		switch p0 := pipes[0].(type) {
+		case *StatsPipe:
+			rows = runStats(s, q, p0)
+			pipes = pipes[1:]
+		case *FieldValuesPipe:
+			rows = runFieldValues(s, q, p0)
+			pipes = pipes[1:]
+		case *FieldNamesPipe:
+			rows = runFieldNames(s, q)
+			pipes = pipes[1:]
+		case *FacetsPipe:
+			rows = runFacets(s, q, p0)
 			pipes = pipes[1:]
 		}
 	}

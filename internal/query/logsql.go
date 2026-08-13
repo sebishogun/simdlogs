@@ -1007,6 +1007,33 @@ func (p *lqlParser) parsePipes() ([]Pipe, error) {
 				return nil, fmt.Errorf("simdlogs: unroll expects a field")
 			}
 			pipes = append(pipes, &UnrollPipe{Field: fs[0]})
+		case "field_names":
+			pipes = append(pipes, &FieldNamesPipe{})
+		case "field_values":
+			fld, err := p.value()
+			if err != nil {
+				return nil, err
+			}
+			fv := &FieldValuesPipe{Field: fld}
+			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "limit") {
+				p.next()
+				n, err := p.intArg()
+				if err != nil {
+					return nil, err
+				}
+				fv.Limit = n
+			}
+			pipes = append(pipes, fv)
+		case "facets":
+			fp := &FacetsPipe{}
+			if p.peek().kind == tIdent && isNumber(p.peek().val) {
+				n, err := p.intArg()
+				if err != nil {
+					return nil, err
+				}
+				fp.N = n
+			}
+			pipes = append(pipes, fp)
 		case "unpack_syslog":
 			up := &UnpackSyslogPipe{}
 			if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "from") {
