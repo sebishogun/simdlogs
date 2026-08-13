@@ -138,6 +138,11 @@ type Field struct {
 type Row struct {
 	Time   int64
 	Fields []Field
+	// NoTime marks a row that has no timestamp of its own -- a stats/aggregation
+	// result, or a projection that did not keep _time. VictoriaLogs treats _time
+	// as an ordinary field subject to projection, so such rows must NOT carry one;
+	// emitting a zero timestamp printed _time=1970-01-01 on every stats row.
+	NoTime bool
 }
 
 // Store is the read surface the engine needs; storage.Store satisfies it.

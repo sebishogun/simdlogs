@@ -70,7 +70,7 @@ func (p *FieldNamesPipe) apply(rows []Row) []Row {
 	}
 	out := make([]Row, 0, len(order))
 	for _, name := range order {
-		out = append(out, Row{Fields: []Field{{"name", name}, {"hits", strconv.Itoa(counts[name])}}})
+		out = append(out, Row{NoTime: true, Fields: []Field{{"name", name}, {"hits", strconv.Itoa(counts[name])}}})
 	}
 	return out
 }
@@ -134,7 +134,7 @@ func runBlockStats(s Store, q *Query) []Row {
 		for _, c := range g.ColumnBytes() {
 			bytes += c.Index + c.Postings + c.Dict + c.Bloom + c.TimeCol
 		}
-		out = append(out, Row{Fields: []Field{
+		out = append(out, Row{NoTime: true, Fields: []Field{
 			{"rows", strconv.Itoa(g.Rows)},
 			{"bytes", strconv.Itoa(bytes)},
 			{"columns", strconv.Itoa(len(g.ColumnNames()))},
@@ -158,7 +158,7 @@ func runFieldNames(s Store, q *Query) []Row {
 		for _, vc := range StatsByField(s, q, name) {
 			hits += vc.Count
 		}
-		out = append(out, Row{Fields: []Field{{"name", name}, {"hits", strconv.Itoa(hits)}}})
+		out = append(out, Row{NoTime: true, Fields: []Field{{"name", name}, {"hits", strconv.Itoa(hits)}}})
 	}
 	return out
 }
@@ -182,7 +182,7 @@ func valueCountRows(vcs []ValueCount, limit int) []Row {
 	}
 	out := make([]Row, 0, len(vcs))
 	for _, vc := range vcs {
-		out = append(out, Row{Fields: []Field{{"value", vc.Value}, {"hits", strconv.Itoa(vc.Count)}}})
+		out = append(out, Row{NoTime: true, Fields: []Field{{"value", vc.Value}, {"hits", strconv.Itoa(vc.Count)}}})
 	}
 	return out
 }
@@ -196,7 +196,7 @@ func facetRows(field string, vcs []ValueCount, n int) []Row {
 	}
 	out := make([]Row, 0, len(vcs))
 	for _, vc := range vcs {
-		out = append(out, Row{Fields: []Field{{"field", field}, {"value", vc.Value}, {"hits", strconv.Itoa(vc.Count)}}})
+		out = append(out, Row{NoTime: true, Fields: []Field{{"field", field}, {"value", vc.Value}, {"hits", strconv.Itoa(vc.Count)}}})
 	}
 	return out
 }

@@ -220,7 +220,7 @@ func statEntryRow(sp *StatsPipe, e *statEntry) Row {
 	for j := range sp.Aggs {
 		fields = append(fields, Field{sp.Aggs[j].Alias, formatAgg(&sp.Aggs[j], &e.slots[j], e.rows, sp.rangeSec)})
 	}
-	return Row{Fields: fields}
+	return Row{NoTime: true, Fields: fields}
 }
 
 // SortPipe is `sort by (fields) [desc] [limit N]`.
@@ -316,7 +316,12 @@ func RunPipeline(s Store, q *Query) []Row {
 	var rows []Row
 	pipes := q.Pipes
 	if len(pipes) > 0 {
-		q.MatAll = false // pipes project their own fields; skip full-record materialize
+		// Only a projecting pipe chain skips the full-record materialize. A chain
+		// that rewrites or slices rows (delete/rename/limit/...) still returns whole
+		// records, and clearing MatAll for those was dropping every field but _time.
+		if PipesProject(pipes) {
+			q.MatAll = false
+		}
 		switch p0 := pipes[0].(type) {
 		case *StatsPipe:
 			rows = runStats(s, q, p0)
@@ -485,7 +490,7 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 		vcs := StatsByField(s, q, sp.By[0])
 		out := make([]Row, 0, len(vcs))
 		for _, vc := range vcs {
-			out = append(out, Row{Fields: []Field{{sp.By[0], vc.Value}, {alias, strconv.Itoa(vc.Count)}}})
+			out = append(out, Row{NoTime: true, Fields: []Field{{sp.By[0], vc.Value}, {alias, strconv.Itoa(vc.Count)}}})
 		}
 		return out
 	}
@@ -790,7 +795,13 @@ func (p *FieldsPipe) apply(rows []Row) []Row {
 	for _, k := range p.Keep {
 		keep[k] = true
 	}
+	// _time is an ordinary field for projection: `fields a, b` drops it unless
+	// asked for, which is what VictoriaLogs does.
+	dropTime := !keep["_time"]
 	for i := range rows {
+		if dropTime {
+			rows[i].NoTime = true
+		}
 		nf := rows[i].Fields[:0]
 		for _, f := range rows[i].Fields {
 			if keep[f.Key] {
@@ -848,7 +859,7 @@ func (p *TopPipe) apply(rows []Row) []Row {
 			fields = append(fields, Field{f, vals[k][i]})
 		}
 		fields = append(fields, Field{"count", strconv.Itoa(c)})
-		out = append(out, Row{Fields: fields})
+		out = append(out, Row{NoTime: true, Fields: fields})
 	}
 	sort.SliceStable(out, func(a, b int) bool {
 		ca, _ := strconv.Atoi(rowField(out[a], "count"))
@@ -1253,7 +1264,11 @@ func (p *DeletePipe) apply(rows []Row) []Row {
 	for _, d := range p.Drop {
 		drop[d] = true
 	}
+	dropTime := drop["_time"] // _time is deletable like any other field
 	for ri := range rows {
+		if dropTime {
+			rows[ri].NoTime = true
+		}
 		nf := rows[ri].Fields[:0]
 		for _, f := range rows[ri].Fields {
 			if !drop[f.Key] {
@@ -1263,4 +1278,24 @@ func (p *DeletePipe) apply(rows []Row) []Row {
 		rows[ri].Fields = nf
 	}
 	return rows
+}
+
+// PipesProject reports whether a pipe chain narrows a row's field set. A chain
+// that only slices or reorders rows (limit/head/tail/sort/offset) still returns
+// whole records, so the engine must materialize every column for it -- matching
+// VictoriaLogs, where `* | limit 5` returns five full records, not five
+// timestamps.
+func PipesProject(pipes []Pipe) bool {
+	for _, p := range pipes {
+		switch p.(type) {
+		case *FieldsPipe, *StatsPipe, *UniqPipe, *TopPipe,
+			*FieldValuesPipe, *FieldNamesPipe, *FacetsPipe,
+			*BlocksCountPipe, *BlockStatsPipe:
+			return true // narrows to a chosen field set or its own aggregate rows
+		}
+	}
+	// Everything else -- limit/head/tail/sort/offset, and the row REWRITERS
+	// (delete/rename/copy/format/math/extract/unpack_*/filter/replace) -- still
+	// emits whole records, so the engine must materialize every column for them.
+	return false
 }

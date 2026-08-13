@@ -238,8 +238,12 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bareSelect := len(q.Pipes) == 0
-	if bareSelect {
-		q.MatAll = true // a bare select returns whole records, not just filter fields
+	if bareSelect || !query.PipesProject(q.Pipes) {
+		// A bare select returns whole records -- and so does one whose pipes only
+		// slice or reorder them (limit/head/sort/offset). Only a pipe that projects
+		// or aggregates (fields/stats/uniq/...) narrows the output, so anything else
+		// must still materialize every column, which is what VictoriaLogs returns.
+		q.MatAll = true
 		// Bound peak memory on an unbounded select, then ERROR rather than silently
 		// truncate. MaxRows (not Limit) so the scan stays PARALLEL -- Limit forces
 		// the serial path because it must return the first N in time order, while
@@ -270,14 +274,23 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 // newline). Shared by the batch select and the live tail so both emit the
 // identical wire shape.
 func appendRowJSON(buf []byte, row query.Row) []byte {
-	buf = append(buf, `{"_time":"`...)
-	buf = time.Unix(0, row.Time).UTC().AppendFormat(buf, time.RFC3339Nano)
-	buf = append(buf, '"')
+	buf = append(buf, '{')
+	first := true
+	if !row.NoTime { // a stats row or a projection without _time carries no timestamp
+		buf = append(buf, `"_time":"`...)
+		buf = time.Unix(0, row.Time).UTC().AppendFormat(buf, time.RFC3339Nano)
+		buf = append(buf, '"')
+		first = false
+	}
 	for _, f := range row.Fields {
 		if f.Key == "_time" {
 			continue
 		}
-		buf = append(buf, ',', '"')
+		if !first {
+			buf = append(buf, ',')
+		}
+		first = false
+		buf = append(buf, '"')
 		buf = appendJSONString(buf, f.Key)
 		buf = append(buf, '"', ':', '"')
 		buf = appendJSONString(buf, f.Value)
