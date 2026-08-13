@@ -217,6 +217,8 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	s.countRows(ing, skip, len(body))
+
 	// One item per document, the shape Elasticsearch clients parse to decide
 	// whether to retry. Written directly: a bulk of 200k documents would
 	// otherwise build 400k maps for the reflective encoder to walk.

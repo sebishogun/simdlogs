@@ -85,8 +85,31 @@ func (s *Server) withTenant(h http.Handler) http.Handler {
 			return
 		}
 		s.countRequest(r.URL.Path)
-		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), tenantKey{}, tn)))
+		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
+		h.ServeHTTP(sw, r.WithContext(context.WithValue(r.Context(), tenantKey{}, tn)))
+		if sw.code >= 400 {
+			atomic.AddInt64(&s.nHTTPErrs, 1)
+		}
 	})
+}
+
+// statusWriter records the status a handler wrote, so /metrics can report the
+// error rate. It forwards Flush and the streaming interfaces the live tail
+// needs -- a wrapper that swallowed them would break tailing entirely.
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // tn is the request's resolved tenant (set by withTenant).

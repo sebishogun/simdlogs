@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
@@ -42,7 +43,16 @@ type Server struct {
 	started    time.Time
 	nIngestReq int64 // ingest requests (atomic)
 	nQueryReq  int64 // query requests (atomic)
-	rr         int64 // round-robin cursor for write routing (atomic)
+	nRowsIn    int64 // log entries ingested (atomic)
+	nBytesIn   int64 // bytes of log data ingested (atomic)
+	nRowsDrop  int64 // entries rejected as malformed (atomic)
+	nHTTPErrs  int64 // responses with a 4xx/5xx status (atomic)
+	nTails     int64 // live tail requests currently open (atomic)
+
+	szMu    sync.Mutex // guards the cached store footprint
+	szBytes int64
+	szAt    time.Time
+	rr      int64 // round-robin cursor for write routing (atomic)
 
 	rmu   sync.Mutex
 	rules []*logRule // metrics-from-logs: LogsQL evaluated on a timer, exposed on /metrics
@@ -227,6 +237,7 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.countRows(ing, skip, len(body))
 	json.NewEncoder(w).Encode(map[string]int{"ingested": ing, "skipped": skip})
 }
 
@@ -240,6 +251,7 @@ func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
 	tn := s.tn(r)
 	lfOpts := ingestOptions(r)
 	ing, skip := ingest.IngestLogfmtOpts(tn.w, body, tn.fallbackTS(), &lfOpts)
+	s.countRows(ing, skip, len(body))
 	if err := tn.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -385,6 +397,8 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // don't let a proxy buffer the stream
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // send headers now so the client's request returns and it can read
+	atomic.AddInt64(&s.nTails, 1)
+	defer atomic.AddInt64(&s.nTails, -1)
 	store := s.tn(r).store
 	cursor := store.TailCursor() // only groups that arrive after we subscribe
 	tick := time.NewTicker(500 * time.Millisecond)

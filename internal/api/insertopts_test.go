@@ -238,3 +238,60 @@ func TestHitsFieldsLimit(t *testing.T) {
 		t.Errorf("remainder total = %d, want 3", last.Total)
 	}
 }
+
+// TestVLMetricNames covers the metrics a dashboard written for the reference
+// reads. Each must carry a REAL value: a metric emitted as a hardcoded zero is
+// worse for an operator than a panel with no data, because it looks like an
+// answer.
+func TestVLMetricNames(t *testing.T) {
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	postTo(t, ts.URL+"/insert/jsonline", "application/x-ndjson",
+		`{"_time":"2024-05-01T00:00:00Z","level":"error"}`+"\n"+
+			`{"_time":"2024-05-01T00:00:01Z","level":"info"}`+"\n"+
+			"not json at all\n")
+	// One request that errors, so the error counter has something to report.
+	r, err := http.Get(ts.URL + "/select/logsql/query")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, r.Body)
+	r.Body.Close()
+
+	r, err = http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	body := string(b)
+
+	for _, want := range []string{
+		"vl_rows_ingested_total 2",
+		"vl_rows_dropped_total 1",
+		"vl_http_errors_total 1",
+		"vl_live_tailing_requests 0",
+		"vl_storage_rows 2",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics missing %q", want)
+		}
+	}
+	// These are gauges whose value depends on the machine; assert only that they
+	// are present and not the fabricated zero.
+	for _, name := range []string{"vl_bytes_ingested_total", "vl_data_size_bytes", "vl_free_disk_space_bytes"} {
+		if !strings.Contains(body, "\n"+name+" ") {
+			t.Errorf("/metrics missing %s", name)
+			continue
+		}
+		if strings.Contains(body, "\n"+name+" 0\n") {
+			t.Errorf("%s reported 0, which is not a measurement", name)
+		}
+	}
+}

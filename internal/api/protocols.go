@@ -39,7 +39,8 @@ func (s *Server) ingestBody(w http.ResponseWriter, r *http.Request, status int,
 	}
 	tn := s.tn(r)
 	opts := ingestOptions(r)
-	parse(tn.w, body, tn.fallbackTS(), &opts)
+	ing, skip := parse(tn.w, body, tn.fallbackTS(), &opts)
+	s.countRows(ing, skip, len(body))
 	if err := tn.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -79,7 +80,8 @@ func (s *Server) insertOTLPLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	tn := s.tn(r)
 	otlpOpts := ingestOptions(r)
-	ingest.IngestOTLPLogsOpts(tn.w, body, tn.fallbackTS(), &otlpOpts)
+	oing, oskip := ingest.IngestOTLPLogsOpts(tn.w, body, tn.fallbackTS(), &otlpOpts)
+	s.countRows(oing, oskip, len(body))
 	if err := tn.w.Flush(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
