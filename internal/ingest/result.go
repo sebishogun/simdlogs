@@ -17,6 +17,41 @@ type Result struct {
 	Accepted int
 	Rejected int
 	Warnings []Warning
+
+	// RejectedAt holds the ZERO-BASED ORDINAL of each rejected record within
+	// the batch, in order.
+	//
+	// A count alone cannot be mapped back to a position, and a caller that
+	// needs per-record statuses -- the Elasticsearch _bulk response, whose
+	// items clients match to their requests BY POSITION -- then has to guess.
+	// Guessing produced the worst possible answer: marking the first N
+	// records failed reported the STORED document as a failure and the
+	// DROPPED one as created, so a client re-sent what landed and treated
+	// what vanished as delivered.
+	//
+	// Bounded by maxRejectedAt: a body of a million bad lines must not become
+	// a million int32s. Past the bound the ordinals stop being recorded and
+	// RejectedTruncated says so, which the caller must treat as "the
+	// positions are not known" rather than as "there were no more".
+	RejectedAt []int32
+
+	// RejectedTruncated reports that RejectedAt stopped short of Rejected.
+	RejectedTruncated bool
+}
+
+// maxRejectedAt bounds the recorded positions. 64Ki covers any batch a client
+// sends deliberately and stops a hostile one from turning a rejection into
+// 4 MB of int32.
+const maxRejectedAt = 1 << 16
+
+// Reject counts a rejected record and remembers WHERE it was.
+func (r *Result) Reject(ordinal int) {
+	r.Rejected++
+	if len(r.RejectedAt) >= maxRejectedAt {
+		r.RejectedTruncated = true
+		return
+	}
+	r.RejectedAt = append(r.RejectedAt, int32(ordinal))
 }
 
 // Add merges another result, for a parser that runs several passes.
@@ -24,6 +59,12 @@ func (r *Result) Add(o Result) {
 	r.Accepted += o.Accepted
 	r.Rejected += o.Rejected
 	r.Warnings = append(r.Warnings, o.Warnings...)
+	// Ordinals are NOT merged: they are relative to their own pass, so
+	// concatenating two passes' positions would produce numbers that index
+	// nothing. A caller that needs them must not use Add.
+	if len(o.RejectedAt) > 0 || o.RejectedTruncated {
+		r.RejectedTruncated = true
+	}
 }
 
 // Warn records a per-record problem that did not stop the batch.

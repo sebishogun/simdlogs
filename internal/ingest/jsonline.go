@@ -237,19 +237,22 @@ func IngestJSONLinesOpts(w *Writer, data []byte, fallback func() int64, opts *Op
 		// One line must not be the whole body. The HTTP layer bounds the
 		// request; this bounds a single record inside it, so a 64 MiB body
 		// cannot be one 64 MiB line that the parser holds entire.
+		// ordinal counts every NON-BLANK line, accepted or not, so it is the
+		// record's position within the batch as the caller numbered it.
+		ordinal := res.Accepted + res.Rejected
 		if w.LineTooLong(len(line)) {
-			res.Rejected++
-			res.Warn(0, "line of %d bytes exceeds the configured maximum", len(line))
+			res.Reject(ordinal)
+			res.Warn(int64(ordinal), "line of %d bytes exceeds the configured maximum", len(line))
 			continue
 		}
 		doc, err := simdjson.Parse(line)
 		if err != nil {
-			res.Rejected++
+			res.Reject(ordinal)
 			continue
 		}
 		v := doc.Root()
 		if v.Kind() != simdjson.Object {
-			res.Rejected++
+			res.Reject(ordinal)
 			continue
 		}
 		for k := range fields {

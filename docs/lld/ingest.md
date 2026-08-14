@@ -150,8 +150,17 @@ This store is **append-only**. `index` and `create` are supported and answer
 201 per item. `update` and `delete` are rejected per item with a 400 and a
 reason, not silently dropped: an `update`'s source is a `{"doc":...}` or
 `{"script":...}` instruction rather than a document, and it used to be stored
-as a log row whose only field was named `doc`; a `delete` used to produce no
-item at all, so a client got a success for a deletion that never happened.
+as an **empty row** carrying only a synthesized timestamp — the ingester drops
+object-valued fields, so the wrapper's single field vanished; a `delete` used
+to produce no item at all, so a client got a success for a deletion that never
+happened.
+
+Two divergences from Elasticsearch, stated rather than implied. ES answers 404
+`document_missing_exception` for an update against a missing document, and 404
+`result: not_found` for a delete — with `errors` staying **false**. This store
+rejects both with 400 because it is append-only and neither operation has a
+meaning here, which the plan requires. And the action cap is 2^20: a body with
+more actions than that fails the request rather than truncating silently.
 
 An action line that cannot be IDENTIFIED fails the whole request with a 400,
 matching Elasticsearch. That is not a shortcut: the body's meaning is carried

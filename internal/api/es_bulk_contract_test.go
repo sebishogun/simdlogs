@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -114,8 +115,10 @@ func TestBulkActionContract(t *testing.T) {
 		},
 		{
 			// The source of an update is {"doc":...} or {"script":...} -- an
-			// instruction, not a document. It used to be stored as a log row
-			// whose only field was named "doc".
+			// instruction, not a document. It used to be stored as an EMPTY
+			// row: the ingester drops object-valued fields, so the wrapper's
+			// only field vanished and the row carried nothing but a
+			// synthesized timestamp.
 			name: "update is rejected, not stored",
 			body: `{"update":{"_index":"logs","_id":"7"}}` + "\n" +
 				`{"doc":{"level":"info"}}` + "\n",
@@ -331,5 +334,109 @@ func TestBulkStoresWhatItAccepts(t *testing.T) {
 	resp.Body.Close()
 	if cnt.Count != 2 {
 		t.Errorf("stored %d rows, want 2", cnt.Count)
+	}
+}
+
+// The reject attribution must name the RIGHT documents.
+//
+// The first implementation marked the FIRST n doc-carrying items 500, and the
+// ingester rejects in body order -- so when the rejected document was not the
+// first, the item that SUCCEEDED was reported failed and the item that was
+// DROPPED was reported created. Elastic's own client matches items positionally
+// and retries anything over 201, so it re-sent the document that had landed (a
+// duplicate, in an append-only store) and recorded the one that vanished as
+// delivered. Both statuses exactly wrong, under a 200.
+func TestBulkRejectAttributionNamesTheRightDocument(t *testing.T) {
+	ts := bulkServer(t)
+	// The second document passes isJSONObject -- it opens and closes as an
+	// object -- and fails the real parse, so the INGESTER rejects it. That is
+	// the only way to exercise the attribution path.
+	body := `{"index":{"_index":"logs","_id":"GOOD"}}` + "\n" +
+		`{"@timestamp":"2023-11-14T22:13:20Z","level":"kept"}` + "\n" +
+		`{"index":{"_index":"logs","_id":"BAD"}}` + "\n" +
+		`{"@timestamp":"2023-11-14T22:13:21Z","level":}` + "\n"
+
+	items, errors, status := postBulk(t, ts, body)
+	if status != http.StatusOK {
+		t.Fatalf("status %d", status)
+	}
+	if len(items) != 2 {
+		t.Fatalf("%d items, want 2: %+v", len(items), items)
+	}
+	if !errors {
+		t.Error("errors = false though a document was rejected")
+	}
+	// GOOD is stored, so it must NOT be reported as a failure.
+	if items[0].Status >= 300 {
+		t.Errorf("the STORED document is reported %d %q -- a client will re-send it",
+			items[0].Status, items[0].ErrTy)
+	}
+	// BAD is not stored, so it must NOT be reported as created.
+	if items[1].Status == 201 {
+		t.Error("the DROPPED document is reported 201 -- a client will record it as delivered")
+	}
+
+	// And the store agrees: exactly one row.
+	resp, err := http.Post(ts+"/_count", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cnt struct{ Count int }
+	json.NewDecoder(resp.Body).Decode(&cnt)
+	resp.Body.Close()
+	if cnt.Count != 1 {
+		t.Errorf("stored %d rows, want 1", cnt.Count)
+	}
+}
+
+// A body the client fills with newlines must not steer the server's
+// allocation. The presize was bytes.Count(body,'\n')/2 ops of 112 bytes each --
+// 56 bytes reserved per body byte, so 64 MiB of newlines asked for 3.5 GiB,
+// and the action cap did not bound it because the reservation ran first.
+func TestBulkNewlineBodyDoesNotAmplifyAllocation(t *testing.T) {
+	const n = 1 << 20 // 1 MiB of newlines
+	body := make([]byte, n)
+	for i := range body {
+		body[i] = '\n'
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	ops, perr := parseBulk(body)
+	runtime.ReadMemStats(&after)
+
+	if perr != "" {
+		t.Fatalf("a body of newlines should parse to zero actions, got %q", perr)
+	}
+	if len(ops) != 0 {
+		t.Fatalf("%d actions from a body of newlines", len(ops))
+	}
+	grew := after.TotalAlloc - before.TotalAlloc
+	// A FIXED reservation, not one the client chooses. bulkPresize is ~458 KB
+	// and is paid once per request regardless of body size; 4 MiB is generous
+	// against it.
+	if grew > 4<<20 {
+		t.Errorf("parsing %d bytes of newlines allocated %d bytes (%.1fx the body); "+
+			"the reservation is steered by the client", n, grew, float64(grew)/float64(n))
+	}
+	t.Logf("%d-byte newline body -> %d actions, %d bytes allocated (%.2fx)",
+		n, len(ops), grew, float64(grew)/float64(n))
+}
+
+// Actions past the cap must FAIL the request, not vanish under a 200.
+func TestBulkOverActionCapFails(t *testing.T) {
+	var sb strings.Builder
+	// One more action than the cap allows. Each is minimal so the body stays
+	// inside the size limits.
+	for i := 0; i <= esBulkMaxActions; i++ {
+		sb.WriteString("{\"delete\":{}}\n") // no source line: one line per action
+	}
+	ops, perr := parseBulk([]byte(sb.String()))
+	if perr == "" {
+		t.Errorf("%d actions parsed with no error; the ones past the cap vanished silently", len(ops))
+	}
+	if !strings.Contains(perr, "actions") {
+		t.Errorf("error %q does not say what was exceeded", perr)
 	}
 }

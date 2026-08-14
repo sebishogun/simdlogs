@@ -194,6 +194,8 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 	fallback := tn.fallbackTS()
 	opts := ingestOptions(r)
 	var ing, skip int
+	var rejectedAt []int32
+	truncated := false
 	if len(docs) >= ingest.MinParallelBytes {
 		var werr error
 		ing, skip, werr = ingest.IngestJSONLinesParallelCfg(tn.store, docs, fallback, s.parallelCfg(), &opts)
@@ -201,12 +203,19 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 			s.failIngest(w, werr, ing, skip, len(body))
 			return
 		}
+		// The parallel path shards the body, so a shard's ordinals are
+		// relative to its own shard. Reporting them as batch positions would
+		// be the same guess with extra steps, so the positions are declared
+		// UNKNOWN and markBulkRejects reports every candidate rather than
+		// picking wrong ones.
+		truncated = skip > 0
 	} else {
 		// Mark before adding: the tenant's buffer is shared, so only
 		// FlushMark can report on the rows this request contributed.
 		mark := tn.w.Mark()
 		res, perr := ingest.IngestJSONLinesOpts(tn.w, docs, fallback, &opts)
 		ing, skip = res.Accepted, res.Rejected
+		rejectedAt, truncated = res.RejectedAt, res.RejectedTruncated
 		if perr != nil {
 			s.countRows(ing, skip, len(body))
 			s.writeErr(w, r, ndjsonSpec(), ingest.StatusFor(perr), perr.Error())
@@ -226,25 +235,17 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 
 	s.countRows(ing, skip, len(body))
 
-	// The ingester reports only a COUNT of rejects, which cannot be mapped back
-	// to a position. Every document handed to it was already checked to be a
-	// JSON object by parseBulk, so a reject here is a failure of a different
-	// kind: report it on the items that could have produced it rather than
-	// claiming 201 for all of them.
-	if skip > 0 {
-		marked := 0
-		for i := range ops {
-			if ops[i].doc != nil && ops[i].errType == "" && marked < skip {
-				ops[i].status = 500
-				ops[i].errType = "server_error"
-				ops[i].errMsg = "the document was not stored; its position within the batch is not attributable"
-				marked++
-			}
-		}
-	}
+	markBulkRejects(ops, skip, rejectedAt, truncated)
 
 	w.Header().Set("Content-Type", "application/json")
-	out := make([]byte, 0, 48+64*len(ops))
+	// Capped for the same reason the op presize is: len(ops) reaches the
+	// action cap, and 64 bytes per item is 64 MB reserved up front. append
+	// grows it for a bulk that genuinely needs it.
+	outCap := 48 + 64*len(ops)
+	if outCap > 1<<22 {
+		outCap = 1 << 22
+	}
+	out := make([]byte, 0, outCap)
 	out = append(out, `{"took":0,"errors":`...)
 	out = strconv.AppendBool(out, bulkHasError(ops))
 	out = appendBulkItems(out, ops)

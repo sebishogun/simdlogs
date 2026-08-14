@@ -13,8 +13,12 @@ import (
 // defects, all silent:
 //
 //   - An `update` action's source line is a WRAPPER -- {"doc":{...}} or
-//     {"script":{...}} -- not a document. It was stored as a log row with a
-//     field named "doc" holding the JSON blob.
+//     {"script":{...}} -- not a document. It was stored as an EMPTY log row
+//     carrying only a synthesized timestamp: the ingester drops object-valued
+//     fields, so the wrapper's single field vanished and what landed was a row
+//     with no content at all. (An earlier version of this comment said the row
+//     carried a field named "doc". Measured against the pre-2.5 code, it did
+//     not -- the row was empty.)
 //   - A `delete` was swallowed with no item and no error, so a client asking
 //     for a deletion got a success and no indication it did not happen.
 //   - The response emitted one item per INGESTED DOCUMENT rather than one per
@@ -48,6 +52,20 @@ type bulkOp struct {
 // make the server build.
 const esBulkMaxActions = 1 << 20
 
+// bulkPresize is the INITIAL reservation: a fixed size a client cannot steer.
+//
+// Sized to a typical bulk rather than the largest possible one. 4096 ops is
+// ~458 KB and covers the batch sizes agents actually send (Filebeat defaults
+// to 50, Logstash to 125, Fluentd to 1000), so the common case is one
+// allocation. A genuinely huge bulk grows past it through append, whose
+// doubling is amortized O(1) and costs ~18 reallocations for a 200k-action
+// body -- nothing against parsing 200k actions.
+//
+// The number matters because it is paid per REQUEST: at the default
+// MaxConcurrentWrite of 32, a 7 MB reservation would be 234 MB of memory held
+// for bulks that mostly do not need it.
+const bulkPresize = 4096
+
 // parseBulk splits a _bulk body into its actions, in order.
 //
 // Every action produces exactly one bulkOp -- that is what keeps the response
@@ -65,13 +83,30 @@ const esBulkMaxActions = 1 << 20
 // still known: an unsupported operation, a missing source line, a source that
 // is not an object.
 func parseBulk(body []byte) ([]bulkOp, string) {
-	// Presized: a bulk is an action line and a source line per document, so
-	// half the newline count is the estimate. Growing a slice of 200k structs
-	// from nil reallocates eighteen times and copies the whole thing each
-	// time.
-	ops := make([]bulkOp, 0, bytes.Count(body, []byte{'\n'})/2+1)
+	// Presized to a CAP, not to an estimate taken from the body.
+	//
+	// The estimate was bytes.Count(body, '\n')/2, which the client controls
+	// freely: a body of nothing but newlines yields ZERO actions and reserved
+	// one bulkOp per two bytes. At 112 bytes per op that is 56 bytes reserved
+	// per body byte -- 3.5 GiB for a 64 MiB body of newlines, 28 GiB for the
+	// 512 MiB decompressed limit, from a gzip POST of about half a megabyte.
+	// esBulkMaxActions did not bound it, because the reservation happened
+	// before the loop.
+	//
+	// It was also a second full pass over the body whose only consumer was
+	// that estimate, and the parse loop below finds every newline anyway.
+	// append grows past the cap for a genuinely large bulk, which is the case
+	// that should pay for the copying rather than every hostile one.
+	ops := make([]bulkOp, 0, bulkPresize)
 	rest := body
-	for len(rest) > 0 && len(ops) < esBulkMaxActions {
+	for len(rest) > 0 {
+		if len(ops) >= esBulkMaxActions {
+			// Silently dropping the rest and answering 200 is the same silent
+			// loss this task exists to remove: reachable at 14.7 MB, well
+			// inside the body limit, with no error anywhere.
+			return nil, "bulk request contains more than " +
+				strconv.Itoa(esBulkMaxActions) + " actions"
+		}
 		line, tail := nextLine(rest)
 		rest = tail
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -109,8 +144,10 @@ func parseBulk(body []byte) ([]bulkOp, string) {
 
 		if op == "update" {
 			// The source is {"doc":...} or {"script":...}, a partial-update
-			// instruction rather than a document. Storing it produced a log
-			// row whose only field was named "doc".
+			// instruction rather than a document. Storing it produced an EMPTY
+			// row: the ingester drops object-valued fields, so the wrapper's
+			// only field vanished and what landed carried nothing but a
+			// synthesized timestamp.
 			cur.status = 400
 			cur.errType = "illegal_argument_exception"
 			cur.errMsg = "update is not supported: this is an append-only log store"
@@ -432,4 +469,59 @@ func bulkHasError(ops []bulkOp) bool {
 		}
 	}
 	return false
+}
+
+// markBulkRejects maps the ingester's rejected records onto their items.
+//
+// The ingester's docs are the doc-carrying ops in order, so ordinal k is the
+// k-th of them. Getting this wrong is not a cosmetic error: the first attempt
+// marked the FIRST n doc-carrying items 500, which reported the STORED
+// document as failed and the DROPPED one as created. Elastic's own client
+// matches items positionally and retries anything over 201, so it re-sent what
+// had landed -- a duplicate, in an append-only store -- and recorded what had
+// vanished as delivered.
+//
+// When the positions are NOT known (the parallel path shards the body, so a
+// shard's ordinals index nothing at batch scale), every candidate item is
+// marked instead of guessing at n of them. Over-reporting causes duplicates,
+// which a caller can reconcile; under-reporting causes loss, which it cannot.
+func markBulkRejects(ops []bulkOp, rejected int, rejectedAt []int32, truncated bool) {
+	if rejected <= 0 {
+		return
+	}
+	// The doc-carrying ops, in the order the ingester saw them.
+	idx := make([]int, 0, len(ops))
+	for i := range ops {
+		if ops[i].doc != nil && ops[i].errType == "" {
+			idx = append(idx, i)
+		}
+	}
+
+	if !truncated && len(rejectedAt) == rejected {
+		for _, ord := range rejectedAt {
+			if int(ord) < 0 || int(ord) >= len(idx) {
+				truncated = true // an ordinal that indexes nothing: fall back
+				break
+			}
+		}
+		if !truncated {
+			for _, ord := range rejectedAt {
+				i := idx[ord]
+				ops[i].status = 500
+				ops[i].errType = "server_error"
+				ops[i].errMsg = "the document was not stored"
+			}
+			return
+		}
+	}
+
+	// Positions unknown. Say so on every candidate rather than choosing.
+	msg := "the document may not have been stored: " +
+		strconv.Itoa(rejected) + " of " + strconv.Itoa(len(idx)) +
+		" documents in this batch were rejected and their positions are not known"
+	for _, i := range idx {
+		ops[i].status = 500
+		ops[i].errType = "server_error"
+		ops[i].errMsg = msg
+	}
 }
