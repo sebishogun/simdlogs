@@ -61,34 +61,80 @@ func (c LocalCold) Delete(name string) error { return os.Remove(c.path(name)) }
 // stays valid until the reader is done (space is reclaimed then), so a
 // concurrent query never sees invalid bytes.
 func (s *Store) Demote(cutoff int64, cold ColdStore) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	kept := s.groups[:0]
-	moved := 0
+	s.structMu.Lock()
+	defer s.structMu.Unlock()
+
+	// Pick candidates, then upload outside the store lock: cold Put is
+	// network or disk IO and holding the write lock across it stalls every
+	// query.
+	s.mu.RLock()
+	var cands []*groupEntry
 	for _, g := range s.groups {
 		if g.timeMax < cutoff {
-			data, err := os.ReadFile(g.path)
-			if err != nil {
-				kept = append(kept, g)
-				continue
+			// Same reason as recompaction: the upload happens outside the
+			// lock, and the entry must stay mapped until this operation is
+			// done with it.
+			if g.acquire() {
+				cands = append(cands, g)
 			}
-			if err := cold.Put(filepath.Base(g.path), data); err != nil {
-				s.groups = append(kept, g) // keep it; surface the error
-				return moved, err
-			}
-			os.Remove(g.path) // unlink; the mapping (if any) stays valid until unmapped
-			moved++
+		}
+	}
+	s.mu.RUnlock()
+	defer func() {
+		for _, g := range cands {
+			g.release()
+		}
+	}()
+
+	moved := 0
+	for _, g := range cands {
+		data, err := os.ReadFile(g.path)
+		if err != nil {
 			continue
 		}
-		kept = append(kept, g)
+		if err := cold.Put(filepath.Base(g.path), data); err != nil {
+			return moved, err
+		}
+		// The cold copy is durable, so the local one may go. Same order as
+		// retention: commit the removal, retire the version so its mapping
+		// outlives any reader still using it, then unlink. The previous code
+		// dropped the entry and discarded the unmap callback, which leaked
+		// the mapping -- an unlinked file's blocks stay allocated while a
+		// mapping of it lives, so demotion freed nothing until process exit.
+		s.mu.Lock()
+		idx := -1
+		for i, cur := range s.groups {
+			if cur == g {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			s.mu.Unlock()
+			continue // already removed by retention
+		}
+		if err := s.man.commit(nil, []uint64{g.id}, nil); err != nil {
+			s.mu.Unlock()
+			return moved, err
+		}
+		s.groups = append(s.groups[:idx], s.groups[idx+1:]...)
+		s.mu.Unlock()
+		g.retire()
+		if rerr := os.Remove(g.path); rerr != nil && !os.IsNotExist(rerr) {
+			retentionFailures.Add(1)
+			pendingTombstones.Add(1)
+			s.addTombstone(g.path)
+		}
+		moved++
 	}
-	s.groups = kept
 	return moved, nil
 }
 
 // Promote restores a cold group back to local disk and into the index so it can
 // be queried again.
 func (s *Store) Promote(name string, cold ColdStore) error {
+	s.structMu.Lock()
+	defer s.structMu.Unlock()
 	data, err := cold.Get(name)
 	if err != nil {
 		return err
@@ -106,9 +152,30 @@ func (s *Store) Promote(name string, cold ColdStore) error {
 		unmap()
 		return err
 	}
-	var id uint64
-	fmt.Sscanf(filepath.Base(final), "group-%d.bin", &id)
+	id, ok := groupIDFromName(final)
+	if !ok {
+		unmap()
+		return fmt.Errorf("storage: cold object %q is not a group file name", name)
+	}
 	s.mu.Lock()
+	// Promotion is idempotent: a group already visible is not added twice,
+	// which would put two entries with one id in the index and unmap the same
+	// file from both.
+	for _, g := range s.groups {
+		if g.id == id {
+			s.mu.Unlock()
+			unmap()
+			return nil
+		}
+	}
+	// Commit before it becomes visible, same as AppendGroup: the file is on
+	// disk either way, and the manifest decides whether it is part of the
+	// store.
+	if err := s.man.commit([]uint64{id}, nil, nil); err != nil {
+		s.mu.Unlock()
+		unmap()
+		return err
+	}
 	s.groups = append(s.groups, &groupEntry{id: id, path: final, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax, unmap: unmap})
 	s.sortGroups()
 	s.mu.Unlock()

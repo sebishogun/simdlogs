@@ -1,7 +1,7 @@
 package storage
 
 import (
-	"time"
+	"os"
 )
 
 // Tiered storage. A group is written LZ4-compressed for fast value reads; once
@@ -11,16 +11,15 @@ import (
 // no change -- recompaction is purely a background rewrite.
 //
 // The mmap lifetime is the subtlety: a query that started before a swap still
-// holds the old *Reader and reads its mapped blob, so unmapping immediately would
-// segfault. Reference counting on the read path would tax every query, so a
-// replaced mapping is retired and unmapped only after a grace period far longer
-// than any request the server will serve.
-const retireGrace = 5 * time.Minute
-
-type retiredMap struct {
-	unmap func() error
-	at    time.Time
-}
+// holds the old *Reader and reads its mapped blob, so unmapping immediately
+// would segfault.
+//
+// This used to be handled by retiring the replaced mapping and unmapping it
+// after a five-minute grace period, on the assumption that no request lives
+// that long. Nothing bounded query duration to five minutes, so the
+// assumption was unfounded rather than merely tight. Ownership is explicit
+// now: a swap installs a NEW group version and retires the old one, whose
+// mapping is released when the last snapshot holding it closes (snapshot.go).
 
 // needsRecompact reports whether any of the group's dict blocks is still stored
 // with the default LZ4 codec -- i.e. whether flate has anything left to do. A
@@ -97,10 +96,21 @@ func (s *Store) Recompact(cutoff int64, dropPostings bool) (groups int, before, 
 	cands := make([]*groupEntry, 0, len(s.groups))
 	for _, g := range s.groups {
 		if g.timeMax < cutoff {
-			cands = append(cands, g)
+			// Take a reference: the candidate list is read outside the
+			// lock, and retention or demotion may retire the entry in the
+			// meantime. Without this, needsRecompact reads an unmapped
+			// region -- a segfault, not a stale answer.
+			if g.acquire() {
+				cands = append(cands, g)
+			}
 		}
 	}
 	s.mu.RUnlock()
+	defer func() {
+		for _, g := range cands {
+			g.release()
+		}
+	}()
 
 	for _, ge := range cands {
 		r := ge.reader
@@ -128,17 +138,39 @@ func (s *Store) Recompact(cutoff int64, dropPostings bool) (groups int, before, 
 			unmap()
 			return groups, before, after, rerr
 		}
+		// Install the rewritten group as a new version and retire the old
+		// one. The entry is replaced rather than mutated in place because a
+		// snapshot captured the old *Reader: mutating ge.unmap under it would
+		// leave the snapshot's reference guarding the new mapping while the
+		// old one it is actually reading went unowned.
 		s.mu.Lock()
-		old := ge.unmap
-		ge.reader, ge.unmap = nr, unmap
-		s.retired = append(s.retired, retiredMap{unmap: old, at: time.Now()})
+		idx := -1
+		for i, cur := range s.groups {
+			if cur == ge {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 || ge.retired.Load() {
+			// Retention removed this group while it was being rewritten. The
+			// file we just wrote resurrected it; take it back out.
+			s.mu.Unlock()
+			unmap()
+			os.Remove(ge.path)
+			continue
+		}
+		ne := &groupEntry{
+			id: ge.id, path: ge.path, reader: nr,
+			timeMin: nr.TimeMin, timeMax: nr.TimeMax, unmap: unmap,
+		}
+		s.groups[idx] = ne
 		s.mu.Unlock()
+		ge.retire()
 
 		groups++
 		before += oldSize
 		after += int64(len(blob))
 	}
-	s.sweepRetired()
 	return groups, before, after, nil
 }
 
@@ -148,22 +180,4 @@ func (s *Store) Recompact(cutoff int64, dropPostings bool) (groups int, before, 
 // data it names.
 func writeGroupFile(path string, blob []byte) error {
 	return writeFileAtomic(path, blob, DataFileMode)
-}
-
-// sweepRetired unmaps replaced mappings whose grace period has passed.
-func (s *Store) sweepRetired() {
-	now := time.Now()
-	s.mu.Lock()
-	keep := s.retired[:0]
-	for _, r := range s.retired {
-		if now.Sub(r.at) < retireGrace {
-			keep = append(keep, r)
-			continue
-		}
-		if r.unmap != nil {
-			r.unmap()
-		}
-	}
-	s.retired = keep
-	s.mu.Unlock()
 }

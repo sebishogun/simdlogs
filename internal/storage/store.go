@@ -24,7 +24,11 @@ type Store struct {
 	// tombstones are files whose group is committed as removed but whose
 	// unlink failed; retried on every later retention pass.
 	tombstones []string
-	retired    []retiredMap // mappings replaced by Recompact, unmapped after a grace period
+	// structMu serializes structural operations -- recompaction, cold
+	// demotion, promotion -- against each other. They each read a candidate
+	// set, do IO, then swap; overlapping two of them lets a stale candidate
+	// recreate a group another one removed.
+	structMu sync.Mutex
 }
 
 type groupEntry struct {

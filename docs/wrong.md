@@ -1165,3 +1165,38 @@ An absolute bound (512 rows) beside the fractional one:
     needle                                     ~10us   unchanged
 
 The shape is in the per-op gate now, so it cannot quietly regress again.
+
+## Reference-counted mappings are not enough without referencing the candidates
+
+**Believed.** Task 4.1 gave every group version a reference count, so
+retention, recompaction and demotion could retire a version and let the
+last reader release it. With that in place, tiering was thought safe.
+
+**Actually.** It segfaulted within three concurrent runs. `Recompact`
+collected its candidate entries under a read lock, released the lock, and
+then called `needsRecompact()` on each raw `*Reader` -- doing IO and
+parsing outside the lock, on purpose, so a rewrite does not stall
+queries. Retention retired and unmapped one of those candidates in the
+meantime, and the next `get32` read a freed page:
+
+    unexpected fault address 0x7f18e902319d
+    [signal SIGSEGV: segmentation violation]
+    encoding/binary.littleEndian.Uint32(...)
+    storage.parseDictSec(...)  dict.go:209
+    storage.(*Reader).needsRecompact(...)  recompact.go:34
+    storage.(*Store).Recompact(...)  recompact.go:106
+
+`Demote` had the identical shape: candidates collected under the lock,
+`os.ReadFile` and the cold upload outside it.
+
+The reference count protects a reader that *holds* one. A candidate list
+is a set of pointers with no reference taken, which is exactly what the
+old raw-`*Reader` API was -- the bug moved rather than went away.
+`acquire()` on each candidate with a deferred `release()` closes it.
+
+**How it surfaced.** `TestTieringOperationsConcurrent`, written for task
+4.3, running retention, recompaction, demotion and eight snapshot loops
+against one store. It failed on the first run, before any of the code it
+was written to test had been reviewed. A structural mutex serializing
+recompaction against demotion would not have caught it: retention does
+not take that mutex, and does not need to.
