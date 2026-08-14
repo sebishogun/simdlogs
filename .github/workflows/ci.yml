@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The required job. Everything that can fail on the reference platform
+  # fails here, bare -- no pipe, so a failure cannot be laundered into a
+  # green exit by the exit status of a downstream command.
+  test:
+    name: linux/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt reports:"; echo "$out"; exit 1
+          fi
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./...
+      - name: race
+        run: go test -race ./...
+      - name: purego
+        run: go test -tags purego ./...
+      - name: whitespace
+        run: git diff --check
+
+  # Compile-only for the targets the kernels claim to support. These do not
+  # run: no hardware, and a build that passes is the claim being made.
+  cross:
+    name: build ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [arm64, ppc64le, s390x, riscv64, 386]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
+      - name: build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
+      - name: build purego
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -tags purego ./...
