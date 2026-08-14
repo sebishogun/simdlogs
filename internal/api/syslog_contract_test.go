@@ -13,11 +13,13 @@ import (
 // The native syslog transport contract.
 //
 // RFC 6587 defines TWO framings for syslog over TCP and a receiver is expected
-// to handle both. Only the newline form was read, and rsyslog's omfwd and
-// syslog-ng's syslog() driver both send OCTET-COUNTED by default -- so the
-// default configuration of the two most common forwarders stored the byte
-// count and the space as part of the message, and split any message containing
-// a newline across several rows.
+// to handle both. Only the newline form was read, so an octet-counted sender's
+// messages stored the count as the HOSTNAME field, and a counted message
+// containing a newline was split across rows.
+//
+// syslog-ng's syslog() driver defaults to octet-counting over TCP; rsyslog's
+// omfwd does not (TCP_Framing="traditional"). An earlier version of this
+// comment claimed both.
 //
 // The listener also had no read deadline (an opened-and-abandoned connection
 // held a goroutine and its buffer forever), no connection limit, no reported
@@ -91,6 +93,16 @@ func TestSyslogFramings(t *testing.T) {
 			waitRows(t, srv, tc.lines)
 			if got := rowCountOf(t, srv); got != tc.lines {
 				t.Errorf("stored %d rows, want %d", got, tc.lines)
+			}
+			// The FIELDS, not only the count. A mis-framed message stores
+			// exactly one row too -- with the octet count in hostname and the
+			// priority in app_name -- so deleting the octet-counting dispatch
+			// left two of these subtests green when this was a count-only
+			// assertion.
+			if f := srv.defaultTenantFields(); f != nil {
+				if h := f["hostname"]; h != "myhost" {
+					t.Errorf("hostname = %q, want myhost: the framing was misread", h)
+				}
 			}
 		})
 	}
@@ -307,5 +319,150 @@ func TestSyslogUDPOversizedDatagramIsDropped(t *testing.T) {
 	waitRows(t, srv, 1)
 	if got := rowCountOf(t, srv); got != 1 {
 		t.Fatalf("the good datagram stored %d rows, want 1", got)
+	}
+}
+
+// A newline-framed message LARGER THAN THE READ BUFFER must be stored, and the
+// connection must survive it.
+//
+// The first version returned an error on every path out of bufio's
+// ErrBufferFull branch, so the effective ceiling was the 8 KiB read buffer
+// rather than MaxFrameBytes -- and the caller closes the connection on a
+// framing error, so one long message also took the good message behind it. The
+// pre-task scanner handled a 500 KB line. A forwarded stack trace or a JSON
+// payload routinely exceeds 8 KiB.
+func TestSyslogLongNewlineFrameIsStored(t *testing.T) {
+	for _, size := range []int{4000, 8192, 65536, 500000} {
+		t.Run(fmt.Sprintf("%d", size), func(t *testing.T) {
+			srv, addr := syslogTestServer(t, SyslogConfig{
+				MaxFrameBytes: 1 << 20,
+				FlushLines:    1,
+			})
+			body := strings.Repeat("x", size)
+			long := "<13>1 2024-05-01T00:00:00Z myhost myapp 1234 ID47 - " + body
+
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The long message, then a good one behind it: the second proves
+			// the connection survived.
+			io.WriteString(conn, long+"\n"+msg5424+"\n")
+			conn.Close()
+
+			waitRows(t, srv, 2)
+			if got := rowCountOf(t, srv); got != 2 {
+				t.Errorf("stored %d rows for a %d-byte message, want 2 "+
+					"(the long one and the good one behind it)", got, size)
+			}
+		})
+	}
+}
+
+// A line that ends at EOF with no newline must still be stored. Returning
+// io.EOF for it reported a clean end of stream for data that was lost, with no
+// counter and no log.
+func TestSyslogPartialLineAtEOFIsStored(t *testing.T) {
+	srv, addr := syslogTestServer(t, SyslogConfig{MaxFrameBytes: 1 << 20, FlushLines: 1})
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Longer than the read buffer, and no terminator.
+	io.WriteString(conn, "<13>1 2024-05-01T00:00:00Z h a - - - "+strings.Repeat("y", 20000))
+	conn.Close()
+
+	waitRows(t, srv, 1)
+	if got := rowCountOf(t, srv); got != 1 {
+		t.Errorf("stored %d rows for a long unterminated line, want 1", got)
+	}
+}
+
+// The flush must happen on TIME while the sender is ACTIVE, not only when it
+// goes idle. Re-arming the deadline relative to now on every read let any
+// sender faster than FlushEvery push it forward forever.
+func TestSyslogFlushesWhileTheSenderIsActive(t *testing.T) {
+	srv, addr := syslogTestServer(t, SyslogConfig{
+		FlushEvery:  50 * time.Millisecond,
+		FlushLines:  1 << 20, // never reached: the TIME half is what is tested
+		ReadTimeout: 30 * time.Second,
+	})
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Keep sending, slower than FlushEvery, and check the rows appear while
+	// the connection is still open and the sender still going.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 60; i++ {
+			fmt.Fprintf(conn, "%s\n", msg5424)
+			time.Sleep(20 * time.Millisecond) // bench:untimed -- pacing the sender
+		}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	seen := 0
+	for time.Now().Before(deadline) && seen == 0 {
+		seen = rowCountOf(t, srv)
+		time.Sleep(10 * time.Millisecond) // bench:untimed -- polling for visibility
+	}
+	<-done
+	if seen == 0 {
+		t.Error("nothing became queryable while the sender was active: " +
+			"the time-based flush only fires when the connection goes idle")
+	}
+}
+
+// A transient flush failure must not kill the listener permanently. The
+// pre-task code logged, counted and kept serving.
+func TestSyslogTransientFlushFailureDoesNotKillTheListener(t *testing.T) {
+	// flushSyslog's contract, exercised directly: only a CLOSED writer is
+	// shutdown. Driving a real disk failure from a test is not portable, so
+	// the discrimination itself is what is pinned.
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := 0
+	if got := srv.flushSyslog(&batch, true, "test"); got != flushOK {
+		t.Errorf("a healthy flush returned %v, want flushOK", got)
+	}
+	srv.Close()
+	batch = 0
+	if got := srv.flushSyslog(&batch, true, "test"); got != flushShutdown {
+		t.Errorf("a closed writer returned %v, want flushShutdown -- a transient "+
+			"failure and a shutdown must not be the same answer", got)
+	}
+}
+
+// One UDP datagram is ONE message, newlines included. The line-splitting entry
+// point turned a datagram containing a newline into two rows.
+func TestSyslogUDPDatagramWithNewlineIsOneMessage(t *testing.T) {
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	udp, _, err := srv.ListenSyslogConfig("127.0.0.1:0", SyslogConfig{
+		FlushLines: 1,
+		FlushEvery: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := net.Dial("udp", udp.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	io.WriteString(c, msg5424+"\nsecond line of the same message")
+
+	waitRows(t, srv, 1)
+	if got := rowCountOf(t, srv); got != 1 {
+		t.Errorf("one datagram containing a newline stored %d rows, want 1", got)
 	}
 }

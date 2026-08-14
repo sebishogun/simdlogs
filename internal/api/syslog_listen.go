@@ -163,13 +163,16 @@ func (s *Server) serveSyslogUDP(c net.PacketConn, cfg SyslogConfig) {
 	buf := make([]byte, 64*1024) // max practical syslog datagram
 	fallback := s.def.fallbackTS()
 	batch := 0
-	// A read deadline is what makes the batch flush on TIME as well as on
-	// count. Without it a lone datagram sat unflushed until FlushLines more
-	// arrived, so a low-rate sender's messages were never queryable -- the
-	// batching fix's own regression, and exactly the kind a per-line flush
-	// cannot have.
+	// An ABSOLUTE next-flush instant, not now+FlushEvery per iteration.
+	//
+	// Re-arming the deadline relative to NOW on every read meant any sender
+	// faster than FlushEvery pushed it forward forever: measured, a datagram
+	// every 20ms with FlushEvery=50ms left 65 messages unqueryable after 1.3
+	// seconds and only flushed when the sender STOPPED. The flush was
+	// idle-only, which is the opposite of what it is for.
+	nextFlush := time.Now().Add(cfg.FlushEvery)
 	for {
-		if err := c.SetReadDeadline(time.Now().Add(cfg.FlushEvery)); err != nil {
+		if err := c.SetReadDeadline(nextFlush); err != nil {
 			s.flushSyslog(&batch, true, "udp")
 			return
 		}
@@ -177,10 +180,11 @@ func (s *Server) serveSyslogUDP(c net.PacketConn, cfg SyslogConfig) {
 		if err != nil {
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
-				// Idle tick: flush whatever is buffered and keep serving.
-				if !s.flushSyslog(&batch, false, "udp") {
+				// The flush instant arrived: flush and set the next one.
+				if s.flushSyslog(&batch, false, "udp") == flushShutdown {
 					return
 				}
+				nextFlush = time.Now().Add(cfg.FlushEvery)
 				continue
 			}
 			s.flushSyslog(&batch, true, "udp")
@@ -197,7 +201,11 @@ func (s *Server) serveSyslogUDP(c net.PacketConn, cfg SyslogConfig) {
 			log.Printf("syslog udp: datagram of %d bytes or more truncated by the receive buffer; dropped", n)
 			continue
 		}
-		res, ierr := ingest.IngestSyslog(s.def.w, buf[:n], fallback)
+		// ONE datagram is ONE message (RFC 5426), newlines included. The
+		// line-splitting entry point turned a datagram containing a newline
+		// into two rows -- the same defect the counted TCP path was fixed for,
+		// left in place on UDP while the LLD claimed otherwise.
+		res, ierr := ingest.IngestSyslogMessage(s.def.w, buf[:n], fallback, nil)
 		s.countRows(res.Accepted, res.Rejected, n)
 		if ierr != nil {
 			// UDP has no response, so an unreported parse failure is silent
@@ -208,29 +216,44 @@ func (s *Server) serveSyslogUDP(c net.PacketConn, cfg SyslogConfig) {
 		}
 		batch += res.Accepted
 		if batch >= cfg.FlushLines {
-			if !s.flushSyslog(&batch, false, "udp") {
+			// Only a CLOSED writer stops the listener. A transient failure is
+			// logged and counted, and serving continues.
+			if s.flushSyslog(&batch, false, "udp") == flushShutdown {
 				return
 			}
+			nextFlush = time.Now().Add(cfg.FlushEvery)
 		}
 	}
 }
 
-// flushSyslog performs the batched durable flush and reports failure. Returns
-// false when the writer is closed, which means shutdown.
-func (s *Server) flushSyslog(batch *int, force bool, transport string) bool {
+// flushOutcome distinguishes the two reasons a flush can fail, which the first
+// version conflated: it returned false for BOTH, and every caller returned on
+// false, so one transient flush failure -- a full disk, a permissions blip --
+// permanently killed the UDP listener. The pre-task code logged, counted and
+// kept serving.
+type flushOutcome int
+
+const (
+	flushOK       flushOutcome = iota
+	flushFailed                // transient: report it, keep serving
+	flushShutdown              // the writer is closed: stop
+)
+
+// flushSyslog performs the batched durable flush and reports what happened.
+func (s *Server) flushSyslog(batch *int, force bool, transport string) flushOutcome {
 	if *batch == 0 && !force {
-		return true
+		return flushOK
 	}
 	*batch = 0
 	if err := s.def.w.Flush(); err != nil {
 		if errors.Is(err, ingest.ErrWriterClosed) {
-			return false // shutting down
+			return flushShutdown
 		}
 		atomic.AddInt64(&s.nHTTPErrs, 1)
 		log.Printf("syslog %s: flush failed: %v", transport, err)
-		return false
+		return flushFailed
 	}
-	return true
+	return flushOK
 }
 
 // serveSyslogTCP accepts connections up to the configured limit.
@@ -287,47 +310,52 @@ func (s *Server) handleSyslogConn(conn net.Conn, cfg SyslogConfig) {
 	fr := newSyslogFrameReader(conn, 8<<10, cfg.MaxFrameBytes)
 
 	batch := 0
-	flushTick := time.NewTicker(cfg.FlushEvery)
-	defer flushTick.Stop()
-	// The ticker fires on another goroutine's schedule, so the flush it
-	// triggers is signalled rather than performed there: two goroutines
-	// flushing the same writer concurrently is a race the writer does not
-	// promise to survive.
-	timeUp := make(chan struct{}, 1)
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		for {
-			select {
-			case <-flushTick.C:
-				select {
-				case timeUp <- struct{}{}:
-				default:
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
-
+	// The flush instant and the idle deadline share ONE read deadline, set to
+	// whichever comes first. No ticker, and no goroutine.
+	//
+	// The first version ran a ticker plus a forwarding goroutine PER
+	// CONNECTION and drained the signal only after fr.Next() returned a frame
+	// -- but fr.Next() blocks until the next frame or ReadTimeout, so the
+	// flush never happened on a held-open connection until the connection was
+	// dropped. With the default five-minute ReadTimeout that is a five-minute
+	// delay on exactly the persistent-connection case rsyslog and syslog-ng
+	// use. Measured at the configured 1024-connection limit, the tickers cost
+	// 131M extra instructions per five idle seconds, 2.1% of a core, 3.4 MiB
+	// and 1025 goroutines -- for a mechanism that did not work.
+	nextFlush := time.Now().Add(cfg.FlushEvery)
 	for {
-		// Reset per frame: a slow but live sender keeps its connection, a
-		// silent one loses it. Without this an opened-and-abandoned connection
-		// held a goroutine forever.
-		if err := conn.SetReadDeadline(time.Now().Add(cfg.ReadTimeout)); err != nil {
+		now := time.Now()
+		// Whichever is sooner. The idle deadline still bounds an abandoned
+		// connection; the flush deadline bounds how long a buffered message
+		// waits to become queryable.
+		deadline := now.Add(cfg.ReadTimeout)
+		idleAt := deadline
+		if nextFlush.Before(deadline) {
+			deadline = nextFlush
+		}
+		if err := conn.SetReadDeadline(deadline); err != nil {
 			s.flushSyslog(&batch, true, "tcp")
 			return
 		}
 		msg, counted, err := fr.Next()
 		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				// A flush deadline, not an idle one: flush and keep reading.
+				if !deadline.Equal(idleAt) {
+					if s.flushSyslog(&batch, false, "tcp") == flushShutdown {
+						return
+					}
+					nextFlush = time.Now().Add(cfg.FlushEvery)
+					continue
+				}
+				s.flushSyslog(&batch, true, "tcp")
+				log.Printf("syslog tcp %s: idle for %v, closing", conn.RemoteAddr(), cfg.ReadTimeout)
+				return
+			}
 			s.flushSyslog(&batch, true, "tcp")
 			if err == io.EOF {
 				return // clean end of stream
-			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				log.Printf("syslog tcp %s: idle for %v, closing", conn.RemoteAddr(), cfg.ReadTimeout)
-				return
 			}
 			// A framing error is reported, not swallowed. The scanner's
 			// Err() was never checked, so an oversized line ended the
@@ -360,20 +388,19 @@ func (s *Server) handleSyslogConn(conn net.Conn, cfg SyslogConfig) {
 		}
 		batch += res.Accepted
 
-		flushNow := batch >= cfg.FlushLines
-		if !flushNow {
-			select {
-			case <-timeUp:
-				flushNow = true
-			default:
-			}
-		}
-		if flushNow {
+		if batch >= cfg.FlushLines || !time.Now().Before(nextFlush) {
 			// TCP can at least stop reading from a sender whose data is not
-			// landing, rather than accepting more of it into a broken store.
-			if !s.flushSyslog(&batch, false, "tcp") {
+			// landing, rather than accepting more of it into a broken store --
+			// but only a CLOSED writer ends the connection. A transient
+			// failure is logged and counted, and the connection keeps serving.
+			switch s.flushSyslog(&batch, false, "tcp") {
+			case flushShutdown:
+				return
+			case flushFailed:
+				log.Printf("syslog tcp %s: closing after a flush failure", conn.RemoteAddr())
 				return
 			}
+			nextFlush = time.Now().Add(cfg.FlushEvery)
 		}
 	}
 }

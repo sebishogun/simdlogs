@@ -90,18 +90,25 @@ length-delimited — and rejected per record rather than stored as bogus log row
 
 ## Native syslog
 
-UDP is RFC 5426: one datagram, one message. TCP is RFC 6587, which defines
+UDP is RFC 5426: one datagram, one message — including when the datagram
+contains a newline, which the line-splitting entry point used to turn into two
+rows while this document claimed otherwise. TCP is RFC 6587, which defines
 **two** framings, and a receiver is expected to handle both:
 
     octet-counting:   "123 <13>1 2024-05-01T00:00:00Z host app - - - msg"
     non-transparent:  "<13>1 2024-05-01T00:00:00Z host app - - - msg\n"
 
-Only the newline form was read. rsyslog's `omfwd` and syslog-ng's `syslog()`
-driver both send **octet-counted by default**, so the default configuration of
-the two most common forwarders stored the byte count and the space as part of
-the message. The two are distinguishable without ambiguity: a frame begins with
-a decimal digit if and only if it is octet-counted, because the other form
-begins with `<`.
+Only the newline form was read, so an octet-counted sender's messages were
+stored wrong — the count became the `hostname` field and the priority became
+the app name. **syslog-ng's `syslog()` driver defaults to octet-counting** over
+TCP; **rsyslog's `omfwd` does not** (`TCP_Framing="traditional"`, newline
+framing, because its documentation notes few implementations support
+octet-counting). An earlier version of this section claimed both.
+
+A frame begins with a decimal digit if and only if it is octet-counted, because
+the other form begins with `<`. That rule is what the reference uses too, and
+it means a PRI-less RFC 3164 line starting with a timestamp digit is rejected —
+parity with VictoriaLogs, not a simdlogs limitation.
 
 An octet-counted frame is **one message even when it contains newlines** —
 which is the entire reason the framing exists. A forwarded multi-line stack
@@ -123,13 +130,25 @@ positive number that then passes the size check. TLS wraps the TCP listener
 when configured (RFC 5425 is TLS over TCP only; UDP is unaffected).
 
 **Flushing is batched**, by count and by time. It used to flush once per LINE,
-which is an fsync per syslog message — the difference between thousands of
-messages a second and tens. The time half is not optional: batching by count
-alone means a low-rate sender's lone message is never queryable, which the
-count-only first version reproduced immediately. UDP gets its tick from a read
-deadline on the socket; TCP from a ticker that signals the read loop rather
-than flushing on its own goroutine, since two goroutines flushing one writer is
-a race the writer does not promise to survive.
+which is an fsync per syslog message. Measured on one TCP connection, 2000
+newline-framed messages: **7,965/s before, 453,203/s after** — 57x, on tmpfs,
+where fsync is nearly free, so a real disk would show the old figure lower
+still. (An earlier version of this section said "thousands and tens", which
+understated the old path.)
+
+The time half uses an **absolute next-flush instant**, on both transports, and
+the deadline is shared with the idle timeout — whichever comes first. Two
+earlier attempts got this wrong. Batching by count alone left a low-rate
+sender's lone message unqueryable. Re-arming the deadline as `now+FlushEvery`
+on every read then made the flush *idle-only*: any sender faster than
+`FlushEvery` pushed it forward forever, so 65 messages sent over 1.3 seconds
+became queryable only when the sender stopped. On TCP a per-connection ticker
+plus a forwarding goroutine was worse than useless — the signal was drained
+only after a frame arrived, and a frame does not arrive on a held-open idle
+connection, so the flush waited for the five-minute read timeout; at the
+1024-connection limit those tickers cost 131M extra instructions per five idle
+seconds, 2.1% of a core and 3.4 MiB. The shared deadline needs no ticker and no
+goroutine.
 
 A parse failure and a framing error are both counted and logged. On UDP there
 is no response to fail, so an unreported failure there is silent loss with no

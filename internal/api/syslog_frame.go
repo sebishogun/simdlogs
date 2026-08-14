@@ -14,11 +14,16 @@ import (
 //	octet-counting:      "123 <13>1 2024-05-01T00:00:00Z host app - - - msg"
 //	non-transparent:     "<13>1 2024-05-01T00:00:00Z host app - - - msg\n"
 //
-// Only the newline form was read. rsyslog's `omfwd` sends OCTET-COUNTED by
-// default over TCP, and syslog-ng's `syslog()` driver does too, so the default
-// configuration of the two most common forwarders produced garbage: the count
-// and the space were stored as part of the message, and a message containing a
-// newline was split into several rows.
+// Only the newline form was read, so an octet-counted sender's messages were
+// stored wrong: the count became the HOSTNAME field and the priority became
+// the app name, because the parser read the count and space as the start of
+// the message. A counted message containing a newline was also split.
+//
+// syslog-ng's `syslog()` driver defaults to octet-counting over TCP. rsyslog's
+// `omfwd` does NOT -- its default is TCP_Framing="traditional", newline
+// framing, because (its own documentation says) few implementations support
+// octet-counting. An earlier version of this comment claimed both, which is
+// wrong for rsyslog.
 //
 // The two are distinguishable without ambiguity: a frame begins with a decimal
 // digit if and only if it is octet-counted, because a non-transparent frame
@@ -125,41 +130,58 @@ func (f *syslogFrameReader) octetCounted() ([]byte, error) {
 }
 
 // newlineFramed reads up to the next '\n'.
+//
+// A line longer than the READ BUFFER is accumulated and returned, not refused.
+// The first version returned an error on every path out of the ErrBufferFull
+// branch, which made the effective ceiling the 8 KiB read buffer rather than
+// MaxFrameBytes -- and the caller closes the connection on a framing error, so
+// one long message also took the good messages behind it. The old scanner
+// handled a 500 KB line; this is the size that matters, because a forwarded
+// stack trace or a JSON payload routinely exceeds 8 KiB.
 func (f *syslogFrameReader) newlineFramed() ([]byte, error) {
 	line, err := f.br.ReadSlice('\n')
 	if err == bufio.ErrBufferFull {
-		// The line is longer than the read buffer. Keep consuming until the
-		// newline or the limit, so ONE oversized line does not desynchronize
-		// every message after it -- the previous scanner simply stopped, which
-		// silently ended the connection.
-		total := len(line)
+		// Accumulate into the reusable buffer. ReadSlice's return aliases the
+		// reader's own buffer and is invalidated by the next read, so the
+		// bytes must be copied out as they arrive.
+		f.buf = append(f.buf[:0], line...)
 		for {
 			more, err2 := f.br.ReadSlice('\n')
-			total += len(more)
-			if total > f.max {
-				return nil, fmt.Errorf("%w: %d > %d", errFrameTooLarge, total, f.max)
+			if len(f.buf)+len(more) > f.max {
+				return nil, fmt.Errorf("%w: %d > %d", errFrameTooLarge, len(f.buf)+len(more), f.max)
 			}
+			f.buf = append(f.buf, more...)
 			if err2 == bufio.ErrBufferFull {
 				continue
 			}
-			if err2 != nil {
+			if err2 != nil && err2 != io.EOF {
 				return nil, err2
 			}
-			return nil, fmt.Errorf("%w: %d bytes", errFrameTooLarge, total)
+			// EOF with no newline still yields what was read: the sender
+			// closed mid-line, and dropping it silently reported a clean end
+			// of stream for data that was lost.
+			return trimEOL(f.buf), nil
 		}
 	}
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
+	// The terminator is not part of the message, so it is trimmed BEFORE the
+	// size test: a message of exactly MaxFrameBytes was refused because its
+	// newline pushed the count one over.
+	line = trimEOL(line)
 	if len(line) > f.max {
 		return nil, fmt.Errorf("%w: %d > %d", errFrameTooLarge, len(line), f.max)
-	}
-	// Trim the terminator; a bare EOF with no newline still yields the line.
-	for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
-		line = line[:len(line)-1]
 	}
 	if err == io.EOF && len(line) == 0 {
 		return nil, io.EOF
 	}
 	return line, nil
+}
+
+func trimEOL(b []byte) []byte {
+	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
+		b = b[:len(b)-1]
+	}
+	return b
 }
