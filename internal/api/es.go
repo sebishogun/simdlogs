@@ -208,7 +208,12 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 	opts := ingestOptions(r)
 	var ing, skip int
 	if len(docs) >= ingest.MinParallelBytes {
-		ing, skip = ingest.IngestJSONLinesParallelOpts(tn.store, docs, fallback, s.compact, &opts)
+		var werr error
+		ing, skip, werr = ingest.IngestJSONLinesParallelCfg(tn.store, docs, fallback, s.parallelCfg(), &opts)
+		if werr != nil {
+			s.failIngest(w, werr, ing, skip, len(body))
+			return
+		}
 	} else {
 		ing, skip = ingest.IngestJSONLinesOpts(tn.w, docs, fallback, &opts)
 		if err := tn.w.Flush(); err != nil {

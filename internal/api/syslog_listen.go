@@ -2,7 +2,9 @@ package api
 
 import (
 	"bufio"
+	"log"
 	"net"
+	"sync/atomic"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
 )
@@ -43,7 +45,12 @@ func (s *Server) serveSyslogUDP(c net.PacketConn) {
 			continue
 		}
 		ingest.IngestSyslog(s.def.w, buf[:n], fallback)
-		s.def.w.Flush()
+		// UDP has no response to fail, so a dropped flush error here is
+		// silent loss with no other signal. Log it and count it.
+		if err := s.def.w.Flush(); err != nil {
+			atomic.AddInt64(&s.nHTTPErrs, 1)
+			log.Printf("syslog udp: flush failed, %d bytes lost: %v", n, err)
+		}
 	}
 }
 
@@ -69,6 +76,12 @@ func (s *Server) handleSyslogConn(conn net.Conn) {
 			continue
 		}
 		ingest.IngestSyslog(s.def.w, line, fallback)
-		s.def.w.Flush()
+		// TCP can at least stop reading from a sender whose data is not
+		// landing, rather than accepting more of it into a broken store.
+		if err := s.def.w.Flush(); err != nil {
+			atomic.AddInt64(&s.nHTTPErrs, 1)
+			log.Printf("syslog tcp %s: flush failed, closing connection: %v", conn.RemoteAddr(), err)
+			return
+		}
 	}
 }

@@ -112,10 +112,18 @@ func parsePairs(v string) [][2]string {
 // names its own must not be forced through them, and must not end up with two
 // _stream columns in the same group.
 func addWithStream(w *Writer, ts int64, fields map[string]string, o *Options) {
+	// The override is a property of the request, not of the row. A row whose
+	// label comes out empty still belongs to the overriding request and must
+	// not silently pick up the deployment default -- that mixed two labelling
+	// schemes inside one column.
 	if o != nil && len(o.StreamFields) > 0 {
 		if sv := buildStreamLabel(o.StreamFields, fields); sv != "" {
 			fields["_stream"] = sv
+		} else {
+			delete(fields, "_stream")
 		}
+		w.AddStreamOverridden(ts, fields)
+		return
 	}
 	w.Add(ts, fields)
 }

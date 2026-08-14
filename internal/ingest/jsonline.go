@@ -15,6 +15,45 @@ import (
 // the goroutine and per-shard writer setup; a small POST stays serial.
 const MinParallelBytes = 1 << 20
 
+// ParallelConfig carries the deployment-wide writer settings that every
+// temporary shard writer must inherit. It exists because the shard writers
+// are built here rather than handed in: anything the server configured on
+// its own writer has to be repeated onto them, and a setting that is
+// forgotten changes the stored schema for large requests only. Compact was
+// copied and the stream fields were not, so the same records produced a
+// _stream column under the small-body path and none under this one.
+type ParallelConfig struct {
+	Compact      bool
+	StreamFields []string
+
+	// Shards overrides the shard count. Zero means derive it from the CPU
+	// count. It exists because the derived value is runtime.NumCPU()/3, which
+	// is below the 2-shard minimum on any machine with fewer than six cores --
+	// including every stock CI runner. Without an override the concurrent
+	// branch is dead code exactly where it is meant to be gated, and the
+	// tests that cover it pass by running the serial fallback instead.
+	Shards int
+}
+
+// shards resolves the shard count for a body of n bytes: 0 means run serial.
+func (c ParallelConfig) shards(n int) int {
+	sh := c.Shards
+	if sh == 0 {
+		sh = runtime.NumCPU() / 3
+	}
+	if sh < 2 || n < MinParallelBytes {
+		return 0
+	}
+	return sh
+}
+
+func (c ParallelConfig) apply(w *Writer) {
+	w.SetCompact(c.Compact)
+	if len(c.StreamFields) > 0 {
+		w.SetStreamFields(c.StreamFields)
+	}
+}
+
 // IngestJSONLinesParallel splits an NDJSON body at line boundaries and
 // ingests the chunks concurrently, each through its own writer over the
 // shared store (AppendGroup is concurrency-safe). The parser was the ingest
@@ -22,42 +61,96 @@ const MinParallelBytes = 1 << 20
 // box; sharding the parse is the lever. Shard count and per-shard flush
 // pool are sized so the total goroutines stay near the core count rather
 // than oversubscribing. Falls back to serial for a small body.
-func IngestJSONLinesParallel(store *storage.Store, data []byte, fallback func() int64, compact bool) (ingested, skipped int) {
-	return IngestJSONLinesParallelOpts(store, data, fallback, compact, nil)
+//
+// The returned error is the caller's proof that the rows reached the store.
+// It must be checked: a non-nil error means some or all of the counted rows
+// were parsed but not persisted, and the request has to fail.
+func IngestJSONLinesParallel(store *storage.Store, data []byte, fallback func() int64, compact bool) (ingested, skipped int, err error) {
+	return IngestJSONLinesParallelCfg(store, data, fallback, ParallelConfig{Compact: compact}, nil)
 }
 
-// IngestJSONLinesParallelOpts is IngestJSONLinesParallel with the request's
-// field mappings applied.
-func IngestJSONLinesParallelOpts(store *storage.Store, data []byte, fallback func() int64, compact bool, opts *Options) (ingested, skipped int) {
-	shards := runtime.NumCPU() / 3
-	if shards < 2 || len(data) < MinParallelBytes {
+// IngestJSONLinesParallelCfg is IngestJSONLinesParallel with the deployment
+// writer settings and the request's field mappings applied.
+//
+// Every shard writer's Close is checked. Close flushes, waits for the flush
+// pool, and reports the first AppendGroup failure, so discarding it -- which
+// this function used to do -- turned a store that could not write a single
+// group into a 200 with a row count. The first error is preserved and the
+// number of failed shards is reported with it, because "3 of 8 shards failed"
+// and "1 of 8 shards failed" are different operational events.
+func IngestJSONLinesParallelCfg(store *storage.Store, data []byte, fallback func() int64, cfg ParallelConfig, opts *Options) (ingested, skipped int, err error) {
+	shards := cfg.shards(len(data))
+	if shards == 0 {
 		w := NewWriter(store)
-		w.SetCompact(compact)
+		cfg.apply(w)
 		i, s := IngestJSONLinesOpts(w, data, fallback, opts)
-		w.Close()
-		return i, s
+		if cerr := w.Close(); cerr != nil {
+			return i, s, &ParallelWriteError{Shards: 1, Failed: 1, Err: cerr}
+		}
+		return i, s, nil
 	}
 	chunks := splitLines(data, shards)
 	var ing, skp int64
+	var (
+		mu       sync.Mutex
+		firstErr error
+		failed   int
+		started  int
+	)
 	var wg sync.WaitGroup
 	for _, c := range chunks {
 		if len(c) == 0 {
 			continue
 		}
+		started++
 		wg.Add(1)
 		go func(chunk []byte) {
 			defer wg.Done()
 			w := NewWriterWorkers(store, 2)
-			w.SetCompact(compact)
+			cfg.apply(w)
 			i, s := IngestJSONLinesOpts(w, chunk, fallback, opts)
-			w.Close()
-			atomic.AddInt64(&ing, int64(i))
+			// Close before counting: a shard whose rows never landed must
+			// not contribute to the accepted total.
+			cerr := w.Close()
+			// Skipped lines are a parse fact: they were malformed whether or
+			// not the group landed, so they are counted either way. Ingested
+			// is only counted when the rows are durable.
 			atomic.AddInt64(&skp, int64(s))
+			if cerr != nil {
+				mu.Lock()
+				failed++
+				if firstErr == nil {
+					firstErr = cerr
+				}
+				mu.Unlock()
+				return
+			}
+			atomic.AddInt64(&ing, int64(i))
 		}(c)
 	}
 	wg.Wait()
-	return int(ing), int(skp)
+	if firstErr != nil {
+		return int(ing), int(skp), &ParallelWriteError{Shards: started, Failed: failed, Err: firstErr}
+	}
+	return int(ing), int(skp), nil
 }
+
+// ParallelWriteError reports that at least one shard writer failed to
+// persist its rows. Ingested counts only the shards that succeeded, so the
+// caller can report how much of the batch is durable while still failing the
+// request.
+type ParallelWriteError struct {
+	Shards int // shard writers started
+	Failed int // shard writers whose Close reported a failure
+	Err    error
+}
+
+func (e *ParallelWriteError) Error() string {
+	return "ingest: " + strconv.Itoa(e.Failed) + " of " + strconv.Itoa(e.Shards) +
+		" shard writers failed to persist: " + e.Err.Error()
+}
+
+func (e *ParallelWriteError) Unwrap() error { return e.Err }
 
 // splitLines cuts data into at most n chunks, each ending on a newline so no
 // line is split across chunks.

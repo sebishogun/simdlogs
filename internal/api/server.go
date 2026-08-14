@@ -132,6 +132,40 @@ func (s *Server) SetStreamFields(fields []string) {
 	s.mu.Unlock()
 }
 
+// parallelCfg is the deployment writer configuration the temporary shard
+// writers of a large ingest must inherit. It reads the same two settings the
+// persistent per-tenant writer is built with (tenant), so a large body and a
+// small one produce the same schema. Copying only Compact here is what made
+// _stream appear under the small-body path and vanish under the parallel one.
+func (s *Server) parallelCfg() ingest.ParallelConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return ingest.ParallelConfig{
+		Compact:      s.compact,
+		StreamFields: append([]string(nil), s.strmFlds...),
+	}
+}
+
+// failIngest reports a partially or wholly failed ingest. The durable rows
+// are counted into the metrics before the error is written, so /metrics and
+// the store cannot disagree: they landed, whatever the response says.
+//
+// The body names how much is durable so an operator (and a shipper that reads
+// it) can tell "nothing was written, retry everything" from "most of it was
+// written, a retry duplicates it". Deduplicating that retry is a write-ID
+// problem, not something this handler can solve.
+func (s *Server) failIngest(w http.ResponseWriter, err error, ingested, skipped, nbytes int) {
+	s.countRows(ingested, skipped, nbytes)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusInternalServerError)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error":    err.Error(),
+		"ingested": ingested,
+		"skipped":  skipped,
+		"durable":  ingested,
+	})
+}
+
 // splitCSV splits a comma-separated list, trimming spaces and dropping empties.
 func splitCSV(v string) []string {
 	parts := strings.Split(v, ",")
@@ -228,7 +262,18 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 	opts := ingestOptions(r)
 	var ing, skip int
 	if len(body) >= ingest.MinParallelBytes {
-		ing, skip = ingest.IngestJSONLinesParallelOpts(tn.store, body, fallback, s.compact, &opts)
+		var werr error
+		ing, skip, werr = ingest.IngestJSONLinesParallelCfg(tn.store, body, fallback, s.parallelCfg(), &opts)
+		if werr != nil {
+			// Some or all of the rows were parsed but did not reach the
+			// store. Answering with a count alone is the silent data loss
+			// this path used to have. The request fails -- but the rows that
+			// DID land are durable and are reported and counted, because a
+			// shipper retrying a bare 500 would otherwise duplicate them with
+			// no way to know.
+			s.failIngest(w, werr, ing, skip, len(body))
+			return
+		}
 	} else {
 		// Small body: reuse the persistent writer, no per-request pool churn.
 		ing, skip = ingest.IngestJSONLinesOpts(tn.w, body, fallback, &opts)

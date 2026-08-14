@@ -121,11 +121,38 @@ func (w *Writer) worker() {
 // fields create a column; a row missing a known field gets an empty value
 // in it, which the dict encodes once (schema-free, like the reference).
 func (w *Writer) Add(ts int64, fields map[string]string) {
+	w.add(ts, fields, false)
+}
+
+// AddStreamOverridden is Add for a record whose _stream was already built
+// from the request's own _stream_fields. The deployment default is skipped
+// for it.
+//
+// The flag is a parameter rather than a sniff of fields["_stream"], and that
+// distinction is the fix: deciding per row by looking for the key made the
+// override per row instead of per request. A row whose override label came
+// out empty fell back to the deployment fields, so one request could produce
+// a column mixing {host="h1"} and {service="api"} -- and any payload field
+// literally named _stream suppressed deployment labelling for that row. Since
+// _stream is what stream-scoped retention groups on, that let a client choose
+// its own retention bucket.
+func (w *Writer) AddStreamOverridden(ts int64, fields map[string]string) {
+	w.add(ts, fields, true)
+}
+
+func (w *Writer) add(ts int64, fields map[string]string, streamOverridden bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// When this writer owns stream labelling and the request did not override
+	// it, a _stream carried in the payload is not authoritative and is
+	// dropped: the synthesized label replaces it below.
+	dropPayloadStream := len(w.strmFlds) > 0 && !streamOverridden
 	row := len(w.ts)
 	w.ts = append(w.ts, ts)
 	for k, v := range fields {
+		if k == "_stream" && dropPayloadStream {
+			continue
+		}
 		cb := w.cols[k]
 		if cb == nil {
 			cb = &colBuf{name: k, vals: make([]string, row)} // backfill prior rows
@@ -143,7 +170,13 @@ func (w *Writer) Add(ts int64, fields map[string]string) {
 	// `stats by (_stream)` and stream-scoped retention have a value to group
 	// on. The selector `_stream:{...}` queries the underlying label fields
 	// directly and needs no column, so this is opt-in (empty strmFlds = off).
-	if len(w.strmFlds) > 0 {
+	//
+	// The request's own _stream_fields override the deployment default, and
+	// the caller says so explicitly. Synthesizing on top of an overridden
+	// record appended a second value to the same column for one row; the
+	// padding loop below only lengthens columns that are short, so nothing
+	// corrected it, and every later row read one row late in that column.
+	if len(w.strmFlds) > 0 && !streamOverridden {
 		if sv := buildStreamLabel(w.strmFlds, fields); sv != "" {
 			cb := w.cols["_stream"]
 			if cb == nil {

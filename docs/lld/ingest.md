@@ -79,19 +79,52 @@ never reject a line.
   set `{k="v",...}` with keys sorted, so the same label set always yields the
   same dict id and the same `StreamID` (`internal/query/stream.go`).
   `SetCompact(true)` makes flushed groups use the flate dict codec.
+- **The request override is per request, not per row.** A request naming its
+  own `_stream_fields` goes through `AddStreamOverridden`, which skips the
+  deployment synthesis for every row of that request. The flag is a parameter
+  rather than a sniff of `fields["_stream"]`, because sniffing made the
+  decision per row: a row whose override label came out empty fell back to the
+  deployment fields, so one request could produce a column mixing
+  `{host="h1"}` and `{service="api"}`.
+- **A payload field named `_stream` is not authoritative.** When the
+  deployment owns labelling and the request did not override it, any `_stream`
+  in the record is dropped and the synthesized label replaces it. `_stream` is
+  what stream-scoped retention groups on (`internal/api/retention.go`), so
+  honouring a client-supplied value would let a client choose its own
+  retention bucket.
 
 ## Parallel path
 
-`internal/ingest/jsonline.go`. `IngestJSONLinesParallelOpts`:
+`internal/ingest/jsonline.go`. `IngestJSONLinesParallelCfg(store, data,
+fallback, cfg ParallelConfig, opts) (ingested, skipped int, err error)`:
 
 - Bodies below `MinParallelBytes = 1 MiB` (or a machine with < 2 useful
   shards) stay serial on the tenant's persistent writer — no goroutine or
   per-shard writer setup cost.
-- Otherwise the body is cut into `NumCPU/3` chunks, each ending on a newline,
-  and each chunk parses through its own `NewWriterWorkers(store, 2)` writer
-  over the shared store (`AppendGroup` is concurrency-safe). Total goroutines
-  stay near the core count rather than oversubscribing. Counts aggregate
-  atomically.
+- Otherwise the body is cut into `cfg.shards()` chunks, each ending on a
+  newline, and each chunk parses through its own `NewWriterWorkers(store, 2)`
+  writer over the shared store (`AppendGroup` is concurrency-safe). Total
+  goroutines stay near the core count rather than oversubscribing.
+- **`ParallelConfig` carries the deployment writer settings** — `Compact` and
+  `StreamFields` — because the shard writers are built here rather than handed
+  in. A setting not repeated onto them changes the stored schema for large
+  bodies only: `Compact` was copied and `StreamFields` was not, so the same
+  records grew a `_stream` column under the small-body path and none here.
+- **`Shards` overrides the derived count**, which is `NumCPU/3` and so below
+  the 2-shard minimum on anything with fewer than six cores. Tests set it so
+  the concurrent branch actually runs; without it they exercise the serial
+  fallback on a CI runner and pass against broken concurrent code.
+- **The error return is the durability contract.** Every shard writer's
+  `Close` is checked — it flushes, drains the pool and reports the first
+  `AppendGroup` failure, so discarding it turned a store that could not write
+  a single group into a 200 with a row count. Failures aggregate into a
+  `*ParallelWriteError{Shards, Failed, Err}`.
+- **Counts follow durability.** `ingested` counts only shards whose rows
+  landed; `skipped` counts every malformed line, since being malformed is a
+  parse fact independent of whether the group was written. On a partial
+  failure the handler returns 500 *and* reports the durable count, because a
+  shipper retrying a bare 500 would otherwise duplicate rows already stored —
+  deduplicating that retry needs write IDs (plan task 8.2).
 - Parsing is simdjson over each line, field values taken as strings
   (`StringNoCopy` where unescaped); a number keeps its source text — a log
   store round-trips what it is given. Malformed lines are counted and
