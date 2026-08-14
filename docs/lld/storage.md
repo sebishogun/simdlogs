@@ -169,7 +169,30 @@ stated here is weaker there.
 - `Groups(from, to)` returns readers whose `[TimeMin, TimeMax)` overlaps the
   window — the first skip, before any column is touched. `TailCursor` /
   `GroupsAfterID` are the live-tail watermark.
-- `Close` unmaps every group; the store must not be used afterward.
+- `Snapshot(from, to)` is how a reader gets groups: it returns the overlapping
+  readers with a reference held on each, valid until `Close`. `Groups` still
+  exists for callers that only inspect metadata, but anything that decodes a
+  column takes a snapshot.
+- `Close` stops new snapshots and retires every group. A mapping an open
+  snapshot still holds is released when that snapshot closes, not at `Close`.
+
+**mmap lifetime is reader-owned** (`snapshot.go`). Each group version carries
+an atomic reference count, a retired flag and a one-shot unmap. A snapshot
+raises the count under the store lock, so a retirement cannot land between the
+overlap test and the acquire; retiring marks the version and unmaps it when
+the last holder releases; a snapshot taken after retirement never sees it.
+
+This replaces two ways of releasing memory a reader was still using.
+Recompaction retired replaced mappings on a five-minute timer that no query
+duration was bound by, and `Close` unmapped everything immediately -- shutdown
+being exactly when in-flight queries are most likely to still be running.
+Retention and cold demotion were worse than either: they dropped the index
+entry while discarding the unmap callback, which leaked the mapping rather
+than freeing it, so an unlinked file's blocks stayed allocated until exit.
+
+The trade is that a pathological long-running query pins disk blocks until it
+finishes. That is bounded and observable -- the lease count is a metric --
+where unmapping under a live reader is a segfault.
 
 Group files are mmap'd read-only (`mmap_unix.go`, `MAP_SHARED`): the OS pages
 them in on access and evicts under pressure, so a large store keeps only its

@@ -23,7 +23,9 @@ func VectorSearch(s Store, from, to int64, field string, q []float32, k int) []R
 		row   int
 	}
 	var cands []cand
-	for _, g := range s.Groups(from, to) {
+	sn1 := snapshotOf(s, from, to)
+	defer sn1.Close()
+	for _, g := range sn1.Groups {
 		dim, data := g.Vectors(field)
 		if dim == 0 || dim != len(q) {
 			continue

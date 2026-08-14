@@ -120,7 +120,9 @@ func (p *BlockStatsPipe) apply(rows []Row) []Row { return rows }
 
 func runBlocksCount(s Store, q *Query) []Row {
 	n := 0
-	for _, g := range s.Groups(q.From, q.To) {
+	sn1 := snapshotOf(s, q.From, q.To)
+	defer sn1.Close()
+	for _, g := range sn1.Groups {
 		if groupCanMatch(g, q) {
 			n++
 		}
@@ -130,7 +132,9 @@ func runBlocksCount(s Store, q *Query) []Row {
 
 func runBlockStats(s Store, q *Query) []Row {
 	var out []Row
-	for _, g := range s.Groups(q.From, q.To) {
+	sn2 := snapshotOf(s, q.From, q.To)
+	defer sn2.Close()
+	for _, g := range sn2.Groups {
 		if !groupCanMatch(g, q) {
 			continue
 		}

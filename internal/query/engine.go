@@ -179,8 +179,25 @@ type Row struct {
 }
 
 // Store is the read surface the engine needs; storage.Store satisfies it.
+//
+// It hands out snapshots rather than raw readers because a reader is a window
+// onto an mmap: retention, recompaction, cold demotion and store close all
+// release mappings, and a query holding a bare *Reader across any of them
+// reads freed memory. A snapshot holds its groups until Close.
 type Store interface {
-	Groups(from, to int64) []*storage.Reader
+	Snapshot(from, to int64) (*storage.Snapshot, error)
+}
+
+// snapshotOf takes a snapshot for a caller that has no way to report an
+// error. A closed store yields an empty snapshot, so the caller's loop runs
+// zero times -- the same answer it gave before, when a closed store simply
+// had no groups left in its index.
+func snapshotOf(s Store, from, to int64) *storage.Snapshot {
+	sn, err := s.Snapshot(from, to)
+	if err != nil || sn == nil {
+		return storage.EmptySnapshot()
+	}
+	return sn
 }
 
 // Run executes q over the store and returns matching rows in time order,
@@ -190,7 +207,9 @@ type Store interface {
 // orders of magnitude over a whole-block scan come from.
 func Run(s Store, q *Query) []Row {
 	resolveTimePreds(q)
-	groups := s.Groups(q.From, q.To)
+	sn1 := snapshotOf(s, q.From, q.To)
+	defer sn1.Close()
+	groups := sn1.Groups
 	// Footer-prune first, then decide whether to fan out. A selective query
 	// (a rare value) survives in one or two groups; spawning a worker pool
 	// for that costs more than it saves, and it was the largest single cost
@@ -731,7 +750,9 @@ func containsSubstr(s, sub string) bool {
 // decode beyond the predicate columns. This is where finer skip
 // granularity turns into a real margin over a scan-and-count.
 func Count(s Store, q *Query) int {
-	groups := s.Groups(q.From, q.To)
+	sn2 := snapshotOf(s, q.From, q.To)
+	defer sn2.Close()
+	groups := sn2.Groups
 	survivors := groups[:0]
 	for _, g := range groups {
 		if groupCanMatch(g, q) {
@@ -822,7 +843,9 @@ const maxHitsBuckets = 100_000
 // Histogram buckets match counts by time at the given step (nanoseconds),
 // the /select/logsql/hits shape -- again without materializing rows.
 func Histogram(s Store, q *Query, step int64) map[int64]int {
-	groups := s.Groups(q.From, q.To)
+	sn3 := snapshotOf(s, q.From, q.To)
+	defer sn3.Close()
+	groups := sn3.Groups
 	survivors := groups[:0]
 	for _, g := range groups {
 		if groupCanMatch(g, q) {

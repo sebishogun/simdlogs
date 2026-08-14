@@ -11,7 +11,9 @@ import (
 // no column decoded.
 func FieldNames(s Store, from, to int64) []string {
 	seen := map[string]struct{}{}
-	for _, g := range s.Groups(from, to) {
+	sn1 := snapshotOf(s, from, to)
+	defer sn1.Close()
+	for _, g := range sn1.Groups {
 		for _, name := range g.ColumnNames() {
 			seen[name] = struct{}{}
 		}
@@ -25,7 +27,9 @@ func FieldNames(s Store, from, to int64) []string {
 // without decoding per-row indices.
 func FieldValues(s Store, field string, from, to int64) []ValueCount {
 	counts := map[string]int{}
-	for _, g := range s.Groups(from, to) {
+	sn2 := snapshotOf(s, from, to)
+	defer sn2.Close()
+	for _, g := range sn2.Groups {
 		for _, vc := range g.ValueCounts(field) {
 			counts[vc.Value] += vc.Count
 		}
@@ -61,7 +65,9 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 	counts := map[string]int{}
 	total := 0
 	var names []string // reused across groups; column sets are small and repeat
-	for _, g := range s.Groups(q.From, q.To) {
+	sn3 := snapshotOf(s, q.From, q.To)
+	defer sn3.Close()
+	for _, g := range sn3.Groups {
 		if !groupCanMatch(g, q) {
 			continue
 		}
@@ -177,7 +183,9 @@ type FacetValue struct {
 // keepConst asks for it.
 func FacetList(s Store, q *Query, limit, maxPerField int, keepConst bool) []FieldFacet {
 	names := FieldNames(s, q.From, q.To)
-	groups := s.Groups(q.From, q.To)
+	sn4 := snapshotOf(s, q.From, q.To)
+	defer sn4.Close()
+	groups := sn4.Groups
 	out := make([]FieldFacet, 0, len(names))
 	for _, name := range names {
 		if name == "_time" {
@@ -314,7 +322,9 @@ const (
 // posting counts filtered by the query's predicates.
 func StatsByField(s Store, q *Query, field string) []ValueCount {
 	counts := map[string]int{}
-	for _, g := range s.Groups(q.From, q.To) {
+	sn5 := snapshotOf(s, q.From, q.To)
+	defer sn5.Close()
+	for _, g := range sn5.Groups {
 		if !groupCanMatch(g, q) {
 			continue
 		}

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // Store is the immutable group set: one file per group (mmap-append is
@@ -16,6 +17,7 @@ type Store struct {
 	mu       sync.RWMutex
 	groups   []*groupEntry
 	nextID   uint64
+	closed   bool
 	openHook func(uint64)
 	retired  []retiredMap // mappings replaced by Recompact, unmapped after a grace period
 }
@@ -27,6 +29,13 @@ type groupEntry struct {
 	timeMin int64
 	timeMax int64
 	unmap   func() error // releases the mmap backing reader.blob
+
+	// Ownership. A snapshot holds a reference for as long as a caller can
+	// read the mapping; retirement marks a version replaced or deleted, and
+	// the mapping is released when the two meet at zero. See snapshot.go.
+	refs     atomic.Int64
+	retired  atomic.Bool
+	unmapped atomic.Bool
 }
 
 // OpenStore opens or creates a store rooted at dir, loading any groups
@@ -92,15 +101,18 @@ func (s *Store) AppendGroup(g *Group) (uint64, error) {
 }
 
 // Close releases every group's mmap. The store must not be used afterward.
+// Close stops new snapshots and retires every group. A mapping still held by
+// an open snapshot is released when that snapshot closes, not here: unmapping
+// under a live reader is a segfault, and shutdown is exactly when in-flight
+// queries are most likely to still be running.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closed = true
 	var firstErr error
 	for _, g := range s.groups {
-		if g.unmap != nil {
-			if err := g.unmap(); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		if err := g.retire(); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	s.groups = nil

@@ -522,7 +522,9 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 	}
 	acc := map[string]*statEntry{}
 	var key []byte
-	for _, g := range s.Groups(q.From, q.To) {
+	sn1 := snapshotOf(s, q.From, q.To)
+	defer sn1.Close()
+	for _, g := range sn1.Groups {
 		if !groupCanMatch(g, q) {
 			continue
 		}

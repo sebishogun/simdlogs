@@ -417,7 +417,13 @@ var emptyStreamID = query.StreamID(query.EmptyStream)
 // over just the groups that arrived since the last poll.
 type readerStore []*storage.Reader
 
-func (rs readerStore) Groups(_, _ int64) []*storage.Reader { return rs }
+// Snapshot hands back the fixed readers. They are already owned by the
+// caller's own snapshot for the duration of this call -- the live tail holds
+// one while it drains -- so this adapter takes no further reference and its
+// Close is a no-op.
+func (rs readerStore) Snapshot(_, _ int64) (*storage.Snapshot, error) {
+	return &storage.Snapshot{Groups: rs}, nil
+}
 
 // tail streams matching rows as new groups are ingested: VictoriaLogs'
 // /select/logsql/tail. It subscribes at the current high-water group id and
