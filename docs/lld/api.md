@@ -220,3 +220,28 @@ connection lives until the client disconnects.
 
 `tail` is not federated: in router mode it tails the router's local store
 (empty when nothing was written locally).
+
+## Request admission
+
+`middleware.go`. Every ingest route is wrapped by `guard`, which is the only
+place a request body becomes readable.
+
+- **Method.** A wrong method is `405` with an `Allow` header. Unwrapped, the
+  handlers took any method, so a `GET` to an ingest path was processed as an
+  empty `POST` and answered `200` with zero records.
+- **Media type.** Each route has an allowlist; a mismatch is `415`. An empty
+  `Content-Type` is allowed because several vendor agents send none. journald
+  has its own spec (`application/vnd.fdo.journal`) rather than that type being
+  accepted on the NDJSON routes, where a journal blob parses as nothing.
+- **Body size.** `http.MaxBytesReader` at `MaxBodyBytes`; over it is `413`.
+  Every handler previously called `io.ReadAll(r.Body)` with no limit.
+- **Compression.** `Content-Encoding: gzip` is decompressed with a *separate*
+  `MaxDecompressed` bound, because a few hundred KB of gzip expands to
+  gigabytes and a wire-only limit accepts that happily. Malformed gzip is
+  `400`; an unknown encoding is `415` rather than being treated as identity,
+  which would store compressed bytes as log lines.
+- **Error envelope.** JSON for the JSON and OTLP protocols, plain text for the
+  query surface, so a client is not handed a body it cannot parse.
+
+Limits come from `internal/config`; `config.Unlimited` (-1) is the explicit
+opt-out and zero means "use the default".

@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -263,29 +262,33 @@ func splitCSV(v string) []string {
 // Handler wires the routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/insert/jsonline", s.insertJSONLine)
-	mux.HandleFunc("/insert/logfmt", s.insertLogfmt)
-	mux.HandleFunc("/_bulk", s.esBulk)                   // Elasticsearch bulk ingest
-	mux.HandleFunc("/loki/api/v1/push", s.insertLoki)    // Grafana Loki push
-	mux.HandleFunc("/api/v2/logs", s.insertDatadog)      // Datadog logs intake
-	mux.HandleFunc("/v1/input", s.insertDatadog)         // Datadog legacy intake
-	mux.HandleFunc("/insert/syslog", s.insertSyslog)     // syslog over HTTP (native transport: ListenSyslog)
-	mux.HandleFunc("/v1/logs", s.insertOTLPLogs)         // OpenTelemetry OTLP/HTTP logs (JSON)
-	mux.HandleFunc("/insert/journald", s.insertJournald) // systemd journal export (systemd-journal-upload)
+	// Every ingest route is wrapped: method, media type and a bounded body.
+	// Unwrapped, each handler read r.Body with io.ReadAll and no limit, took
+	// any method, and ignored Content-Type entirely.
+	nd := ndjsonSpec()
+	mux.HandleFunc("/insert/jsonline", s.guard(nd, s.insertJSONLine))
+	mux.HandleFunc("/insert/logfmt", s.guard(nd, s.insertLogfmt))
+	mux.HandleFunc("/_bulk", s.guard(nd, s.esBulk))                               // Elasticsearch bulk ingest
+	mux.HandleFunc("/loki/api/v1/push", s.guard(nd, s.insertLoki))                // Grafana Loki push
+	mux.HandleFunc("/api/v2/logs", s.guard(nd, s.insertDatadog))                  // Datadog logs intake
+	mux.HandleFunc("/v1/input", s.guard(nd, s.insertDatadog))                     // Datadog legacy intake
+	mux.HandleFunc("/insert/syslog", s.guard(nd, s.insertSyslog))                 // syslog over HTTP (native transport: ListenSyslog)
+	mux.HandleFunc("/v1/logs", s.guard(otlpSpec(), s.insertOTLPLogs))             // OpenTelemetry OTLP/HTTP logs
+	mux.HandleFunc("/insert/journald", s.guard(journaldSpec(), s.insertJournald)) // systemd journal export
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	// VictoriaLogs serves every third-party ingest protocol under /insert/<vendor>/.
 	// An agent whose config was written against VictoriaLogs sends the prefixed
 	// path, so serving only the vendor-native path 404s a drop-in client. Both
 	// spellings are registered; the unprefixed ones are what the vendors' own
 	// agents use when pointed at a bare host.
-	mux.HandleFunc("/insert/elasticsearch/_bulk", s.esBulk)
-	mux.HandleFunc("/insert/loki/api/v1/push", s.insertLoki)
-	mux.HandleFunc("/insert/datadog/api/v2/logs", s.insertDatadog)
+	mux.HandleFunc("/insert/elasticsearch/_bulk", s.guard(nd, s.esBulk))
+	mux.HandleFunc("/insert/loki/api/v1/push", s.guard(nd, s.insertLoki))
+	mux.HandleFunc("/insert/datadog/api/v2/logs", s.guard(nd, s.insertDatadog))
 	mux.HandleFunc("/insert/datadog/api/v1/validate", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	mux.HandleFunc("/insert/opentelemetry/v1/logs", s.insertOTLPLogs)
-	mux.HandleFunc("/admin/backup", s.backup)  // tar snapshot for offline restore
-	mux.HandleFunc("/metrics", s.metrics)      // Prometheus text exposition
-	mux.HandleFunc("/alerts", s.alertsHandler) // alerting rule state
+	mux.HandleFunc("/insert/opentelemetry/v1/logs", s.guard(otlpSpec(), s.insertOTLPLogs))
+	mux.HandleFunc("/admin/backup", s.guard(adminSpec(), s.backup)) // tar snapshot for offline restore
+	mux.HandleFunc("/metrics", s.metrics)                           // Prometheus text exposition
+	mux.HandleFunc("/alerts", s.alertsHandler)                      // alerting rule state
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
 	mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
 	mux.HandleFunc("/-/ready", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
@@ -332,9 +335,9 @@ func recoverPanic(h http.Handler) http.Handler {
 
 // insertJSONLine ingests an NDJSON body and flushes it into a group.
 func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
+	body, berr := s.readBody(w, r)
+	if berr != nil {
+		s.writeErr(w, r, ndjsonSpec(), berr.code, berr.msg)
 		return
 	}
 	// Fallback timestamp for a line missing _time; atomic because the
@@ -370,9 +373,9 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 
 // insertLogfmt ingests a logfmt body (key=value lines) and flushes it.
 func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
+	body, berr := s.readBody(w, r)
+	if berr != nil {
+		s.writeErr(w, r, ndjsonSpec(), berr.code, berr.msg)
 		return
 	}
 	tn := s.tn(r)

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"io"
 	"net/http"
 	"strings"
 
@@ -33,9 +32,9 @@ func ingestOptions(r *http.Request) ingest.Options {
 // success code the protocol's clients expect.
 func (s *Server) ingestBody(w http.ResponseWriter, r *http.Request, status int,
 	parse func(*ingest.Writer, []byte, func() int64, *ingest.Options) (int, int)) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
+	body, berr := s.readBody(w, r)
+	if berr != nil {
+		s.writeErr(w, r, ndjsonSpec(), berr.code, berr.msg)
 		return
 	}
 	tn := s.tn(r)
@@ -74,9 +73,9 @@ func (s *Server) insertDatadog(w http.ResponseWriter, r *http.Request) {
 // insertOTLPLogs ingests an OpenTelemetry logs export (OTLP/HTTP, JSON). The
 // OTLP spec expects a 200 with an ExportLogsServiceResponse body.
 func (s *Server) insertOTLPLogs(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
+	body, berr := s.readBody(w, r)
+	if berr != nil {
+		s.writeErr(w, r, ndjsonSpec(), berr.code, berr.msg)
 		return
 	}
 	tn := s.tn(r)

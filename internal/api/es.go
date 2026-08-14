@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -193,9 +192,9 @@ func stripBulkActions(body []byte) []byte {
 // timestamp). So Filebeat/Logstash/Fluentd/OTel-ES exporters point here
 // unchanged.
 func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
+	body, berr := s.readBody(w, r)
+	if berr != nil {
+		s.writeErr(w, r, ndjsonSpec(), berr.code, berr.msg)
 		return
 	}
 	// Strip the action lines in place. A document is never longer than the input
