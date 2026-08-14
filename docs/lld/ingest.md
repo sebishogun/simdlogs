@@ -15,12 +15,12 @@ parallelism as the box has cores.
 |---|---|---|
 | NDJSON | `/insert/jsonline` | simdjson parse; parallel ≥ 1 MiB |
 | logfmt | `/insert/logfmt` | key=value lines |
-| Elasticsearch bulk | `/_bulk`, `/insert/elasticsearch/_bulk` | action lines stripped in place; per-doc `{"create":{"status":201}}` items |
+| Elasticsearch bulk | `/_bulk`, `/insert/elasticsearch/_bulk` | one item per ACTION; `update`/`delete` rejected explicitly; see below |
 | Loki push | `/loki/api/v1/push`, `/insert/loki/api/v1/push` | JSON and snappy-protobuf; see below |
 | Datadog | `/api/v2/logs`, `/v1/input`, `/insert/datadog/api/v2/logs` | array or single object; `validate` answers 200 |
 | OTLP/HTTP logs | `/v1/logs`, `/insert/opentelemetry/v1/logs` | JSON and protobuf; see below |
 | journald export | `/insert/journald` | systemd-journal-upload |
-| syslog | `/insert/syslog`; `-syslog` listens UDP+TCP | RFC3164/5424 lines |
+| syslog | `/insert/syslog`; `-syslog` listens UDP+TCP | RFC3164/5424; both RFC6587 framings; see below |
 
 The `/insert/<vendor>/...` spellings exist so an agent configured against
 VictoriaLogs (which serves every third-party protocol under `/insert/`) does
@@ -87,6 +87,93 @@ body told them the data was delivered. A metrics or traces export posted to
 `/v1/logs` is discriminated by wire type — `LogRecord.time_unix_nano` is a
 fixed64 where `Metric.name` and `Span.trace_id` at the same field number are
 length-delimited — and rejected per record rather than stored as bogus log rows.
+
+## Native syslog
+
+UDP is RFC 5426: one datagram, one message. TCP is RFC 6587, which defines
+**two** framings, and a receiver is expected to handle both:
+
+    octet-counting:   "123 <13>1 2024-05-01T00:00:00Z host app - - - msg"
+    non-transparent:  "<13>1 2024-05-01T00:00:00Z host app - - - msg\n"
+
+Only the newline form was read. rsyslog's `omfwd` and syslog-ng's `syslog()`
+driver both send **octet-counted by default**, so the default configuration of
+the two most common forwarders stored the byte count and the space as part of
+the message. The two are distinguishable without ambiguity: a frame begins with
+a decimal digit if and only if it is octet-counted, because the other form
+begins with `<`.
+
+An octet-counted frame is **one message even when it contains newlines** —
+which is the entire reason the framing exists. A forwarded multi-line stack
+trace arrives as one counted frame, and passing it through the line-splitting
+ingest path turned it into one valid record plus a run of records that parse as
+nothing. `IngestSyslogMessage` is the whole-frame entry point.
+
+**Bounds** (`SyslogConfig`, all defaulted): concurrent connections, a read
+deadline reset per frame, the largest frame accepted, and the flush batching.
+Every one closes a hole the listener shipped with — no deadline, so a
+connection that opened and sent nothing held a goroutine and its buffer
+forever; no connection limit; and `bufio.Scanner`'s `Err()` was never checked,
+so an oversized line ended the connection silently and the sender saw a healthy
+close. An over-limit connection is closed immediately rather than queued:
+holding an unbounded number of accepted sockets waiting for a slot is the same
+exhaustion one level down. The octet count is bounded **as it is read**, so a
+sender writing digits forever cannot overflow the accumulator into a small
+positive number that then passes the size check. TLS wraps the TCP listener
+when configured (RFC 5425 is TLS over TCP only; UDP is unaffected).
+
+**Flushing is batched**, by count and by time. It used to flush once per LINE,
+which is an fsync per syslog message — the difference between thousands of
+messages a second and tens. The time half is not optional: batching by count
+alone means a low-rate sender's lone message is never queryable, which the
+count-only first version reproduced immediately. UDP gets its tick from a read
+deadline on the socket; TCP from a ticker that signals the read loop rather
+than flushing on its own goroutine, since two goroutines flushing one writer is
+a race the writer does not promise to survive.
+
+A parse failure and a framing error are both counted and logged. On UDP there
+is no response to fail, so an unreported failure there is silent loss with no
+signal anywhere; on TCP one bad frame does not end a good connection, but a
+flush failure does — the server can at least stop reading from a sender whose
+data is not landing.
+
+## Elasticsearch bulk
+
+A `_bulk` body alternates an ACTION line with a SOURCE line, except `delete`,
+which carries none. The response is **one item per action, in order**, because
+Elasticsearch clients match items to their requests BY POSITION — an action
+that produces no item shifts every later status onto the wrong document, which
+is worse than an error because it is a wrong answer that looks like a right
+one.
+
+This store is **append-only**. `index` and `create` are supported and answer
+201 per item. `update` and `delete` are rejected per item with a 400 and a
+reason, not silently dropped: an `update`'s source is a `{"doc":...}` or
+`{"script":...}` instruction rather than a document, and it used to be stored
+as a log row whose only field was named `doc`; a `delete` used to produce no
+item at all, so a client got a success for a deletion that never happened.
+
+An action line that cannot be IDENTIFIED fails the whole request with a 400,
+matching Elasticsearch. That is not a shortcut: the body's meaning is carried
+entirely by the alternation, so once a line cannot be identified the parser no
+longer knows whether the next one is a source or an action, and every item
+after it would be a guess. The failures that stay per-item are the ones where
+the alternation is still known — an unsupported operation, a missing source
+line, a source that is not an object.
+
+The action's operation is read as the object's single KEY, not by substring.
+It used to be detected with `bytes.Contains(line, "\"delete\"")`, so indexing
+into an index NAMED `delete` was read as a delete action and the document that
+followed was then read as an action line, desynchronizing the rest of the body.
+
+**Allocation.** `parseBulkAction` runs once per action, so a 200k-document bulk
+runs it 200k times. It is a byte scan over the fixed shape rather than a
+`json.Unmarshal` into a `map[string]json.RawMessage`, which would build 200k
+maps. Measured: `{"create":{}}` parses with **0 allocations**, and an action
+carrying `_index` and `_id` costs exactly **2** — the two strings that have to
+reach the response. The source lines are compacted into the front of the body
+buffer in place, since each is preceded by at least its own action line, so a
+multi-megabyte bulk is not copied twice.
 
 ## Loki push
 

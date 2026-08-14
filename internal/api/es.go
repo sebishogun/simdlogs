@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -166,40 +165,6 @@ func toStr(v any) string {
 	return ""
 }
 
-// stripBulkActions compacts an Elasticsearch _bulk body down to just its
-// documents, in place. Actions alternate with documents (except "delete",
-// which carries none), so the write cursor always trails the read cursor and
-// the result aliases the input buffer.
-func stripBulkActions(body []byte) []byte {
-	w, r := 0, 0
-	wantDoc := false
-	for r < len(body) {
-		nl := bytes.IndexByte(body[r:], '\n')
-		var line []byte
-		if nl < 0 {
-			line, nl = body[r:], len(body)-r
-		} else {
-			line = body[r : r+nl]
-		}
-		start := r
-		r += nl + 1
-		if t := bytes.TrimSpace(line); len(t) == 0 {
-			continue
-		}
-		if !wantDoc {
-			// An action line. Only "delete" is self-contained; every other
-			// action is followed by the document it applies to.
-			wantDoc = !bytes.Contains(line, []byte(`"delete"`))
-			continue
-		}
-		wantDoc = false
-		w += copy(body[w:], body[start:start+nl])
-		body[w] = '\n'
-		w++
-	}
-	return body[:w]
-}
-
 // esBulk ingests the Elasticsearch _bulk NDJSON: alternating action and
 // document lines. The action ({"index":{...}} / "create" / "update" /
 // "delete") is dropped -- delete carries no document, the rest are followed
@@ -212,10 +177,18 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, ndjsonSpec(), berr.code, berr.msg)
 		return
 	}
-	// Strip the action lines in place. A document is never longer than the input
-	// already consumed at that point, so the compacted NDJSON can overwrite the
-	// head of the same buffer -- no second copy of a multi-megabyte bulk body.
-	docs := stripBulkActions(body)
+	// Parse the actions rather than stripping them: the response must carry one
+	// item per ACTION, in order, because Elasticsearch clients match items to
+	// their requests by position. See esbulk.go for the four defects the
+	// strip-and-forget approach produced.
+	ops, perr := parseBulk(body)
+	if perr != "" {
+		// The alternation is lost, so nothing after the bad line can be
+		// attributed. Elasticsearch answers 400 for the request here too.
+		s.writeErr(w, r, ndjsonSpec(), http.StatusBadRequest, perr)
+		return
+	}
+	docs := bulkDocs(ops, body)
 
 	tn := s.tn(r)
 	fallback := tn.fallbackTS()
@@ -253,21 +226,28 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 
 	s.countRows(ing, skip, len(body))
 
-	// One item per document, the shape Elasticsearch clients parse to decide
-	// whether to retry. Written directly: a bulk of 200k documents would
-	// otherwise build 400k maps for the reflective encoder to walk.
-	const itemOK = `{"create":{"status":201}}`
-	w.Header().Set("Content-Type", "application/json")
-	out := make([]byte, 0, 32+(len(itemOK)+1)*ing)
-	out = append(out, `{"took":0,"errors":`...)
-	out = strconv.AppendBool(out, skip > 0)
-	out = append(out, `,"items":[`...)
-	for i := 0; i < ing; i++ {
-		if i > 0 {
-			out = append(out, ',')
+	// The ingester reports only a COUNT of rejects, which cannot be mapped back
+	// to a position. Every document handed to it was already checked to be a
+	// JSON object by parseBulk, so a reject here is a failure of a different
+	// kind: report it on the items that could have produced it rather than
+	// claiming 201 for all of them.
+	if skip > 0 {
+		marked := 0
+		for i := range ops {
+			if ops[i].doc != nil && ops[i].errType == "" && marked < skip {
+				ops[i].status = 500
+				ops[i].errType = "server_error"
+				ops[i].errMsg = "the document was not stored; its position within the batch is not attributable"
+				marked++
+			}
 		}
-		out = append(out, itemOK...)
 	}
-	out = append(out, "]}\n"...)
+
+	w.Header().Set("Content-Type", "application/json")
+	out := make([]byte, 0, 48+64*len(ops))
+	out = append(out, `{"took":0,"errors":`...)
+	out = strconv.AppendBool(out, bulkHasError(ops))
+	out = appendBulkItems(out, ops)
+	out = append(out, "}\n"...)
 	w.Write(out)
 }

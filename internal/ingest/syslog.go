@@ -47,6 +47,32 @@ func IngestSyslogOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 	return res, nil
 }
 
+// IngestSyslogMessage ingests ONE syslog message, newlines included.
+//
+// The line-splitting entry point above is right for UDP (one datagram, one
+// message) and for newline-framed TCP. It is WRONG for an RFC 6587
+// octet-counted frame, which is the framing that exists precisely so a message
+// CAN contain newlines: a forwarded multi-line stack trace arrives as one
+// counted frame, and splitting it again turns line two onward into records
+// that parse as nothing.
+func IngestSyslogMessage(w *Writer, msg []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
+	if len(trimSpace(msg)) == 0 {
+		return res, nil
+	}
+	fields := map[string]string{}
+	ts, ok := parseSyslogInto(string(msg), fields)
+	if !ok {
+		ts = fallback()
+	}
+	if !opts.Empty() {
+		opts.apply(fields)
+	}
+	addWithStream(w, ts, fields, opts)
+	res.Accepted++
+	return res, nil
+}
+
 var severityName = [8]string{"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"}
 
 // parseSyslogInto fills fields from one syslog line and returns its timestamp.

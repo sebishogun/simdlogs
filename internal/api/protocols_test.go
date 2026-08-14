@@ -585,19 +585,37 @@ func TestOTLPLogsIngest(t *testing.T) {
 	}
 }
 
-// TestStripBulkActions guards the in-place compaction: it aliases the caller's
-// buffer, so an off-by-one writes a document over one not yet read.
-func TestStripBulkActions(t *testing.T) {
+// TestBulkDocsCompaction guards the in-place compaction: it aliases the
+// caller's buffer, so an off-by-one writes a document over one not yet read.
+//
+// Replaces TestStripBulkActions. The old function detected a delete with
+// bytes.Contains(line, `"delete"`), so indexing into an index NAMED delete was
+// read as a delete action and the whole rest of the body desynchronized; its
+// third case below pins that the parser now reads the action's KEY.
+func TestBulkDocsCompaction(t *testing.T) {
 	cases := []struct{ name, in, want string }{
 		{"pairs", "{\"create\":{}}\n{\"a\":1}\n{\"index\":{}}\n{\"b\":2}\n", "{\"a\":1}\n{\"b\":2}\n"},
 		{"delete carries no doc", "{\"delete\":{\"_id\":\"1\"}}\n{\"create\":{}}\n{\"a\":1}\n", "{\"a\":1}\n"},
+		// An index NAMED delete is an index action, not a delete: the value
+		// contains the word, the KEY does not.
+		{"index named delete", "{\"index\":{\"_index\":\"delete\"}}\n{\"a\":1}\n{\"index\":{}}\n{\"b\":2}\n",
+			"{\"a\":1}\n{\"b\":2}\n"},
 		{"no trailing newline", "{\"create\":{}}\n{\"a\":1}", "{\"a\":1}\n"},
 		{"blank lines", "{\"create\":{}}\n\n{\"a\":1}\n\n", "{\"a\":1}\n"},
 		{"action with no doc", "{\"create\":{}}\n", ""},
+		// update's source is a wrapper, not a document: it must not be stored.
+		{"update is not a document", "{\"update\":{\"_id\":\"1\"}}\n{\"doc\":{\"a\":1}}\n{\"create\":{}}\n{\"b\":2}\n",
+			"{\"b\":2}\n"},
 		{"empty", "", ""},
 	}
 	for _, c := range cases {
-		got := string(stripBulkActions([]byte(c.in)))
+		body := []byte(c.in)
+		ops, perr := parseBulk(body)
+		if perr != "" {
+			t.Errorf("%s: parse failed: %s", c.name, perr)
+			continue
+		}
+		got := string(bulkDocs(ops, body))
 		if got != c.want {
 			t.Errorf("%s: got %q want %q", c.name, got, c.want)
 		}
@@ -662,12 +680,49 @@ func TestESBulkIngest(t *testing.T) {
 		t.Fatal(err)
 	}
 	var resp struct {
-		Items []any `json:"items"`
+		Errors bool `json:"errors"`
+		Items  []struct {
+			Index *struct {
+				Status int `json:"status"`
+			} `json:"index"`
+			Create *struct {
+				Status int `json:"status"`
+			} `json:"create"`
+			Delete *struct {
+				Status int                    `json:"status"`
+				Error  *struct{ Type string } `json:"error"`
+			} `json:"delete"`
+		} `json:"items"`
 	}
 	json.NewDecoder(r.Body).Decode(&resp)
 	r.Body.Close()
-	if len(resp.Items) != 3 {
-		t.Fatalf("bulk items = %d want 3 (delete has no doc)", len(resp.Items))
+	// ONE ITEM PER ACTION, including the delete. This used to be one item per
+	// INGESTED DOCUMENT -- three for four actions -- and Elasticsearch clients
+	// match items to their requests BY POSITION, so the delete's absence shifted
+	// the third action's status onto the fourth action's document.
+	if len(resp.Items) != 4 {
+		t.Fatalf("bulk items = %d want 4, one per action", len(resp.Items))
+	}
+	if resp.Items[0].Index == nil || resp.Items[0].Index.Status != 201 {
+		t.Errorf("item 0 (index) = %+v, want status 201", resp.Items[0])
+	}
+	if resp.Items[1].Create == nil || resp.Items[1].Create.Status != 201 {
+		t.Errorf("item 1 (create) = %+v, want status 201", resp.Items[1])
+	}
+	// delete is REJECTED explicitly rather than swallowed: this store is
+	// append-only, and a client asking for a deletion that silently did not
+	// happen has been told the wrong thing.
+	if resp.Items[2].Delete == nil || resp.Items[2].Delete.Status != 400 {
+		t.Errorf("item 2 (delete) = %+v, want status 400", resp.Items[2])
+	}
+	if resp.Items[2].Delete != nil && resp.Items[2].Delete.Error == nil {
+		t.Error("the rejected delete carries no error object")
+	}
+	if resp.Items[3].Index == nil || resp.Items[3].Index.Status != 201 {
+		t.Errorf("item 3 (index) = %+v, want status 201", resp.Items[3])
+	}
+	if !resp.Errors {
+		t.Error("errors = false though the delete was rejected")
 	}
 	// The two error docs are found via the ES _count DSL (@timestamp mapped).
 	cbody := `{"query":{"bool":{"filter":[{"term":{"level":"error"}}]}}}`
