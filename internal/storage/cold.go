@@ -127,6 +127,10 @@ func (s *Store) Demote(cutoff int64, cold ColdStore) (int, error) {
 		}
 		moved++
 	}
+	// Retry here too. retryTombstones used to run only from dropGroups, and
+	// retention is disabled by default, so a failed demotion unlink was
+	// counted forever and its disk never reclaimed.
+	s.retryTombstones()
 	return moved, nil
 }
 

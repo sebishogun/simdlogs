@@ -34,7 +34,14 @@ type Limits struct {
 	// Concurrency and tenancy.
 	MaxConcurrentQuery int
 	MaxConcurrentWrite int
-	MaxOpenTenants     int
+	// MaxConcurrentTail bounds live tails. They are not charged the query
+	// budget -- an open tail is an idle connection, and charging it meant a
+	// few of them returned 429 for every other read including /metrics --
+	// but "not charged" is not "unbounded": each one holds a connection, a
+	// goroutine and a poll timer, and with no bound an anonymous client
+	// opened as many as it liked.
+	MaxConcurrentTail int
+	MaxOpenTenants    int
 }
 
 // Unlimited is the explicit opt-out for a numeric bound. It is negative so it
@@ -60,6 +67,7 @@ func DefaultLimits() Limits {
 
 		MaxConcurrentQuery: 32,
 		MaxConcurrentWrite: 32,
+		MaxConcurrentTail:  64,
 		MaxOpenTenants:     1024,
 	}
 }
@@ -76,6 +84,7 @@ func TestLimits() Limits {
 	l.MaxQueryDuration = 2 * time.Second
 	l.MaxConcurrentQuery = 4
 	l.MaxConcurrentWrite = 4
+	l.MaxConcurrentTail = 4
 	l.MaxOpenTenants = 8
 	return l
 }
@@ -100,6 +109,7 @@ func fields() []field {
 		{"max-query-bytes", func(l *Limits) int64 { return l.MaxQueryBytes }, func(l *Limits, v int64) { l.MaxQueryBytes = v }},
 		{"max-concurrent-query", func(l *Limits) int64 { return int64(l.MaxConcurrentQuery) }, func(l *Limits, v int64) { l.MaxConcurrentQuery = int(v) }},
 		{"max-concurrent-write", func(l *Limits) int64 { return int64(l.MaxConcurrentWrite) }, func(l *Limits, v int64) { l.MaxConcurrentWrite = int(v) }},
+		{"max-concurrent-tail", func(l *Limits) int64 { return int64(l.MaxConcurrentTail) }, func(l *Limits, v int64) { l.MaxConcurrentTail = int(v) }},
 		{"max-open-tenants", func(l *Limits) int64 { return int64(l.MaxOpenTenants) }, func(l *Limits, v int64) { l.MaxOpenTenants = int(v) }},
 	}
 }

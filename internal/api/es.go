@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -59,7 +60,11 @@ func (s *Server) esSearch(w http.ResponseWriter, r *http.Request) {
 		q.Limit = body.Size
 	}
 	q.MatAll = true // ES _source expects the whole document, not just filter fields
+	esStopped := s.applyQueryBudget(r, q)
 	rows := query.Run(s.tn(r).store, q)
+	if s.queryStopped(w, r, esStopped) {
+		return
+	}
 	hits := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
 		src := map[string]any{"@timestamp": time.Unix(0, row.Time).UTC().Format(time.RFC3339Nano)}
@@ -84,7 +89,12 @@ func (s *Server) esCount(w http.ResponseWriter, r *http.Request) {
 	var body esQuery
 	json.NewDecoder(r.Body).Decode(&body)
 	q := esToQuery(body.Query)
-	json.NewEncoder(w).Encode(map[string]any{"count": query.Count(s.tn(r).store, q)})
+	stopped := s.applyQueryBudget(r, q)
+	n := query.Count(s.tn(r).store, q)
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"count": n})
 }
 
 // esToQuery maps the DSL subset onto the planner's Query. A range on a
@@ -214,9 +224,24 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		ing, skip = ingest.IngestJSONLinesOpts(tn.w, docs, fallback, &opts)
-		if err := tn.w.Flush(); err != nil {
-			http.Error(w, err.Error(), 500)
+		// Mark before adding: the tenant's buffer is shared, so only
+		// FlushMark can report on the rows this request contributed.
+		mark := tn.w.Mark()
+		res, perr := ingest.IngestJSONLinesOpts(tn.w, docs, fallback, &opts)
+		ing, skip = res.Accepted, res.Rejected
+		if perr != nil {
+			s.countRows(ing, skip, len(body))
+			s.writeErr(w, r, ndjsonSpec(), ingest.StatusFor(perr), perr.Error())
+			return
+		}
+		if err := tn.w.FlushMark(mark); err != nil {
+			// A closed writer dropped the rows silently, so counting them
+			// would inflate the ingested total by rows that were never
+			// stored. Every other flush failure did buffer them.
+			if !errors.Is(err, ingest.ErrWriterClosed) {
+				s.countRows(ing, skip, len(body))
+			}
+			s.writeErr(w, r, ndjsonSpec(), http.StatusServiceUnavailable, err.Error())
 			return
 		}
 	}

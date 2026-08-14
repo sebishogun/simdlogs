@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -112,6 +113,7 @@ type manifest struct {
 	path    string
 	f       *os.File
 	seq     uint64
+	records int // records appended since the last compaction
 	visible map[uint64]bool
 }
 
@@ -170,16 +172,60 @@ func (m *manifest) apply(rec manifestRecord) {
 // is durable, so a caller may treat a successful commit as the point the
 // group set changed.
 func (m *manifest) commit(add, remove []uint64, receipt []byte) error {
-	m.seq++
-	rec := manifestRecord{Seq: m.seq, Add: add, Remove: remove, Receipt: receipt}
-	if _, err := m.f.Write(rec.encode()); err != nil {
+	// Where the record starts, so a short write can be undone. Without this,
+	// a partial record stayed on the tail and every later commit was appended
+	// after it -- replay then stopped at the garbage and silently dropped
+	// every acknowledged, fsynced commit that followed.
+	//
+	// The size, NOT Seek(0, io.SeekCurrent). The file is opened O_APPEND,
+	// which repositions before each write and leaves the descriptor's offset
+	// at 0 until the first one -- so the current offset was 0 for the first
+	// commit of every process. A failed first commit then truncated the whole
+	// manifest, and OpenStore's legacy path re-adopted every group file on
+	// disk, resurrecting exactly the removals this log exists to make
+	// durable. ENOSPC during a retention pass is the ordinary way to hit it.
+	fi, err := m.f.Stat()
+	if err != nil {
 		return err
 	}
-	if err := m.f.Sync(); err != nil {
-		return err
+	off := fi.Size()
+	seq := m.seq + 1
+	rec := manifestRecord{Seq: seq, Add: add, Remove: remove, Receipt: receipt}
+	if _, werr := m.f.Write(rec.encode()); werr != nil {
+		m.truncateTo(off)
+		return werr
 	}
+	if serr := m.f.Sync(); serr != nil {
+		m.truncateTo(off)
+		return serr
+	}
+	// Only now is the record durable, so only now does the sequence advance.
+	m.seq = seq
 	m.apply(rec)
+	m.records++
+	// Fold the log down once it is long. Without a caller, compact() was
+	// dead code and replay stayed proportional to every change ever made.
+	if m.records >= compactThreshold {
+		if err := m.compact(); err != nil {
+			// The log is still valid, just long; report nothing and try again
+			// at the next commit.
+			m.reopen()
+			return nil
+		}
+		m.records = 0
+	}
 	return nil
+}
+
+// truncateTo rolls the file back to a record boundary after a failed append.
+// A failure here is reported by leaving the manifest as it is: the next open
+// truncates the torn tail, which is the same repair one restart later.
+func (m *manifest) truncateTo(off int64) {
+	if err := m.f.Truncate(off); err != nil {
+		return
+	}
+	m.f.Seek(off, io.SeekStart)
+	m.f.Sync()
 }
 
 // isVisible reports whether the manifest says a group id is part of the
@@ -202,12 +248,15 @@ func (m *manifest) visibleIDs() []uint64 {
 // complete one.
 func (m *manifest) bootstrap(ids []uint64) error {
 	if err := m.f.Close(); err != nil {
+		m.f = nil
+		m.reopen()
 		return err
 	}
 	m.f = nil
 	m.seq = 1
 	rec := manifestRecord{Seq: 1, Add: ids}
 	if err := writeFileAtomic(m.path, rec.encode(), DataFileMode); err != nil {
+		m.reopen()
 		return err
 	}
 	m.visible = map[uint64]bool{}
@@ -224,15 +273,28 @@ func (m *manifest) bootstrap(ids []uint64) error {
 // currently visible, so replay cost stays proportional to the live group set
 // rather than to every change ever made. It goes through the atomic helper:
 // a crash leaves the old manifest or the new one.
+// compactThreshold is the record count past which a commit compacts the log.
+// Replay cost is proportional to the file, so an append-only manifest on a
+// busy store grows without bound.
+const compactThreshold = 4096
+
 func (m *manifest) compact() error {
 	ids := m.visibleIDs()
 	if err := m.f.Close(); err != nil {
+		// Clear the handle first. Returning with m.f non-nil but closed made
+		// reopen()'s nil check a no-op, so every later commit failed with
+		// "file already closed" forever -- the same permanent-unwritability
+		// defect reopen exists for, one branch over. close(2) reports EIO or
+		// ENOSPC on writeback failure, so this is reachable.
+		m.f = nil
+		m.reopen()
 		return err
 	}
 	m.f = nil
 	m.seq++
 	rec := manifestRecord{Seq: m.seq, Add: ids}
 	if err := writeFileAtomic(m.path, rec.encode(), DataFileMode); err != nil {
+		m.reopen()
 		return err
 	}
 	f, err := os.OpenFile(m.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, DataFileMode)
@@ -241,6 +303,19 @@ func (m *manifest) compact() error {
 	}
 	m.f = f
 	return nil
+}
+
+// reopen restores the append handle after a failed compaction or bootstrap.
+// Both close the file before rewriting it, so a failure left m.f nil and
+// every later commit failed with os.ErrInvalid forever -- a transient disk
+// error turned into a permanently unwritable store.
+func (m *manifest) reopen() {
+	if m.f != nil {
+		return
+	}
+	if f, err := os.OpenFile(m.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, DataFileMode); err == nil {
+		m.f = f
+	}
 }
 
 func (m *manifest) close() error {

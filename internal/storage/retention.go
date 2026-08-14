@@ -59,7 +59,12 @@ func (s *Store) DropGroupsBefore(cutoff int64) int {
 func (s *Store) dropGroups(match func(*groupEntry) bool) int {
 	s.mu.Lock()
 	var victims []*groupEntry
-	kept := s.groups[:0]
+	// A fresh slice, not s.groups[:0]. Filtering in place overwrote the
+	// backing array before the manifest commit was known to succeed, so a
+	// failed commit left the index corrupted -- [0 1 2] became [1 2 2], with
+	// group 0 invisible until a restart and group 2 counted twice by every
+	// query and by TotalRows.
+	kept := make([]*groupEntry, 0, len(s.groups))
 	for _, g := range s.groups {
 		if match(g) {
 			victims = append(victims, g)

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
@@ -31,7 +33,7 @@ func ingestOptions(r *http.Request) ingest.Options {
 // parsers against the request's tenant writer, then flushes. status is the
 // success code the protocol's clients expect.
 func (s *Server) ingestBody(w http.ResponseWriter, r *http.Request, status int,
-	parse func(*ingest.Writer, []byte, func() int64, *ingest.Options) (int, int)) {
+	parse func(*ingest.Writer, []byte, func() int64, *ingest.Options) (ingest.Result, error)) {
 	body, berr := s.readBody(w, r)
 	if berr != nil {
 		s.writeErr(w, r, ndjsonSpec(), berr.code, berr.msg)
@@ -39,13 +41,69 @@ func (s *Server) ingestBody(w http.ResponseWriter, r *http.Request, status int,
 	}
 	tn := s.tn(r)
 	opts := ingestOptions(r)
-	ing, skip := parse(tn.w, body, tn.fallbackTS(), &opts)
-	s.countRows(ing, skip, len(body))
-	if err := tn.w.Flush(); err != nil {
-		http.Error(w, err.Error(), 500)
+	mark := tn.w.Mark()
+	res, perr := parse(tn.w, body, tn.fallbackTS(), &opts)
+	// Whatever was accepted before the failure is still counted: the rows are
+	// in the writer either way, and metrics that disagree with the store are
+	// worse than metrics that report a partial batch.
+	if perr != nil {
+		// A payload this parser could not read is a failed request. Every one
+		// of these used to return zero records and success, so a
+		// misconfigured agent looked healthy while nothing was stored.
+		s.writeErr(w, r, ndjsonSpec(), ingest.StatusFor(perr), perr.Error())
+		return
+	}
+	// FlushMark, not Flush: the row buffer is shared by every request and
+	// every syslog connection on this tenant, so a plain Flush reports on
+	// whatever batches it happened to wait for -- which is routinely another
+	// request's rows. This asks about the rows THIS request added.
+	if err := tn.w.FlushMark(mark); err != nil {
+		s.writeErr(w, r, ndjsonSpec(), http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	// Counted after the flush, not before it with a subtraction on failure.
+	// vl_rows_ingested_total is declared a Prometheus counter, and a scrape
+	// landing between the add and the subtract saw a spike that the
+	// correction then turned into an apparent restart for rate().
+	s.countRows(res.Accepted, res.Rejected, len(body))
+	// Records the parser refused are reported rather than dropped silently.
+	//
+	// A 204 carries no body -- Go discards anything written after it -- so a
+	// route whose success code is 204 reports the rejects in headers instead.
+	// Writing a JSON body after WriteHeader(204) looked like reporting and
+	// dropped the counts exactly as before.
+	if res.Rejected > 0 {
+		if status == http.StatusNoContent {
+			w.Header().Set("X-Simdlogs-Accepted", strconv.Itoa(res.Accepted))
+			w.Header().Set("X-Simdlogs-Rejected", strconv.Itoa(res.Rejected))
+			if ws := warningStrings(res.Warnings); len(ws) > 0 {
+				w.Header().Set("X-Simdlogs-Warning", ws[0])
+			}
+			w.WriteHeader(status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]any{
+			"accepted": res.Accepted,
+			"rejected": res.Rejected,
+			"warnings": warningStrings(res.Warnings),
+		})
 		return
 	}
 	w.WriteHeader(status)
+}
+
+// warningStrings flattens the parser's warnings for a response body.
+func warningStrings(ws []ingest.Warning) []string {
+	if len(ws) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, w.Msg)
+	}
+	return out
 }
 
 // insertLoki ingests a Grafana Loki push body (JSON); clients expect 204.
@@ -85,17 +143,28 @@ func (s *Server) insertOTLPLogs(w http.ResponseWriter, r *http.Request) {
 	// the JSON decoder stored nothing while answering 200 -- silent data loss
 	// for the DEFAULT client configuration.
 	proto := strings.Contains(r.Header.Get("Content-Type"), "protobuf")
-	var oing, oskip int
+	mark := tn.w.Mark()
+	var ores ingest.Result
+	var operr error
 	if proto {
-		oing, oskip = ingest.IngestOTLPLogsProto(tn.w, body, tn.fallbackTS(), &otlpOpts)
+		ores, operr = ingest.IngestOTLPLogsProto(tn.w, body, tn.fallbackTS(), &otlpOpts)
 	} else {
-		oing, oskip = ingest.IngestOTLPLogsOpts(tn.w, body, tn.fallbackTS(), &otlpOpts)
+		ores, operr = ingest.IngestOTLPLogsOpts(tn.w, body, tn.fallbackTS(), &otlpOpts)
 	}
-	s.countRows(oing, oskip, len(body))
-	if err := tn.w.Flush(); err != nil {
-		http.Error(w, err.Error(), 500)
+	if operr != nil {
+		// OTLP exporters retry 5xx and give up on 4xx; answering 200 for an
+		// undecodable body told them the data was delivered.
+		s.writeErr(w, r, otlpSpec(), ingest.StatusFor(operr), operr.Error())
 		return
 	}
+	if err := tn.w.FlushMark(mark); err != nil {
+		s.writeErr(w, r, otlpSpec(), http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	// After the flush, like every sibling path: a counter must not go
+	// backwards, and counting first meant a scrape could see a spike the
+	// correction then read as a restart.
+	s.countRows(ores.Accepted, ores.Rejected, len(body))
 	// The response mirrors the request's encoding, as the OTLP/HTTP spec
 	// requires: an empty ExportLogsServiceResponse is zero bytes in protobuf
 	// and {} in JSON, both meaning full success.

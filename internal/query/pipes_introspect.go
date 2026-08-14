@@ -123,6 +123,14 @@ func runBlocksCount(s Store, q *Query) []Row {
 	sn1 := snapshotOf(s, q.From, q.To)
 	defer sn1.Close()
 	for _, g := range sn1.Groups {
+		// The deadline, checked per group. These paths return counts and
+		// facets rather than rows, so MaxBytes has nothing to measure --
+		// but a scan of every group is exactly what the wall-clock budget
+		// exists to bound, and until this went in twelve read routes ran
+		// with no bound at all.
+		if q.exceeded(0) {
+			break
+		}
 		if groupCanMatch(g, q) {
 			n++
 		}
@@ -135,6 +143,14 @@ func runBlockStats(s Store, q *Query) []Row {
 	sn2 := snapshotOf(s, q.From, q.To)
 	defer sn2.Close()
 	for _, g := range sn2.Groups {
+		// The deadline, checked per group. These paths return counts and
+		// facets rather than rows, so MaxBytes has nothing to measure --
+		// but a scan of every group is exactly what the wall-clock budget
+		// exists to bound, and until this went in twelve read routes ran
+		// with no bound at all.
+		if q.exceeded(0) {
+			break
+		}
 		if !groupCanMatch(g, q) {
 			continue
 		}

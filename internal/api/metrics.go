@@ -97,6 +97,15 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		"counter", storage.RetentionFailures())
 	m("simdlogs_retention_tombstones", "Groups committed as removed whose file is still on disk.",
 		"gauge", storage.PendingTombstones())
+	// Tenant lifecycle. No tenant-id label: a per-tenant label on a map an
+	// untrusted header can grow is unbounded cardinality, which is how a
+	// metrics endpoint takes down its own scraper.
+	s.mu.Lock()
+	openTenants := int64(len(s.tenants))
+	s.mu.Unlock()
+	m("simdlogs_tenants_open", "Tenants currently held open.", "gauge", openTenants)
+	m("simdlogs_tenants_evicted_total", "Tenants closed to make room for another.", "counter", TenantsEvicted())
+	m("simdlogs_tenants_rejected_total", "Requests refused because every tenant slot was busy.", "counter", TenantsRejected())
 	s.writeRuleMetrics(w) // metrics-from-logs rules
 }
 

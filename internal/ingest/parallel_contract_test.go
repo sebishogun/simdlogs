@@ -254,9 +254,9 @@ func TestRequestStreamFieldsDoNotDoubleTheColumn(t *testing.T) {
 		fmt.Fprintf(&sb, `{"_time":%d,"service":"api","host":"h%d","seq":"s%d"}`+"\n",
 			base+int64(i)*1000, i, i)
 	}
-	ing, skip := IngestJSONLinesOpts(w, []byte(sb.String()), monotonic(), opts)
-	if ing != rows || skip != 0 {
-		t.Fatalf("ingested %d skipped %d", ing, skip)
+	ingRes, _ := IngestJSONLinesOpts(w, []byte(sb.String()), monotonic(), opts)
+	if ingRes.Accepted != rows || ingRes.Rejected != 0 {
+		t.Fatalf("ingested %d skipped %d", ingRes.Accepted, ingRes.Rejected)
 	}
 	if err := w.Flush(); err != nil {
 		t.Fatal(err)
@@ -309,8 +309,8 @@ func TestStreamOverrideIsPerRequestNotPerRow(t *testing.T) {
 	// Row 0 has host; row 1 does not, so its override label is empty.
 	body := `{"_time":1700000000000000001,"service":"api","host":"h1"}` + "\n" +
 		`{"_time":1700000000000000002,"service":"api"}` + "\n"
-	if ing, _ := IngestJSONLinesOpts(w, []byte(body), monotonic(), opts); ing != 2 {
-		t.Fatalf("ingested %d rows", ing)
+	if ingRes, _ := IngestJSONLinesOpts(w, []byte(body), monotonic(), opts); ingRes.Accepted != 2 {
+		t.Fatalf("ingested %d rows", ingRes.Accepted)
 	}
 	if err := w.Flush(); err != nil {
 		t.Fatal(err)
@@ -340,7 +340,7 @@ func TestPayloadStreamFieldDoesNotOverrideDeployment(t *testing.T) {
 	w.SetStreamFields([]string{"service"})
 
 	body := `{"_time":1700000000000000001,"service":"api","_stream":"{tenant=\"attacker\"}"}` + "\n"
-	if ing, _ := IngestJSONLines(w, []byte(body), monotonic()); ing != 1 {
+	if ingRes, _ := IngestJSONLines(w, []byte(body), monotonic()); ingRes.Accepted != 1 {
 		t.Fatal("row not ingested")
 	}
 	if err := w.Flush(); err != nil {

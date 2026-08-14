@@ -346,7 +346,7 @@ func (r *Reader) EqualityRows(name, value string) (rows []uint32, has bool) {
 	if id < 0 {
 		return nil, true
 	}
-	return postingRows(r.blob[m.PostOff:m.PostOff+m.PostLen], id), true
+	return postingRows(r.blob[m.PostOff:m.PostOff+m.PostLen], id, r.Rows), true
 }
 
 // ---- dict-value bloom, on the simd hash ----

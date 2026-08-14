@@ -1,6 +1,9 @@
 package ingest
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+)
 
 // lokiPush is Grafana Loki's push payload: streams of label sets, each with a
 // list of [timestamp-ns, line] pairs (an optional third element carries
@@ -12,25 +15,35 @@ type lokiPush struct {
 	} `json:"streams"`
 }
 
+var errNoStreams = errors.New("no streams field: not a Loki push payload")
+
 // IngestLoki ingests a Loki push body: each stream's labels become fields, its
 // log line becomes _msg, and the nanosecond timestamp is taken from the pair
 // (fallback when absent or unparseable). One record per value entry.
-func IngestLoki(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestLoki(w *Writer, data []byte, fallback func() int64) (Result, error) {
 	return IngestLokiOpts(w, data, fallback, nil)
 }
 
 // IngestLokiOpts is IngestLoki with the request's field mappings applied.
-func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	var p lokiPush
 	if err := json.Unmarshal(data, &p); err != nil {
-		return 0, 0
+		// A push whose JSON does not parse is a failed request, not an empty
+		// one. Returning zero records and no error made it answer 200, so a
+		// misconfigured agent looked healthy while nothing was stored.
+		return res, encodingErr(err)
+	}
+	if p.Streams == nil {
+		return res, envelopeErr(errNoStreams)
 	}
 	fields := map[string]string{}
 	for _, st := range p.Streams {
 		for _, ent := range st.Values {
 			if len(ent) < 2 {
-				skipped++
+				res.Rejected++
+				res.Warn(0, "stream entry has fewer than two elements")
 				continue
 			}
 			var tsStr, line string
@@ -51,8 +64,8 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 				opts.apply(fields)
 			}
 			addWithStream(w, ts, fields, opts)
-			ingested++
+			res.Accepted++
 		}
 	}
-	return ingested, skipped
+	return res, nil
 }

@@ -11,12 +11,13 @@ import (
 // named severity; the structured header fields (hostname, app, procid, msgid)
 // become fields and the free text becomes _msg. A line that is not syslog at
 // all is stored whole as _msg so nothing is dropped.
-func IngestSyslog(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestSyslog(w *Writer, data []byte, fallback func() int64) (Result, error) {
 	return IngestSyslogOpts(w, data, fallback, nil)
 }
 
 // IngestSyslogOpts is IngestSyslog with the request's field mappings applied.
-func IngestSyslogOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestSyslogOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	fields := map[string]string{}
 	for len(data) > 0 {
@@ -41,9 +42,9 @@ func IngestSyslogOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 			opts.apply(fields)
 		}
 		addWithStream(w, ts, fields, opts)
-		ingested++
+		res.Accepted++
 	}
-	return ingested, skipped
+	return res, nil
 }
 
 var severityName = [8]string{"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"}

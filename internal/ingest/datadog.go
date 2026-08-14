@@ -2,31 +2,40 @@ package ingest
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 )
+
+var errEmptyBody = errors.New("empty body")
 
 // IngestDatadog ingests the Datadog logs intake body: a JSON array of log
 // objects (or a single object). "message" becomes _msg, "ddtags" is split into
 // comma-separated key:value fields, "timestamp"/"date" set the time (ms since
 // epoch as a number, or an RFC3339/ns string), and every other attribute
 // becomes a field. https://docs.datadoghq.com/api/latest/logs/ (/api/v2/logs).
-func IngestDatadog(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestDatadog(w *Writer, data []byte, fallback func() int64) (Result, error) {
 	return IngestDatadogOpts(w, data, fallback, nil)
 }
 
 // IngestDatadogOpts is IngestDatadog with the request's field mappings applied.
-func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	trim := trimSpace(data)
+	if len(trim) == 0 {
+		return res, envelopeErr(errEmptyBody)
+	}
 	var entries []map[string]json.RawMessage
-	if len(trim) > 0 && trim[0] == '[' {
+	if trim[0] == '[' {
 		if err := json.Unmarshal(trim, &entries); err != nil {
-			return 0, 0
+			// Undecodable is a failed request. It answered 200 with a zero
+			// count, which is what an empty valid batch also looks like.
+			return res, encodingErr(err)
 		}
 	} else {
 		var one map[string]json.RawMessage
 		if err := json.Unmarshal(trim, &one); err != nil {
-			return 0, 0
+			return res, encodingErr(err)
 		}
 		entries = []map[string]json.RawMessage{one}
 	}
@@ -56,7 +65,8 @@ func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Opti
 			}
 		}
 		if len(fields) == 0 {
-			skipped++
+			res.Rejected++
+			res.Warn(0, "entry has no message field")
 			continue
 		}
 		if !haveTS {
@@ -66,9 +76,9 @@ func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Opti
 			opts.apply(fields)
 		}
 		addWithStream(w, ts, fields, opts)
-		ingested++
+		res.Accepted++
 	}
-	return ingested, skipped
+	return res, nil
 }
 
 // ddTime reads a Datadog timestamp: a JSON number is milliseconds since epoch

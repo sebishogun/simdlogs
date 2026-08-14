@@ -123,11 +123,25 @@ func hexPackBlock(raw []byte, count int) []byte {
 // raw block so blockValAt and the searches read it unchanged. The nibble->char
 // expansion is simd.HexEncode (SIMD): faster than the LZ4 kernel it replaces.
 func hexUnpackBlock(packed []byte) []byte {
+	if len(packed) < 4 {
+		return nil
+	}
 	count := int(get32(packed, 0))
+	// count and total are file bytes: a corrupt count slices the offset
+	// table past the block, and a corrupt total sizes the output.
+	if count < 0 || count > (len(packed)-4)/4 {
+		return nil
+	}
 	strBase := 4 * (count + 1)
+	if 4+strBase > len(packed) {
+		return nil
+	}
 	total := int(get32(packed[4:], 4*count)) // last offset = total chars
 	nb := (total + 1) / 2
 	nibBase := 4 + strBase
+	if total < 0 || nb > len(packed)-nibBase {
+		return nil
+	}
 	// HexEncode writes 2*nb chars; for an odd total that is one pad char past
 	// the strings, unread (offsets bound reads to total). Size raw for it.
 	raw := make([]byte, strBase+2*nb)
@@ -202,39 +216,92 @@ type dictSec struct {
 	comp      []byte // compressed blocks
 }
 
+// parseDictSec reads a dict section, validating every length against what is
+// left of the slice.
+//
+// It had no bounds checks at all: nb came straight from the file, and
+// sec[p : p+4*(nb+1)] on a corrupt count panicked. That mattered more than a
+// bad request, because needsRecompact calls this from the tiering goroutine,
+// which has no recover -- a single corrupt group killed the process. A zero
+// dictSec is the failure signal; every caller already treats it as an empty
+// section.
 func parseDictSec(sec []byte) dictSec {
 	if len(sec) < 8 {
 		return dictSec{}
 	}
 	nb := int(get32(sec, 0))
+	// Each block costs 4 bytes of first-value offset plus 12 of index, so a
+	// count beyond that is corrupt however large the section is.
+	if nb < 0 || nb > (len(sec)-8)/16 {
+		return dictSec{}
+	}
 	p := 8
+	need := func(n int) bool { return n >= 0 && n <= len(sec)-p }
+
+	if !need(4 * (nb + 1)) {
+		return dictSec{}
+	}
 	fvOff := sec[p : p+4*(nb+1)]
 	p += 4 * (nb + 1)
+
+	if !need(4) {
+		return dictSec{}
+	}
 	fvLen := int(get32(sec, p))
 	p += 4
+	if !need(fvLen) {
+		return dictSec{}
+	}
 	fvStr := sec[p : p+fvLen]
 	p += fvLen
+
+	if !need(nb * 12) {
+		return dictSec{}
+	}
 	idx := sec[p : p+nb*12]
 	p += nb * 12
+
+	if !need(4) {
+		return dictSec{}
+	}
 	compLen := int(get32(sec, p))
 	p += 4
+	if !need(compLen) {
+		return dictSec{}
+	}
 	comp := sec[p : p+compLen]
 	return dictSec{numBlocks: nb, fvOff: fvOff, fvStr: fvStr, idx: idx, comp: comp}
 }
 
 func (d dictSec) firstVal(k int) string {
-	o0 := get32(d.fvOff, 4*k)
-	o1 := get32(d.fvOff, 4*(k+1))
+	// Both offsets are four bytes of file, and so is every length below in
+	// block/blockValAt. parseDictSec validates the section's own geometry;
+	// nothing validated the per-block table inside it, and Recompact reaches
+	// here from the tiering goroutine, which has no recover.
+	if k < 0 || 4*(k+1)+4 > len(d.fvOff) {
+		return ""
+	}
+	o0 := int(get32(d.fvOff, 4*k))
+	o1 := int(get32(d.fvOff, 4*(k+1)))
+	if o0 < 0 || o1 < o0 || o1 > len(d.fvStr) {
+		return ""
+	}
 	return string(d.fvStr[o0:o1])
 }
 
 // block decompresses block k into [k'+1 offsets][strings], dispatching on the
 // per-block codec flagged in rawLen's high bit (default LZ4, compact flate).
 func (d dictSec) block(k int) []byte {
+	if k < 0 || k*12+12 > len(d.idx) {
+		return nil
+	}
 	compOff := int(get32(d.idx, k*12))
 	compLen := int(get32(d.idx, k*12+4))
 	rawField := get32(d.idx, k*12+8)
 	rawLen := int(rawField &^ (dictCodecFlate | dictCodecHex))
+	if compOff < 0 || compLen < 0 || compOff > len(d.comp) || compLen > len(d.comp)-compOff {
+		return nil
+	}
 	comp := d.comp[compOff : compOff+compLen]
 	switch {
 	case rawField&dictCodecHex != 0:
@@ -248,10 +315,16 @@ func (d dictSec) block(k int) []byte {
 
 // blockValAt reads value i within a decompressed block of count vals.
 func blockValAt(raw []byte, count, i int) string {
+	if i < 0 || count < 0 || 4*(i+1)+4 > len(raw) || i >= count {
+		return ""
+	}
 	base := 4 * (count + 1)
-	o0 := get32(raw, 4*i)
-	o1 := get32(raw, 4*(i+1))
-	return string(raw[base+int(o0) : base+int(o1)])
+	o0 := int(get32(raw, 4*i))
+	o1 := int(get32(raw, 4*(i+1)))
+	if o0 < 0 || o1 < o0 || base < 0 || base+o1 > len(raw) {
+		return ""
+	}
+	return string(raw[base+o0 : base+o1])
 }
 
 // blockCount is how many values block k holds.

@@ -12,7 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -69,22 +71,44 @@ type Server struct {
 	// itself, and the alert and rule tickers had no stop at all and ran for
 	// the life of the process.
 	auth     *authState
-	bgCtx    context.Context
-	bgCancel context.CancelFunc
-	bg       sync.WaitGroup
-	stopping atomic.Bool
+	querySem chan struct{} // MaxConcurrentQuery
+	writeSem chan struct{} // MaxConcurrentWrite
+	tailSem  chan struct{} // MaxConcurrentTail
+	// Syslog listeners accept outside the HTTP server, so shutdown has to
+	// close their connections explicitly.
+	syslogMu        sync.Mutex
+	syslogConns     map[net.Conn]struct{}
+	syslogListeners []io.Closer
+	syslogClosing   bool
+	syslogWG        sync.WaitGroup
+	routeMu         sync.Mutex
+	routes          []string
+	bgCtx           context.Context
+	bgCancel        context.CancelFunc
+	bg              sync.WaitGroup
+	bgMu            sync.Mutex // orders the stopping check against bg.Add
+	stopping        atomic.Bool
 }
 
 // goBackground runs fn on an interval until the server shuts down. It is the
 // only way this package starts a periodic loop, so no loop can be added that
 // shutdown does not know about.
 func (s *Server) goBackground(interval time.Duration, fn func()) (stop func()) {
-	if interval <= 0 || s.stopping.Load() {
+	if interval <= 0 {
+		return func() {}
+	}
+	// The check and the Add happen under the same lock Close takes before
+	// waiting, so a loop cannot register after bg.Wait() has returned --
+	// which is the documented WaitGroup misuse.
+	s.bgMu.Lock()
+	if s.stopping.Load() {
+		s.bgMu.Unlock()
 		return func() {}
 	}
 	done := make(chan struct{})
 	var once sync.Once
 	s.bg.Add(1)
+	s.bgMu.Unlock()
 	go func() {
 		defer s.bg.Done()
 		t := time.NewTicker(interval)
@@ -130,6 +154,16 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	}
 	srv := &Server{dir: dir, tenants: map[string]*tenant{}, started: time.Now()}
 	srv.limits = c.Limits
+	// Concurrency budgets. A nil channel means unbounded.
+	if n := c.Limits.MaxConcurrentQuery; n > 0 {
+		srv.querySem = make(chan struct{}, n)
+	}
+	if n := c.Limits.MaxConcurrentWrite; n > 0 {
+		srv.writeSem = make(chan struct{}, n)
+	}
+	if n := c.Limits.MaxConcurrentTail; n > 0 {
+		srv.tailSem = make(chan struct{}, n)
+	}
 	srv.compact = c.Compact
 	if len(c.StreamFields) > 0 {
 		srv.strmFlds = append([]string(nil), c.StreamFields...)
@@ -151,8 +185,47 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// tenant() hands it back marked busy; this one is the server's default,
+	// not an in-flight request, so release the reference or every request
+	// sees one permanently busy tenant. It is kept out of eviction by
+	// identity instead (evictIdleLocked), which is what a request-count
+	// reference cannot express: the default is not busy, it is not
+	// evictable.
+	def.inFlight.Add(-1)
 	srv.def = def
 	return srv, nil
+}
+
+// closeDrainTimeout bounds how long Close waits for in-flight requests. Past
+// it, closing anyway is the lesser evil: the alternative is a process that
+// will not exit because one client will not hang up.
+const closeDrainTimeout = 10 * time.Second
+
+// drainInFlight waits until no tenant has a request in flight, or until the
+// deadline. It reports whether the wait succeeded.
+//
+// s.stopping is already set, so no new request gets a tenant; this is only
+// about the ones already inside.
+func (s *Server) drainInFlight(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		busy := 0
+		s.mu.Lock()
+		for _, tn := range s.tenants {
+			if n := tn.inFlight.Load(); n > 0 {
+				busy += int(n)
+			}
+		}
+		s.mu.Unlock()
+		if busy == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			log.Printf("shutdown: %d requests still in flight after %s; closing anyway", busy, d)
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // Dir is the data directory the server was opened on -- what a caller measures
@@ -166,11 +239,24 @@ func (s *Server) Close() error {
 	// Stop accepting new background work, cancel what is running, and wait
 	// for it. Closing the stores first would unmap under a retention or
 	// recompaction pass that is still walking them.
+	s.bgMu.Lock()
 	s.stopping.Store(true)
+	s.bgMu.Unlock()
 	if s.bgCancel != nil {
 		s.bgCancel()
 	}
 	s.bg.Wait()
+	// Syslog connections next: they write through the tenant writers, so they
+	// must be gone before those writers close.
+	s.closeSyslogConns()
+
+	// Then in-flight HTTP requests. Closing a store unmaps it, and a handler
+	// still inside a query is reading that mapping -- Close returning while a
+	// request was mid-flight was a use-after-unmap waiting for the timing to
+	// line up. http.Server.Shutdown is not enough on its own: it is the
+	// caller's to run, main.go logs its expiry and closes anyway, and a live
+	// tail is not an idle connection it would ever drain.
+	s.drainInFlight(closeDrainTimeout)
 
 	s.mu.Lock()
 	tenants := make([]*tenant, 0, len(s.tenants))
@@ -180,13 +266,22 @@ func (s *Server) Close() error {
 	s.mu.Unlock()
 	var firstErr error
 	for _, t := range tenants {
-		if err := t.w.Close(); err != nil && firstErr == nil { // flush buffered rows, stop the pool
+		// ErrWriterClosed on a second Close is the writer reporting it is
+		// already shut, not a failure -- Close is documented idempotent.
+		if err := t.w.Close(); err != nil && !errors.Is(err, ingest.ErrWriterClosed) && firstErr == nil {
 			firstErr = err
 		}
 		if err := t.store.Close(); err != nil && firstErr == nil { // unmap
 			firstErr = err
 		}
 	}
+	// Forget them. Leaving the map populated meant a request arriving after
+	// Close found a closed tenant, and a request for a NEW tenant opened a
+	// store -- with its directory lock and writer pool -- that nothing would
+	// ever close.
+	s.mu.Lock()
+	s.tenants = map[string]*tenant{}
+	s.mu.Unlock()
 	return firstErr
 }
 
@@ -214,6 +309,42 @@ func (s *Server) SetStreamFields(fields []string) {
 	s.mu.Unlock()
 }
 
+// applyQueryBudget stamps the configured wall-clock and byte budgets onto a
+// query, and returns a flag the caller checks afterwards.
+//
+// The request context alone did nothing: Go does not abort a handler when its
+// context is cancelled, and internal/query took no context, so
+// -search.maxDuration bounded the cluster fan-out and nothing else. The scan
+// checks these per group.
+func (s *Server) applyQueryBudget(r *http.Request, q *query.Query) *atomic.Bool {
+	stopped := new(atomic.Bool)
+	q.Stopped = stopped
+	if d := s.limits.MaxQueryDuration; d > 0 {
+		q.Deadline = time.Now().Add(d)
+	}
+	if dl, ok := r.Context().Deadline(); ok {
+		if q.Deadline.IsZero() || dl.Before(q.Deadline) {
+			q.Deadline = dl
+		}
+	}
+	if n := s.limits.MaxQueryBytes; n > 0 {
+		q.MaxBytes = n
+	}
+	return stopped
+}
+
+// queryStopped answers a query that hit a budget. A short result presented as
+// complete is the silent truncation this exists to prevent.
+func (s *Server) queryStopped(w http.ResponseWriter, r *http.Request, stopped *atomic.Bool) bool {
+	if stopped == nil || !stopped.Load() {
+		return false
+	}
+	s.writeErr(w, r, readSpec(), http.StatusGatewayTimeout,
+		"query exceeded its time or byte budget; narrow the window, add a filter, "+
+			"or raise -search.maxDuration / -search.maxQueryBytes")
+	return true
+}
+
 // parallelCfg is the deployment writer configuration the temporary shard
 // writers of a large ingest must inherit. It reads the same two settings the
 // persistent per-tenant writer is built with (tenant), so a large body and a
@@ -225,6 +356,8 @@ func (s *Server) parallelCfg() ingest.ParallelConfig {
 	return ingest.ParallelConfig{
 		Compact:      s.compact,
 		StreamFields: append([]string(nil), s.strmFlds...),
+		MaxLineBytes: s.limits.MaxLineBytes,
+		Limits:       s.recordLimits(),
 	}
 }
 
@@ -260,73 +393,115 @@ func splitCSV(v string) []string {
 	return out
 }
 
+// registeredPaths records every path Handler() registers, in registration
+// order. It exists so the route audit can enumerate the real mux instead of a
+// hand-written list -- the list is what missed /_search and /_count.
+// routeCount is the number of paths Handler() registered, so the audit can
+// assert it saw all of them rather than compare against a constant.
+func (s *Server) routeCount() int {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	return len(s.routes)
+}
+
+func (s *Server) registeredPaths() []string {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	return append([]string(nil), s.routes...)
+}
+
 // Handler wires the routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	s.routeMu.Lock()
+	s.routes = nil
+	s.routeMu.Unlock()
+	handle := func(pattern string, h http.HandlerFunc) {
+		s.routeMu.Lock()
+		s.routes = append(s.routes, pattern)
+		s.routeMu.Unlock()
+		mux.HandleFunc(pattern, h)
+	}
 	// Every ingest route is wrapped: method, media type and a bounded body.
 	// Unwrapped, each handler read r.Body with io.ReadAll and no limit, took
 	// any method, and ignored Content-Type entirely.
 	nd := ndjsonSpec()
 	// ingest is the role every write path needs; query for reads; admin for
 	// the backup and diagnostic surfaces. in/rd/adm wrap guard with it.
+	// Authentication is outermost, then the request-shape guard. An
+	// unauthenticated caller gets 401 whatever it sends; with the guard
+	// outside, a wrong Content-Type answered 415 first, which tells an
+	// anonymous caller which media types a route accepts.
 	in := func(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
-		return s.guard(spec, s.requireAuth(config.RoleIngest, spec, h))
+		return s.requireAuth(config.RoleIngest, spec, s.guard(spec, h))
 	}
 	rd := func(h http.HandlerFunc) http.HandlerFunc {
 		sp := readSpec()
-		return s.guard(sp, s.requireAuth(config.RoleQuery, sp, h))
+		return s.requireAuth(config.RoleQuery, sp, s.guard(sp, h))
 	}
 	adm := func(h http.HandlerFunc) http.HandlerFunc {
 		sp := adminSpec()
-		return s.guard(sp, s.requireAuth(config.RoleAdmin, sp, h))
+		return s.requireAuth(config.RoleAdmin, sp, s.guard(sp, h))
 	}
-	mux.HandleFunc("/insert/jsonline", in(nd, s.insertJSONLine))
-	mux.HandleFunc("/insert/logfmt", in(nd, s.insertLogfmt))
-	mux.HandleFunc("/_bulk", in(nd, s.esBulk))                               // Elasticsearch bulk ingest
-	mux.HandleFunc("/loki/api/v1/push", in(nd, s.insertLoki))                // Grafana Loki push
-	mux.HandleFunc("/api/v2/logs", in(nd, s.insertDatadog))                  // Datadog logs intake
-	mux.HandleFunc("/v1/input", in(nd, s.insertDatadog))                     // Datadog legacy intake
-	mux.HandleFunc("/insert/syslog", in(nd, s.insertSyslog))                 // syslog over HTTP (native transport: ListenSyslog)
-	mux.HandleFunc("/v1/logs", in(otlpSpec(), s.insertOTLPLogs))             // OpenTelemetry OTLP/HTTP logs
-	mux.HandleFunc("/insert/journald", in(journaldSpec(), s.insertJournald)) // systemd journal export
-	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	handle("/insert/jsonline", in(nd, s.insertJSONLine))
+	handle("/insert/logfmt", in(nd, s.insertLogfmt))
+	handle("/_bulk", in(nd, s.esBulk))                                                // Elasticsearch bulk ingest
+	handle("/loki/api/v1/push", in(nd, s.insertLoki))                                 // Grafana Loki push
+	handle("/api/v2/logs", in(nd, s.insertDatadog))                                   // Datadog logs intake
+	handle("/v1/input", in(nd, s.insertDatadog))                                      // Datadog legacy intake
+	handle("/insert/syslog", in(nd, s.insertSyslog))                                  // syslog over HTTP (native transport: ListenSyslog)
+	handle("/v1/logs", in(specForPath("/v1/logs"), s.insertOTLPLogs))                 // OpenTelemetry OTLP/HTTP logs
+	handle("/insert/journald", in(specForPath("/insert/journald"), s.insertJournald)) // systemd journal export
+	handle("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	// VictoriaLogs serves every third-party ingest protocol under /insert/<vendor>/.
 	// An agent whose config was written against VictoriaLogs sends the prefixed
 	// path, so serving only the vendor-native path 404s a drop-in client. Both
 	// spellings are registered; the unprefixed ones are what the vendors' own
 	// agents use when pointed at a bare host.
-	mux.HandleFunc("/insert/elasticsearch/_bulk", in(nd, s.esBulk))
-	mux.HandleFunc("/insert/loki/api/v1/push", in(nd, s.insertLoki))
-	mux.HandleFunc("/insert/datadog/api/v2/logs", in(nd, s.insertDatadog))
-	mux.HandleFunc("/insert/datadog/api/v1/validate", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	mux.HandleFunc("/insert/opentelemetry/v1/logs", in(otlpSpec(), s.insertOTLPLogs))
-	mux.HandleFunc("/admin/backup", adm(s.backup))                                                            // tar snapshot for offline restore
-	mux.HandleFunc("/metrics", s.guard(readSpec(), s.requireAuth(config.RoleMetrics, readSpec(), s.metrics))) // Prometheus text exposition
-	mux.HandleFunc("/alerts", rd(s.alertsHandler))                                                            // alerting rule state
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
-	mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
-	mux.HandleFunc("/-/ready", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
-	mux.HandleFunc("/flags", adm(s.flagsHandler)) // flag dump: administrative
-	mux.HandleFunc("/vmui", s.ui)                 // web UI (vmui equivalent)
-	mux.HandleFunc("/select/vmui", rd(s.ui))
-	mux.HandleFunc("/", s.ui) // catch-all: serve the UI at the root
-	mux.HandleFunc("/select/logsql/query", rd(s.selectQuery))
-	mux.HandleFunc("/select/sql", rd(s.sqlQuery))        // SQL SELECT subset (beyond VL)
-	mux.HandleFunc("/select/vector", rd(s.vectorSearch)) // k-NN over embeddings (beyond VL)
-	mux.HandleFunc("/select/logsql/tail", rd(s.tail))    // live tail: stream matching rows as they arrive
-	mux.HandleFunc("/select/logsql/hits", rd(s.selectHits))
-	mux.HandleFunc("/select/logsql/field_names", rd(s.fieldNames))
-	mux.HandleFunc("/select/logsql/field_values", rd(s.fieldValues))
-	mux.HandleFunc("/select/logsql/facets", rd(s.facets))
-	mux.HandleFunc("/select/logsql/stats_query", rd(s.statsQuery))
-	mux.HandleFunc("/select/logsql/stats_query_range", rd(s.statsQueryRange))
-	mux.HandleFunc("/select/logsql/streams", rd(s.streamsHandler))
-	mux.HandleFunc("/select/logsql/stream_ids", rd(s.streamIDsHandler))
-	mux.HandleFunc("/select/logsql/stream_field_names", rd(s.streamFieldNamesHandler))
-	mux.HandleFunc("/select/logsql/stream_field_values", rd(s.streamFieldValuesHandler))
+	handle("/insert/elasticsearch/_bulk", in(nd, s.esBulk))
+	handle("/insert/loki/api/v1/push", in(nd, s.insertLoki))
+	handle("/insert/datadog/api/v2/logs", in(nd, s.insertDatadog))
+	// Datadog agents call this to check their API key. Answering 200
+	// unconditionally told every agent its key was valid; behind the ingest
+	// role it now answers for credentials this server actually accepts.
+	handle("/insert/datadog/api/v1/validate",
+		in(specForPath("/insert/datadog/api/v1/validate"), func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	handle("/insert/opentelemetry/v1/logs", in(specForPath("/insert/opentelemetry/v1/logs"), s.insertOTLPLogs))
+	handle("/admin/backup", adm(s.backup))                                                          // tar snapshot for offline restore
+	handle("/metrics", s.requireAuth(config.RoleMetrics, opsSpec(), s.guard(opsSpec(), s.metrics))) // Prometheus text exposition
+	handle("/alerts", rd(s.alertsHandler))                                                          // alerting rule state
+	handle("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
+	handle("/-/healthy", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
+	handle("/-/ready", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
+	handle("/flags", adm(s.flagsHandler)) // flag dump: administrative
+	handle("/vmui", rd(s.ui))             // web UI (vmui equivalent); same gate as /select/vmui
+	handle("/select/vmui", rd(s.ui))
+	// The catch-all serves the same UI page /vmui and /select/vmui gate, so
+	// it carries the same role. It was the one registration in this function
+	// with no wrapper.
+	handle("/", rd(s.ui))
+	handle("/select/logsql/query", rd(s.selectQuery))
+	handle("/select/sql", rd(s.sqlQuery))        // SQL SELECT subset (beyond VL)
+	handle("/select/vector", rd(s.vectorSearch)) // k-NN over embeddings (beyond VL)
+	// The tail has no deadline: it is long-lived by design.
+	handle("/select/logsql/tail", s.requireAuth(config.RoleQuery, tailSpec(), s.guard(tailSpec(), s.tail))) // live tail: stream matching rows as they arrive
+	handle("/select/logsql/hits", rd(s.selectHits))
+	handle("/select/logsql/field_names", rd(s.fieldNames))
+	handle("/select/logsql/field_values", rd(s.fieldValues))
+	handle("/select/logsql/facets", rd(s.facets))
+	handle("/select/logsql/stats_query", rd(s.statsQuery))
+	handle("/select/logsql/stats_query_range", rd(s.statsQueryRange))
+	handle("/select/logsql/streams", rd(s.streamsHandler))
+	handle("/select/logsql/stream_ids", rd(s.streamIDsHandler))
+	handle("/select/logsql/stream_field_names", rd(s.streamFieldNamesHandler))
+	handle("/select/logsql/stream_field_values", rd(s.streamFieldValuesHandler))
 	// The Elasticsearch search surface VictoriaLogs lacks.
-	mux.HandleFunc("/_search", s.esSearch)
-	mux.HandleFunc("/_count", s.esCount)
+	// The Elasticsearch read surface returns tenant _source documents, so it
+	// needs the query role like every other read route. Registered bare, it
+	// also skipped the method guard, the media-type allowlist and the body
+	// limit: an anonymous POST /_search returned another tenant's payloads.
+	handle("/_search", rd(s.esSearch))
+	handle("/_count", rd(s.esCount))
 	// In router mode, writes forward to storage nodes (outermost, before the
 	// tenant/local path); reads fall through to withTenant -> federatedSelect.
 	// recoverPanic is outermost so one bad request can never take the server down.
@@ -375,9 +550,25 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// Small body: reuse the persistent writer, no per-request pool churn.
-		ing, skip = ingest.IngestJSONLinesOpts(tn.w, body, fallback, &opts)
-		if err := tn.w.Flush(); err != nil {
-			http.Error(w, err.Error(), 500)
+		// Mark first: that writer's buffer is shared with every other
+		// request on this tenant, so only FlushMark can say whether THESE
+		// rows landed.
+		mark := tn.w.Mark()
+		res, perr := ingest.IngestJSONLinesOpts(tn.w, body, fallback, &opts)
+		ing, skip = res.Accepted, res.Rejected
+		if perr != nil {
+			s.countRows(ing, skip, len(body))
+			s.writeErr(w, r, ndjsonSpec(), ingest.StatusFor(perr), perr.Error())
+			return
+		}
+		if err := tn.w.FlushMark(mark); err != nil {
+			// A closed writer dropped the rows silently, so counting them
+			// would inflate the ingested total by rows that were never
+			// stored. Every other flush failure did buffer them.
+			if !errors.Is(err, ingest.ErrWriterClosed) {
+				s.countRows(ing, skip, len(body))
+			}
+			s.writeErr(w, r, ndjsonSpec(), http.StatusServiceUnavailable, err.Error())
 			return
 		}
 	}
@@ -394,13 +585,19 @@ func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
 	}
 	tn := s.tn(r)
 	lfOpts := ingestOptions(r)
-	ing, skip := ingest.IngestLogfmtOpts(tn.w, body, tn.fallbackTS(), &lfOpts)
-	s.countRows(ing, skip, len(body))
-	if err := tn.w.Flush(); err != nil {
-		http.Error(w, err.Error(), 500)
+	lfMark := tn.w.Mark()
+	lfRes, lfErr := ingest.IngestLogfmtOpts(tn.w, body, tn.fallbackTS(), &lfOpts)
+	if lfErr != nil {
+		s.writeErr(w, r, ndjsonSpec(), ingest.StatusFor(lfErr), lfErr.Error())
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]int{"ingested": ing, "skipped": skip})
+	if err := tn.w.FlushMark(lfMark); err != nil {
+		s.writeErr(w, r, ndjsonSpec(), http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	// After the flush: a counter must not go backwards.
+	s.countRows(lfRes.Accepted, lfRes.Rejected, len(body))
+	json.NewEncoder(w).Encode(map[string]int{"ingested": lfRes.Accepted, "skipped": lfRes.Rejected})
 }
 
 // selectQuery runs a parsed LogsQL query and streams matched rows as
@@ -431,7 +628,11 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 			q.MaxRows = s.maxRows
 		}
 	}
+	stopped := s.applyQueryBudget(r, q)
 	rows := query.RunPipeline(s.tn(r).store, q) // applies the pipe chain; == Run when there are none
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
 	if bareSelect && s.maxRows > 0 && len(rows) > s.maxRows {
 		http.Error(w, fmt.Sprintf("simdlogs: result exceeds -search.maxRows=%d; add a `| limit N`, a stats pipe, or narrow the query", s.maxRows), 400)
 		return
@@ -550,6 +751,11 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&s.nTails, 1)
 	defer atomic.AddInt64(&s.nTails, -1)
 	store := s.tn(r).store
+	// The store pointer is all this loop needs from here on, and every read
+	// through it takes its own lease. Holding the tenant claim for the life
+	// of the connection is what let a handful of anonymous tails fill the
+	// tenant table and 503 everyone else.
+	tenantRefOf(r).release()
 	cursor := store.TailCursor() // only groups that arrive after we subscribe
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
@@ -567,26 +773,83 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 			offset = d
 		}
 	}
+	// The backlog is a batch query, not a stream: start_offset is a
+	// client-supplied duration, so without a budget one request replayed the
+	// whole store, and MaxConcurrentTail (64 by default) was the only bound
+	// on how many did it at once. tailSpec drops the deadline for the
+	// STREAM, which is right; this part is not the stream.
 	backlog := *q
 	backlog.From = time.Now().Add(-offset).UnixNano()
 	backlog.To = int64(1) << 62
-	for _, row := range query.RunPipeline(store, &backlog) {
+	backlogStopped := s.applyQueryBudget(r, &backlog)
+	if n := s.maxRows; n > 0 && backlog.MaxRows == 0 {
+		backlog.MaxRows = n
+	}
+	replayed := query.RunPipeline(store, &backlog)
+	for _, row := range replayed {
 		buf = appendRowJSON(buf[:0], row, backlog.MatAll)
 		bw.Write(buf)
+	}
+	// MaxRows exits Run early WITHOUT setting Stopped -- that path is the
+	// one the batch select turns into a 400 by comparing len(rows). The tail
+	// has no such comparison, so the replay was silently short.
+	rowCap := backlog.MaxRows > 0 && len(replayed) > backlog.MaxRows
+	if rowCap || (backlogStopped != nil && backlogStopped.Load()) {
+		// The replay hit its budget. The headers are already sent, so this
+		// cannot be a 504 -- say so in the stream and start tailing, which
+		// is what the client asked for.
+		line, _ := json.Marshal(map[string]string{
+			".error": "the backlog replay was cut short (budget or row cap); " +
+				"narrow start_offset. Live tailing continues.",
+		})
+		bw.Write(line)
+		bw.WriteByte('\n')
 	}
 	bw.Flush()
 	flusher.Flush()
 	for {
-		readers, nc := store.GroupsAfterID(cursor)
-		if len(readers) > 0 {
-			cursor = nc
-			for _, row := range query.RunPipeline(readerStore(readers), q) {
-				buf = appendRowJSON(buf[:0], row, q.MatAll)
-				bw.Write(buf)
-			}
+		// SnapshotAfterID, not GroupsAfterID: the latter hands out raw
+		// *Reader values with no reference taken, so retention could unmap a
+		// group this loop was still decoding. Task 4.1 built the leased form
+		// and nothing called it.
+		snap, nc, serr := store.SnapshotAfterID(cursor)
+		if serr != nil {
+			// The store is closing -- shutdown, or this tenant being evicted
+			// out from under the stream. Returning silently gave the client
+			// a clean end-of-stream on a 200, indistinguishable from a
+			// normal close, with no way to know it must reconnect.
+			// Not "_stream_error": nothing reserves that name, so a stored
+			// row can carry it and a client cannot tell a marker from a log
+			// line. The leading dot is not a legal field name here, and the
+			// line is encoded rather than concatenated so an error text with
+			// a quote in it cannot break the stream's framing.
+			line, _ := json.Marshal(map[string]string{
+				".error": "the log stream ended: " + serr.Error() + "; reconnect to resume",
+			})
+			bw.Write(line)
+			bw.WriteByte('\n')
 			bw.Flush()
 			flusher.Flush()
+			return
 		}
+		// The lease is released in a closure, so the defer runs per
+		// iteration. A defer written directly in the loop body fires only at
+		// function return: the panic-safety held, but every poll pushed
+		// another closure retaining a *Snapshot, so a day-long tail at two
+		// polls a second accumulated ~172,800 of them.
+		func() {
+			defer snap.Close()
+			readers := snap.Groups
+			if len(readers) > 0 {
+				cursor = nc
+				for _, row := range query.RunPipeline(readerStore(readers), q) {
+					buf = appendRowJSON(buf[:0], row, q.MatAll)
+					bw.Write(buf)
+				}
+				bw.Flush()
+				flusher.Flush()
+			}
+		}()
 		select {
 		case <-ctx.Done():
 			return
@@ -611,7 +874,12 @@ func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	var buf []byte
-	for _, row := range query.RunPipeline(s.tn(r).store, q) {
+	sqlStopped := s.applyQueryBudget(r, q)
+	sqlRows := query.RunPipeline(s.tn(r).store, q)
+	if s.queryStopped(w, r, sqlStopped) {
+		return
+	}
+	for _, row := range sqlRows {
 		buf = appendRowJSON(buf[:0], row, q.MatAll)
 		bw.Write(buf)
 	}
@@ -638,7 +906,13 @@ func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	var buf []byte
-	for _, row := range query.VectorSearch(s.tn(r).store, from, to, body.Field, body.Vector, body.K) {
+	vq := &query.Query{From: from, To: to}
+	vStopped := s.applyQueryBudget(r, vq)
+	rows := query.VectorSearch(s.tn(r).store, from, to, body.Field, body.Vector, body.K, vq)
+	if s.queryStopped(w, r, vStopped) {
+		return
+	}
+	for _, row := range rows {
 		buf = appendRowJSON(buf[:0], row, false)
 		bw.Write(buf)
 	}
@@ -668,7 +942,11 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 	if by == "" {
 		by = r.FormValue("fields")
 	}
+	stopped := s.applyQueryBudget(r, q)
 	series := query.Hits(s.tn(r).store, q, step, by)
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
 	// fields_limit keeps the busiest N series and folds the rest into one
 	// unlabelled remainder, so a graph of a high-cardinality field stays
 	// readable instead of returning a series per value.
@@ -810,7 +1088,12 @@ func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, limitValues(query.FieldNameCounts(s.tn(r).store, q), r))
+	stopped := s.applyQueryBudget(r, q)
+	vals := query.FieldNameCounts(s.tn(r).store, q)
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
+	writeValues(w, limitValues(vals, r))
 }
 
 func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
@@ -823,7 +1106,11 @@ func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	stopped := s.applyQueryBudget(r, q)
 	vcs := query.StatsByField(s.tn(r).store, q, r.FormValue("field"))
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
 	query.SortValueCounts(vcs)
 	if n := intParam(r, "limit", 0); n > 0 && len(vcs) > n {
 		vcs = vcs[:n]
@@ -837,10 +1124,14 @@ func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	stopped := s.applyQueryBudget(r, q)
 	facets := query.FacetList(s.tn(r).store, q,
 		intParam(r, "limit", query.DefaultFacetLimit),
 		intParam(r, "max_values_per_field", query.DefaultFacetMaxValues),
 		r.FormValue("keep_const_fields") == "1")
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
 	if facets == nil {
 		facets = []query.FieldFacet{}
 	}
@@ -867,7 +1158,12 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 	if to == int64(1)<<62 {
 		to = time.Now().UnixNano()
 	}
-	samples, err := query.StatsQueryInstant(s.tn(r).store, r.FormValue("query"), from, to, time.Now().UnixNano())
+	sq := &query.Query{From: from, To: to}
+	stopped := s.applyQueryBudget(r, sq)
+	samples, err := query.StatsQueryInstant(s.tn(r).store, r.FormValue("query"), from, to, time.Now().UnixNano(), sq)
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
 	if err != nil {
 		// A query with no stats pipe has no series; the group-by form below is
 		// the older shape and still answers it.
@@ -879,7 +1175,14 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 			}
 			// `by=` is an extension the reference has no equivalent for, so it
 			// keeps its own key rather than pretending to be a Prometheus vector.
+			// It re-parses, so it needs its own budget: the one applied above
+			// belongs to the Query that failed, and without this the fallback
+			// answered a COMPLETE 200 with the deadline already spent.
+			byStopped := s.applyQueryBudget(r, q)
 			vcs := query.StatsByField(s.tn(r).store, q, by)
+			if s.queryStopped(w, r, byStopped) {
+				return
+			}
 			query.SortValueCounts(vcs)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{"stats": vcs})
@@ -972,7 +1275,12 @@ func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, limitValues(query.Streams(s.tn(r).store, q), r))
+	stopped := s.applyQueryBudget(r, q)
+	vals := query.Streams(s.tn(r).store, q)
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
+	writeValues(w, limitValues(vals, r))
 }
 
 // streamIDsHandler lists the distinct stream ids in the window.
@@ -986,7 +1294,12 @@ func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, limitValues(query.StreamIDs(s.tn(r).store, q), r))
+	stopped := s.applyQueryBudget(r, q)
+	vals := query.StreamIDs(s.tn(r).store, q)
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
+	writeValues(w, limitValues(vals, r))
 }
 
 // streamFieldNamesHandler lists the distinct stream label names.
@@ -1000,7 +1313,12 @@ func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, limitValues(query.StreamFieldNames(s.tn(r).store, q), r))
+	stopped := s.applyQueryBudget(r, q)
+	vals := query.StreamFieldNames(s.tn(r).store, q)
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
+	writeValues(w, limitValues(vals, r))
 }
 
 // streamFieldValuesHandler lists the distinct values of one stream label.
@@ -1014,7 +1332,12 @@ func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, limitValues(query.StreamFieldValues(s.tn(r).store, q, r.FormValue("field")), r))
+	stopped := s.applyQueryBudget(r, q)
+	vals := query.StreamFieldValues(s.tn(r).store, q, r.FormValue("field"))
+	if s.queryStopped(w, r, stopped) {
+		return
+	}
+	writeValues(w, limitValues(vals, r))
 }
 
 // statsQueryRange buckets a stats query over the time range and returns a
@@ -1026,7 +1349,12 @@ func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	from, to := timeWindow(r)
 	step := parseStepNs(r.FormValue("step"), from, to)
-	series, err := query.StatsQueryRange(s.tn(r).store, r.FormValue("query"), from, to, step, time.Now().UnixNano())
+	rq := &query.Query{From: from, To: to}
+	rStopped := s.applyQueryBudget(r, rq)
+	series, err := query.StatsQueryRange(s.tn(r).store, r.FormValue("query"), from, to, step, time.Now().UnixNano(), rq)
+	if s.queryStopped(w, r, rStopped) {
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return

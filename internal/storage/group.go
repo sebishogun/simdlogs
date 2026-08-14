@@ -3,6 +3,7 @@ package storage
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"math"
 )
@@ -68,6 +69,29 @@ type colMeta struct {
 
 // Marshal serializes the group to a self-describing blob.
 func (g *Group) Marshal() []byte {
+	// Every column must carry exactly Rows values. Nothing on the read side
+	// can recover a short one: the block-count check pins Rows only to block
+	// granularity, so a timestamp column up to blockSize-1 short was accepted
+	// and the missing rows decoded a fabricated time. Cheaper and exact to
+	// refuse to write it.
+	for i := range g.Columns {
+		switch c := &g.Columns[i]; c.Type {
+		case ColTimestamp:
+			if len(c.Ts) != g.Rows {
+				panic(fmt.Sprintf("simdlogs: column %q has %d timestamps for %d rows",
+					c.Name, len(c.Ts), g.Rows))
+			}
+		case ColDict:
+			if c.Dict == nil || len(c.Dict.Indices) != g.Rows {
+				n := -1
+				if c.Dict != nil {
+					n = len(c.Dict.Indices)
+				}
+				panic(fmt.Sprintf("simdlogs: column %q has %d indices for %d rows",
+					c.Name, n, g.Rows))
+			}
+		}
+	}
 	var b []byte
 	b = appU32(b, magic)
 	b = appU32(b, versionV8)

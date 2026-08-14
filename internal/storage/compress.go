@@ -23,6 +23,13 @@ func flateCompress(src []byte) []byte {
 }
 
 func flateDecompress(src []byte, rawLen int) []byte {
+	// rawLen is four bytes of file and this allocates it up front. DEFLATE's
+	// widest expansion is a run of 258 bytes from a 48-bit match token, so
+	// anything past ~1032x the input never came from the compressor -- the
+	// same shape as the LZ4 bound below, with DEFLATE's ratio.
+	if rawLen < 0 || rawLen > 1032*len(src)+16 {
+		return nil
+	}
 	r := flate.NewReader(bytes.NewReader(src))
 	out := make([]byte, rawLen)
 	io.ReadFull(r, out)
@@ -112,6 +119,14 @@ func lz4Compress(src []byte) []byte {
 // lz4Decompress inflates a block into a buffer of the known original
 // length, on the simd kernel.
 func lz4Decompress(block []byte, origLen int) []byte {
+	// origLen is four bytes of file, and this allocates it before decoding a
+	// single byte -- a corrupt length is a multi-gigabyte allocation on the
+	// query path. An LZ4 block cannot expand by more than 255x (the widest
+	// match a one-byte token can copy), so anything past that is a header
+	// that never came from the compressor.
+	if origLen < 0 || origLen > 255*len(block)+16 {
+		return nil
+	}
 	dst := make([]byte, origLen)
 	n := simd.LZ4BlockDecode(dst, block)
 	if n != origLen {
@@ -137,6 +152,10 @@ func unmarshalDictBlob(b []byte, n int) []string {
 	for i := 0; i < n && p+4 <= len(b); i++ {
 		l := int(binary.LittleEndian.Uint32(b[p:]))
 		p += 4
+		// The length is from the file: a corrupt one slices past the blob.
+		if l < 0 || p+l > len(b) {
+			break
+		}
 		out = append(out, string(b[p:p+l]))
 		p += l
 	}

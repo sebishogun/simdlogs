@@ -57,12 +57,15 @@ type InstantSample struct {
 // StatsQueryInstant runs raw as a stats query over the whole [from,to) window
 // and returns one sample per (group, aggregate) -- the instant counterpart of
 // StatsQueryRange, which is what /select/logsql/stats_query answers.
-func StatsQueryInstant(s Store, raw string, from, to, now int64) ([]InstantSample, error) {
+// budget carries the deadline, the byte bound and the stop flag onto the
+// Query this parses for itself. Nil is unbounded.
+func StatsQueryInstant(s Store, raw string, from, to, now int64, budget *Query) ([]InstantSample, error) {
 	q, err := ParseLogsQL(raw)
 	if err != nil {
 		return nil, err
 	}
 	q.From, q.To, q.Now = from, to, now
+	applyBudget(q, budget)
 	by, aliases, ok := statsAliases(q)
 	if !ok {
 		return nil, errNotStats
@@ -89,7 +92,10 @@ func StatsQueryInstant(s Store, raw string, from, to, now int64) ([]InstantSampl
 // buckets, returning one series per group-by tuple with a point per bucket. The
 // query is re-parsed per bucket so each gets a clean window (RunPipeline mutates
 // the query while resolving _time). ts is the bucket start in unix seconds.
-func StatsQueryRange(s Store, raw string, from, to, step, now int64) ([]RangeSeries, error) {
+// budget carries the deadline and the stop flag onto every bucket's Query.
+// A range query re-parses per bucket, so the budget has to be re-applied per
+// bucket too or only the first one is bounded. Nil is unbounded.
+func StatsQueryRange(s Store, raw string, from, to, step, now int64, budget *Query) ([]RangeSeries, error) {
 	if step <= 0 {
 		step = to - from
 	}
@@ -110,6 +116,7 @@ func StatsQueryRange(s Store, raw string, from, to, step, now int64) ([]RangeSer
 			return nil, err
 		}
 		q.From, q.To, q.Now = bs, be, now
+		applyBudget(q, budget)
 		if b, a, ok := statsShape(q); ok {
 			by, alias = b, a
 		}
@@ -143,4 +150,13 @@ func StatsQueryRange(s Store, raw string, from, to, step, now int64) ([]RangeSer
 		out = append(out, *acc[k])
 	}
 	return out, nil
+}
+
+// applyBudget copies the budget fields -- and only those -- onto q. The
+// filter half of budget is never read.
+func applyBudget(q, budget *Query) {
+	if budget == nil {
+		return
+	}
+	q.Deadline, q.MaxBytes, q.Stopped = budget.Deadline, budget.MaxBytes, budget.Stopped
 }

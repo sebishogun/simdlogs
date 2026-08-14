@@ -111,6 +111,15 @@ func parsePairs(v string) [][2]string {
 // The writer's own stream fields are a deployment-wide default; a request that
 // names its own must not be forced through them, and must not end up with two
 // _stream columns in the same group.
+// RecordLimits bounds one record. They are applied by the writer rather than
+// by each parser, so a limit cannot be enforced on one protocol and forgotten
+// on the next.
+type RecordLimits struct {
+	MaxFields     int
+	MaxNameBytes  int
+	MaxValueBytes int
+}
+
 func addWithStream(w *Writer, ts int64, fields map[string]string, o *Options) {
 	// The override is a property of the request, not of the row. A row whose
 	// label comes out empty still belongs to the overriding request and must

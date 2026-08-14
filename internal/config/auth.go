@@ -55,7 +55,21 @@ func ParseTenantKey(s string) (TenantKey, error) {
 	if err := checkNumeric("project", proj); err != nil {
 		return TenantKey{}, err
 	}
-	return TenantKey{Account: acc, Project: proj}, nil
+	// Canonical decimal, not the raw string. ParseUint accepts leading
+	// zeros, and the key is what names both the map entry and the directory
+	// -- so "7", "07" and "007" were three separate stores with three
+	// directories and mutually invisible data, all reachable by varying one
+	// request header.
+	return TenantKey{Account: canonNum(acc), Project: canonNum(proj)}, nil
+}
+
+// canonNum renders a validated numeric id in canonical decimal.
+func canonNum(v string) string {
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return v // checkNumeric already rejected it; do not mask that
+	}
+	return strconv.FormatUint(n, 10)
 }
 
 func checkNumeric(what, v string) error {
@@ -110,6 +124,18 @@ func (p *Principal) DefaultTenant() (TenantKey, bool) {
 	return TenantKey{}, false
 }
 
+// CertSpec maps an mTLS client-certificate subject to a principal. It is how
+// a verified certificate becomes an identity rather than only a transport
+// gate: without it, RequireAndVerifyClientCert proves the client is trusted
+// by the CA and then discards who they are.
+type CertSpec struct {
+	// CommonName matches the client certificate's subject CN exactly.
+	CommonName string   `json:"commonName"`
+	Subject    string   `json:"subject"`
+	Roles      []string `json:"roles"`
+	Tenants    []string `json:"tenants"`
+}
+
 // TokenSpec is one credential in the auth file.
 type TokenSpec struct {
 	// SHA256 is the hex-encoded SHA-256 of the bearer token. The token
@@ -130,11 +156,29 @@ type AuthConfig struct {
 	// makes a misplaced config file silently open the server to everyone.
 	Disabled bool        `json:"disabled"`
 	Tokens   []TokenSpec `json:"tokens"`
+	// Certs maps mTLS client certificates to principals.
+	Certs []CertSpec `json:"certs"`
 	// TrustedProxy declares that a terminating proxy in front of this server
-	// authenticates callers and sets the tenant headers. When set, tenant
-	// headers are believed. It is a deployment assertion, and naming it is
-	// the point: the previous behaviour was to believe them always.
+	// authenticates callers and sets the tenant headers.
+	//
+	// When set, a request arriving with no credential of its own is given the
+	// principal named by ProxyRoles/ProxyTenants -- the proxy has already
+	// decided who it is. It is a deployment assertion, and naming it is the
+	// point: the previous behaviour was to believe the headers always.
+	//
+	// Bind loopback or a private interface when using this. A trusted-proxy
+	// server reachable directly is an unauthenticated server.
 	TrustedProxy bool `json:"trustedProxy"`
+	// ProxyRoles and ProxyTenants are what a proxy-authenticated request may
+	// do. Both are REQUIRED when TrustedProxy is set; there is no default.
+	//
+	// They used to default to every role and every tenant, which made
+	// omitting a credential strictly more powerful than presenting one: a
+	// least-privilege token got 403 on /admin/backup while an anonymous
+	// request got 200 and a tar of the whole store. A default that outranks
+	// every configured credential is not a default, it is a bypass.
+	ProxyRoles   []string `json:"proxyRoles"`
+	ProxyTenants []string `json:"proxyTenants"`
 }
 
 // LoadAuth reads and validates an auth file.
@@ -160,8 +204,70 @@ func (a *AuthConfig) Validate() error {
 	if a.Disabled {
 		return nil
 	}
-	if len(a.Tokens) == 0 && !a.TrustedProxy {
-		return fmt.Errorf("no tokens and no trustedProxy: set disabled:true to run without authentication")
+	if len(a.Tokens) == 0 && len(a.Certs) == 0 && !a.TrustedProxy {
+		return fmt.Errorf("no tokens, certs or trustedProxy: set disabled:true to run without authentication")
+	}
+	for i, c := range a.Certs {
+		if c.CommonName == "" {
+			return fmt.Errorf("cert %d: no commonName", i)
+		}
+		if c.Subject == "" {
+			return fmt.Errorf("cert %d (%s): no subject", i, c.CommonName)
+		}
+		if len(c.Roles) == 0 {
+			return fmt.Errorf("cert %d (%s): no roles", i, c.CommonName)
+		}
+		for _, r := range c.Roles {
+			if !validRole(Role(r)) {
+				return fmt.Errorf("cert %d (%s): unknown role %q", i, c.CommonName, r)
+			}
+		}
+		if len(c.Tenants) == 0 {
+			return fmt.Errorf("cert %d (%s): no tenants; use \"*\" for all", i, c.CommonName)
+		}
+		for _, tn := range c.Tenants {
+			if tn == "*" {
+				continue
+			}
+			if _, err := ParseTenantKey(tn); err != nil {
+				return fmt.Errorf("cert %d (%s): %w", i, c.CommonName, err)
+			}
+		}
+	}
+	if a.TrustedProxy {
+		if len(a.ProxyRoles) == 0 {
+			return fmt.Errorf("trustedProxy needs proxyRoles: an unauthenticated request must not " +
+				"get more than a configured token does")
+		}
+		if len(a.ProxyTenants) == 0 {
+			return fmt.Errorf("trustedProxy needs proxyTenants: use [\"*\"] only if the proxy " +
+				"really does authorize every tenant")
+		}
+		if len(a.Tokens) > 0 || len(a.Certs) > 0 {
+			// Both configured is legitimate -- a proxy for some clients,
+			// direct credentials for others -- but the proxy identity must
+			// not exceed what a credential can get, or omitting the
+			// credential is the privilege escalation.
+			for _, r := range a.ProxyRoles {
+				if Role(r) == RoleAdmin {
+					return fmt.Errorf("trustedProxy grants the admin role while tokens or certs are " +
+						"also configured: an unauthenticated request would outrank every credential")
+				}
+			}
+		}
+	}
+	for _, r := range a.ProxyRoles {
+		if !validRole(Role(r)) {
+			return fmt.Errorf("proxyRoles: unknown role %q", r)
+		}
+	}
+	for _, tn := range a.ProxyTenants {
+		if tn == "*" {
+			continue
+		}
+		if _, err := ParseTenantKey(tn); err != nil {
+			return fmt.Errorf("proxyTenants: %w", err)
+		}
 	}
 	seen := map[string]bool{}
 	for i, t := range a.Tokens {
@@ -227,6 +333,51 @@ func (a *AuthConfig) Principals() (map[string]*Principal, error) {
 		out[strings.ToLower(t.SHA256)] = p
 	}
 	return out, nil
+}
+
+// CertPrincipals maps client-certificate common names to principals.
+func (a *AuthConfig) CertPrincipals() (map[string]*Principal, error) {
+	if err := a.Validate(); err != nil {
+		return nil, err
+	}
+	out := make(map[string]*Principal, len(a.Certs))
+	for _, c := range a.Certs {
+		p, err := buildPrincipal(c.Subject, c.Roles, c.Tenants)
+		if err != nil {
+			return nil, err
+		}
+		out[c.CommonName] = p
+	}
+	return out, nil
+}
+
+// ProxyPrincipal is the identity a proxy-authenticated request runs as, or
+// nil when TrustedProxy is off.
+func (a *AuthConfig) ProxyPrincipal() (*Principal, error) {
+	if !a.TrustedProxy {
+		return nil, nil
+	}
+	// No defaulting: Validate requires both to be set.
+	return buildPrincipal("proxy", a.ProxyRoles, a.ProxyTenants)
+}
+
+func buildPrincipal(subject string, roles, tenants []string) (*Principal, error) {
+	p := &Principal{Subject: subject, Roles: map[Role]bool{}, Tenants: map[TenantKey]bool{}}
+	for _, r := range roles {
+		p.Roles[Role(r)] = true
+	}
+	for _, tn := range tenants {
+		if tn == "*" {
+			p.AllTenants = true
+			continue
+		}
+		k, err := ParseTenantKey(tn)
+		if err != nil {
+			return nil, err
+		}
+		p.Tenants[k] = true
+	}
+	return p, nil
 }
 
 // HashToken is the hex SHA-256 of a bearer token, the form the auth file

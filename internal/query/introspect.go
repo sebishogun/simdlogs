@@ -68,6 +68,14 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 	sn3 := snapshotOf(s, q.From, q.To)
 	defer sn3.Close()
 	for _, g := range sn3.Groups {
+		// The deadline, checked per group. These paths return counts and
+		// facets rather than rows, so MaxBytes has nothing to measure --
+		// but a scan of every group is exactly what the wall-clock budget
+		// exists to bound, and until this went in twelve read routes ran
+		// with no bound at all.
+		if q.exceeded(0) {
+			break
+		}
 		if !groupCanMatch(g, q) {
 			continue
 		}
@@ -198,6 +206,18 @@ func FacetList(s Store, q *Query, limit, maxPerField int, keepConst bool) []Fiel
 		// group's dictionary holds, so a high-cardinality field is rejected from
 		// the footers -- without building the map over its values that made
 		// field_names take nine seconds.
+		// Outside the maxPerField branch, not inside it. Inside, a request
+		// with max_values_per_field=0 -- which intParam accepts -- switched
+		// the budget check off entirely and kept calling StatsByField once
+		// per field past the deadline.
+		//
+		// And before the cardinality loop, not inside it: inside, an early
+		// break left `lower` smaller than the truth, so `lower > maxPerField`
+		// went false and the high-cardinality field was NOT skipped -- a
+		// budget check that both changed the answer and increased the work.
+		if q.exceeded(0) {
+			break
+		}
 		if maxPerField > 0 {
 			lower := 0
 			for _, g := range groups {
@@ -325,6 +345,14 @@ func StatsByField(s Store, q *Query, field string) []ValueCount {
 	sn5 := snapshotOf(s, q.From, q.To)
 	defer sn5.Close()
 	for _, g := range sn5.Groups {
+		// The deadline, checked per group. These paths return counts and
+		// facets rather than rows, so MaxBytes has nothing to measure --
+		// but a scan of every group is exactly what the wall-clock budget
+		// exists to bound, and until this went in twelve read routes ran
+		// with no bound at all.
+		if q.exceeded(0) {
+			break
+		}
 		if !groupCanMatch(g, q) {
 			continue
 		}

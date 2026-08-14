@@ -12,6 +12,7 @@
 package ingest
 
 import (
+	"errors"
 	"runtime"
 	"sort"
 	"strings"
@@ -45,16 +46,51 @@ type Writer struct {
 	cols     map[string]*colBuf
 	colOrder []string
 	strmFlds []string // fields that identify a log stream; synthesize _stream from them
-	compact  bool     // compact mode: flate the dict (smaller groups, slower decode)
+	limits   RecordLimits
+	maxLine  int
+	compact  bool // compact mode: flate the dict (smaller groups, slower decode)
 	bytes    int
 	lastFlsh time.Time
 	mu       sync.Mutex
 
-	jobs      chan flushJob
-	pending   sync.WaitGroup // in-flight flush jobs
-	workers   sync.WaitGroup // worker goroutines, joined by Close
-	flushErr  atomic.Pointer[error]
+	jobs    chan flushJob
+	workers sync.WaitGroup // worker goroutines, joined by Close
+	// batch takes new jobs; live is every batch with jobs still outstanding.
+	// A Flush waits on all of live, because the row buffer is shared and a
+	// caller's rows are routinely carried away by another goroutine's
+	// Flush. Both guarded by mu.
+	batch *flushBatch
+	live  []*flushBatch
+	// hist is the last batchHistory batches, newest last, so a caller that
+	// took a Mark before adding rows can ask about exactly the batches its
+	// rows could have joined. Retiring by anything coarser loses writes:
+	// with a shared buffer another goroutine's Flush carries this caller's
+	// rows away, and if that batch is dropped before this caller asks, the
+	// caller is told success for rows that failed.
+	hist    []*flushBatch
+	nextSeq uint64
+
+	closed    atomic.Bool
 	closeOnce sync.Once
+}
+
+// flushBatch is one Flush's worth of jobs. One per Flush, not one per
+// Writer, and that is the whole point.
+//
+// A single shared sync.WaitGroup was reused across concurrent Flush calls:
+// one goroutine's Add ran while another's Wait was in progress, which is
+// the documented misuse and panics with "WaitGroup is reused before
+// previous Wait has returned". A tenant's Writer is shared by every request
+// and by every syslog connection, and handleSyslogConn flushes after each
+// line with no recover above it -- so two syslog senders, needing no
+// credential at all, killed the process. Over HTTP the same shape produced
+// 46 panics in 640 concurrent posts to one tenant, each downgraded to a 500
+// whose rows may or may not be durable.
+type flushBatch struct {
+	seq  uint64 // monotonic; identifies which batches a caller's rows could be in
+	wg   sync.WaitGroup
+	err  atomic.Pointer[error]
+	done atomic.Bool
 }
 
 // colBuf is one column's row values awaiting a flush.
@@ -70,6 +106,7 @@ type flushJob struct {
 	colOrder []string
 	vals     map[string][]string
 	compact  bool
+	batch    *flushBatch // the Flush waiting for this job, never nil
 }
 
 // NewWriter makes a writer over the store and starts its flush pool.
@@ -87,7 +124,9 @@ func NewWriterWorkers(s *storage.Store, workers int) *Writer {
 		cols:     map[string]*colBuf{},
 		lastFlsh: nowFn(),
 		jobs:     make(chan flushJob, workers),
+		batch:    &flushBatch{},
 	}
+	w.hist = append(w.hist, w.batch)
 	for i := 0; i < workers; i++ {
 		w.workers.Add(1)
 		go w.worker()
@@ -111,9 +150,9 @@ func (w *Writer) worker() {
 		g := &storage.Group{Rows: len(j.ts), Columns: cols, Compact: j.compact}
 		if _, err := w.store.AppendGroup(g); err != nil {
 			e := err
-			w.flushErr.CompareAndSwap(nil, &e)
+			j.batch.err.CompareAndSwap(nil, &e)
 		}
-		w.pending.Done()
+		j.batch.wg.Done()
 	}
 }
 
@@ -140,9 +179,134 @@ func (w *Writer) AddStreamOverridden(ts int64, fields map[string]string) {
 	w.add(ts, fields, true)
 }
 
+// SetMaxLineBytes rejects an input line longer than n bytes. Zero disables
+// the bound.
+func (w *Writer) SetMaxLineBytes(n int) {
+	w.mu.Lock()
+	w.maxLine = n
+	w.mu.Unlock()
+}
+
+// LineTooLong reports whether a line exceeds the configured bound.
+func (w *Writer) LineTooLong(n int) bool {
+	w.mu.Lock()
+	max := w.maxLine
+	w.mu.Unlock()
+	return max > 0 && n > max
+}
+
+// SetRecordLimits bounds what one record may carry. Zero fields mean no
+// bound for that dimension.
+//
+// The limits are applied here rather than in each parser, because a
+// per-protocol check is a check that gets forgotten on the next protocol --
+// these were declared in the configuration and read by nothing.
+func (w *Writer) SetRecordLimits(l RecordLimits) {
+	w.mu.Lock()
+	w.limits = l
+	w.mu.Unlock()
+}
+
+// reservedField reports whether a name carries meaning the store depends on:
+// the message, the timestamp, and the stream label retention groups by.
+func reservedField(k string) bool {
+	return k == "_msg" || k == "_time" || k == "_stream"
+}
+
+// controlField reports whether a name is reserved for the server's own
+// out-of-band signalling rather than for log data. A leading dot is not a
+// name any log producer emits, and the live tail ends a cut-short stream
+// with a {".error": ...} line -- which only distinguishes a marker from a
+// log line if a log line can never carry that key. Enforced on ingest, not
+// merely documented: the first version of the tail sentinel asserted this
+// property in a comment while the store accepted the name.
+func controlField(k string) bool { return len(k) > 0 && k[0] == '.' }
+
+// truncateForLimits drops fields and clips values that exceed the record
+// limits. It clips rather than rejecting the record: a log line with one
+// oversized field is still worth storing, and dropping the whole record
+// loses more than it protects.
+func (w *Writer) truncateForLimits(fields map[string]string) {
+	l := w.limits
+	if l.MaxNameBytes > 0 || l.MaxValueBytes > 0 {
+		for k, v := range fields {
+			if reservedField(k) {
+				continue
+			}
+			if l.MaxNameBytes > 0 && len(k) > l.MaxNameBytes {
+				delete(fields, k)
+				continue
+			}
+			// A stream field's value is clipped like any other -- but that
+			// changes the label retention groups on, so the fields that build
+			// _stream are left alone.
+			if w.isStreamField(k) {
+				continue
+			}
+			if l.MaxValueBytes > 0 && len(v) > l.MaxValueBytes {
+				fields[k] = v[:l.MaxValueBytes]
+			}
+		}
+	}
+	if l.MaxFields > 0 && len(fields) > l.MaxFields {
+		// Deterministic: drop the highest-sorting names, so the same record
+		// always stores the same fields.
+		//
+		// The reserved names are exempt. '_' is 0x5F, which sorts after
+		// digits and uppercase, so a plain sort dropped _msg first: a wide
+		// record kept AAA/BBB/CCC and lost the log line itself. _stream also
+		// drives stream-scoped retention, so dropping it moves the record to
+		// a different retention bucket.
+		keys := make([]string, 0, len(fields))
+		for k := range fields {
+			if reservedField(k) {
+				continue
+			}
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		budget := l.MaxFields - (len(fields) - len(keys))
+		if budget < 0 {
+			budget = 0
+		}
+		if budget < len(keys) {
+			for _, k := range keys[budget:] {
+				delete(fields, k)
+			}
+		}
+	}
+}
+
+// isStreamField reports whether k contributes to the synthesized _stream
+// label. Caller holds w.mu.
+func (w *Writer) isStreamField(k string) bool {
+	for _, f := range w.strmFlds {
+		if f == k {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *Writer) add(ts int64, fields map[string]string, streamOverridden bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed.Load() {
+		return // the batch is going nowhere; Flush reports ErrWriterClosed
+	}
+	// Control names go first, whatever the limits say. Gating this on
+	// w.limits meant a Writer built through the exported NewWriter, or the
+	// four-argument IngestJSONLinesParallel, stored a forged ".error" -- and
+	// the tail's end-of-stream marker is only distinguishable from a log
+	// line because that name cannot be stored.
+	for k := range fields {
+		if controlField(k) {
+			delete(fields, k)
+		}
+	}
+	if w.limits != (RecordLimits{}) {
+		w.truncateForLimits(fields)
+	}
 	// When this writer owns stream labelling and the request did not override
 	// it, a _stream carried in the payload is not authoritative and is
 	// dropped: the synthesized label replaces it below.
@@ -254,15 +418,67 @@ func buildStreamLabel(streamFields []string, fields map[string]string) string {
 
 // Flush enqueues the buffered rows and waits for every in-flight group to
 // land -- the batch boundary, where durability is promised.
+// ErrWriterClosed reports a write to a writer that has been closed. It is a
+// typed error rather than a panic because it is reachable from an ordinary
+// request: http.Server.Shutdown lets in-flight requests finish, so a handler
+// can call Flush after Close has already run.
+var ErrWriterClosed = errors.New("ingest: writer is closed")
+
 func (w *Writer) Flush() error {
+	// defer, not a bare Unlock. flushLocked used to send on a channel that
+	// Close had already closed; the panic unwound past the Unlock, so the
+	// mutex was never released and the next Close blocked on it forever --
+	// shutdown deadlocked permanently after one racing request.
 	w.mu.Lock()
-	w.flushLocked()
-	w.mu.Unlock()
-	w.pending.Wait()
-	if e := w.flushErr.Load(); e != nil {
-		return *e
+	closed := w.closed.Load()
+	var wait []*flushBatch
+	if !closed {
+		w.flushLocked()
+		// Wait on EVERY batch with work outstanding, not only this call's.
+		// The buffer is shared by every request and every syslog connection
+		// on the tenant, so a row added here is routinely carried away by
+		// another goroutine's Flush; waiting only on this call's batch told
+		// 9 of 32 concurrent callers "stored" for rows that had failed in
+		// someone else's batch.
+		wait = append(wait, w.live...)
+		// New jobs go to a fresh batch, so nothing in `wait` can gain one
+		// after this point -- which is what makes each WaitGroup waited
+		// exactly once and never re-Added after. A single shared WaitGroup
+		// was reused across callers, the documented misuse: two syslog
+		// senders, needing no credential, killed the process, and 46 of 640
+		// concurrent HTTP posts to one tenant panicked into 500s.
+		w.batch = w.newBatchLocked()
 	}
-	return nil
+	w.mu.Unlock()
+	if closed {
+		return ErrWriterClosed
+	}
+
+	var first error
+	for _, b := range wait {
+		b.wg.Wait()
+		b.done.Store(true)
+		if e := b.err.Load(); e != nil && first == nil {
+			first = *e
+		}
+	}
+
+	// Retire what is finished. Errors are no longer retained here: a caller
+	// that needs to know whether ITS rows landed uses Mark/FlushMark, which
+	// asks about exactly the batches those rows could have joined. Holding
+	// errored batches for a plain Flush was the previous attempt, and it
+	// made every later empty Flush -- an empty body, a rejected line, Close
+	// at shutdown -- return a failure that was already reported.
+	w.mu.Lock()
+	kept := w.live[:0]
+	for _, b := range w.live {
+		if !b.done.Load() {
+			kept = append(kept, b)
+		}
+	}
+	w.live = kept
+	w.mu.Unlock()
+	return first
 }
 
 // Close flushes, stops the pool, and joins the workers. After Close the
@@ -270,6 +486,11 @@ func (w *Writer) Flush() error {
 func (w *Writer) Close() error {
 	err := w.Flush()
 	w.closeOnce.Do(func() {
+		// Mark closed under the same lock Add and Flush take, so no send can
+		// be in flight when the channel closes.
+		w.mu.Lock()
+		w.closed.Store(true)
+		w.mu.Unlock()
 		close(w.jobs)
 		w.workers.Wait()
 	})
@@ -286,8 +507,11 @@ func (w *Writer) flushLocked() {
 	for _, k := range w.colOrder {
 		vals[k] = w.cols[k].vals
 	}
-	w.pending.Add(1)
-	w.jobs <- flushJob{ts: w.ts, colOrder: w.colOrder, vals: vals, compact: w.compact}
+	if len(w.live) == 0 || w.live[len(w.live)-1] != w.batch {
+		w.live = append(w.live, w.batch)
+	}
+	w.batch.wg.Add(1)
+	w.jobs <- flushJob{ts: w.ts, colOrder: w.colOrder, vals: vals, compact: w.compact, batch: w.batch}
 
 	// Fresh buffers; the job owns the handed-off ones.
 	w.ts = make([]int64, 0, FlushRows)
@@ -295,4 +519,73 @@ func (w *Writer) flushLocked() {
 	w.colOrder = nil
 	w.bytes = 0
 	w.lastFlsh = nowFn()
+}
+
+// batchHistory bounds the batch ring. A caller marks, adds rows, then
+// flushes, so it is never more than a handful of batches behind; 64 is far
+// past any real interleaving and costs three words each.
+const batchHistory = 64
+
+// newBatchLocked installs the next batch and remembers it. w.mu must be held.
+func (w *Writer) newBatchLocked() *flushBatch {
+	w.nextSeq++
+	b := &flushBatch{seq: w.nextSeq}
+	w.hist = append(w.hist, b)
+	if len(w.hist) > batchHistory {
+		w.hist = append(w.hist[:0], w.hist[len(w.hist)-batchHistory:]...)
+	}
+	return b
+}
+
+// Mark names the point a caller is about to add rows from. Pass it to
+// FlushMark to learn whether THOSE rows reached the store.
+//
+// Flush cannot answer that question. The row buffer is shared by every
+// request and every syslog connection on a tenant, so another goroutine's
+// Flush routinely carries a caller's rows away, and a plain Flush reports on
+// whatever it happened to wait for. That is how a caller got 200 for rows
+// that died in someone else's batch.
+func (w *Writer) Mark() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.batch.seq
+}
+
+// FlushMark flushes and reports the first error from any batch a row added
+// since mark could have joined -- that is, every batch from mark onward.
+func (w *Writer) FlushMark(mark uint64) error {
+	w.mu.Lock()
+	closed := w.closed.Load()
+	var wait []*flushBatch
+	if !closed {
+		w.flushLocked()
+		for _, b := range w.hist {
+			if b.seq >= mark {
+				wait = append(wait, b)
+			}
+		}
+		w.batch = w.newBatchLocked()
+	}
+	w.mu.Unlock()
+	if closed {
+		return ErrWriterClosed
+	}
+	var first error
+	for _, b := range wait {
+		b.wg.Wait()
+		b.done.Store(true)
+		if e := b.err.Load(); e != nil && first == nil {
+			first = *e
+		}
+	}
+	w.mu.Lock()
+	kept := w.live[:0]
+	for _, b := range w.live {
+		if !b.done.Load() {
+			kept = append(kept, b)
+		}
+	}
+	w.live = kept
+	w.mu.Unlock()
+	return first
 }

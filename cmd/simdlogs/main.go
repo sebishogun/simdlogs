@@ -5,7 +5,9 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -33,9 +35,47 @@ func main() {
 	maxRows := flag.Int("search.maxRows", 0, "cap on rows a bare (no-pipe) select may return; 0 = the built-in default, -1 = unlimited. Over the cap the query errors (never silently truncates); add a `| limit N` or a stats pipe.")
 	maxBody := flag.Int64("http.maxBodyBytes", 0, "maximum request body in bytes; 0 = the built-in default, -1 = unlimited")
 	maxQueryDur := flag.Duration("search.maxDuration", 0, "maximum wall time for one query; 0 = the built-in default, -1ns = unlimited")
+	maxQueryBytes := flag.Int64("search.maxQueryBytes", 0, "maximum bytes one query may materialize; 0 = the built-in default, -1 = unlimited. Over it the query errors rather than returning a short answer.")
 	maxTenants := flag.Int("tenants.max", 0, "maximum tenants held open; 0 = the built-in default, -1 = unlimited")
 	authFile := flag.String("auth.config", "", "path to the JSON auth file (bearer-token hashes, roles, tenants). Without it the server is UNAUTHENTICATED: every client can query, ingest and download backups.")
+	tlsCert := flag.String("tls.certFile", "", "PEM certificate; with -tls.keyFile this serves HTTPS")
+	tlsKey := flag.String("tls.keyFile", "", "PEM private key for -tls.certFile")
+	tlsClientCA := flag.String("tls.clientCAFile", "", "PEM CA bundle; when set, clients must present a certificate signed by it (mTLS)")
+	// Two spellings: -tls.insecure follows the dotted convention of every
+	// neighbouring flag, and -insecure-http is kept because it is what the
+	// first documentation said. Either turns it on.
+	insecureTLS := flag.Bool("tls.insecure", false, "serve plaintext on a non-loopback address (log data travels in clear text)")
+	insecureHTTP := flag.Bool("insecure-http", false, "alias for -tls.insecure")
 	flag.Parse()
+
+	// Validate the listener configuration before anything is acquired. It
+	// depends only on flags, and log.Fatal calls os.Exit, so a failure after
+	// the store is open leaves a data directory, bound sockets and running
+	// goroutines behind with no deferred cleanup.
+	tlsCfg := config.TLSConfig{
+		CertFile:     *tlsCert,
+		KeyFile:      *tlsKey,
+		ClientCAFile: *tlsClientCA,
+		InsecureHTTP: *insecureTLS || *insecureHTTP,
+	}
+	if err := tlsCfg.CheckListen(*addr); err != nil {
+		log.Fatal(err)
+	}
+	// The syslog listener is plaintext by construction and unauthenticated,
+	// writing to the default tenant. Exempting it would make the refusal a
+	// half-truth: the larger hole would be the one left open.
+	if *syslogAddr != "" {
+		// CheckPlaintextListen, not CheckListen: the syslog port is plaintext
+		// whatever the HTTP listener does, so a certificate on the HTTP side
+		// must not exempt it.
+		if err := tlsCfg.CheckPlaintextListen(*syslogAddr); err != nil {
+			log.Fatalf("syslog: %v", err)
+		}
+	}
+	tc, err := tlsCfg.Build()
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	cfg := config.Default()
 	cfg.Dir = *dir
@@ -49,11 +89,12 @@ func main() {
 	cfg.Limits.MaxQueryRows = *maxRows
 	cfg.Limits.MaxBodyBytes = *maxBody
 	cfg.Limits.MaxQueryDuration = *maxQueryDur
+	cfg.Limits.MaxQueryBytes = *maxQueryBytes
 	cfg.Limits.MaxOpenTenants = *maxTenants
 
-	srv, err := api.NewServerConfig(cfg)
-	if err != nil {
-		log.Fatal(err)
+	srv, err2 := api.NewServerConfig(cfg)
+	if err2 != nil {
+		log.Fatal(err2)
 	}
 	if *authFile != "" {
 		ac, err := config.LoadAuth(*authFile)
@@ -66,12 +107,26 @@ func main() {
 		if ac.Disabled {
 			log.Print("WARNING: authentication is explicitly disabled in " + *authFile)
 		} else {
-			log.Printf("authentication enabled: %d credentials from %s", len(ac.Tokens), *authFile)
+			// Count every credential kind, not just tokens: a certs-only file
+			// logged "0 credentials".
+			creds := len(ac.Tokens) + len(ac.Certs)
+			if ac.TrustedProxy {
+				creds++
+			}
+			log.Printf("authentication enabled: %d credentials from %s", creds, *authFile)
+			if *tlsClientCA != "" && len(ac.Certs) == 0 {
+				log.Print("WARNING: -tls.clientCAFile is set but the auth file has no certs entries; " +
+					"a client certificate proves only that the CA trusts the client and grants nothing")
+			}
 		}
 	} else {
 		// Loud, once, at startup. A server that is open to everyone should
 		// say so rather than leaving an operator to infer it.
 		log.Print("WARNING: no -auth.config; the server is UNAUTHENTICATED and every client can query, ingest and download backups")
+		if *tlsClientCA != "" {
+			log.Print("WARNING: -tls.clientCAFile without -auth.config gates the transport only; " +
+				"every client the CA signs gets full access, including /admin/backup")
+		}
 	}
 	if *backends != "" {
 		srv.SetBackends(strings.Split(*backends, ","))
@@ -92,9 +147,20 @@ func main() {
 		defer stop()
 		log.Printf("retention: dropping data older than %s", *retention)
 	}
+	var syslogClosers []io.Closer
 	if *syslogAddr != "" {
-		if _, _, err := srv.ListenSyslog(*syslogAddr); err != nil {
+		// Both closers are kept. Discarding them left the UDP and TCP
+		// listeners accepting data all the way through shutdown, into writers
+		// that were being flushed and stores that were being unmapped.
+		udpC, tcpC, err := srv.ListenSyslog(*syslogAddr)
+		if err != nil {
 			log.Fatalf("syslog listen %s: %v", *syslogAddr, err)
+		}
+		if udpC != nil {
+			syslogClosers = append(syslogClosers, udpC)
+		}
+		if tcpC != nil {
+			syslogClosers = append(syslogClosers, tcpC)
 		}
 		log.Printf("syslog listener on %s (UDP+TCP)", *syslogAddr)
 	}
@@ -102,10 +168,33 @@ func main() {
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second, // slowloris protection
+		ReadTimeout:       5 * time.Minute,  // a large ingest body may legitimately take a while
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+		TLSConfig:         tc,
+		// No WriteTimeout on purpose: it is absolute, not idle-based, and
+		// would cut the live tail off mid-stream. Per-route deadlines belong
+		// with the query executor (plan task 6.1), which can tell a tail from
+		// a query.
 	}
 	go func() {
-		log.Printf("simdlogs on %s, storage %s, simd tier %s", *addr, *dir, simd.Tier())
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		scheme := "http"
+		if tc != nil {
+			scheme = "https"
+			if tc.ClientAuth == tls.RequireAndVerifyClientCert {
+				scheme = "https+mtls"
+			}
+		}
+		log.Printf("simdlogs %s on %s, storage %s, simd tier %s", scheme, *addr, *dir, simd.Tier())
+		var err error
+		if tc != nil {
+			// The certificate is already in TLSConfig; empty paths here tell
+			// ListenAndServeTLS to use it rather than re-reading the files.
+			err = httpSrv.ListenAndServeTLS("", "")
+		} else {
+			err = httpSrv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			log.Fatal(err)
 		}
 	}()
@@ -116,10 +205,30 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 	log.Print("shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+
+	// Order matters, and each step has a reason.
+	//
+	// 1. Stop the native listeners first. They are not part of the HTTP
+	//    server, so Shutdown does not touch them: leaving them open fed rows
+	//    into writers that were already being flushed.
+	for _, c := range syslogClosers {
+		if err := c.Close(); err != nil {
+			log.Printf("syslog listener close: %v", err)
+		}
+	}
+	// 2. Drain HTTP. Shutdown stops accepting and waits for in-flight
+	//    requests. Its error was discarded before, so a deadline expiring with
+	//    requests still running looked identical to a clean drain.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	httpSrv.Shutdown(ctx)
+	if err := httpSrv.Shutdown(ctx); err != nil {
+		log.Printf("http shutdown did not drain cleanly (requests may have been cut): %v", err)
+	}
+	// 3. Close the server: stops background loops and waits for them, flushes
+	//    every tenant writer, then releases the stores. Only now is it safe to
+	//    unmap -- steps 1 and 2 guarantee nothing is still reading.
 	if err := srv.Close(); err != nil {
 		log.Printf("close: %v", err)
 	}
+	log.Print("stopped")
 }

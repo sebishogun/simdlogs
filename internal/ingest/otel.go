@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"encoding/json"
+	"errors"
 	"strconv"
 )
 
@@ -52,20 +53,28 @@ type otlpLogs struct {
 	} `json:"resourceLogs"`
 }
 
+var errNoResourceLogs = errors.New("no resourceLogs field: not an OTLP logs payload")
+
 // IngestOTLPLogs ingests an OpenTelemetry logs export (OTLP/HTTP, JSON): each
 // log record becomes a record whose fields are the resource attributes plus
 // the record's own attributes, with severityText -> severity, body -> _msg,
 // and timeUnixNano (or observedTimeUnixNano) -> time.
-func IngestOTLPLogs(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestOTLPLogs(w *Writer, data []byte, fallback func() int64) (Result, error) {
 	return IngestOTLPLogsOpts(w, data, fallback, nil)
 }
 
 // IngestOTLPLogsOpts is IngestOTLPLogs with the request's field mappings applied.
-func IngestOTLPLogsOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestOTLPLogsOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	var p otlpLogs
 	if err := json.Unmarshal(data, &p); err != nil {
-		return 0, 0
+		// OTLP exporters retry on 5xx and give up on 4xx. Answering 200 for
+		// an undecodable body told them the data was delivered.
+		return res, encodingErr(err)
+	}
+	if p.ResourceLogs == nil {
+		return res, envelopeErr(errNoResourceLogs)
 	}
 	fields := map[string]string{}
 	for _, rl := range p.ResourceLogs {
@@ -102,9 +111,9 @@ func IngestOTLPLogsOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 					opts.apply(fields)
 				}
 				addWithStream(w, ts, fields, opts)
-				ingested++
+				res.Accepted++
 			}
 		}
 	}
-	return ingested, skipped
+	return res, nil
 }

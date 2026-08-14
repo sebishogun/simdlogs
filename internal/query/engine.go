@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -30,6 +31,25 @@ type Query struct {
 	// Limit (which must return the first N in time order, and so forces the serial
 	// path) this only has to DETECT overflow, so it keeps the parallel scan.
 	MaxRows int
+	// Deadline stops the scan when the wall clock passes it, and MaxBytes
+	// stops it when the materialized rows exceed a budget. Both are checked
+	// per group rather than per row: a group is the unit of work the scan
+	// commits to, and a per-row check costs more than it saves.
+	//
+	// They exist here because the executor-level cancellation of plan task
+	// 6.1 does not, and without them -search.maxDuration and
+	// -search.maxQueryBytes were configuration nothing read: a query ran to
+	// completion whatever the request context said, because Go does not
+	// abort a handler when its context is cancelled.
+	Deadline time.Time
+	MaxBytes int64
+	// Stopped reports that a limit ended the scan early, so a caller can
+	// answer with an error instead of a short result presented as complete.
+	// A pointer to an atomic, not to a bool: runParallel checks the budget
+	// from every worker, so a plain *bool here is a data race the moment the
+	// budget is ever reached with more than one group in flight.
+	Stopped *atomic.Bool
+
 	// LastN returns the n most RECENT matching rows, newest first -- the select
 	// endpoint's `limit` argument, which is how a log viewer shows the tail of a
 	// stream. Deliberately not Limit: the `| limit N` pipe returns the FIRST n,
@@ -178,6 +198,43 @@ type Row struct {
 	NoTime bool
 }
 
+// rowBytes is a row's materialized size: the timestamp plus every key and
+// value it carries. It is what MaxBytes bounds, so it has to be the size that
+// actually accumulates in memory rather than a per-row constant.
+func rowBytes(r Row) int64 {
+	n := int64(8)
+	for _, f := range r.Fields {
+		n += int64(len(f.Key) + len(f.Value))
+	}
+	return n
+}
+
+// exceeded reports whether a scan budget is spent, and records that it was.
+// bytes is the materialized size so far.
+//
+// Both budgets were checked in exactly three places, all inside the group
+// pre-filter, and all with a literal zero for bytes -- so MaxBytes could
+// never fire at all, and the deadline could only fire if it had already
+// passed before any work started. A 300,000-row scan with a 20 ms budget and
+// a 1-byte byte budget ran to completion in 121 ms and returned 69 MB. The
+// scan loop below is where they have to be checked, because the scan is what
+// costs.
+func (q *Query) exceeded(bytes int64) bool {
+	if !q.Deadline.IsZero() && time.Now().After(q.Deadline) {
+		if q.Stopped != nil {
+			q.Stopped.Store(true)
+		}
+		return true
+	}
+	if q.MaxBytes > 0 && bytes > q.MaxBytes {
+		if q.Stopped != nil {
+			q.Stopped.Store(true)
+		}
+		return true
+	}
+	return false
+}
+
 // Store is the read surface the engine needs; storage.Store satisfies it.
 //
 // It hands out snapshots rather than raw readers because a reader is a window
@@ -217,6 +274,9 @@ func Run(s Store, q *Query) []Row {
 	// no column decoded, so it is always worth doing before the fork.
 	survivors := groups[:0]
 	for _, g := range groups {
+		if q.exceeded(0) {
+			break
+		}
 		if groupCanMatch(g, q) {
 			survivors = append(survivors, g)
 		}
@@ -228,13 +288,41 @@ func Run(s Store, q *Query) []Row {
 		return runParallel(survivors, q)
 	}
 	var out []Row
+	var bytes int64
 	for _, g := range survivors {
+		before := len(out)
 		out = appendMatches(out, g, q)
+		// Only pay for the accounting when something reads it: a per-row,
+		// per-field walk. An earlier version of this comment quoted +11.7%
+		// against 890.9M instructions per op, which does not reproduce and
+		// named no corpus or query to reproduce it from. Re-measured with
+		// perf stat -e instructions:u, GOMAXPROCS=1 GOGC=off, slope between
+		// 1x and 5x, MatAll over 3M rows: +2.4% on a four-column corpus
+		// with a near-unique _msg, +6.9% when every value is short and
+		// low-cardinality. The cost is real and it scales with field count,
+		// not with a single number.
+		//
+		// Who reaches the fast path is narrower than it looks, and an
+		// earlier version of this comment said the opposite:
+		// config.DefaultLimits sets MaxQueryBytes to 256 MiB and
+		// applyQueryBudget copies it onto every HTTP read, so a default
+		// deployment pays the walk on every query. Only an internal caller
+		// with no budget, or -search.maxQueryBytes=-1, skips it.
+		if q.MaxBytes > 0 {
+			for _, r := range out[before:] {
+				bytes += rowBytes(r)
+			}
+		}
 		if q.Limit > 0 && len(out) >= q.Limit {
 			return out[:q.Limit]
 		}
 		if q.MaxRows > 0 && len(out) > q.MaxRows {
 			return out // over the cap: stop scanning, the caller errors
+		}
+		// The budget check that costs something: after a group has been
+		// materialized, not only before the first one.
+		if q.exceeded(bytes) {
+			return out
 		}
 	}
 	return out
@@ -247,8 +335,24 @@ func Run(s Store, q *Query) []Row {
 // newer than the oldest one kept.
 func runNewest(survivors []*storage.Reader, q *Query) []Row {
 	var out []Row
+	var bytes int64
 	for i := len(survivors) - 1; i >= 0; i-- {
+		before := len(out)
 		out = appendMatches(out, survivors[i], q)
+		if q.MaxBytes > 0 {
+			for _, r := range out[before:] {
+				bytes += rowBytes(r)
+			}
+		}
+		// The budgets apply here too: this is a scan, and the bounded-tail
+		// shape is the one an interactive client uses most.
+		if q.exceeded(bytes) {
+			sortByTimeDesc(out)
+			if len(out) > q.LastN {
+				out = out[:q.LastN]
+			}
+			return out
+		}
 		if len(out) < q.LastN {
 			continue
 		}
@@ -755,6 +859,9 @@ func Count(s Store, q *Query) int {
 	groups := sn2.Groups
 	survivors := groups[:0]
 	for _, g := range groups {
+		if q.exceeded(0) {
+			break
+		}
 		if groupCanMatch(g, q) {
 			survivors = append(survivors, g)
 		}
@@ -764,6 +871,14 @@ func Count(s Store, q *Query) int {
 	}
 	total := 0
 	for _, g := range survivors {
+		// The deadline, checked per group. These paths return counts and
+		// facets rather than rows, so MaxBytes has nothing to measure --
+		// but a scan of every group is exactly what the wall-clock budget
+		// exists to bound, and until this went in twelve read routes ran
+		// with no bound at all.
+		if q.exceeded(0) {
+			break
+		}
 		total += matchBitset(g, q).Count()
 	}
 	return total
@@ -848,6 +963,9 @@ func Histogram(s Store, q *Query, step int64) map[int64]int {
 	groups := sn3.Groups
 	survivors := groups[:0]
 	for _, g := range groups {
+		if q.exceeded(0) {
+			break
+		}
 		if groupCanMatch(g, q) {
 			survivors = append(survivors, g)
 		}
@@ -860,6 +978,14 @@ func Histogram(s Store, q *Query, step int64) map[int64]int {
 	}
 	out := map[int64]int{}
 	for _, g := range survivors {
+		// The deadline, checked per group. These paths return counts and
+		// facets rather than rows, so MaxBytes has nothing to measure --
+		// but a scan of every group is exactly what the wall-clock budget
+		// exists to bound, and until this went in twelve read routes ran
+		// with no bound at all.
+		if q.exceeded(0) {
+			break
+		}
 		histoGroup(g, q, step, out)
 	}
 	return out

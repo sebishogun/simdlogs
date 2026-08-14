@@ -7,12 +7,13 @@ import "strings"
 // emit. Keys without a value become an empty field; a bare word becomes a
 // present-but-empty field. Timestamp comes from _time/@timestamp or the
 // fallback. Malformed nothing here -- every line yields a record.
-func IngestLogfmt(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestLogfmt(w *Writer, data []byte, fallback func() int64) (Result, error) {
 	return IngestLogfmtOpts(w, data, fallback, nil)
 }
 
 // IngestLogfmtOpts is IngestLogfmt with the request's field mappings applied.
-func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	fields := map[string]string{}
 	for len(data) > 0 {
@@ -42,7 +43,7 @@ func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 			fields[k] = v
 		})
 		if len(fields) == 0 {
-			skipped++
+			res.Rejected++
 			continue
 		}
 		if !haveTS {
@@ -52,9 +53,9 @@ func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 			opts.apply(fields)
 		}
 		addWithStream(w, ts, fields, opts)
-		ingested++
+		res.Accepted++
 	}
-	return ingested, skipped
+	return res, nil
 }
 
 // parseLogfmtLine tokenizes one logfmt line, calling emit per key/value.

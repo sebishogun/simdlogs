@@ -1,6 +1,9 @@
 package storage
 
-import "errors"
+import (
+	"errors"
+	"sync/atomic"
+)
 
 // ErrStoreClosed is returned by Snapshot once the store is closing. A caller
 // that gets it has no groups to read and should answer as it would for an
@@ -30,16 +33,18 @@ type Snapshot struct {
 	Groups []*Reader
 
 	entries []*groupEntry
-	closed  bool
+	// closed is atomic: two concurrent Close calls both passed a plain-bool
+	// check and released every entry twice, driving refs below zero and
+	// unmapping a version another snapshot still held.
+	closed atomic.Bool
 }
 
 // Close releases every group this snapshot holds. It is idempotent, so a
 // deferred Close next to an early return is safe.
 func (s *Snapshot) Close() error {
-	if s == nil || s.closed {
+	if s == nil || !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	s.closed = true
 	var firstErr error
 	for _, e := range s.entries {
 		if err := e.release(); err != nil && firstErr == nil {

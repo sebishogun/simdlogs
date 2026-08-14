@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"sort"
 	"strconv"
@@ -12,6 +15,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/sebishogun/simdlogs/internal/config"
 	"github.com/sebishogun/simdlogs/internal/query"
 	"sync/atomic"
 	"time"
@@ -89,6 +93,13 @@ func (s *Server) getFromShard(r *http.Request, shard []string, path string, post
 // isWritePath reports whether a path ingests data (and so, in router mode,
 // should forward to a storage node rather than be served locally).
 func isWritePath(p string) bool {
+	// A liveness probe is not a write. It lives under /insert only because
+	// that is where the reference put it, and forwarding it made a router
+	// answer 401 to an unauthenticated Kubernetes probe -- forever -- while
+	// the same probe on a non-router node answered 200.
+	if p == "/insert/ready" {
+		return false
+	}
 	switch {
 	case strings.HasPrefix(p, "/insert"), p == "/_bulk", p == "/v1/logs", p == "/v1/input",
 		strings.HasPrefix(p, "/api/"), strings.HasPrefix(p, "/loki"):
@@ -103,6 +114,78 @@ func isWritePath(p string) bool {
 func (s *Server) routeWrites(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(s.backends) > 0 && isWritePath(r.URL.Path) {
+			// Forwarding returns before the mux, so none of the per-route
+			// wrappers run: the role check, method, media type and body limit
+			// all live in there. Unguarded, a router was an unauthenticated,
+			// unbounded ingest proxy -- an anonymous multi-megabyte POST was
+			// relayed to a backend whose own limits it had already bypassed.
+			// The same checks are applied here before anything is forwarded.
+			spec := specForPath(r.URL.Path)
+			// Authentication FIRST, exactly as Handler() orders it. With the
+			// shape checks outside, a wrong Content-Type answered 415 and a
+			// wrong method 405 before the 401 -- telling an anonymous caller
+			// which media types and methods a route accepts. Single-node
+			// answered 401 for both.
+			if st := s.auth; st != nil && st.enabled {
+				p := principalOf(r)
+				if p == nil {
+					w.Header().Set("WWW-Authenticate", `Bearer realm="simdlogs"`)
+					s.writeErr(w, r, spec, http.StatusUnauthorized, "authentication required")
+					return
+				}
+				if !p.Can(config.RoleIngest) {
+					s.writeErr(w, r, spec, http.StatusForbidden,
+						"principal "+p.Subject+" does not hold the ingest role")
+					return
+				}
+			}
+			if !allowedMethod(spec.methods, r.Method) {
+				w.Header().Set("Allow", strings.Join(spec.methods, ", "))
+				s.writeErr(w, r, spec, http.StatusMethodNotAllowed,
+					"method "+r.Method+" not allowed")
+				return
+			}
+			// Gated the same two ways guard() gates it. Neither guard was
+			// here, so a spec with deliberately nil types -- datadogValidateSpec,
+			// the very route specForPath exists to select -- rejected every
+			// Content-Type with 415, and a GET body-less request was typed at
+			// all.
+			if len(spec.types) > 0 && r.Method != http.MethodGet && r.Method != http.MethodHead {
+				if ct := r.Header.Get("Content-Type"); ct != "" {
+					if mt, _, err := mime.ParseMediaType(ct); err != nil || !allowedType(spec.types, mt) {
+						s.writeErr(w, r, spec, http.StatusUnsupportedMediaType,
+							"unsupported media type "+ct)
+						return
+					}
+				}
+			}
+			if lim := s.limits.MaxBodyBytes; lim != config.Unlimited && r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, lim)
+			}
+			// Resolve the tenant here too, and forward the RESOLVED key
+			// rather than whatever the client sent. forwardWrite clones the
+			// client's headers verbatim, and a storage node normally runs
+			// with no -auth.config at all, so the router is the only place
+			// AccountID is ever checked: without this a token scoped to one
+			// tenant wrote into any other by setting a header.
+			key, err := s.tenantFor(r)
+			if err != nil {
+				s.writeErr(w, r, spec, authStatus(err), err.Error())
+				return
+			}
+			r.Header.Set("AccountID", key.Account)
+			r.Header.Set("ProjectID", key.Project)
+			// Admission and the request counter both live in guard() and
+			// withTenant(), which forwarding returns before. Without the
+			// first, N concurrent posts each ReadAll a whole body with no
+			// bound; without the second, /metrics reads zero ingest on a
+			// router under full load.
+			if release, ok := s.admit(s.writeSem, spec, w, r); ok {
+				defer release()
+			} else {
+				return
+			}
+			s.countRequest(r.URL.Path)
 			s.forwardWrite(w, r)
 			return
 		}
@@ -117,7 +200,15 @@ func (s *Server) routeWrites(next http.Handler) http.Handler {
 func (s *Server) forwardWrite(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), 400)
+		// MaxBytesReader is installed by routeWrites, so an oversized body
+		// lands here as a MaxBytesError and must be 413 rather than 400.
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			s.writeErr(w, r, ndjsonSpec(), http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("request body exceeds %d bytes", mbe.Limit))
+			return
+		}
+		s.writeErr(w, r, ndjsonSpec(), http.StatusBadRequest, err.Error())
 		return
 	}
 	shards := s.shards()

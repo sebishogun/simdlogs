@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"encoding/binary"
+	"errors"
 	"math"
 	"strconv"
 )
@@ -26,13 +27,26 @@ import (
 // IngestOTLPLogsProto ingests the protobuf encoding, producing records
 // IDENTICAL to the JSON path's: resource attributes plus record attributes,
 // severity_text -> severity, body -> _msg, time (or observed time) -> time.
-func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	fields := map[string]string{}
+	// Protobuf is OTLP's default encoding, and this parser accepted anything:
+	// a body that decoded to no records returned success, so an exporter
+	// sending garbage was told its data was delivered.
+	if !validProtobuf(data) {
+		return res, encodingErr(errBadProtobuf)
+	}
+	sawResourceLogs := false
+	// sawLogShape is the discriminator: a LogRecord carries its timestamp as
+	// a fixed64, where Metric.name and Span.trace_id at the same field number
+	// are length-delimited.
+	sawLogShape := false
 	eachField(data, func(num int, wire int, payload []byte) {
 		if num != 1 || wire != 2 { // resource_logs
 			return
 		}
+		sawResourceLogs = true
 		var resAttrs []otlpKV
 		// First pass: the resource's attributes; second: the records. The
 		// resource message may follow its scope_logs on the wire, so both
@@ -63,12 +77,18 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 					fields[a.Key] = a.Value.str()
 				}
 				var ts, observed int64
+				isLog := false
+				// wrongShape: field 1 present but length-delimited, which is
+				// Metric.name or Span.trace_id rather than time_unix_nano.
+				wrongShape := false
 				eachField(rec, func(fn, fw int, fp []byte) {
 					switch {
 					case fn == 1 && fw == 1: // time_unix_nano
 						ts = int64(binary.LittleEndian.Uint64(fp))
+						isLog = true
 					case fn == 11 && fw == 1: // observed_time_unix_nano
 						observed = int64(binary.LittleEndian.Uint64(fp))
+						isLog = true
 					case fn == 3 && fw == 2: // severity_text
 						if len(fp) > 0 {
 							fields["severity"] = string(fp)
@@ -83,8 +103,45 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 						if k, v, ok := decodeKV(fp); ok {
 							fields[k] = v.str()
 						}
+					// Four field numbers where a length-delimited value
+					// cannot be a LogRecord and can be a Metric:
+					//   1  Metric.name       vs LogRecord.time_unix_nano (fixed64)
+					//   2  Metric.description vs LogRecord.severity_number (enum, varint)
+					//   7  Metric.sum        vs LogRecord.dropped_attributes_count (varint)
+					//   11 Metric.summary    vs LogRecord.observed_time_unix_nano (fixed64)
+					// Span.trace_id is field 1 wire 2 and every span has one.
+					// Rejecting these does not touch the legal case below --
+					// a LogRecord that omits every timestamp -- because none
+					// of these four is a LogRecord field of wire type 2.
+					//
+					// Field 3 (Metric.unit vs LogRecord.severity_text) and
+					// field 5 (Metric.gauge vs LogRecord.body) are both
+					// length-delimited on both sides and stay ambiguous; a
+					// unit-only or gauge-only metric is still stored as a log
+					// row. Recorded in docs/wrong.md.
+					case fw == 2 && (fn == 1 || fn == 2 || fn == 7 || fn == 11):
+						wrongShape = true
 					}
 				})
+				// Decide per record, before storing it. A LogRecord carries
+				// its timestamp as a fixed64; Metric.name and Span.trace_id
+				// sit at the same field number as length-delimited values. A
+				// check made only after the walk still stored the bogus rows.
+				//
+				// A record with NO field 1 and NO field 11 at all is legal:
+				// every LogRecord field is optional, and the spec has the
+				// receiver stamp observed_time_unix_nano when the producer
+				// omits it -- which is what the fallback below does. Only a
+				// record whose field 1 is length-delimited is another signal
+				// wearing a log's field numbers.
+				if wrongShape {
+					res.Rejected++
+					res.Warn(0, "record's field 1 is not a timestamp; a metrics or traces payload, not logs")
+					return
+				}
+				if isLog {
+					sawLogShape = true
+				}
 				if ts == 0 {
 					ts = observed
 				}
@@ -95,11 +152,91 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 					opts.apply(fields)
 				}
 				addWithStream(w, ts, fields, opts)
-				ingested++
+				res.Accepted++
 			})
 		})
 	})
-	return ingested, skipped
+	// Discriminate logs from the other two signals. ResourceMetrics and
+	// ResourceSpans use the same field numbers as ResourceLogs -- resource=1,
+	// scope=2, and Metric/Span/LogRecord all sit at field 2 of the scope --
+	// so a metrics or traces export posted to /v1/logs walked as logs and
+	// stored a bogus row per record with a 200. Counting records could not
+	// see it; the wire types can.
+	//
+	// LogRecord.time_unix_nano is field 1 wire 1 (fixed64), while Metric.name
+	// and Span.trace_id are both field 1 wire 2. One record carrying field 1
+	// or field 11 as fixed64 separates all three.
+	// Fire on rejected-only, not on "no record had the log shape". Those are
+	// different: a ResourceLogs carrying genuinely zero records is a legal
+	// empty batch and must stay a success, and it has nothing to reject.
+	if len(data) > 0 && res.Accepted == 0 {
+		if !sawResourceLogs {
+			return res, envelopeErr(errNoResourceLogsProto)
+		}
+		if res.Rejected > 0 {
+			return res, envelopeErr(errNotLogRecords)
+		}
+		// A resource_logs that yielded no records is NOT an error. OTLP
+		// requires success for a request that carries no data, exporters
+		// treat 4xx as permanent, and an empty export is indistinguishable
+		// on the wire from an empty metrics one anyway -- both are field 1,
+		// wire 2, with nothing inside that names a signal. Rejecting it
+		// bought a discrimination that does not exist and cost a retry loop
+		// that does.
+		_ = sawLogShape
+	}
+	return res, nil
+}
+
+var (
+	errBadProtobuf         = errors.New("body is not decodable protobuf")
+	errNoResourceLogsProto = errors.New("no resource_logs field: not an OTLP protobuf logs payload")
+	errNotLogRecords       = errors.New("records carry no log timestamp: this is a metrics or traces payload, not logs")
+	errNoLogRecordsProto   = errors.New("resource_logs carries no log records")
+)
+
+// validProtobuf reports whether data is a well-formed sequence of protobuf
+// fields end to end. eachField stops silently at the first malformed tag,
+// which is why a garbage body parsed to zero records and no error.
+func validProtobuf(data []byte) bool {
+	for len(data) > 0 {
+		tag, n := binary.Uvarint(data)
+		if n <= 0 {
+			return false
+		}
+		data = data[n:]
+		switch tag & 7 {
+		case 0: // varint
+			_, n := binary.Uvarint(data)
+			if n <= 0 {
+				return false
+			}
+			data = data[n:]
+		case 1: // 64-bit
+			if len(data) < 8 {
+				return false
+			}
+			data = data[8:]
+		case 2: // length-delimited
+			l, n := binary.Uvarint(data)
+			if n <= 0 {
+				return false
+			}
+			data = data[n:]
+			if uint64(len(data)) < l {
+				return false
+			}
+			data = data[l:]
+		case 5: // 32-bit
+			if len(data) < 4 {
+				return false
+			}
+			data = data[4:]
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // eachField walks one protobuf message, calling fn per field with the wire type

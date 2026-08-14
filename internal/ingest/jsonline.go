@@ -25,6 +25,20 @@ const MinParallelBytes = 1 << 20
 type ParallelConfig struct {
 	Compact      bool
 	StreamFields []string
+	// MaxLineBytes rejects a single line longer than this. Zero means no
+	// bound. It is per line rather than per body because the body limit is
+	// enforced at the HTTP layer; this is what stops one line from being the
+	// whole body.
+	MaxLineBytes int
+
+	// Limits are the per-record caps. They were absent, so every shard
+	// writer ran with a zero RecordLimits and add() skipped
+	// truncateForLimits entirely: a body over MinParallelBytes on
+	// /insert/jsonline or either bulk route got no field cap, no name or
+	// value cap, and no control-name drop. Measured on a 1 MiB body with
+	// MaxFieldNameBytes=8 and MaxFieldValueBytes=16: a 64-byte name and a
+	// 512-byte value stored, and a forged ".error" control name with them.
+	Limits RecordLimits
 
 	// Shards overrides the shard count. Zero means derive it from the CPU
 	// count. It exists because the derived value is runtime.NumCPU()/3, which
@@ -49,6 +63,10 @@ func (c ParallelConfig) shards(n int) int {
 
 func (c ParallelConfig) apply(w *Writer) {
 	w.SetCompact(c.Compact)
+	w.SetRecordLimits(c.Limits)
+	if c.MaxLineBytes > 0 {
+		w.SetMaxLineBytes(c.MaxLineBytes)
+	}
 	if len(c.StreamFields) > 0 {
 		w.SetStreamFields(c.StreamFields)
 	}
@@ -83,11 +101,11 @@ func IngestJSONLinesParallelCfg(store *storage.Store, data []byte, fallback func
 	if shards == 0 {
 		w := NewWriter(store)
 		cfg.apply(w)
-		i, s := IngestJSONLinesOpts(w, data, fallback, opts)
+		r, perr := IngestJSONLinesOpts(w, data, fallback, opts)
 		if cerr := w.Close(); cerr != nil {
-			return i, s, &ParallelWriteError{Shards: 1, Failed: 1, Err: cerr}
+			return r.Accepted, r.Rejected, &ParallelWriteError{Shards: 1, Failed: 1, Err: cerr}
 		}
-		return i, s, nil
+		return r.Accepted, r.Rejected, perr
 	}
 	chunks := splitLines(data, shards)
 	var ing, skp int64
@@ -108,7 +126,8 @@ func IngestJSONLinesParallelCfg(store *storage.Store, data []byte, fallback func
 			defer wg.Done()
 			w := NewWriterWorkers(store, 2)
 			cfg.apply(w)
-			i, s := IngestJSONLinesOpts(w, chunk, fallback, opts)
+			pr, _ := IngestJSONLinesOpts(w, chunk, fallback, opts)
+			i, s := pr.Accepted, pr.Rejected
 			// Close before counting: a shard whose rows never landed must
 			// not contribute to the accepted total.
 			cerr := w.Close()
@@ -190,14 +209,15 @@ func splitLines(data []byte, n int) [][]byte {
 // The field values are taken as strings (StringNoCopy where the bytes are
 // unescaped) and interned by the writer's per-column dictionaries; a
 // number keeps its source text, which is what a log store round-trips.
-func IngestJSONLines(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestJSONLines(w *Writer, data []byte, fallback func() int64) (Result, error) {
 	return IngestJSONLinesOpts(w, data, fallback, nil)
 }
 
 // IngestJSONLinesOpts is IngestJSONLines with the request's field mappings
 // applied: a shipper configured against the reference sends them as query args
 // and expects its message, timestamp and stream read from the fields it names.
-func IngestJSONLinesOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestJSONLinesOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	fields := map[string]string{}
 	for len(data) > 0 {
@@ -214,14 +234,22 @@ func IngestJSONLinesOpts(w *Writer, data []byte, fallback func() int64, opts *Op
 		if len(trimSpace(line)) == 0 {
 			continue
 		}
+		// One line must not be the whole body. The HTTP layer bounds the
+		// request; this bounds a single record inside it, so a 64 MiB body
+		// cannot be one 64 MiB line that the parser holds entire.
+		if w.LineTooLong(len(line)) {
+			res.Rejected++
+			res.Warn(0, "line of %d bytes exceeds the configured maximum", len(line))
+			continue
+		}
 		doc, err := simdjson.Parse(line)
 		if err != nil {
-			skipped++
+			res.Rejected++
 			continue
 		}
 		v := doc.Root()
 		if v.Kind() != simdjson.Object {
-			skipped++
+			res.Rejected++
 			continue
 		}
 		for k := range fields {
@@ -269,9 +297,9 @@ func IngestJSONLinesOpts(w *Writer, data []byte, fallback func() int64, opts *Op
 			opts.apply(fields)
 		}
 		addWithStream(w, ts, fields, opts)
-		ingested++
+		res.Accepted++
 	}
-	return ingested, skipped
+	return res, nil
 }
 
 // isTimeKey reports whether a field carries the record timestamp: _time

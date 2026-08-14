@@ -1200,3 +1200,132 @@ against one store. It failed on the first run, before any of the code it
 was written to test had been reviewed. A structural mutex serializing
 recompaction against demotion would not have caught it: retention does
 not take that mutex, and does not need to.
+
+## Ten reviewed commits, eighteen findings: what self-assessment missed
+
+**Believed.** Tasks 3.1-3.3, 4.1-4.4, 1.1, 1.2 and 1.4 were each written
+test-first, passed their own tests, `-race`, vet and gofmt, and were
+committed. Task 2.2 had been reviewed by a subagent and its fourteen
+findings fixed; the ten after it were not reviewed.
+
+**Actually.** An adversarial review of those ten commits returned
+eighteen findings, most reproduced with working probes:
+
+- `/_search` and `/_count` were registered with no auth wrapper. An
+  anonymous POST returned another tenant's `_source` documents. The
+  hand-written route matrix in `auth_test.go` listed routes by hand and
+  did not enumerate the mux, so it could not see them.
+- Router-mode write forwarding returns before the mux, so none of the
+  per-route wrappers ran: an anonymous 4 MiB POST was relayed to a
+  backend on a server configured with a 64 KiB body limit.
+- `Recompact` never took `structMu`, although the field's own comment
+  claimed it serialized recompaction. Its cleanup path then deleted a
+  *live committed* group's file, after which `OpenStore` failed with
+  "group N is committed but its file is missing" -- the tenant unopenable.
+- The live tail still called `GroupsAfterID`, which hands out raw
+  readers. `SnapshotAfterID`, written for task 4.1, had zero callers.
+- The v8 "bounds-safe" parser validated the footer and nothing else.
+  Column decodes are driven by `Rows`, which was never checked against
+  the column's data span: a group claiming a million rows over a
+  512-byte span sliced past the blob. `parseDictSec` had no bounds check
+  at all, and `needsRecompact` reaches it from the tiering goroutine,
+  which has no recover -- one corrupt file killed the process.
+- `dropGroups` filtered with `kept := s.groups[:0]`, overwriting the
+  backing array before the manifest commit was known to succeed. A failed
+  commit turned index `[0 1 2]` into `[1 2 2]`: one group invisible until
+  restart, another counted twice by every query.
+- A write racing `Server.Close` sent on a closed channel. The panic
+  unwound past a bare `w.mu.Unlock()`, so the mutex was never released
+  and every later `Close` blocked forever.
+- `manifest.commit` had no torn-tail recovery, so after a short write an
+  acknowledged, fsynced append vanished at the next restart with no error
+  anywhere.
+
+**How it surfaced.** A reviewer that was told not to be agreeable, given
+the task specs, and asked for `file:line` plus a reproduction. Nothing
+here was visible from inside: every one of these commits was green.
+
+The rule that follows is not "review before committing" -- task 2.2 was
+reviewed. It is that the reviewer must not be the author, and after
+fixing a reviewer's findings a *different* reviewer signs off, because a
+reviewer grading its own feedback is grading its own work.
+
+## An OTLP metrics payload whose Metric carries no name is stored as a log row
+
+**Believed.** The wire-type discriminator in `internal/ingest/otelproto.go`
+tells logs from metrics and traces by looking at each record's field 1:
+`LogRecord.time_unix_nano` is field 1 wire type 1 (fixed64), while
+`Metric.name` and `Span.trace_id` are field 1 wire type 2. A record whose
+field 1 is length-delimited is the wrong signal and is rejected.
+
+**Actually.** proto3 omits an empty `string`, so a `Metric` with no name has
+no field 1 at all and the discriminator has nothing to key on. Measured:
+
+```
+NAMED metric            -> accepted=0 rejected=1 err=records carry no log timestamp...
+UNNAMED metric          -> accepted=1 rejected=0 err=<nil>
+description-only metric -> accepted=1 rejected=0 err=<nil>
+traces payload          -> accepted=0 rejected=1 (Span.trace_id is always present)
+```
+
+The row lands with a fabricated fallback timestamp.
+
+**The first version of this entry got the reasoning wrong**, and review
+caught it. It claimed the only discriminator left was
+`res.Accepted > 0 && !sawLogShape`, whose cost would be rejecting a legal
+`LogRecord` batch where every record omits both timestamps. Three more
+discriminators exist, each unambiguous, and none of them touches that case:
+
+| field | Metric | LogRecord | wire types |
+|---|---|---|---|
+| 1 | `name` (string) | `time_unix_nano` (fixed64) | 2 vs 1 |
+| 2 | `description` (string) | `severity_number` (enum) | 2 vs 0 |
+| 7 | `sum` (message) | `dropped_attributes_count` (uint32) | 2 vs 0 |
+| 11 | `summary` (message) | `observed_time_unix_nano` (fixed64) | 2 vs 1 |
+
+A length-delimited value at any of those four field numbers cannot be a
+`LogRecord`. Measured before the fix, each stored as a log row:
+
+```
+description-only metric (field 2 wire 2)  accepted=1  STORED
+unit-only metric        (field 3 wire 2)  accepted=1  STORED as severity=ms
+sum-only metric         (field 7 wire 2)  accepted=1  STORED
+summary-only metric     (field 11 wire 2) accepted=1  STORED
+timestampless LogRecord (sev 2 wire 0)    accepted=1  must keep working -- does
+body-only LogRecord     (field 5 wire 2)  accepted=1  must keep working -- does
+```
+
+**Fix: all four rejected.** `wrongShape` now fires on
+`fw == 2 && (fn == 1 || fn == 2 || fn == 7 || fn == 11)`.
+
+**Residual risk, accepted -- and the first count of it was wrong.** This
+entry said two field numbers stay ambiguous. It is five. Every `Metric`
+field is wire type 2, and `Metric` intersects `LogRecord` at wire 2 on
+`{3, 5, 9, 10, 12}`:
+
+```
+field 3  (unit)                   -> accepted=1   (was documented)
+field 5  (gauge)                  -> accepted=1   (was documented)
+field 9  (histogram)              -> accepted=1   UNDOCUMENTED
+field 10 (exponential_histogram)  -> accepted=1   UNDOCUMENTED
+field 12 (metadata)               -> accepted=1   UNDOCUMENTED
+field 2 / 7 / 11                  -> rejected     correctly caught
+```
+
+`Metric.metadata` = 12 (OTLP v1.2.0) collides with `LogRecord.event_name`
+= 12 (v1.5.0), which is why 12 cannot join the reject list without
+rejecting a legal log record. Same for 3 and 5. Fields 9 and 10 CANNOT be added, and the first
+version of this paragraph gave the opposite reason -- it said they had no
+`LogRecord` counterpart at wire 2. They do: `LogRecord.trace_id` is field 9
+and `LogRecord.span_id` is field 10, both `bytes`, both wire type 2, and
+both present on every trace-correlated log line. `wrongShape` fires on
+field number and wire type alone, before the record is stored, so acting on
+the stated reason would have rejected exactly the logs an OpenTelemetry
+deployment cares most about.
+
+A metric posted to `/v1/logs` carrying only one of those five is still
+stored as a log row. The four discriminators that ARE applied
+(`fw == 2 && fn in {1, 2, 7, 11}`) reject no legal `LogRecord`: fields 1
+and 11 are `fixed64`, 2 is an enum, 7 is `uint32`, and none is `repeated`
+in any OTLP version from v0.7.0 on, so no packed encoding puts them at
+wire 2.

@@ -291,7 +291,19 @@ func decodeTimeRangeInto(b []byte, n int, from, to int64, out []bool) []bool {
 		prev := geti64(b[hdr+4:])
 		pos := int(get32(b, hdr))
 		for i := lo; i < hi; i++ {
+			if pos >= len(stream) {
+				break
+			}
 			d, w := binary.Uvarint(stream[pos:])
+			// binary.Uvarint returns a NEGATIVE count for an overlong varint
+			// (more than ten continuation bytes). Adding it walked pos
+			// backwards and the next slice panicked -- and this runs in the
+			// tiering goroutine, which has no recover, so a checksum-valid
+			// file with a corrupt varint stream killed the process. Header
+			// validation cannot reach this: it is payload, not geometry.
+			if w <= 0 {
+				break
+			}
 			pos += w
 			prev += unzigzag(d)
 			out[i] = prev >= from && prev < to
@@ -345,7 +357,13 @@ func decodeTsRange(b []byte, lo, hi int) []int64 {
 	pos := int(get32(b, hdr))
 	out := make([]int64, hi-lo)
 	for i := k * bs; i < hi; i++ {
+		if pos >= len(stream) {
+			break
+		}
 		d, w := binary.Uvarint(stream[pos:])
+		if w <= 0 { // overlong varint: see decodeTimeRangeInto
+			break
+		}
 		pos += w
 		prev += unzigzag(d)
 		if i >= lo {
@@ -371,7 +389,13 @@ func decodeTsAt(b []byte, row int) int64 {
 	stream := b[8+numBlocks*tsHdrStride:]
 	pos := off
 	for i := k * bs; i <= row; i++ {
+		if pos >= len(stream) {
+			break
+		}
 		d, n := binary.Uvarint(stream[pos:])
+		if n <= 0 { // overlong varint: see decodeTimeRangeInto
+			break
+		}
 		pos += n
 		prev += unzigzag(d)
 	}

@@ -32,6 +32,7 @@ func runParallel(groups []*storage.Reader, q *Query) []Row {
 	}
 	close(ch)
 	var produced atomic.Int64 // only used when q.MaxRows is set
+	var scanned atomic.Int64  // materialized bytes, for the query budget
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
@@ -43,9 +44,26 @@ func runParallel(groups []*storage.Reader, q *Query) []Row {
 				if q.MaxRows > 0 && produced.Load() > int64(q.MaxRows) {
 					continue
 				}
+				// The deadline and the byte budget, checked between groups.
+				// Checking only in the pre-filter meant neither bounded the
+				// scan, which is the part that costs.
+				if q.exceeded(scanned.Load()) {
+					continue
+				}
 				// groups are already footer-pruned by the caller.
 				rows := appendMatches(nil, groups[gi], q)
 				parts[gi] = rows
+				var n int64
+				if q.MaxBytes > 0 {
+					for _, r := range rows {
+						n += rowBytes(r)
+					}
+				}
+				// Record the trip AFTER adding, not only before. Every
+				// worker starts with scanned == 0, so with four groups and
+				// thirty-two workers the pre-check passed for all of them
+				// and nothing ever observed the budget being spent.
+				q.exceeded(scanned.Add(n))
 				if q.MaxRows > 0 {
 					produced.Add(int64(len(rows)))
 				}
@@ -81,6 +99,13 @@ func histogramParallel(groups []*storage.Reader, q *Query, step int64) map[int64
 		go func() {
 			defer wg.Done()
 			for gi := range ch {
+				// The deadline, per group. runParallel had this; these two
+				// did not, so the budget bound the small queries that never
+				// needed it and not the fan-out it exists for: 16 groups ran
+				// 5.3ms past a 1ms deadline with Stopped never set.
+				if q.exceeded(0) {
+					continue
+				}
 				m := map[int64]int{}
 				histoGroup(groups[gi], q, step, m)
 				parts[gi] = m
@@ -117,6 +142,9 @@ func countParallel(groups []*storage.Reader, q *Query) int {
 			defer wg.Done()
 			local := 0
 			for gi := range ch {
+				if q.exceeded(0) {
+					continue
+				}
 				// groups are already footer-pruned by the caller.
 				local += matchBitset(groups[gi], q).Count()
 			}

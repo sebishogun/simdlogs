@@ -14,12 +14,13 @@ import (
 // not lines). __REALTIME_TIMESTAMP (microseconds) sets the time, MESSAGE
 // becomes _msg, and other names are lowercased with a leading underscore
 // stripped (_HOSTNAME -> hostname).
-func IngestJournald(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestJournald(w *Writer, data []byte, fallback func() int64) (Result, error) {
 	return IngestJournaldOpts(w, data, fallback, nil)
 }
 
 // IngestJournaldOpts is IngestJournald with the request's field mappings applied.
-func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	fields := map[string]string{}
 	var ts int64
@@ -41,7 +42,7 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 			opts.apply(fields)
 		}
 		addWithStream(w, ts, fields, opts)
-		ingested++
+		res.Accepted++
 		reset()
 	}
 	set := func(name string, val []byte) {
@@ -105,5 +106,5 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 		}
 	}
 	emit() // trailing entry with no closing blank line
-	return ingested, skipped
+	return res, nil
 }

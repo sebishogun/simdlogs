@@ -24,7 +24,10 @@ func (p *StreamContextPipe) run(s Store, parent *Query, matches []Row) []Row {
 	// the window's rows in time order. Cap the materialize at streamContextCap
 	// rows so a huge window degrades (context over the first cap rows) instead
 	// of OOMing; real stream-context use is over a bounded slice.
-	all := Run(s, &Query{From: parent.From, To: parent.To, Now: parent.Now, Filter: &Expr{Op: OpAnd}, MatAll: true, Limit: streamContextCap})
+	ctxQ := &Query{From: parent.From, To: parent.To, Now: parent.Now,
+		Filter: &Expr{Op: OpAnd}, MatAll: true, Limit: streamContextCap}
+	applyBudget(ctxQ, parent)
+	all := Run(s, ctxQ)
 	sort.SliceStable(all, func(i, j int) bool { return all[i].Time < all[j].Time })
 	matchTime := map[int64]bool{}
 	for _, m := range matches {
@@ -107,10 +110,17 @@ func (p *UnionPipe) run(s Store, parent *Query, rows []Row) []Row {
 	return append(rows, runSub(s, parent, p.Sub)...)
 }
 
-// runSub executes a subquery over the parent's time window.
+// runSub executes a subquery over the parent's time window and under the
+// parent's budget.
+//
+// The budget half was missing: only From/To/Now were copied, so `| union (*)`
+// appended to any query ran a full unbounded scan while the outer query's
+// deadline was already spent. The route still answered 504 -- the outer scan
+// sets Stopped -- so the unbounded work was invisible from outside.
 func runSub(s Store, parent *Query, sub *Query) []Row {
 	q := *sub // copy so the parsed template is not mutated by run
 	q.From, q.To, q.Now = parent.From, parent.To, parent.Now
+	applyBudget(&q, parent)
 	return RunPipeline(s, &q)
 }
 

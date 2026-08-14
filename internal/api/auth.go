@@ -25,6 +25,11 @@ type authState struct {
 	trustedProxy bool
 	// byHash maps the hex SHA-256 of a bearer token to its principal.
 	byHash map[string]*config.Principal
+	// byCN maps an mTLS client certificate's common name to its principal.
+	byCN map[string]*config.Principal
+	// proxy is the identity a request with no credential runs as when a
+	// terminating proxy is trusted; nil otherwise.
+	proxy *config.Principal
 }
 
 // SetAuth installs an authentication configuration.
@@ -37,7 +42,18 @@ func (s *Server) SetAuth(a *config.AuthConfig) error {
 	if err != nil {
 		return err
 	}
-	s.auth = &authState{enabled: true, trustedProxy: a.TrustedProxy, byHash: ps}
+	cs, err := a.CertPrincipals()
+	if err != nil {
+		return err
+	}
+	proxy, err := a.ProxyPrincipal()
+	if err != nil {
+		return err
+	}
+	s.auth = &authState{
+		enabled: true, trustedProxy: a.TrustedProxy,
+		byHash: ps, byCN: cs, proxy: proxy,
+	}
 	return nil
 }
 
@@ -66,6 +82,28 @@ func (s *Server) authFor(r *http.Request) (*config.Principal, bool) {
 		return nil, false
 	}
 	return p, true
+}
+
+// certPrincipal maps a verified client certificate to a principal. The
+// certificate has already been verified against the configured CA by the TLS
+// stack -- ClientAuth is RequireAndVerifyClientCert -- so the common name can
+// be trusted as a lookup key here.
+func (s *Server) certPrincipal(r *http.Request) *config.Principal {
+	st := s.auth
+	if st == nil || len(st.byCN) == 0 || r.TLS == nil {
+		return nil
+	}
+	for _, chain := range r.TLS.VerifiedChains {
+		if len(chain) == 0 {
+			continue
+		}
+		if p := st.byCN[chain[0].Subject.CommonName]; p != nil {
+			return p
+		}
+	}
+	// PeerCertificates without a verified chain means verification did not
+	// happen; do not trust the name.
+	return nil
 }
 
 func bearerToken(r *http.Request) (string, bool) {
@@ -108,6 +146,21 @@ func (s *Server) withPrincipal(h http.Handler) http.Handler {
 				return
 			}
 			r = r.WithContext(context.WithValue(r.Context(), principalKey{}, p))
+			h.ServeHTTP(w, r)
+			return
+		}
+		// A verified client certificate is an identity, not just a transport
+		// gate. RequireAndVerifyClientCert proves the CA trusts this client;
+		// mapping its common name is what turns that into a principal, and
+		// without the mapping the certificate was verified and then discarded.
+		if p := s.certPrincipal(r); p != nil {
+			r = r.WithContext(context.WithValue(r.Context(), principalKey{}, p))
+			h.ServeHTTP(w, r)
+			return
+		}
+		// A terminating proxy has already authenticated the caller.
+		if st.proxy != nil {
+			r = r.WithContext(context.WithValue(r.Context(), principalKey{}, st.proxy))
 		}
 		h.ServeHTTP(w, r)
 	})
@@ -151,6 +204,15 @@ func (s *Server) tenantFor(r *http.Request) (config.TenantKey, error) {
 	proj := strings.TrimSpace(r.Header.Get("ProjectID"))
 	p := principalOf(r)
 
+	// With authentication on, an unauthenticated request resolves no tenant
+	// at all. It used to fall through to the default: the request was
+	// answered 401 by the route, but tenant resolution had already run in the
+	// outer middleware and created the store -- directory, lock, mmaps and a
+	// writer pool -- for whatever AccountID the caller sent. Unbounded disk
+	// and inode growth from an anonymous client.
+	if st := s.auth; st != nil && st.enabled && p == nil {
+		return config.TenantKey{}, errUnauthenticatedTenant
+	}
 	if acc == "" && proj == "" {
 		if p == nil {
 			return config.TenantKey{Account: "0", Project: "0"}, nil
@@ -184,8 +246,9 @@ type authError struct {
 func (e *authError) Error() string { return e.msg }
 
 var (
-	errForbiddenTenant = &authError{msg: "not authorized for that tenant", code: http.StatusForbidden}
-	errAmbiguousTenant = &authError{msg: "principal has several tenants; name one with AccountID/ProjectID", code: http.StatusBadRequest}
+	errUnauthenticatedTenant = &authError{msg: "authentication required", code: http.StatusUnauthorized}
+	errForbiddenTenant       = &authError{msg: "not authorized for that tenant", code: http.StatusForbidden}
+	errAmbiguousTenant       = &authError{msg: "principal has several tenants; name one with AccountID/ProjectID", code: http.StatusBadRequest}
 )
 
 func authStatus(err error) int {

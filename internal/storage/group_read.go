@@ -199,6 +199,7 @@ func readGroup(b, flenWord []byte, hasCRC bool) (*Reader, error) {
 	// it is corrupt.
 	dataEnd := fEnd - flen
 
+	var rowsBacked bool
 	for i := 0; i < ncol; i++ {
 		var m colMeta
 		m.Name = c.str()
@@ -242,10 +243,134 @@ func readGroup(b, flenWord []byte, hasCRC bool) (*Reader, error) {
 		if m.Width < 0 || m.Width > 32 {
 			return nil, corruptf("column %d index width %d outside [0, 32]", i, m.Width)
 		}
+		// DictLen was bounded only by maxGroupRows (1<<30) and never
+		// cross-checked against the section that stores the values, so a
+		// 635-byte group could declare 16,777,216 dict entries -- and
+		// ValueCounts, dictSectionAll and dictSectionSome each allocate
+		// straight from it. Measured: 640 MB, 256 MB and 256 MB from that
+		// one file, and ~41 GB at the accepted ceiling. The section stores
+		// its values in blocks of dictBlock, so the block count it declares
+		// is the real bound.
+		if m.DictLen > 0 && m.DictLen2 > 0 {
+			if nb := parseDictSec(b[m.DictOff : m.DictOff+m.DictLen2]).numBlocks; m.DictLen > nb*dictBlock {
+				return nil, corruptf("column %d declares %d dictionary values but its section holds at most %d",
+					i, m.DictLen, nb*dictBlock)
+			}
+		}
 		if m.DictLen < 0 || m.DictLen > maxGroupRows {
 			return nil, corruptf("column %d dictionary length %d outside [0, %d]", i, m.DictLen, maxGroupRows)
 		}
+		// The row count drives every column decode: idxBytes computes
+		// ((Rows*Width+31)/32+1)*4 and the decoder slices that many bytes out
+		// of the data span. Validating the span without validating the count
+		// against it left the footer safe and the decoders not -- a group
+		// claiming a million rows over a 512-byte span sliced past the blob,
+		// which on an mmap reads adjacent pages or takes SIGBUS.
+		// The timestamp column is validated here too. The ColDict-only check
+		// left it entirely unchecked: numBlocks and blockSize come straight
+		// from the file, and every timestamp decoder slices on the first and
+		// divides by the second. A corrupt numBlocks sliced past the blob and
+		// a zero blockSize divided by zero -- both reachable from
+		// needsRecompact in the tiering goroutine, which has no recover, so
+		// each was a process kill on a checksum-valid file.
+		if m.Type == ColTimestamp {
+			if m.DataLen < 8 {
+				if rows > 0 {
+					return nil, corruptf("column %d: timestamp span is %d bytes, too short for a header", i, m.DataLen)
+				}
+			} else {
+				if m.DataOff+8 > len(b) {
+					return nil, corruptf("column %d: timestamp header outside the blob", i)
+				}
+				nb := int(get32(b, m.DataOff))
+				bs := int(get32(b, m.DataOff+4))
+				if nb < 0 || nb > maxGroupRows {
+					return nil, corruptf("column %d: timestamp block count %d outside [0, %d]", i, nb, maxGroupRows)
+				}
+				// Every block carries a fixed-size checkpoint header, so the
+				// count is bounded by the span that holds them.
+				if nb > (m.DataLen-8)/tsHdrStride {
+					return nil, corruptf("column %d: %d timestamp blocks do not fit a %d-byte span", i, nb, m.DataLen)
+				}
+				if nb > 0 && bs <= 0 {
+					return nil, corruptf("column %d: timestamp block size is %d", i, bs)
+				}
+				// The encoder sets numBlocks = ceil(rows/blockSize), so the
+				// two pin each other. Checking only bs > 0 accepted bs = 1
+				// with rows = 4 and nb = 1, which decodes a wrong time
+				// window rather than crashing -- a silently wrong answer.
+				// Asserting the pair survives a change to the block constant.
+				if nb > 0 && rows > 0 {
+					// Equality, not two one-sided bounds. The pair of
+					// inequalities caught too many blocks and a trailing empty
+					// one, and neither caught too FEW -- bs=1 with rows=4 and
+					// nb=1 passed both, and decodeTimeRangeInto then marks
+					// only bs rows per block and leaves the rest false, which
+					// is a silently wrong time filter rather than a crash.
+					if nb != (rows+bs-1)/bs {
+						return nil, corruptf("column %d: %d blocks of %d do not encode %d rows (want %d blocks)",
+							i, nb, bs, rows, (rows+bs-1)/bs)
+					}
+				}
+				if rows > 0 && nb == 0 {
+					return nil, corruptf("column %d: %d rows but no timestamp blocks", i, rows)
+				}
+				// Every block's checkpoint carries a byte offset into the
+				// stream that follows the headers, and each decoder slices
+				// stream[off:]. Validating the count and the block size and
+				// not these left the same panic one field over.
+				hdrEnd := 8 + nb*tsHdrStride
+				streamLen := m.DataLen - hdrEnd
+				if streamLen < 0 {
+					return nil, corruptf("column %d: timestamp headers exceed the %d-byte span", i, m.DataLen)
+				}
+				for k := 0; k < nb; k++ {
+					at := m.DataOff + 8 + k*tsHdrStride
+					if at+4 > len(b) {
+						return nil, corruptf("column %d: timestamp checkpoint %d outside the blob", i, k)
+					}
+					off := int(get32(b, at))
+					if off < 0 || off > streamLen {
+						return nil, corruptf("column %d: timestamp block %d starts at %d, past the %d-byte stream",
+							i, k, off, streamLen)
+					}
+				}
+				// A timestamp-only group can otherwise declare a row count
+				// bounded by nothing it stores: rebuild then allocates
+				// 8*rows from a 48-byte file.
+				if rows > streamLen*8+8 {
+					return nil, corruptf("column %d: %d rows cannot be encoded in a %d-byte stream", i, rows, streamLen)
+				}
+			}
+		}
+		if m.Type == ColDict && m.Width > 0 {
+			// rows and Width are both already bounded (maxGroupRows, 32), so
+			// the product cannot overflow; the check is still explicit
+			// because both come from the file.
+			if rows > maxGroupRows/m.Width {
+				return nil, corruptf("column %d: rows*width overflows (%d, %d)", i, rows, m.Width)
+			}
+			bits := rows * m.Width
+			need := (bits+31)/32*4 + 4
+			if need > m.DataLen {
+				return nil, corruptf("column %d needs %d bytes for %d rows at width %d, but its data span is %d",
+					i, need, rows, m.Width, m.DataLen)
+			}
+		}
+		// A column whose storage actually scales with the row count is what
+		// makes Rows checkable. A timestamp column does; so does a dict
+		// column at a non-zero width. A dict column at width 0 does not --
+		// every index is the same, so the data span is four bytes whatever
+		// Rows says, and the checks above skip it. That was enough for a
+		// 233-byte group to declare 16,777,216 rows and have DictIndicesRaw
+		// allocate 64 MB of indices from it.
+		if m.Type == ColTimestamp || (m.Type == ColDict && m.Width > 0) {
+			rowsBacked = true
+		}
 		r.cols[i] = m
+	}
+	if r.Rows > 0 && !rowsBacked {
+		return nil, corruptf("group declares %d rows with no column whose storage encodes them", r.Rows)
 	}
 	return r, nil
 }

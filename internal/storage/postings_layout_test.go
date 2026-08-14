@@ -114,7 +114,7 @@ func TestV7BackCompat(t *testing.T) {
 		if c7, c8 := postCount(v7, id), postCount(v8, id); c7 != c8 {
 			t.Fatalf("id %d: v7 count %d != v8 count %d", id, c7, c8)
 		}
-		r7, r8 := postingRows(v7, id), postingRows(v8, id)
+		r7, r8 := postingRows(v7, id, len(indices)), postingRows(v8, id, len(indices))
 		if len(r7) != len(r8) {
 			t.Fatalf("id %d: v7 %d rows != v8 %d rows", id, len(r7), len(r8))
 		}

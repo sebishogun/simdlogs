@@ -12,7 +12,10 @@ import (
 // search, which VictoriaLogs does not offer. Brute-force k-NN (exact; an ANN
 // index is a future optimization). Embeddings are bring-your-own: logs carry a
 // vector column and this ranks them.
-func VectorSearch(s Store, from, to int64, field string, q []float32, k int) []Row {
+// budget carries the deadline and the stop flag. It is a *Query only because
+// that is where those live; none of its filter fields is read. Nil means
+// unbounded, which is what the tests want and no HTTP caller should pass.
+func VectorSearch(s Store, from, to int64, field string, q []float32, k int, budget *Query) []Row {
 	if k <= 0 {
 		k = 10
 	}
@@ -26,6 +29,11 @@ func VectorSearch(s Store, from, to int64, field string, q []float32, k int) []R
 	sn1 := snapshotOf(s, from, to)
 	defer sn1.Close()
 	for _, g := range sn1.Groups {
+		// The deadline, checked per group. This path scans every vector in
+		// the window; until this went in it had no bound at all.
+		if budget != nil && budget.exceeded(0) {
+			break
+		}
 		dim, data := g.Vectors(field)
 		if dim == 0 || dim != len(q) {
 			continue

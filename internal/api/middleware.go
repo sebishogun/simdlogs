@@ -2,6 +2,7 @@ package api
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,42 @@ type routeSpec struct {
 	types   []string     // allowed media types; empty means any
 	format  errorFormat  // error envelope
 	limit   func() int64 // body limit override; nil uses the server's
+	// deadline applies MaxQueryDuration to the request context. Off for the
+	// live tail, which is long-lived by design.
+	deadline bool
+	// write selects the ingest concurrency budget rather than the query one.
+	write bool
+	// nosem exempts the route from concurrency admission entirely. Only the
+	// operational surface uses it: a scraper that gets 429 under load takes
+	// away the telemetry that explains the load.
+	nosem bool
+	// stream selects the tail budget. A live tail is an idle connection, not
+	// a running query -- charging it the query budget meant a handful of open
+	// tails returned 429 for every other read, /metrics included. It still
+	// gets a budget of its own, because "not a query" is not "free": each
+	// tail holds a connection, a goroutine and a poll timer.
+	stream bool
+}
+
+// admit bounds how many requests of one class run at once.
+//
+// MaxConcurrentQuery and MaxConcurrentWrite were declared, defaulted and
+// validated, and read by nothing: any number of concurrent queries each
+// spawned their own worker pool. A rejected request gets 429 rather than
+// queueing without bound, so a client learns to back off instead of timing
+// out.
+func (s *Server) admit(sem chan struct{}, spec routeSpec, w http.ResponseWriter, r *http.Request) (release func(), ok bool) {
+	if sem == nil {
+		return func() {}, true
+	}
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, true
+	default:
+		s.writeErr(w, r, spec, http.StatusTooManyRequests,
+			"too many concurrent requests; retry after a moment")
+		return nil, false
+	}
 }
 
 // countErr tallies an error response for /metrics.
@@ -73,6 +110,31 @@ func (s *Server) guard(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
 				}
 			}
 		}
+		// A query deadline. -search.maxDuration was accepted, stored and read
+		// by nothing: an operator setting it got no timeout and no warning.
+		// The full executor-level cancellation is task 6.1; this bounds the
+		// request now, which is what the flag says it does.
+		if d := s.limits.MaxQueryDuration; d > 0 && spec.deadline {
+			ctx, cancel := context.WithTimeout(r.Context(), d)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
+		// Concurrency admission, by class.
+		if !spec.nosem {
+			sem := s.querySem
+			switch {
+			case spec.write:
+				sem = s.writeSem
+			case spec.stream:
+				sem = s.tailSem
+			}
+			release, ok := s.admit(sem, spec, w, r)
+			if !ok {
+				return
+			}
+			defer release()
+		}
+
 		limit := s.limits.MaxBodyBytes
 		if spec.limit != nil {
 			limit = spec.limit()
@@ -179,6 +241,7 @@ func bodyErrFor(err error) *bodyError {
 // Content-Type is allowed because several send none.
 func ndjsonSpec() routeSpec {
 	return routeSpec{
+		write:   true,
 		methods: []string{http.MethodPost, http.MethodPut},
 		types: []string{
 			"application/x-ndjson", "application/json", "text/plain",
@@ -201,6 +264,7 @@ func journaldSpec() routeSpec {
 // otlpSpec is OTLP/HTTP: protobuf or JSON, and errors in JSON.
 func otlpSpec() routeSpec {
 	return routeSpec{
+		write:   true,
 		methods: []string{http.MethodPost},
 		types:   []string{"application/x-protobuf", "application/json"},
 		format:  errJSON,
@@ -210,7 +274,58 @@ func otlpSpec() routeSpec {
 // readSpec is the query surface: GET or POST, any type, plain-text errors as
 // the existing clients expect.
 func readSpec() routeSpec {
-	return routeSpec{methods: []string{http.MethodGet, http.MethodPost}, format: errText}
+	return routeSpec{methods: []string{http.MethodGet, http.MethodPost}, format: errText, deadline: true}
+}
+
+// tailSpec is the live tail: a read route with no deadline, since it is meant
+// to stay open.
+func tailSpec() routeSpec {
+	sp := readSpec()
+	sp.deadline = false
+	sp.stream = true // its own budget: not a query, not unbounded either
+	return sp
+}
+
+// datadogValidateSpec is the Datadog Agent's API-key probe. It is a GET --
+// the agent calls GET /api/v1/validate at startup -- so wrapping it in the
+// ingest spec answered the agent 405 and it reported the key as invalid.
+func datadogValidateSpec() routeSpec {
+	sp := ndjsonSpec()
+	sp.methods = []string{http.MethodGet, http.MethodPost, http.MethodHead}
+	sp.types = nil // a GET carries no body to type
+	return sp
+}
+
+// specForPath is the single source of truth for which route spec a write path
+// carries. The mux picks its spec per route; routeWrites hardcoded
+// ndjsonSpec() for everything, so in router mode a collector's default
+// protobuf OTLP got 415, journald got 415, and the Datadog key probe got 405
+// -- the exact failures the per-route specs exist to prevent, reintroduced
+// one layer up. One function both call is what stops them disagreeing again.
+func specForPath(p string) routeSpec {
+	switch p {
+	case "/v1/logs", "/insert/opentelemetry/v1/logs":
+		return otlpSpec()
+	case "/insert/journald":
+		return journaldSpec()
+	case "/insert/datadog/api/v1/validate":
+		return datadogValidateSpec()
+	case "/insert/ready":
+		sp := ndjsonSpec()
+		sp.methods = []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodHead}
+		sp.types = nil
+		return sp
+	}
+	return ndjsonSpec()
+}
+
+// opsSpec is the operational surface -- metrics, health details, flags. It is
+// exempt from the query budget: a scraper that gets 429 under load takes away
+// the telemetry that explains the load.
+func opsSpec() routeSpec {
+	sp := readSpec()
+	sp.nosem = true
+	return sp
 }
 
 // adminSpec is the administrative surface.

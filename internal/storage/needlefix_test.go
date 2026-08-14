@@ -115,7 +115,7 @@ func TestPostingRowsSeek(t *testing.T) {
 					want = append(want, uint32(row))
 				}
 			}
-			got := postingRows(blob, id)
+			got := postingRows(blob, id, len(c.indices))
 			if len(got) != len(want) {
 				t.Fatalf("case %d id %d: got %v want %v", ci, id, got, want)
 			}

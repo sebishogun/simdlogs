@@ -18,11 +18,36 @@ Go 1.26.5 or later is required. The server uses published `simd v1.20.0` and
 `simdjson v0.6.0`; neither dependency requires cgo.
 
 ```sh
-go run ./cmd/simdlogs -storage ./simdlogs-data -addr :9428
+go run ./cmd/simdlogs -storage ./simdlogs-data -addr 127.0.0.1:9428
 ```
 
 The default port matches VictoriaLogs. On startup the server prints the SIMD
 tier selected for the current CPU.
+
+**Binding a public address needs a decision about transport.** The server
+refuses to serve plaintext on anything but loopback, because log data is
+tenant data and a server that binds every interface in the clear should take a
+deliberate flag rather than be what happens when the operator forgets. Pick
+one:
+
+```sh
+# TLS (add -tls.clientCAFile for mTLS)
+go run ./cmd/simdlogs -storage ./simdlogs-data -addr :9428 \
+  -tls.certFile server.pem -tls.keyFile server-key.pem
+
+# behind a terminating proxy: bind loopback, let the proxy hold the certificate
+go run ./cmd/simdlogs -storage ./simdlogs-data -addr 127.0.0.1:9428
+
+# plaintext on a public interface, accepted deliberately
+go run ./cmd/simdlogs -storage ./simdlogs-data -addr :9428 -insecure-http
+```
+
+The same rule applies to `-syslog`: that listener is plaintext by construction
+and unauthenticated, so a public syslog address needs `-insecure-http` too.
+
+**The server is unauthenticated without `-auth.config`,** and says so at
+startup. See [docs/lld/api.md](docs/lld/api.md) for the token file format,
+roles, and the tenant-authorization rules.
 
 Ingest newline-delimited JSON:
 

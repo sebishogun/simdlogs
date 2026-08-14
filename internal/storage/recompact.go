@@ -92,6 +92,13 @@ func (r *Reader) rebuild(compact, dropPostings bool) *Group {
 // bytes before and after, so the caller can report the saving. Groups already
 // free of LZ4 blocks are skipped, so calling it repeatedly is cheap.
 func (s *Store) Recompact(cutoff int64, dropPostings bool) (groups int, before, after int64, err error) {
+	// structMu, like Demote and Promote. Recompaction writes a group file in
+	// place, so running it alongside a promotion that writes the same path is
+	// two writers on one name. store.go documents this mutex as serializing
+	// recompaction; without the lock here that was simply untrue.
+	s.structMu.Lock()
+	defer s.structMu.Unlock()
+
 	s.mu.RLock()
 	cands := make([]*groupEntry, 0, len(s.groups))
 	for _, g := range s.groups {
@@ -152,11 +159,34 @@ func (s *Store) Recompact(cutoff int64, dropPostings bool) (groups int, before, 
 			}
 		}
 		if idx < 0 || ge.retired.Load() {
-			// Retention removed this group while it was being rewritten. The
-			// file we just wrote resurrected it; take it back out.
+			// This entry is no longer the store's. Either retention removed
+			// it while the rewrite was in flight, or another structural
+			// operation replaced it.
+			//
+			// Only delete the file if no live entry claims that path. The
+			// unconditional Remove here deleted a *new*, committed group that
+			// a promote had put at the same name, and OpenStore then failed
+			// with "group N is committed but its file is missing" -- the
+			// whole tenant unopenable.
+			claimed := false
+			for _, cur := range s.groups {
+				if cur.path == ge.path {
+					claimed = true
+					break
+				}
+			}
 			s.mu.Unlock()
 			unmap()
-			os.Remove(ge.path)
+			if !claimed {
+				if rerr := os.Remove(ge.path); rerr != nil && !os.IsNotExist(rerr) {
+					// Task 4.3 requires this error be checked rather than
+					// dropped: a file left behind is an uncommitted group the
+					// next open ignores, but it is still disk.
+					retentionFailures.Add(1)
+					pendingTombstones.Add(1)
+					s.addTombstone(ge.path)
+				}
+			}
 			continue
 		}
 		ne := &groupEntry{
@@ -171,6 +201,9 @@ func (s *Store) Recompact(cutoff int64, dropPostings bool) (groups int, before, 
 		before += oldSize
 		after += int64(len(blob))
 	}
+	// A rewrite that could not unlink its stale file leaves a tombstone;
+	// retry them here as well, since retention may be disabled.
+	s.retryTombstones()
 	return groups, before, after, nil
 }
 

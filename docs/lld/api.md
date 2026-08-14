@@ -155,7 +155,8 @@ recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
 
 ## Bounds and errors
 
-- `-search.maxRows`: a bare (no-pipe) select over the cap errors with an
+- `-search.maxRows`: zero now means the built-in default rather than
+  unlimited, which is what it used to mean. A bare (no-pipe) select over the cap errors with an
   explicit message (never silently truncates); `MaxRows` keeps the parallel
   scan, `Limit` would force the serial path. Pipes' input is never bounded.
 - `maxHitsBuckets = 100K` caps a hits response (a one-second step over a year
@@ -181,7 +182,15 @@ recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
 | `-syslog` | also listen for syslog on UDP/TCP |
 | `-select-backends` | peer node URLs; sets select-router mode (vmselect role) |
 | `-replicas` | replication factor for the backends |
-| `-search.maxRows` | cap on a bare select's rows; 0 = unlimited |
+| `-search.maxRows` | cap on a bare select's rows; 0 = built-in default, -1 = unlimited |
+| `-search.maxDuration` | wall-time cap for one query request (not the live tail); 0 = default, -1ns = unlimited |
+| `-search.maxQueryBytes` | cap on the bytes one query may materialize; 0 = default (256 MiB), -1 = unlimited. Over it the query errors 504 rather than returning a short answer. |
+| `-http.maxBodyBytes` | maximum request body; 0 = default, -1 = unlimited |
+| `-tenants.max` | maximum tenants held open; 0 = default, -1 = unlimited |
+| `-auth.config` | JSON auth file (token hashes, cert mappings, roles, tenants). Absent = **unauthenticated** |
+| `-tls.certFile` / `-tls.keyFile` | PEM pair; serves HTTPS |
+| `-tls.clientCAFile` | PEM CA bundle; requires and verifies a client certificate (mTLS) |
+| `-tls.insecure` | serve plaintext on a non-loopback address, including `-syslog` (alias: `-insecure-http`) |
 
 Environment: `SIMDLOGS_STREAM_FIELDS` (stream-field default before the
 default tenant opens, so a deployment can synthesize `_stream` without a
@@ -281,3 +290,57 @@ mux. With authentication applied only per route, the principal was not in the
 context when the tenant headers were checked, and they were believed
 unconditionally -- the exact defect being fixed. A test pins the cross-tenant
 rejection.
+
+## Transport security
+
+`internal/config/tls.go`. `-tls.certFile` and `-tls.keyFile` serve HTTPS;
+`-tls.clientCAFile` additionally requires a client certificate signed by that
+bundle (mTLS), with `RequireAndVerifyClientCert` -- a certificate that is
+requested and not verified is decoration. TLS 1.2 is the floor, 1.3 preferred,
+and ALPN advertises h2 so an HTTP/2 client is not silently downgraded.
+
+Half a pair is an error rather than a quiet fallback to plaintext: a cert with
+no key would otherwise start the server in the clear while the operator
+believes TLS is on. A client CA with no server certificate is an error too,
+instead of a setting that does nothing.
+
+**Plaintext on a public address is refused.** `CheckListen` allows it only on
+loopback, or with `-insecure-http`. Log data is tenant data, and a server that
+binds every interface in clear text should take a deliberate flag rather than
+being what happens when the operator forgets one.
+
+The `-syslog` address gets `CheckPlaintextListen`, not `CheckListen`. That
+listener is plaintext by construction and unauthenticated, writing to the
+default tenant, so exempting it would have made the guarantee a half-truth
+with the larger hole left open -- and `CheckListen` would have exempted it,
+because `CheckListen` returns early once a certificate is configured, which a
+syslog port never uses.
+
+**mTLS is an identity, not only a gate.** A verified client certificate is
+mapped to a principal by its subject common name through the auth file's
+`certs` entries. Without such an entry the certificate proves only that the CA
+trusts the client: the request then falls through to the bearer-token path and
+is refused like any other credential-less request. `certPrincipal` reads
+`VerifiedChains`, never `PeerCertificates`, so an unverified chain is never
+trusted.
+
+**The alternative trust boundary** is a terminating proxy. Set
+`"trustedProxy": true` in the auth file, together with **both** `proxyRoles`
+and `proxyTenants` -- there is no default, and the configuration is rejected
+without them.
+
+They used to default to every role and every tenant, which made *omitting* a
+credential strictly more powerful than presenting one: a least-privilege token
+got 403 on `/admin/backup` while an anonymous request got 200 and a tar of the
+whole store. A default that outranks every configured credential is not a
+default, it is a bypass. For the same reason `proxyRoles` may not include
+`admin` when tokens or certs are also configured.
+
+Bind loopback when using it -- a trusted-proxy server reachable directly is an
+unauthenticated server -- and have the proxy strip and re-set the
+`AccountID`/`ProjectID` headers, because they are authorization inputs and a
+proxy that forwards a client's copy unchanged has handed the client the tenant
+selector back.
+
+Certificate rotation needs a process restart: there is no `GetCertificate`
+callback, so the pair is read once at startup.
