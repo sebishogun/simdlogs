@@ -39,15 +39,9 @@ func (s *Server) AddMetricRule(name, logsql, by string, interval time.Duration) 
 	s.rules = append(s.rules, r)
 	s.rmu.Unlock()
 	r.eval(s)
-	if interval > 0 {
-		go func() {
-			t := time.NewTicker(interval)
-			defer t.Stop()
-			for range t.C {
-				r.eval(s)
-			}
-		}()
-	}
+	// Under the server's background lifecycle, like the alert rules: a bare
+	// ticker here outlived the stores it queries.
+	s.goBackground(interval, func() { r.eval(s) })
 	return nil
 }
 

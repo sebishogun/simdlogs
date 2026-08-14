@@ -31,15 +31,10 @@ func (s *Server) AddAlertRule(name, logsql, op string, threshold float64, interv
 	s.alerts = append(s.alerts, a)
 	s.amu.Unlock()
 	a.eval(s)
-	if interval > 0 {
-		go func() {
-			t := time.NewTicker(interval)
-			defer t.Stop()
-			for range t.C {
-				a.eval(s)
-			}
-		}()
-	}
+	// Under the server's background lifecycle: this loop used to be a bare
+	// ticker with no stop, running for the life of the process even after
+	// the stores it queries had closed.
+	s.goBackground(interval, func() { a.eval(s) })
 	return nil
 }
 

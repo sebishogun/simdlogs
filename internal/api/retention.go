@@ -49,18 +49,5 @@ func (s *Server) StartRetention(maxAge, interval time.Duration) (stop func()) {
 		return func() {}
 	}
 	s.EnforceRetention(maxAge) // sweep once at startup, not only after the first tick
-	done := make(chan struct{})
-	go func() {
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				s.EnforceRetention(maxAge)
-			}
-		}
-	}()
-	return func() { close(done) }
+	return s.goBackground(interval, func() { s.EnforceRetention(maxAge) })
 }

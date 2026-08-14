@@ -38,20 +38,9 @@ func (s *Server) StartTiering(age, interval time.Duration, dropPostings bool) (s
 	if age <= 0 || interval <= 0 {
 		return func() {}
 	}
-	done := make(chan struct{})
-	go func() {
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				if n, saved := s.RecompactOlderThan(age, dropPostings); n > 0 {
-					log.Printf("tiering: recompacted %d groups, saved %.1f MB", n, float64(saved)/1e6)
-				}
-			}
+	return s.goBackground(interval, func() {
+		if n, saved := s.RecompactOlderThan(age, dropPostings); n > 0 {
+			log.Printf("tiering: recompacted %d groups, saved %.1f MB", n, float64(saved)/1e6)
 		}
-	}()
-	return func() { close(done) }
+	})
 }

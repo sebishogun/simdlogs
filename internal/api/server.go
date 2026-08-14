@@ -8,6 +8,7 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,6 +60,48 @@ type Server struct {
 
 	amu    sync.Mutex
 	alerts []*alertRule // alerting: LogsQL count vs a threshold, exposed on /alerts
+
+	// Background lifecycle. Every periodic loop -- retention, tiering, log
+	// rules, alert rules -- runs under bgCtx and is counted in bg, so Close
+	// can cancel them and WAIT. Stopping without waiting is not enough: a
+	// retention pass in flight when the stores close would unmap under
+	// itself, and the alert and rule tickers had no stop at all and ran for
+	// the life of the process.
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	bg       sync.WaitGroup
+	stopping atomic.Bool
+}
+
+// goBackground runs fn on an interval until the server shuts down. It is the
+// only way this package starts a periodic loop, so no loop can be added that
+// shutdown does not know about.
+func (s *Server) goBackground(interval time.Duration, fn func()) (stop func()) {
+	if interval <= 0 || s.stopping.Load() {
+		return func() {}
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	s.bg.Add(1)
+	go func() {
+		defer s.bg.Done()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-s.bgCtx.Done():
+				return
+			case <-done:
+				return
+			case <-t.C:
+				if s.stopping.Load() {
+					return
+				}
+				fn()
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // NewServer opens (or creates) the data directory at dir and returns the
@@ -68,6 +111,7 @@ func NewServer(dir string) (*Server, error) {
 		return nil, err
 	}
 	srv := &Server{dir: dir, tenants: map[string]*tenant{}, started: time.Now()}
+	srv.bgCtx, srv.bgCancel = context.WithCancel(context.Background())
 	// Optional stream-field default from the environment, so a deployment can
 	// synthesize _stream without a code change. Set before the default tenant
 	// opens so it inherits the policy.
@@ -90,6 +134,15 @@ func (s *Server) Dir() string { return s.dir }
 // its pool stopped, and every store is unmapped. Call it at process shutdown
 // after the HTTP server has stopped accepting requests. Safe to call once.
 func (s *Server) Close() error {
+	// Stop accepting new background work, cancel what is running, and wait
+	// for it. Closing the stores first would unmap under a retention or
+	// recompaction pass that is still walking them.
+	s.stopping.Store(true)
+	if s.bgCancel != nil {
+		s.bgCancel()
+	}
+	s.bg.Wait()
+
 	s.mu.Lock()
 	tenants := make([]*tenant, 0, len(s.tenants))
 	for _, t := range s.tenants {
