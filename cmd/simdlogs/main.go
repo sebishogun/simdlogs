@@ -34,6 +34,7 @@ func main() {
 	maxBody := flag.Int64("http.maxBodyBytes", 0, "maximum request body in bytes; 0 = the built-in default, -1 = unlimited")
 	maxQueryDur := flag.Duration("search.maxDuration", 0, "maximum wall time for one query; 0 = the built-in default, -1ns = unlimited")
 	maxTenants := flag.Int("tenants.max", 0, "maximum tenants held open; 0 = the built-in default, -1 = unlimited")
+	authFile := flag.String("auth.config", "", "path to the JSON auth file (bearer-token hashes, roles, tenants). Without it the server is UNAUTHENTICATED: every client can query, ingest and download backups.")
 	flag.Parse()
 
 	cfg := config.Default()
@@ -53,6 +54,24 @@ func main() {
 	srv, err := api.NewServerConfig(cfg)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *authFile != "" {
+		ac, err := config.LoadAuth(*authFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := srv.SetAuth(ac); err != nil {
+			log.Fatal(err)
+		}
+		if ac.Disabled {
+			log.Print("WARNING: authentication is explicitly disabled in " + *authFile)
+		} else {
+			log.Printf("authentication enabled: %d credentials from %s", len(ac.Tokens), *authFile)
+		}
+	} else {
+		// Loud, once, at startup. A server that is open to everyone should
+		// say so rather than leaving an operator to infer it.
+		log.Print("WARNING: no -auth.config; the server is UNAUTHENTICATED and every client can query, ingest and download backups")
 	}
 	if *backends != "" {
 		srv.SetBackends(strings.Split(*backends, ","))

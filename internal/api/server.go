@@ -68,6 +68,7 @@ type Server struct {
 	// retention pass in flight when the stores close would unmap under
 	// itself, and the alert and rule tickers had no stop at all and ran for
 	// the life of the process.
+	auth     *authState
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 	bg       sync.WaitGroup
@@ -266,57 +267,70 @@ func (s *Server) Handler() http.Handler {
 	// Unwrapped, each handler read r.Body with io.ReadAll and no limit, took
 	// any method, and ignored Content-Type entirely.
 	nd := ndjsonSpec()
-	mux.HandleFunc("/insert/jsonline", s.guard(nd, s.insertJSONLine))
-	mux.HandleFunc("/insert/logfmt", s.guard(nd, s.insertLogfmt))
-	mux.HandleFunc("/_bulk", s.guard(nd, s.esBulk))                               // Elasticsearch bulk ingest
-	mux.HandleFunc("/loki/api/v1/push", s.guard(nd, s.insertLoki))                // Grafana Loki push
-	mux.HandleFunc("/api/v2/logs", s.guard(nd, s.insertDatadog))                  // Datadog logs intake
-	mux.HandleFunc("/v1/input", s.guard(nd, s.insertDatadog))                     // Datadog legacy intake
-	mux.HandleFunc("/insert/syslog", s.guard(nd, s.insertSyslog))                 // syslog over HTTP (native transport: ListenSyslog)
-	mux.HandleFunc("/v1/logs", s.guard(otlpSpec(), s.insertOTLPLogs))             // OpenTelemetry OTLP/HTTP logs
-	mux.HandleFunc("/insert/journald", s.guard(journaldSpec(), s.insertJournald)) // systemd journal export
+	// ingest is the role every write path needs; query for reads; admin for
+	// the backup and diagnostic surfaces. in/rd/adm wrap guard with it.
+	in := func(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
+		return s.guard(spec, s.requireAuth(config.RoleIngest, spec, h))
+	}
+	rd := func(h http.HandlerFunc) http.HandlerFunc {
+		sp := readSpec()
+		return s.guard(sp, s.requireAuth(config.RoleQuery, sp, h))
+	}
+	adm := func(h http.HandlerFunc) http.HandlerFunc {
+		sp := adminSpec()
+		return s.guard(sp, s.requireAuth(config.RoleAdmin, sp, h))
+	}
+	mux.HandleFunc("/insert/jsonline", in(nd, s.insertJSONLine))
+	mux.HandleFunc("/insert/logfmt", in(nd, s.insertLogfmt))
+	mux.HandleFunc("/_bulk", in(nd, s.esBulk))                               // Elasticsearch bulk ingest
+	mux.HandleFunc("/loki/api/v1/push", in(nd, s.insertLoki))                // Grafana Loki push
+	mux.HandleFunc("/api/v2/logs", in(nd, s.insertDatadog))                  // Datadog logs intake
+	mux.HandleFunc("/v1/input", in(nd, s.insertDatadog))                     // Datadog legacy intake
+	mux.HandleFunc("/insert/syslog", in(nd, s.insertSyslog))                 // syslog over HTTP (native transport: ListenSyslog)
+	mux.HandleFunc("/v1/logs", in(otlpSpec(), s.insertOTLPLogs))             // OpenTelemetry OTLP/HTTP logs
+	mux.HandleFunc("/insert/journald", in(journaldSpec(), s.insertJournald)) // systemd journal export
 	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	// VictoriaLogs serves every third-party ingest protocol under /insert/<vendor>/.
 	// An agent whose config was written against VictoriaLogs sends the prefixed
 	// path, so serving only the vendor-native path 404s a drop-in client. Both
 	// spellings are registered; the unprefixed ones are what the vendors' own
 	// agents use when pointed at a bare host.
-	mux.HandleFunc("/insert/elasticsearch/_bulk", s.guard(nd, s.esBulk))
-	mux.HandleFunc("/insert/loki/api/v1/push", s.guard(nd, s.insertLoki))
-	mux.HandleFunc("/insert/datadog/api/v2/logs", s.guard(nd, s.insertDatadog))
+	mux.HandleFunc("/insert/elasticsearch/_bulk", in(nd, s.esBulk))
+	mux.HandleFunc("/insert/loki/api/v1/push", in(nd, s.insertLoki))
+	mux.HandleFunc("/insert/datadog/api/v2/logs", in(nd, s.insertDatadog))
 	mux.HandleFunc("/insert/datadog/api/v1/validate", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	mux.HandleFunc("/insert/opentelemetry/v1/logs", s.guard(otlpSpec(), s.insertOTLPLogs))
-	mux.HandleFunc("/admin/backup", s.guard(adminSpec(), s.backup)) // tar snapshot for offline restore
-	mux.HandleFunc("/metrics", s.metrics)                           // Prometheus text exposition
-	mux.HandleFunc("/alerts", s.alertsHandler)                      // alerting rule state
+	mux.HandleFunc("/insert/opentelemetry/v1/logs", in(otlpSpec(), s.insertOTLPLogs))
+	mux.HandleFunc("/admin/backup", adm(s.backup))                                                            // tar snapshot for offline restore
+	mux.HandleFunc("/metrics", s.guard(readSpec(), s.requireAuth(config.RoleMetrics, readSpec(), s.metrics))) // Prometheus text exposition
+	mux.HandleFunc("/alerts", rd(s.alertsHandler))                                                            // alerting rule state
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
 	mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
 	mux.HandleFunc("/-/ready", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
-	mux.HandleFunc("/flags", s.flagsHandler)
-	mux.HandleFunc("/vmui", s.ui) // web UI (vmui equivalent)
-	mux.HandleFunc("/select/vmui", s.ui)
+	mux.HandleFunc("/flags", adm(s.flagsHandler)) // flag dump: administrative
+	mux.HandleFunc("/vmui", s.ui)                 // web UI (vmui equivalent)
+	mux.HandleFunc("/select/vmui", rd(s.ui))
 	mux.HandleFunc("/", s.ui) // catch-all: serve the UI at the root
-	mux.HandleFunc("/select/logsql/query", s.selectQuery)
-	mux.HandleFunc("/select/sql", s.sqlQuery)        // SQL SELECT subset (beyond VL)
-	mux.HandleFunc("/select/vector", s.vectorSearch) // k-NN over embeddings (beyond VL)
-	mux.HandleFunc("/select/logsql/tail", s.tail)    // live tail: stream matching rows as they arrive
-	mux.HandleFunc("/select/logsql/hits", s.selectHits)
-	mux.HandleFunc("/select/logsql/field_names", s.fieldNames)
-	mux.HandleFunc("/select/logsql/field_values", s.fieldValues)
-	mux.HandleFunc("/select/logsql/facets", s.facets)
-	mux.HandleFunc("/select/logsql/stats_query", s.statsQuery)
-	mux.HandleFunc("/select/logsql/stats_query_range", s.statsQueryRange)
-	mux.HandleFunc("/select/logsql/streams", s.streamsHandler)
-	mux.HandleFunc("/select/logsql/stream_ids", s.streamIDsHandler)
-	mux.HandleFunc("/select/logsql/stream_field_names", s.streamFieldNamesHandler)
-	mux.HandleFunc("/select/logsql/stream_field_values", s.streamFieldValuesHandler)
+	mux.HandleFunc("/select/logsql/query", rd(s.selectQuery))
+	mux.HandleFunc("/select/sql", rd(s.sqlQuery))        // SQL SELECT subset (beyond VL)
+	mux.HandleFunc("/select/vector", rd(s.vectorSearch)) // k-NN over embeddings (beyond VL)
+	mux.HandleFunc("/select/logsql/tail", rd(s.tail))    // live tail: stream matching rows as they arrive
+	mux.HandleFunc("/select/logsql/hits", rd(s.selectHits))
+	mux.HandleFunc("/select/logsql/field_names", rd(s.fieldNames))
+	mux.HandleFunc("/select/logsql/field_values", rd(s.fieldValues))
+	mux.HandleFunc("/select/logsql/facets", rd(s.facets))
+	mux.HandleFunc("/select/logsql/stats_query", rd(s.statsQuery))
+	mux.HandleFunc("/select/logsql/stats_query_range", rd(s.statsQueryRange))
+	mux.HandleFunc("/select/logsql/streams", rd(s.streamsHandler))
+	mux.HandleFunc("/select/logsql/stream_ids", rd(s.streamIDsHandler))
+	mux.HandleFunc("/select/logsql/stream_field_names", rd(s.streamFieldNamesHandler))
+	mux.HandleFunc("/select/logsql/stream_field_values", rd(s.streamFieldValuesHandler))
 	// The Elasticsearch search surface VictoriaLogs lacks.
 	mux.HandleFunc("/_search", s.esSearch)
 	mux.HandleFunc("/_count", s.esCount)
 	// In router mode, writes forward to storage nodes (outermost, before the
 	// tenant/local path); reads fall through to withTenant -> federatedSelect.
 	// recoverPanic is outermost so one bad request can never take the server down.
-	return recoverPanic(s.routeWrites(s.withTenant(mux)))
+	return recoverPanic(s.withPrincipal(s.routeWrites(s.withTenant(mux))))
 }
 
 // recoverPanic turns a handler panic into a 500 and keeps the server serving --

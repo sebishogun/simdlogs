@@ -245,3 +245,39 @@ place a request body becomes readable.
 
 Limits come from `internal/config`; `config.Unlimited` (-1) is the explicit
 opt-out and zero means "use the default".
+
+## Authentication and tenancy
+
+`auth.go`, `internal/config/auth.go`. Off unless `-auth.config` names a file,
+and the server logs a warning at startup when it is absent -- a server open to
+everyone should say so rather than leaving an operator to infer it.
+
+**Credentials** are bearer tokens. The auth file stores only the hex SHA-256
+of each token, so a leaked file is not a set of working credentials. Lookup is
+by hash, so a timing difference leaks nothing about the token itself. An
+unknown field in the file is an error: `"disable": true` must not read as
+authentication being on. An empty token list is an error too -- `disabled:
+true` is the explicit opt-out, because a list that means "no auth" when empty
+turns a truncated config file into an open server.
+
+**Roles** are `ingest`, `query`, `admin`, `metrics`; `admin` implies the rest.
+Every route names the role it needs. `TestRoutePermissionMatrix` walks the
+registered endpoints and asserts 401 without a credential, 403 with the wrong
+role, and acceptance with the right one. Liveness stays unauthenticated: a
+load balancer's probe carries no credential, and 401 there takes the node out
+of rotation.
+
+**Tenancy.** `AccountID`/`ProjectID` are a *request*, checked against the
+principal's allowed tenants. They used to be the identity: any client could
+name any tenant and read or write its data. A malformed id is now rejected
+rather than rewritten to `0`, which silently sent a typo's data into the
+default tenant. A principal scoped to exactly one tenant gets it by default; a
+multi-tenant principal must name one, since the server picking would be a
+guess.
+
+**Ordering matters.** `withPrincipal` is the outermost middleware, because
+tenant resolution runs in the outer chain while the role check runs inside the
+mux. With authentication applied only per route, the principal was not in the
+context when the tenant headers were checked, and they were believed
+unconditionally -- the exact defect being fixed. A test pins the cross-tenant
+rejection.

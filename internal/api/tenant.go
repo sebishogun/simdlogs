@@ -29,26 +29,19 @@ func (t *tenant) fallbackTS() func() int64 {
 
 type tenantKey struct{}
 
-// sanitizeID keeps only digits, so a header cannot direct the storage path
-// outside the data directory (AccountID/ProjectID are numeric in VL). A
-// non-numeric or empty value falls back to the default tenant.
-func sanitizeID(v string) string {
-	if v == "" {
-		return "0"
-	}
-	for i := 0; i < len(v); i++ {
-		if v[i] < '0' || v[i] > '9' {
-			return "0"
-		}
-	}
-	return v
-}
-
-// tenantOf resolves the request's tenant from the AccountID/ProjectID headers,
-// creating its store on first use. Absent headers select the default 0:0
-// tenant, so single-tenant deployments behave exactly as before.
+// tenantOf resolves the request's tenant, creating its store on first use.
+//
+// The tenant comes from tenantFor, which validates the headers and checks
+// them against the authenticated principal. sanitizeID is gone: rewriting a
+// malformed AccountID to "0" meant a typo silently wrote into the default
+// tenant instead of failing, and treating the header as identity meant any
+// client could name any tenant.
 func (s *Server) tenantOf(r *http.Request) (*tenant, error) {
-	return s.tenant(sanitizeID(r.Header.Get("AccountID")), sanitizeID(r.Header.Get("ProjectID")))
+	k, err := s.tenantFor(r)
+	if err != nil {
+		return nil, err
+	}
+	return s.tenant(k.Account, k.Project)
 }
 
 // tenant returns the store+writer for acc:proj, opening it under
@@ -81,7 +74,11 @@ func (s *Server) withTenant(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tn, err := s.tenantOf(r)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			// A rejected tenant is the caller's fault (unparseable header) or
+			// a permission failure -- not a 500, which is what it used to be
+			// reported as for every cause.
+			atomic.AddInt64(&s.nHTTPErrs, 1)
+			http.Error(w, err.Error(), authStatus(err))
 			return
 		}
 		s.countRequest(r.URL.Path)
