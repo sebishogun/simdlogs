@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sebishogun/simdlogs/internal/config"
 	"github.com/sebishogun/simdlogs/internal/ingest"
 	"github.com/sebishogun/simdlogs/internal/query"
 	"github.com/sebishogun/simdlogs/internal/storage"
@@ -40,7 +41,8 @@ type Server struct {
 	compact    bool     // compact mode default for new tenants (flate dict)
 	backends   []string // peer node base URLs; when set, selects fan out and merge (vmselect role)
 	replicas   int      // replication factor: backends group into shards of this many replicas
-	maxRows    int      // cap on a bare (no-pipe) select's rows; 0 = unlimited. Errors, never truncates.
+	maxRows    int      // cap on a bare (no-pipe) select's rows. Errors, never truncates.
+	limits     config.Limits
 	started    time.Time
 	nIngestReq int64 // ingest requests (atomic)
 	nQueryReq  int64 // query requests (atomic)
@@ -106,11 +108,38 @@ func (s *Server) goBackground(interval time.Duration, fn func()) (stop func()) {
 
 // NewServer opens (or creates) the data directory at dir and returns the
 // server with its default tenant ready.
+// NewServer opens (or creates) the data directory at dir with the production
+// default limits. NewServerConfig takes an explicit configuration.
 func NewServer(dir string) (*Server, error) {
+	c := config.Default()
+	c.Dir = dir
+	return NewServerConfig(c)
+}
+
+// NewServerConfig opens the server with an explicit configuration. The
+// configuration is validated first, so a limit that is neither positive nor
+// config.Unlimited fails at startup rather than at the request that would
+// have tripped it.
+func NewServerConfig(c config.Config) (*Server, error) {
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	dir := c.Dir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 	srv := &Server{dir: dir, tenants: map[string]*tenant{}, started: time.Now()}
+	srv.limits = c.Limits
+	srv.compact = c.Compact
+	if len(c.StreamFields) > 0 {
+		srv.strmFlds = append([]string(nil), c.StreamFields...)
+	}
+	// A bare select is bounded by the configured row limit. It used to
+	// default to zero and be read as "no cap", so a single query could
+	// materialize an entire store.
+	if c.Limits.MaxQueryRows != config.Unlimited {
+		srv.maxRows = c.Limits.MaxQueryRows
+	}
 	srv.bgCtx, srv.bgCancel = context.WithCancel(context.Background())
 	// Optional stream-field default from the environment, so a deployment can
 	// synthesize _stream without a code change. Set before the default tenant

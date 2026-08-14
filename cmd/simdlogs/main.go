@@ -16,6 +16,7 @@ import (
 
 	"github.com/sebishogun/simd"
 	"github.com/sebishogun/simdlogs/internal/api"
+	"github.com/sebishogun/simdlogs/internal/config"
 )
 
 func main() {
@@ -29,17 +30,30 @@ func main() {
 	backends := flag.String("select-backends", "", "comma-separated peer node URLs; when set this node is a select router (vmselect role)")
 	compact := flag.Bool("compact", false, "compact mode: flate dictionaries for ~15% smaller groups, but 2-10x slower value-reading queries -- for cold archival only, not a queryable store")
 	replicas := flag.Int("replicas", 1, "replication factor for -select-backends: backends group into shards of this many replicas")
-	maxRows := flag.Int("search.maxRows", 0, "cap on rows a bare (no-pipe) select may return; 0 = unlimited. Over the cap the query errors (never silently truncates); add a `| limit N` or a stats pipe.")
+	maxRows := flag.Int("search.maxRows", 0, "cap on rows a bare (no-pipe) select may return; 0 = the built-in default, -1 = unlimited. Over the cap the query errors (never silently truncates); add a `| limit N` or a stats pipe.")
+	maxBody := flag.Int64("http.maxBodyBytes", 0, "maximum request body in bytes; 0 = the built-in default, -1 = unlimited")
+	maxQueryDur := flag.Duration("search.maxDuration", 0, "maximum wall time for one query; 0 = the built-in default, -1ns = unlimited")
+	maxTenants := flag.Int("tenants.max", 0, "maximum tenants held open; 0 = the built-in default, -1 = unlimited")
 	flag.Parse()
 
-	srv, err := api.NewServer(*dir)
+	cfg := config.Default()
+	cfg.Dir = *dir
+	cfg.Compact = *compact
+	if *streamFields != "" {
+		cfg.StreamFields = strings.Split(*streamFields, ",")
+	}
+	// A flag left at zero keeps the built-in default; -1 is the explicit
+	// opt-out. Zero used to mean unlimited for maxRows, which is why one
+	// query could materialize a whole store by default.
+	cfg.Limits.MaxQueryRows = *maxRows
+	cfg.Limits.MaxBodyBytes = *maxBody
+	cfg.Limits.MaxQueryDuration = *maxQueryDur
+	cfg.Limits.MaxOpenTenants = *maxTenants
+
+	srv, err := api.NewServerConfig(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if *streamFields != "" {
-		srv.SetStreamFields(strings.Split(*streamFields, ","))
-	}
-	srv.SetMaxRows(*maxRows)
 	if *backends != "" {
 		srv.SetBackends(strings.Split(*backends, ","))
 		srv.SetReplicas(*replicas)
