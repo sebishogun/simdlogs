@@ -446,7 +446,7 @@ func (s *Server) Handler() http.Handler {
 	handle("/insert/jsonline", in(nd, s.insertJSONLine))
 	handle("/insert/logfmt", in(nd, s.insertLogfmt))
 	handle("/_bulk", in(nd, s.esBulk))                                                // Elasticsearch bulk ingest
-	handle("/loki/api/v1/push", in(nd, s.insertLoki))                                 // Grafana Loki push
+	handle("/loki/api/v1/push", in(lokiSpec(), s.insertLoki))                         // Grafana Loki push
 	handle("/api/v2/logs", in(nd, s.insertDatadog))                                   // Datadog logs intake
 	handle("/v1/input", in(nd, s.insertDatadog))                                      // Datadog legacy intake
 	handle("/insert/syslog", in(nd, s.insertSyslog))                                  // syslog over HTTP (native transport: ListenSyslog)
@@ -459,7 +459,7 @@ func (s *Server) Handler() http.Handler {
 	// spellings are registered; the unprefixed ones are what the vendors' own
 	// agents use when pointed at a bare host.
 	handle("/insert/elasticsearch/_bulk", in(nd, s.esBulk))
-	handle("/insert/loki/api/v1/push", in(nd, s.insertLoki))
+	handle("/insert/loki/api/v1/push", in(lokiSpec(), s.insertLoki))
 	handle("/insert/datadog/api/v2/logs", in(nd, s.insertDatadog))
 	// Datadog agents call this to check their API key. Answering 200
 	// unconditionally told every agent its key was valid; behind the ingest
@@ -510,13 +510,27 @@ func (s *Server) Handler() http.Handler {
 
 // recoverPanic turns a handler panic into a 500 and keeps the server serving --
 // a single malformed request must never crash the process.
+//
+// http.ErrAbortHandler is re-panicked, not converted. It is net/http's sentinel
+// meaning "abandon this response without a reply", and only net/http's own
+// conn.serve honours it -- silently, without logging. Because this middleware
+// is the OUTERMOST wrapper (see Handler above), swallowing it here made the
+// sentinel unreachable: /admin/backup's abort became a 200 with "internal
+// error" appended to a truncated tar, which is the exact failure the abort was
+// added to prevent. A handler that needs to abandon a half-written response has
+// no other mechanism, because the status and the first bytes are already gone.
 func recoverPanic(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
-			if v := recover(); v != nil {
-				log.Printf("simdlogs: panic serving %s: %v", r.URL.Path, v)
-				http.Error(w, "internal error", http.StatusInternalServerError)
+			v := recover()
+			if v == nil {
+				return
 			}
+			if v == http.ErrAbortHandler {
+				panic(v) // net/http handles this one; it must reach conn.serve
+			}
+			log.Printf("simdlogs: panic serving %s: %v", r.URL.Path, v)
+			http.Error(w, "internal error", http.StatusInternalServerError)
 		}()
 		h.ServeHTTP(w, r)
 	})
@@ -573,6 +587,7 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.countRows(ing, skip, len(body))
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int{"ingested": ing, "skipped": skip})
 }
 
@@ -597,6 +612,7 @@ func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
 	}
 	// After the flush: a counter must not go backwards.
 	s.countRows(lfRes.Accepted, lfRes.Rejected, len(body))
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int{"ingested": lfRes.Accepted, "skipped": lfRes.Rejected})
 }
 
@@ -637,6 +653,11 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("simdlogs: result exceeds -search.maxRows=%d; add a `| limit N`, a stats pipe, or narrow the query", s.maxRows), 400)
 		return
 	}
+	// NDJSON, so say so: this is what the reference sends, and a client that
+	// switches on Content-Type was previously told text/plain for a stream of
+	// JSON objects. Set before the first write -- after it the header is
+	// already on the wire and Set is silently ignored.
+	w.Header().Set("Content-Type", ndjsonContentType)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	// Hand-built NDJSON: no map[string]any, no reflection. The engine
@@ -871,6 +892,7 @@ func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
 	if len(q.Pipes) == 0 {
 		q.MatAll = true
 	}
+	w.Header().Set("Content-Type", ndjsonContentType)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	var buf []byte
@@ -903,6 +925,7 @@ func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
 		body.Field = "emb"
 	}
 	from, to := timeWindow(r)
+	w.Header().Set("Content-Type", ndjsonContentType)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	var buf []byte
@@ -1205,6 +1228,13 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ndjsonContentType is the media type every endpoint that streams NDJSON
+// rows announces. One constant because the single-node select and the
+// router's federatedSelect answer the SAME path: they disagreed before this,
+// text/plain against application/x-ndjson, so a client's behaviour depended on
+// which deployment mode it happened to be talking to.
+const ndjsonContentType = "application/x-ndjson"
+
 // promResponse is the Prometheus query envelope both stats endpoints return.
 // A struct rather than a map so the fields keep the reference's order on the
 // wire; JSON object order carries no meaning, but a byte-comparable body makes
@@ -1368,6 +1398,7 @@ func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
 		}
 		result = append(result, map[string]any{"metric": se.Metric, "values": vals})
 	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(promResponse{
 		Status: "success",
 		Data:   promData{ResultType: "matrix", Result: result},

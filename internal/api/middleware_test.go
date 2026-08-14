@@ -127,6 +127,7 @@ func TestGuardRejectsMalformedGzip(t *testing.T) {
 // A decompression bomb is 413 on the decompressed size. The wire limit alone
 // does not catch it: a few hundred KB of gzip expands to gigabytes.
 func TestGuardRejectsDecompressionBomb(t *testing.T) {
+	t.Parallel()
 	ts := guardedServer(t, nil)
 	lim := config.TestLimits().MaxDecompressed
 

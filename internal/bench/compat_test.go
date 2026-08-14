@@ -35,7 +35,7 @@ func TestLogsQLCompat(t *testing.T) {
 	postNDJSON(t, slURL+"/insert/jsonline", body)
 
 	if _, err := os.Stat("victoria-logs"); err != nil {
-		t.Skip("victoria-logs binary not staged")
+		skipNoVL(t, "the LogsQL compatibility differential")
 	}
 	vlDir, _ := os.MkdirTemp("", "compat-vl-")
 	defer os.RemoveAll(vlDir)
@@ -49,7 +49,8 @@ func TestLogsQLCompat(t *testing.T) {
 	vlURL := "http://127.0.0.1:19440"
 	waitReadyCompat(t, vlURL+"/insert/ready", 30*time.Second)
 	postNDJSON(t, vlURL+"/insert/jsonline", body)
-	time.Sleep(3 * time.Second) // let VL flush before querying
+	waitFor(t, readyAtLeast(vlURL, compatFrom, compatTo, compatRows), time.Minute,
+		"victoria-logs never made the compatibility corpus queryable")
 
 	// The LogsQL surface, grouped so a failure names the feature.
 	queries := []struct{ group, q string }{
@@ -133,9 +134,33 @@ func TestLogsQLCompat(t *testing.T) {
 	for _, m := range missing {
 		t.Errorf("REJECTED (missing feature): %s", m)
 	}
+	// A differing answer FAILS. It used to be logged, which meant the
+	// differential could be fully red on semantics and still exit 0 -- the
+	// report shape this task exists to remove. A normalized body difference is
+	// a semantic gap, and the only reason to soften one is a documented,
+	// enumerated exception below, not a t.Logf.
 	for _, d := range differing {
-		t.Logf("DIFFERS: %s", d)
+		if reason, ok := compatKnownDiff[diffGroup(d)]; ok {
+			t.Logf("KNOWN DIFFERENCE %s (%s)", diffGroup(d), reason)
+			continue
+		}
+		t.Errorf("DIFFERS: %s", d)
 	}
+}
+
+// compatKnownDiff enumerates the query groups whose answers legitimately differ
+// from the reference, each with the reason. Empty by design: an entry here is
+// a claim that a difference is CORRECT, and every one of them has to be argued
+// for rather than accumulated by a logging loop.
+var compatKnownDiff = map[string]string{}
+
+// diffGroup pulls the group name off the front of a detail line, which is
+// formatted "<group> (<query>): ...".
+func diffGroup(detail string) string {
+	if i := strings.IndexAny(detail, " ("); i > 0 {
+		return detail[:i]
+	}
+	return detail
 }
 
 // normalizeNDJSON makes two NDJSON result sets comparable: each line's keys
@@ -212,7 +237,7 @@ func waitReadyCompat(t *testing.T, url string, d time.Duration) {
 			resp.Body.Close()
 			return
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond) // bench:untimed -- readiness poll
 	}
 	t.Fatalf("%s not ready", url)
 }

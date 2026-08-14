@@ -12,6 +12,7 @@ import (
 // dents them. Nibble-packing halves them losslessly and decodes fast. This is a
 // measurement to size the win, not a format change.
 func TestHexDictOpportunity(t *testing.T) {
+	t.Parallel()
 	const n = 100_000
 	cols := map[string][]string{}
 	corpus.GenRealistic(7, n, func(r corpus.RealisticRecord) {

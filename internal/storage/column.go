@@ -345,6 +345,12 @@ func decodeInto(b []byte, raw []uint64, out []int64) (int, error) {
 // the block containing lo rather than the column start -- so a windowed query
 // decodes only its window's span, not the whole column.
 func decodeTsRange(b []byte, lo, hi int) []int64 {
+	return decodeTsRangeInto(nil, b, lo, hi)
+}
+
+// decodeTsRangeInto is decodeTsRange writing into the caller's buffer. See
+// Reader.TimestampsRangeInto for who may pass one.
+func decodeTsRangeInto(dst []int64, b []byte, lo, hi int) []int64 {
 	if hi <= lo || len(b) < 8 {
 		return nil
 	}
@@ -355,8 +361,13 @@ func decodeTsRange(b []byte, lo, hi int) []int64 {
 	hdr := 8 + k*tsHdrStride
 	prev := geti64(b[hdr+4:])
 	pos := int(get32(b, hdr))
-	out := make([]int64, hi-lo)
-	for i := k * bs; i < hi; i++ {
+	out := dst[:0]
+	if cap(out) < hi-lo {
+		out = make([]int64, hi-lo)
+	}
+	out = out[:hi-lo]
+	i := k * bs
+	for ; i < hi; i++ {
 		if pos >= len(stream) {
 			break
 		}
@@ -369,6 +380,18 @@ func decodeTsRange(b []byte, lo, hi int) []int64 {
 		if i >= lo {
 			out[i-lo] = prev
 		}
+	}
+	// A stream that ends before hi leaves the tail unwritten. That was zero
+	// when this allocated its own slice every time; a reused buffer would
+	// instead hand back the PREVIOUS group's timestamps, which read as
+	// plausible times rather than as corruption. Zeroing keeps the answer
+	// exactly what a fresh allocation gave.
+	if i < hi {
+		j := i - lo
+		if j < 0 {
+			j = 0
+		}
+		clear(out[j:])
 	}
 	return out
 }

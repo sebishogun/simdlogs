@@ -48,6 +48,7 @@ func buildStore(t testing.TB, dir string, total, gsize int) *storage.Store {
 }
 
 func TestEngineSelectiveAndSkip(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s := buildStore(t, dir, 200_000, 20_000) // 10 groups
 	var opens int64

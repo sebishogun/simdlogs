@@ -10,6 +10,7 @@ import (
 // A rare value must be found with its field materialized correctly via the
 // posting + single-row-decode path.
 func TestNeedleCorrectness(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, _ := storage.OpenStore(dir)
 	var ts []int64

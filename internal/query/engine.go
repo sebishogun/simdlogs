@@ -519,7 +519,11 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	var ts []int64
 	pointRead := cnt*tsBlockGuess < hi-lo
 	if !pointRead {
-		ts = g.TimestampsRange("_time", lo, hi)
+		// Scratch: every time read below is copied into a Row's Time field
+		// before this returns, so the buffer goes back to the pool here.
+		var tp *[]int64
+		tp, ts = groupTimestamps(g, lo, hi)
+		defer releaseTs(tp)
 	}
 	// Many matches: decode each materialize column once and index into it,
 	// rather than a per-row DictValueAt point read (which decompresses a dict
@@ -1003,7 +1007,9 @@ func histoGroup(g *storage.Reader, q *Query, step int64, out map[int64]int) {
 	if lo >= hi {
 		lo, hi = 0, g.Rows
 	}
-	ts := g.TimestampsRange("_time", lo, hi)
+	// Scratch: each time is bucketed into out and nothing keeps the slice.
+	tp, ts := groupTimestamps(g, lo, hi)
+	defer releaseTs(tp)
 	sel.ForEach(func(i int) {
 		out[ts[i-lo]/step*step]++
 	})

@@ -16,9 +16,9 @@ parallelism as the box has cores.
 | NDJSON | `/insert/jsonline` | simdjson parse; parallel ≥ 1 MiB |
 | logfmt | `/insert/logfmt` | key=value lines |
 | Elasticsearch bulk | `/_bulk`, `/insert/elasticsearch/_bulk` | action lines stripped in place; per-doc `{"create":{"status":201}}` items |
-| Loki push | `/loki/api/v1/push`, `/insert/loki/api/v1/push` | |
-| Datadog | `/api/v2/logs`, `/v1/input`, `/insert/datadog/api/v2/logs` | `validate` endpoint answers 200 |
-| OTLP/HTTP logs | `/v1/logs`, `/insert/opentelemetry/v1/logs` | JSON |
+| Loki push | `/loki/api/v1/push`, `/insert/loki/api/v1/push` | JSON and snappy-protobuf; see below |
+| Datadog | `/api/v2/logs`, `/v1/input`, `/insert/datadog/api/v2/logs` | array or single object; `validate` answers 200 |
+| OTLP/HTTP logs | `/v1/logs`, `/insert/opentelemetry/v1/logs` | JSON and protobuf; see below |
 | journald export | `/insert/journald` | systemd-journal-upload |
 | syslog | `/insert/syslog`; `-syslog` listens UDP+TCP | RFC3164/5424 lines |
 
@@ -30,6 +30,118 @@ Every insert handler follows the same shape (`ingestBody`): read the body,
 parse through the tenant's writer, `Flush()` (fsync + atomic rename of any
 completed groups), reply with the protocol's expected status and body, and
 count ingested/skipped rows and bytes for `/metrics`.
+
+## OTLP/HTTP logs
+
+Both encodings, decoded by hand (`internal/ingest/otel.go` for JSON,
+`otelproto.go` for protobuf) because the repository takes no protobuf
+dependency. The collector's `otlphttp` exporter sends **protobuf by default**,
+so the Content-Type picks the parser: `application/x-protobuf` or
+`application/json`, and nothing else is accepted. An unknown `Content-Encoding`
+is rejected rather than read as identity; `gzip` is decompressed under the same
+decompressed-size limit as every other route.
+
+**The two encodings must produce identical rows.** That is a contract, not an
+aspiration: an operator who switches their exporter's encoding must not see
+their columns change. `internal/ingest/otel_conformance_test.go` describes one
+export once, renders it into both encodings, and compares the stored rows field
+by field.
+
+All seven `AnyValue` kinds are stored:
+
+| kind | stored as |
+|---|---|
+| string, bool | as written |
+| int | decimal text (OTLP's JSON mapping already writes int64 as a string) |
+| double | shortest round-tripping decimal |
+| bytes | base64 — the encoding OTLP's own JSON mapping uses, so the two wire formats agree |
+| array | compact JSON array, elements rendered by the same rule |
+| kvlist | compact JSON object, keys in wire order |
+
+Composite values nest, and the nesting arrives from an untrusted exporter, so
+the decoder is depth-bounded (`maxAnyValueDepth`); a value past the bound is
+truncated rather than dropped, and never recurses far enough to exhaust the
+stack.
+
+Beyond the attributes, each record carries `severity`, `severity_number`,
+`trace_id`, `span_id`, `event_name`, `flags` and `dropped_attributes_count`,
+plus `scope_name`, `scope_version` and the scope's own attributes. `trace_id`
+and `span_id` are hex in both encodings — JSON sends hex, protobuf sends raw
+bytes, and the protobuf path encodes them so the two agree. `severityNumber`
+accepts either JSON spelling, the integer or the enum name with or without its
+`SEVERITY_NUMBER_` prefix; an unrecognized one means UNSPECIFIED rather than a
+rejected export. Zero and empty values are not stored: OTLP's zero values all
+mean "unset", and a column of `0` for every record is storage spent to say
+nothing.
+
+Rejected records are reported through OTLP's `partial_success`, in the request's
+own encoding, with a **200**. Not a 4xx: that tells the exporter to drop the
+whole batch including the records this store did accept. Not a 5xx: that makes
+it resend them. An empty response body (`{}` in JSON, zero bytes in protobuf) is
+OTLP's "everything was accepted", so an accepted export of zero records is still
+a 200 with an empty body — an exporter is entitled to send an empty batch.
+
+A body that does not decode is an error, not a 200 with zero records: OTLP
+exporters retry 5xx and give up on 4xx, and answering 200 for an undecodable
+body told them the data was delivered. A metrics or traces export posted to
+`/v1/logs` is discriminated by wire type — `LogRecord.time_unix_nano` is a
+fixed64 where `Metric.name` and `Span.trace_id` at the same field number are
+length-delimited — and rejected per record rather than stored as bogus log rows.
+
+## Loki push
+
+Both encodings. Promtail, Grafana Alloy and the Grafana Agent all send
+**snappy-compressed protobuf by default** (`Content-Type:
+application/x-protobuf`), so the Content-Type picks the parser exactly as it
+does for OTLP. Before that was supported the default configuration was not
+merely unsupported but actively broken twice over: `lokiSpec` did not list
+`application/x-protobuf`, so the media-type gate rejected the request, and a
+snappy body is not JSON, so anything getting past would have failed the decode.
+An agent shipping correctly-formed data got a 4xx.
+
+`github.com/golang/snappy` is the only new dependency — not Loki's server
+module, which brings a distributed database with it. The PushRequest itself is
+decoded by hand, like OTLP's.
+
+The two encodings carry the stream's labels differently: JSON sends a map,
+protobuf sends the whole set as ONE Prometheus-syntax string
+(`{app="api", env="prod"}`), which `parseLokiLabels` reads — braces, commas,
+quoted values and Go-style escapes. A label set that does not parse rejects
+that stream's entries and records a warning; it does not fail the push, because
+the other streams in the same body are unaffected and their data is still
+wanted.
+
+**Structured metadata** — the optional third element of a JSON entry, and
+`EntryAdapter.structuredMetadata` in protobuf — is stored. It used to be
+discarded with a comment saying so, which meant a trace id sent there was
+answered 204 and then was not in the store. It is applied AFTER the stream's
+labels, so on a key collision the entry's own metadata wins: it is the more
+specific of the two, and both encodings agree on that.
+
+A snappy body is refused on its DECLARED decompressed length, before the
+allocation. snappy's ratio on log text is routinely 4-6x and far higher on
+repetitive input, so a body that passed the wire-size limit can still expand to
+gigabytes — the same amplification the gzip path already guards.
+
+## Datadog logs intake
+
+A JSON **array** of entries or a **single object**; agents send both, and the
+two produce identical rows for the same entry. `message` becomes `_msg`,
+`timestamp`/`date` set the time (a number is milliseconds since epoch, a string
+goes through the shared parser), and every other attribute becomes a field.
+gzip is handled by the shared body reader.
+
+`ddtags` is a comma-separated list. A `key:value` tag becomes a field, split at
+the FIRST colon so `url:https://example.com/a:b` keeps its value intact. A
+**bare** tag with no colon is equally legal Datadog and used to be dropped
+silently — `ddtags=env,prod-canary` stored nothing at all — and is now kept
+verbatim in the `ddtags` field so no tag the sender wrote is lost.
+
+A nested object or array attribute is stored **compacted**. Keeping the source
+bytes meant the whitespace the sender happened to use was part of the stored
+value, so a pretty-printing agent and a compact one wrote two different strings
+for the same attribute and neither matched a query written against the other.
+Compacting also matches what the OTLP path does with a composite attribute.
 
 ## Per-request field mappings
 

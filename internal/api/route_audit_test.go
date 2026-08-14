@@ -19,6 +19,7 @@ import (
 // _source documents, and both also skipped the method guard, the media-type
 // allowlist and the body limit.
 func TestNoUnauthenticatedDataRoute(t *testing.T) {
+	t.Parallel()
 	srv, ts := authedServer(t)
 
 	// Routes that are open by design, with the reason each one is.
@@ -105,6 +106,7 @@ func TestESReadSurfaceRequiresAuth(t *testing.T) {
 // Router mode forwards writes before the mux, so none of the per-route
 // wrappers run. Unguarded it was an unauthenticated, unbounded ingest proxy.
 func TestClusterForwardingIsGuarded(t *testing.T) {
+	t.Parallel()
 	// A backend that records what it receives.
 	var got struct {
 		calls int

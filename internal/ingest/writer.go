@@ -41,17 +41,18 @@ var flushWorkers = min(4, runtime.NumCPU())
 // Writer accumulates rows and flushes groups to a store. Add is for one
 // goroutine; the flush pool runs concurrently behind it.
 type Writer struct {
-	store    *storage.Store
-	ts       []int64
-	cols     map[string]*colBuf
-	colOrder []string
-	strmFlds []string // fields that identify a log stream; synthesize _stream from them
-	limits   RecordLimits
-	maxLine  int
-	compact  bool // compact mode: flate the dict (smaller groups, slower decode)
-	bytes    int
-	lastFlsh time.Time
-	mu       sync.Mutex
+	store     *storage.Store
+	ts        []int64
+	cols      map[string]*colBuf
+	colOrder  []string
+	strmFlds  []string // fields that identify a log stream; synthesize _stream from them
+	limits    RecordLimits
+	maxLine   int
+	maxDecomp int
+	compact   bool // compact mode: flate the dict (smaller groups, slower decode)
+	bytes     int
+	lastFlsh  time.Time
+	mu        sync.Mutex
 
 	jobs    chan flushJob
 	workers sync.WaitGroup // worker goroutines, joined by Close
@@ -177,6 +178,27 @@ func (w *Writer) Add(ts int64, fields map[string]string) {
 // its own retention bucket.
 func (w *Writer) AddStreamOverridden(ts int64, fields map[string]string) {
 	w.add(ts, fields, true)
+}
+
+// SetMaxDecompressedBytes bounds what one compressed body may expand to.
+//
+// The Loki protobuf path needs this because snappy's ratio on log text is
+// routinely 4-6x and far higher on repetitive input, so a body that passed the
+// WIRE limit can still declare gigabytes. It used to be a hardcoded 256 MiB
+// that ignored the operator's -max-decompressed-bytes entirely -- lowering the
+// configured limit did nothing on that path, and with MaxConcurrentWrite at 32
+// a set of 20-byte requests could each claim 256 MiB.
+func (w *Writer) SetMaxDecompressedBytes(n int) {
+	w.mu.Lock()
+	w.maxDecomp = n
+	w.mu.Unlock()
+}
+
+// MaxDecompressedBytes reports the configured bound, or 0 when unset.
+func (w *Writer) MaxDecompressedBytes() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.maxDecomp
 }
 
 // SetMaxLineBytes rejects an input line longer than n bytes. Zero disables

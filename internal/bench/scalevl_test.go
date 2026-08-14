@@ -93,9 +93,15 @@ func TestScaleVsVL(t *testing.T) {
 	wlo := time.Unix(0, lo+(hi-lo)/2).UTC().Format(time.RFC3339Nano)
 	whi := time.Unix(0, lo+(hi-lo)/2+(hi-lo)/50).UTC().Format(time.RFC3339Nano)
 
-	t0 := time.Now()
-	streamChunks(func(c []byte) { post(t, sl.URL+"/insert/jsonline", c) })
-	slIngest := time.Since(t0)
+	// Measured the same way as VL's, so the ratio compares the same event.
+	slIngest, err := timeIngest(
+		func() { streamChunks(func(c []byte) { post(t, sl.URL+"/insert/jsonline", c) }) },
+		readyAtLeast(sl.URL, lo/1e9, hi/1e9+1, N),
+		200*time.Millisecond, 60*time.Minute)
+	if err != nil {
+		t.Fatalf("simdlogs ingest: %v", err)
+	}
+	requireRows(t, "simdlogs", sl.URL, lo/1e9, hi/1e9+1, N)
 	nq := url.Values{"query": {"trace:=" + needle}, "start": {full}, "end": {fullEnd}}.Encode()
 	sq := url.Values{"query": {"service:=auth"}, "start": {wlo}, "end": {whi}}.Encode()
 	hq := url.Values{"query": {"service:=auth"}, "start": {wlo}, "end": {whi}, "step": {"1m"}}.Encode()
@@ -116,8 +122,10 @@ func TestScaleVsVL(t *testing.T) {
 	}
 	slM := measure(sl.URL)
 	slNeedle, slSel, slAgg := slM["needle"], slM["selective"], slM["agg"]
-	t.Logf("simdlogs  N=%d: ingest %v (%.2fM rec/s) | needle %v selective %v agg %v",
-		N, slIngest.Round(time.Millisecond), float64(N)/slIngest.Seconds()/1e6, slNeedle, slSel, slAgg)
+	t.Logf("simdlogs  N=%d: ingest accept %v (%.2fM rec/s) queryable %v (%.2fM rec/s) | needle %v selective %v agg %v",
+		N, slIngest.accept.Round(time.Millisecond), float64(N)/slIngest.accept.Seconds()/1e6,
+		slIngest.queryable.Round(time.Millisecond), float64(N)/slIngest.queryable.Seconds()/1e6,
+		slNeedle, slSel, slAgg)
 
 	// ---- VictoriaLogs, HTTP, disk-backed ----
 	binPath := "victoria-logs"
@@ -143,22 +151,32 @@ func TestScaleVsVL(t *testing.T) {
 	vl := "http://127.0.0.1:19429"
 	waitReady(t, vl+"/insert/ready", 30*time.Second)
 
-	t0 = time.Now()
-	streamChunks(func(c []byte) { post(t, vl+"/insert/jsonline", c) })
-	time.Sleep(5 * time.Second) // let VL flush before querying
-	vlIngest := time.Since(t0)
+	// Polled, not slept. The fixed five seconds this used to spend landed in
+	// vlIngest and so in every ingest ratio this harness printed; it was also
+	// a floor, so a VL that had flushed in 200ms still reported five seconds.
+	vlIngest, err := timeIngest(
+		func() { streamChunks(func(c []byte) { post(t, vl+"/insert/jsonline", c) }) },
+		readyAtLeast(vl, lo/1e9, hi/1e9+1, N),
+		200*time.Millisecond, 60*time.Minute)
+	if err != nil {
+		t.Fatalf("victorialogs ingest: %v", err)
+	}
+	requireRows(t, "victorialogs", vl, lo/1e9, hi/1e9+1, N)
 	vlM := measure(vl)
 	vlNeedle, vlSel, vlAgg := vlM["needle"], vlM["selective"], vlM["agg"]
-	t.Logf("victorialogs N=%d: ingest %v (%.2fM rec/s) | needle %v selective %v agg %v",
-		N, vlIngest.Round(time.Millisecond), float64(N)/vlIngest.Seconds()/1e6, vlNeedle, vlSel, vlAgg)
+	t.Logf("victorialogs N=%d: ingest accept %v (%.2fM rec/s) queryable %v (%.2fM rec/s) | needle %v selective %v agg %v",
+		N, vlIngest.accept.Round(time.Millisecond), float64(N)/vlIngest.accept.Seconds()/1e6,
+		vlIngest.queryable.Round(time.Millisecond), float64(N)/vlIngest.queryable.Seconds()/1e6,
+		vlNeedle, vlSel, vlAgg)
 
 	slSize := dirSize(slDir)
 	vlSize := dirSize(vlDir)
 	t.Logf("FOOTPRINT N=%d | simdlogs %.2fGB vs VL %.2fGB (%.2fx of VL)",
 		N, float64(slSize)/1e9, float64(vlSize)/1e9, float64(slSize)/float64(vlSize))
-	t.Logf("SCALE HEAD-TO-HEAD N=%d | needle %.1fx | selective %.1fx | agg %.1fx | ingest sl/vl %.2f",
+	t.Logf("SCALE HEAD-TO-HEAD N=%d | needle %.1fx | selective %.1fx | agg %.1fx | ingest accept sl/vl %.2f | ingest queryable sl/vl %.2f",
 		N, ratio(vlNeedle, slNeedle), ratio(vlSel, slSel), ratio(vlAgg, slAgg),
-		vlIngest.Seconds()/slIngest.Seconds())
+		vlIngest.accept.Seconds()/slIngest.accept.Seconds(),
+		vlIngest.queryable.Seconds()/slIngest.queryable.Seconds())
 }
 
 func ratio(a, b time.Duration) float64 { return float64(a) / float64(b) }

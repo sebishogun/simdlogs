@@ -73,6 +73,10 @@ func (s *Server) esSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		hits = append(hits, map[string]any{"_source": src})
 	}
+	// Elasticsearch clients switch on Content-Type; this answered text/plain
+	// for a JSON document, and so does its federated twin unless both are
+	// changed together.
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"hits": map[string]any{
 			"total": map[string]any{"value": len(rows), "relation": "eq"},
@@ -94,6 +98,7 @@ func (s *Server) esCount(w http.ResponseWriter, r *http.Request) {
 	if s.queryStopped(w, r, stopped) {
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"count": n})
 }
 

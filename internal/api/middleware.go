@@ -261,6 +261,28 @@ func journaldSpec() routeSpec {
 	return sp
 }
 
+// lokiSpec is the Loki push surface. It differs from ndjsonSpec by one media
+// type -- application/x-protobuf -- and that one type is the whole default
+// configuration of Promtail, Grafana Alloy and the Grafana Agent, all of which
+// send a snappy-compressed protobuf PushRequest unless told otherwise. Without
+// it the route rejected the default client at the media-type gate, before any
+// decoder saw the body.
+func lokiSpec() routeSpec {
+	return routeSpec{
+		write:   true,
+		methods: []string{http.MethodPost},
+		types: []string{
+			// Both protobuf spellings: application/x-protobuf is what Loki's
+			// clients send, application/protobuf is the IANA registration and
+			// what VictoriaLogs accepts.
+			"application/x-protobuf", "application/protobuf",
+			"application/json", "application/x-ndjson",
+			"text/plain", "application/octet-stream",
+		},
+		format: errJSON,
+	}
+}
+
 // otlpSpec is OTLP/HTTP: protobuf or JSON, and errors in JSON.
 func otlpSpec() routeSpec {
 	return routeSpec{
@@ -306,6 +328,11 @@ func specForPath(p string) routeSpec {
 	switch p {
 	case "/v1/logs", "/insert/opentelemetry/v1/logs":
 		return otlpSpec()
+	case "/loki/api/v1/push", "/insert/loki/api/v1/push":
+		// Router mode uses THIS table, not the mux's per-route spec. Wiring
+		// lokiSpec only into the mux left the whole headline fix inert behind
+		// a router: a default snappy-protobuf push still got 415 there.
+		return lokiSpec()
 	case "/insert/journald":
 		return journaldSpec()
 	case "/insert/datadog/api/v1/validate":

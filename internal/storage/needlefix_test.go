@@ -7,6 +7,7 @@ import "testing"
 // let a selective query materialize a match's time without decoding the whole
 // timestamp column. A boundary off-by-one would show here and nowhere else.
 func TestTimestampAtMatchesFullDecode(t *testing.T) {
+	t.Parallel()
 	for _, n := range []int{1, tsBlock - 1, tsBlock, tsBlock + 1, 3*tsBlock + 7, 100_000} {
 		g, _ := buildGroup(n)
 		r, err := ReadGroup(g.Marshal())
@@ -88,6 +89,7 @@ func TestTimeRangeMaskNonMonotonic(t *testing.T) {
 // reached only by walking every preceding list. Correctness must hold for the
 // value whose lookup the fix was about.
 func TestPostingRowsSeek(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		indices []uint32
 		dictLen int
@@ -132,6 +134,7 @@ func TestPostingRowsSeek(t *testing.T) {
 // plus the two-table postings) through a Reader: the rows and count a dict
 // value reports must match a brute-force scan of the source records.
 func TestEqualityRowsAfterLayout(t *testing.T) {
+	t.Parallel()
 	g, recs := buildGroup(20_000)
 	r, err := ReadGroup(g.Marshal())
 	if err != nil {

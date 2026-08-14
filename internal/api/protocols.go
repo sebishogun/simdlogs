@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -11,12 +12,46 @@ import (
 
 // backup streams a tar of the tenant's group files: a consistent point-in-time
 // snapshot for offline restore via storage.RestoreTar.
+//
+// A backup that fails partway CANNOT be reported with a status code, because
+// the 200 and the first bytes are already on the wire. It used to call
+// http.Error anyway, which logged "superfluous WriteHeader" and appended the
+// error text to the archive -- so a truncated backup arrived as a 200 with a
+// plausible-looking tar that had an error message glued to the end of it. For
+// a disaster-recovery artifact that is the worst possible failure mode: it is
+// discovered at restore time.
+//
+// So the response is failed the only way HTTP allows once bytes are out:
+// http.ErrAbortHandler, which drops the connection without the terminating
+// chunk. Every HTTP client reports that as an unexpected EOF, which is a
+// truthful "this transfer did not complete". Before any byte is written a
+// clean 500 is still possible, and that path is taken.
 func (s *Server) backup(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.Header().Set("Content-Disposition", `attachment; filename="simdlogs-backup.tar"`)
-	if err := s.tn(r).store.BackupTar(w); err != nil {
-		http.Error(w, err.Error(), 500)
+	cw := &countingWriter{w: w}
+	if err := s.tn(r).store.BackupTar(cw); err != nil {
+		if cw.n == 0 {
+			s.writeErr(w, r, opsSpec(), http.StatusInternalServerError,
+				"backup failed before any data was written: "+err.Error())
+			return
+		}
+		// Bytes are already out. Abort rather than append.
+		panic(http.ErrAbortHandler)
 	}
+}
+
+// countingWriter records whether anything reached the client yet, which is
+// what decides whether a failure can still be a status code.
+type countingWriter struct {
+	w http.ResponseWriter
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // ingestOptions reads the per-request field mappings a shipper sends as query
@@ -106,9 +141,26 @@ func warningStrings(ws []ingest.Warning) []string {
 	return out
 }
 
-// insertLoki ingests a Grafana Loki push body (JSON); clients expect 204.
+// insertLoki ingests a Grafana Loki push body; clients expect 204.
+//
+// Promtail, Grafana Alloy and the Grafana Agent send snappy-compressed
+// protobuf BY DEFAULT, so the Content-Type picks the parser exactly as it does
+// for OTLP. Before this, a default-configured agent's body went to the JSON
+// decoder, which is not JSON, so a correctly-formed push was answered 400 --
+// the whole default configuration was unusable.
 func (s *Server) insertLoki(w http.ResponseWriter, r *http.Request) {
-	s.ingestBody(w, r, http.StatusNoContent, ingest.IngestLokiOpts)
+	// JSON is the exception, protobuf is the default -- the way round Loki's
+	// own API defines it ("the default behavior is for the POST body to be a
+	// Snappy-compressed Protocol Buffer message") and the way VictoriaLogs
+	// routes it. Matching on "protobuf" instead sent everything else to the
+	// JSON decoder, so `application/protobuf` (the IANA spelling), an absent
+	// Content-Type, and application/octet-stream all reached a JSON parser
+	// holding a snappy blob and answered 400.
+	if strings.Contains(r.Header.Get("Content-Type"), "json") {
+		s.ingestBody(w, r, http.StatusNoContent, ingest.IngestLokiOpts)
+		return
+	}
+	s.ingestBody(w, r, http.StatusNoContent, ingest.IngestLokiProto)
 }
 
 // insertJournald ingests the systemd journal export (systemd-journal-upload).
@@ -168,11 +220,62 @@ func (s *Server) insertOTLPLogs(w http.ResponseWriter, r *http.Request) {
 	// The response mirrors the request's encoding, as the OTLP/HTTP spec
 	// requires: an empty ExportLogsServiceResponse is zero bytes in protobuf
 	// and {} in JSON, both meaning full success.
+	// partial_success, when anything was rejected. Before this the response
+	// was always the empty "everything was accepted" message, so an exporter
+	// whose records this store dropped -- a metrics payload posted to /v1/logs,
+	// a record whose shape was refused -- was told they were all stored, and
+	// had no signal at all that some of its data was gone.
+	//
+	// It is a 200 either way: OTLP's partial success is deliberately NOT an
+	// error status, because a 4xx tells the exporter to drop the whole batch
+	// including the records this store did accept, and a 5xx makes it resend
+	// them.
 	if proto {
 		w.Header().Set("Content-Type", "application/x-protobuf")
 		w.WriteHeader(http.StatusOK)
+		if ores.Rejected > 0 {
+			w.Write(otlpPartialSuccessProto(ores.Rejected, otlpRejectMessage(ores)))
+		}
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if ores.Rejected > 0 {
+		json.NewEncoder(w).Encode(ingest.OTLPResponseFor(ores, otlpRejectMessage(ores)))
+		return
+	}
 	w.Write([]byte("{}")) // empty ExportLogsServiceResponse == full success
+}
+
+// otlpRejectMessage renders the reasons the ingest recorded. OTLP says
+// error_message is for a human and must not be parsed, so this is the
+// operator's only route from "records vanished" to "why".
+func otlpRejectMessage(res ingest.Result) string {
+	if len(res.Warnings) == 0 {
+		return ""
+	}
+	msgs := make([]string, 0, len(res.Warnings))
+	for _, w := range res.Warnings {
+		msgs = append(msgs, w.Msg)
+	}
+	return strings.Join(msgs, "; ")
+}
+
+// otlpPartialSuccessProto encodes ExportLogsServiceResponse{ partial_success }
+// by hand, in the same style as the request decoder and for the same reason:
+// this repository takes no protobuf dependency.
+//
+//	ExportLogsServiceResponse: partial_success = 1
+//	ExportLogsPartialSuccess:  rejected_log_records = 1 (int64), error_message = 2
+func otlpPartialSuccessProto(rejected int, msg string) []byte {
+	var ps []byte
+	ps = binary.AppendUvarint(ps, 1<<3|0) // field 1, varint
+	ps = binary.AppendUvarint(ps, uint64(rejected))
+	if msg != "" {
+		ps = binary.AppendUvarint(ps, 2<<3|2) // field 2, length-delimited
+		ps = binary.AppendUvarint(ps, uint64(len(msg)))
+		ps = append(ps, msg...)
+	}
+	out := binary.AppendUvarint(nil, 1<<3|2) // field 1, length-delimited
+	out = binary.AppendUvarint(out, uint64(len(ps)))
+	return append(out, ps...)
 }

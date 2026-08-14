@@ -228,6 +228,7 @@ func TestTailsAreBoundedByTheirOwnBudget(t *testing.T) {
 // use-after-unmap waiting for the timing to line up. The shipped test
 // released its request BEFORE calling Close, so it did not test its name.
 func TestCloseWaitsForARequestThatIsStillRunning(t *testing.T) {
+	t.Parallel()
 	c := config.Default()
 	c.Dir = t.TempDir()
 	c.Limits = config.TestLimits()
@@ -323,6 +324,7 @@ func TestOTLPDoesNotCountRowsAClosedWriterDropped(t *testing.T) {
 // blockSize-1 short was accepted and the missing rows decoded a fabricated
 // time. Marshal refuses to write one.
 func TestQueryStillWorksAfterTheColumnLengthAssertion(t *testing.T) {
+	t.Parallel()
 	c := config.Default()
 	c.Dir = t.TempDir()
 	c.Limits = config.TestLimits()
@@ -434,6 +436,14 @@ func TestRouterUsesEachRoutesOwnSpec(t *testing.T) {
 		{http.MethodPost, "/insert/opentelemetry/v1/logs", "application/x-protobuf"},
 		{http.MethodPost, "/insert/journald", "application/vnd.fdo.journal"},
 		{http.MethodGet, "/insert/datadog/api/v1/validate", ""},
+		// Loki. specForPath is the table ROUTER mode consults, and wiring
+		// lokiSpec into the mux alone left the whole snappy-protobuf fix inert
+		// behind a router: a default-configured Promtail still got 415 there,
+		// which is the exact bug class this test was written for.
+		{http.MethodPost, "/loki/api/v1/push", "application/x-protobuf"},
+		{http.MethodPost, "/insert/loki/api/v1/push", "application/x-protobuf"},
+		{http.MethodPost, "/loki/api/v1/push", "application/protobuf"},
+		{http.MethodPost, "/loki/api/v1/push", "application/json"},
 	} {
 		hdr := map[string]string{}
 		if c.ctype != "" {
@@ -458,6 +468,7 @@ func TestRouterUsesEachRoutesOwnSpec(t *testing.T) {
 // applied no ingest budget: N concurrent posts each read a whole body into
 // memory with no bound.
 func TestRouterAppliesTheIngestBudget(t *testing.T) {
+	t.Parallel()
 	// The backend blocks until released. Release BEFORE any deferred
 	// shutdown runs: ts.Close() waits for outstanding requests, and a
 	// deferred close(release) would run after it -- a deadlock, not a test.
@@ -541,6 +552,7 @@ func TestRouterCountsForwardedWrites(t *testing.T) {
 // the deadline could only fire if it had already passed before any work
 // started. A 300,000-row scan with a 20 ms budget ran to completion.
 func TestQueryBudgetsBoundTheScanNotOnlyThePrefilter(t *testing.T) {
+	t.Parallel()
 	c := config.Default()
 	c.Dir = t.TempDir()
 	c.Limits = config.TestLimits()
@@ -663,6 +675,7 @@ var flagNames = func() map[string]bool {
 // with no bound at all, so a 1-byte budget still returned 15 MB and a 10 ms
 // budget still took 122 ms. Every route that scans must be bounded.
 func TestEveryReadRouteIsBounded(t *testing.T) {
+	t.Parallel()
 	c := config.Default()
 	c.Dir = t.TempDir()
 	c.Limits = config.TestLimits()
@@ -763,6 +776,7 @@ func TestReadyProbeAnswersTheSameInRouterMode(t *testing.T) {
 // outer deadline was already spent. The route still answered 504, which is
 // why this was invisible from outside.
 func TestSubqueriesInheritTheBudget(t *testing.T) {
+	t.Parallel()
 	c := config.Default()
 	c.Dir = t.TempDir()
 	c.Limits = config.TestLimits()
@@ -809,6 +823,7 @@ func TestSubqueriesInheritTheBudget(t *testing.T) {
 // failed does not cover it. It answered a COMPLETE 200 with the deadline
 // already spent.
 func TestStatsQueryByFallbackIsBounded(t *testing.T) {
+	t.Parallel()
 	c := config.Default()
 	c.Dir = t.TempDir()
 	c.Limits = config.TestLimits()
@@ -924,6 +939,7 @@ func TestControlFieldNamesAreNotStorable(t *testing.T) {
 // made the tail's {".error": ...} sentinel forgeable again for any body
 // over 1 MiB.
 func TestParallelIngestAppliesRecordLimits(t *testing.T) {
+	t.Parallel()
 	c := config.Default()
 	c.Dir = t.TempDir()
 	c.Limits = config.TestLimits()

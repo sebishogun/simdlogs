@@ -158,6 +158,7 @@ func TestMaxQueryDurationAppliesToRequests(t *testing.T) {
 
 // The live tail must not carry the query deadline: it is meant to stay open.
 func TestTailHasNoQueryDeadline(t *testing.T) {
+	t.Parallel()
 	_, ts := limitServer(t, func(l *config.Limits) { l.MaxQueryDuration = 100 * time.Millisecond })
 
 	req, err := http.NewRequest(http.MethodGet, ts.URL+"/select/logsql/tail?query=*", nil)

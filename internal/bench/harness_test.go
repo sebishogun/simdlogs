@@ -71,6 +71,16 @@ func corpusNDJSON(n int) ([]byte, int64, int64) {
 }
 
 func TestHeadToHead(t *testing.T) {
+	// Env-gated like every other VL-starting test in this package
+	// (SIMDLOGS_COMPAT, SIMDLOGS_SHAPES, SIMDLOGS_OPS, SIMDLOGS_REAL,
+	// SIMDLOGS_SCALEVL). testing.Short() alone was not enough: a plain
+	// `go test ./...` with the binary staged starts VictoriaLogs, ingests
+	// 200k rows against a ten-minute internal limit, and blows a CI timeout
+	// of 120s -- which kills the test binary WITHOUT running deferred
+	// cleanups, leaving the subprocess alive and its port held.
+	if os.Getenv("SIMDLOGS_H2H") == "" {
+		t.Skip("set SIMDLOGS_H2H=1 to run the head-to-head report (it starts VictoriaLogs)")
+	}
 	if testing.Short() {
 		t.Skip("head-to-head is a report, run with -run TestHeadToHead")
 	}
@@ -90,9 +100,20 @@ func TestHeadToHead(t *testing.T) {
 	sl := httptest.NewServer(srv.Handler())
 	defer sl.Close()
 
-	t0 := time.Now()
-	post(t, sl.URL+"/insert/jsonline", nd)
-	slIngest := time.Since(t0)
+	// Both engines' ingest is measured identically: accept is the POST
+	// returning -- what a client waits for -- and queryable is when the rows
+	// actually read back. simdlogs is synchronous so its two numbers sit
+	// together; VictoriaLogs is not, and collapsing them is how this harness
+	// used to credit VL's ingest with a fixed three-second flush sleep.
+	fullLo, fullHi := lo/1e9, hi/1e9+1
+	slIngest, err := timeIngest(
+		func() { post(t, sl.URL+"/insert/jsonline", nd) },
+		readyAtLeast(sl.URL, fullLo, fullHi, n),
+		50*time.Millisecond, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("simdlogs ingest: %v", err)
+	}
+	requireRows(t, "simdlogs", sl.URL, fullLo, fullHi, n)
 
 	// Selective query: a narrow window plus an equality, expressed
 	// identically to both engines as RFC3339 (the format VL uses).
@@ -101,8 +122,9 @@ func TestHeadToHead(t *testing.T) {
 	qstr := url.Values{"query": {"service:=auth"}, "start": {wlo}, "end": {whi}}.Encode()
 	slQuery := timeQuery(t, func() { get(t, sl.URL+"/select/logsql/query?"+qstr) })
 
-	t.Logf("simdlogs: ingest %d recs in %v (%.0f rec/s), selective query %v",
-		n, slIngest, float64(n)/slIngest.Seconds(), slQuery)
+	t.Logf("simdlogs: ingest %d recs, accept %v (%.0f rec/s), queryable %v (%.0f rec/s), selective query %v",
+		n, slIngest.accept, float64(n)/slIngest.accept.Seconds(),
+		slIngest.queryable, float64(n)/slIngest.queryable.Seconds(), slQuery)
 
 	// VictoriaLogs subprocess, if the binary is here.
 	binPath := "victoria-logs"
@@ -125,14 +147,25 @@ func TestHeadToHead(t *testing.T) {
 	vl := "http://127.0.0.1:19428"
 	waitReady(t, vl+"/insert/ready", 30*time.Second)
 
-	t0 = time.Now()
-	post(t, vl+"/insert/jsonline", nd)
-	// VL ingest is async; give it a moment to flush before querying.
-	time.Sleep(3 * time.Second)
-	vlIngest := time.Since(t0)
+	// The same two stamps, polled rather than slept. Polling also removes the
+	// other half of the old defect: a fixed sleep is a floor as well as a
+	// tax, so a VL that flushed in 200ms was still reported at 3s.
+	vlIngest, err := timeIngest(
+		func() { post(t, vl+"/insert/jsonline", nd) },
+		readyAtLeast(vl, fullLo, fullHi, n),
+		50*time.Millisecond, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("victorialogs ingest: %v", err)
+	}
+	requireRows(t, "victorialogs", vl, fullLo, fullHi, n)
 	vlQuery := timeQuery(t, func() { get(t, vl+"/select/logsql/query?"+qstr) })
-	t.Logf("victorialogs: ingest %d recs in %v (%.0f rec/s), selective query %v",
-		n, vlIngest, float64(n)/vlIngest.Seconds(), vlQuery)
+	t.Logf("victorialogs: ingest %d recs, accept %v (%.0f rec/s), queryable %v (%.0f rec/s), selective query %v",
+		n, vlIngest.accept, float64(n)/vlIngest.accept.Seconds(),
+		vlIngest.queryable, float64(n)/vlIngest.queryable.Seconds(), vlQuery)
+	t.Logf("HEAD-TO-HEAD ingest accept: simdlogs %v vs VL %v = %.1fx",
+		slIngest.accept, vlIngest.accept, float64(vlIngest.accept)/float64(slIngest.accept))
+	t.Logf("HEAD-TO-HEAD ingest queryable: simdlogs %v vs VL %v = %.1fx",
+		slIngest.queryable, vlIngest.queryable, float64(vlIngest.queryable)/float64(slIngest.queryable))
 	t.Logf("HEAD-TO-HEAD selective query: simdlogs %v vs VL %v = %.1fx",
 		slQuery, vlQuery, float64(vlQuery)/float64(slQuery))
 
@@ -175,7 +208,7 @@ func TestHeadToHead(t *testing.T) {
 }
 
 func post(t *testing.T, url string, body []byte) {
-	r, err := http.Post(url, "application/x-ndjson", bytes.NewReader(body))
+	r, err := benchHTTP.Post(url, "application/x-ndjson", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +217,7 @@ func post(t *testing.T, url string, body []byte) {
 }
 
 func get(t *testing.T, url string) {
-	r, err := http.Get(url)
+	r, err := benchHTTP.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +263,7 @@ func waitReady(t *testing.T, url string, d time.Duration) {
 				return
 			}
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond) // bench:untimed -- readiness poll, before any stamp
 	}
 	t.Fatal("VL did not become ready")
 }

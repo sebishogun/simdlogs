@@ -344,7 +344,19 @@ func decodeForRun(blk []byte, w, lo, cnt, maxRow int) []uint32 {
 	out := make([]uint32, 0, cnt)
 	var acc uint32
 	if cnt >= forBulkThreshold {
-		words := make([]uint32, len(blk)/4)
+		// words and scratch are dead at return and are both fully overwritten
+		// before anything reads them -- words by the loop below, scratch by
+		// BitUnpackInto, which writes every element of dst. So they come from
+		// the pool rather than from a zeroing make. out is returned to the
+		// caller and stays a plain allocation.
+		var wordsP, scratchP *[]uint32
+		var words []uint32
+		if poolScratch {
+			wordsP, words = getU32(len(blk) / 4)
+			defer putU32(wordsP)
+		} else {
+			words = make([]uint32, len(blk)/4)
+		}
 		for i := range words {
 			words[i] = binary.LittleEndian.Uint32(blk[i*4:])
 		}
@@ -357,7 +369,13 @@ func decodeForRun(blk []byte, w, lo, cnt, maxRow int) []uint32 {
 		if startBlk*w > len(words) || (startBlk+nBlk)*w > len(words) {
 			return nil
 		}
-		scratch := make([]uint32, nBlk*32)
+		var scratch []uint32
+		if poolScratch {
+			scratchP, scratch = getU32(nBlk * 32)
+			defer putU32(scratchP)
+		} else {
+			scratch = make([]uint32, nBlk*32)
+		}
 		simd.BitUnpackInto(scratch, words[startBlk*w:], int32(w))
 		for i := startVal; i < startVal+cnt; i++ {
 			acc += scratch[i]

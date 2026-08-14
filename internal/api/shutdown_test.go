@@ -82,6 +82,7 @@ func TestCloseWaitsForInFlightRequest(t *testing.T) {
 // is absolute rather than idle-based, so setting it would kill every tail at
 // the timeout regardless of activity.
 func TestLiveTailIsNotCutByWriteDeadline(t *testing.T) {
+	t.Parallel()
 	c := config.Default()
 	c.Dir = t.TempDir()
 	srv, err := NewServerConfig(c)
@@ -221,6 +222,7 @@ func TestCloseWithOpenSyslogListeners(t *testing.T) {
 // shut the writer that used to send on a closed channel -- in a bare
 // goroutine, outside recoverPanic.
 func TestShutdownWithLiveSyslogConnection(t *testing.T) {
+	t.Parallel()
 	c := config.Default()
 	c.Dir = t.TempDir()
 	srv, err := NewServerConfig(c)

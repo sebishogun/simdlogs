@@ -235,6 +235,15 @@ func (s *Server) forwardWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer lastResp.Body.Close()
+	// Relay the backend's Content-Type. Without it the router answered with
+	// whatever Go sniffed from the first bytes, so the SAME path returned a
+	// different media type depending on deployment mode -- and fixing the
+	// single-node handlers made two more paths diverge rather than fewer,
+	// because the router half never moved with them. A client must not have to
+	// know whether it is talking to a storage node or a router.
+	if ct := lastResp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
 	w.WriteHeader(lastResp.StatusCode)
 	io.Copy(w, lastResp.Body)
 }
@@ -291,7 +300,7 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Content-Type", ndjsonContentType)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	for i, rw := range all {

@@ -71,6 +71,7 @@ func reseal(b []byte) {
 // Every twelve-byte window of the postings span, zeroed and set to all-ones.
 // Neither may panic, hang, or return rows outside the group.
 func TestPostingsSurviveCorruptionSweep(t *testing.T) {
+	t.Parallel()
 	full, off, length := postingsFixture(t)
 	const win = 12
 

@@ -239,7 +239,7 @@ bytes over HTTP into disk-backed stores; query order is shuffled.
 
 | | simdlogs | VictoriaLogs | ratio |
 |---|---:|---:|---:|
-| ingest | 2.12 s (0.47M rec/s) | 8.96 s (0.11M rec/s) | 4.2x |
+| ingest | 2.12 s (0.47M rec/s) | 8.96 s (0.11M rec/s) | 4.2x — **withdrawn, see below** |
 | footprint | 0.11 GB (110.08 bytes/row) | 0.05 GB | **2.05x of VL** |
 | groupby | 21 µs | 9.84 ms | 463x |
 | topN | 33 µs | 13.3 ms | 407x |
@@ -248,6 +248,24 @@ bytes over HTTP into disk-backed stores; query order is shuffled.
 | and | 11.9 ms | 58.7 ms | 4.9x |
 | common | 98.6 ms | 171.0 ms | 1.7x |
 | or | 171.7 ms | 273.5 ms | 1.6x |
+
+**The ingest row is withdrawn.** At the commit it was measured on, the harness
+stamped VictoriaLogs' ingest duration *after* a hardcoded
+`time.Sleep(5 * time.Second)` that existed to let VL flush, so the 8.96 s
+contains five seconds VL did not spend. VL's accept was 8.96 − 5.00 = **3.96 s
+(0.25M rec/s)**, an accept ratio of **1.87x**, not 4.2x. The other half — when
+the written rows become *queryable*, which is the number that five seconds was
+standing in for — was never measured, so the true queryable ratio is somewhere
+in [1.87x, 4.2x] and this table cannot say where.
+
+The harness now measures **accept** and **queryable** separately, by polling
+each engine's row count rather than sleeping (`internal/bench/timing_test.go`).
+The ingest row will be replaced when it has been re-measured on a quiet machine;
+until then the number above is history, not a claim. The query rows are
+unaffected — they were timed with `timeQuery`, which never contained the sleep.
+The scale-curve `ingest` column below came from `TestScaleVsVL`, which slept the
+same fixed five seconds inside its timed interval: at 1M rows that dominates, at
+1B rows it is noise.
 | substring | 170.6 ms | 249.1 ms | 1.5x |
 
 Measured at `50d13df` on amd64/AVX-512, two consecutive runs. The footprint

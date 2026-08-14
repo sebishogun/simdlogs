@@ -10,6 +10,7 @@ import (
 // used by every count consumer) must agree with what encodeIndices packed,
 // across widths and lengths including partial tail blocks.
 func TestCountLayoutEquiv(t *testing.T) {
+	t.Parallel()
 	for _, n := range []int{1, 31, 32, 33, 100, 4096, 130000} {
 		for _, w := range []int{1, 3, 7, 14, 20} {
 			vals := make([]uint32, n)

@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -51,10 +52,32 @@ func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Opti
 			case "message":
 				fields["_msg"] = rawToString(raw)
 			case "ddtags":
+				// Datadog tags are `key:value` by convention but a BARE tag
+				// with no colon is equally legal, and those were being
+				// dropped on the floor: the `i > 0` test skipped them and
+				// nothing recorded it, so `env,prod-canary` stored nothing at
+				// all. Keyed tags become fields; the rest are kept verbatim in
+				// ddtags so no tag the sender wrote is lost.
+				var bare []string
 				for _, kv := range strings.Split(rawToString(raw), ",") {
+					kv = strings.TrimSpace(kv)
+					if kv == "" {
+						continue
+					}
 					if i := strings.IndexByte(kv, ':'); i > 0 {
 						fields[kv[:i]] = kv[i+1:]
+						continue
 					}
+					bare = append(bare, kv)
+				}
+				// Stored under a name the tag namespace cannot reach. Using
+				// "ddtags" collided with a tag literally named ddtags: the
+				// keyed value was written first and then overwritten by this
+				// join, so `ddtags="ddtags:x,bare"` lost x -- the exact
+				// opposite of the "no tag the sender wrote is lost" this was
+				// added for.
+				if len(bare) > 0 {
+					fields["_ddtags"] = strings.Join(bare, ",")
 				}
 			case "timestamp", "date":
 				if t, ok := ddTime(raw); ok {
@@ -64,9 +87,14 @@ func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Opti
 				fields[k] = rawToString(raw)
 			}
 		}
+		// An entry that produced no fields at all carries nothing to store --
+		// not even a message. The old warning said "no message field", which is
+		// wrong for an entry that HAS a message and nothing else (it would have
+		// one field and pass), and wrong again for one carrying only a
+		// timestamp (no fields, but a message is not what it is missing).
 		if len(fields) == 0 {
 			res.Rejected++
-			res.Warn(0, "entry has no message field")
+			res.Warn(0, "entry carries no storable attribute")
 			continue
 		}
 		if !haveTS {
@@ -96,11 +124,25 @@ func ddTime(raw json.RawMessage) (int64, bool) {
 }
 
 // rawToString renders a JSON value as a plain string: a JSON string is
-// unquoted, anything else (number, bool, object) keeps its source bytes.
+// unquoted, a number or bool keeps its literal text, and an object or array is
+// COMPACTED.
+//
+// Compacted, not passed through: the source bytes carry whatever whitespace
+// and line breaks the sender happened to use, so two agents sending the same
+// logical attribute stored two different values and neither matched a query
+// written against the other. Compacting also matches what the OTLP path does
+// with a composite attribute, so the same nested object arrives the same way
+// whichever protocol carried it.
 func rawToString(raw json.RawMessage) string {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
 		return s
+	}
+	if len(raw) > 0 && (raw[0] == '{' || raw[0] == '[') {
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, raw); err == nil {
+			return buf.String()
+		}
 	}
 	return string(raw)
 }

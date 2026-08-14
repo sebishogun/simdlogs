@@ -72,12 +72,36 @@ func runParallel(groups []*storage.Reader, q *Query) []Row {
 	}
 	wg.Wait()
 	// Merge in group order (groups already time-sorted by the store).
+	//
+	// The total is known here -- every worker has finished and parts is
+	// complete -- so the merge takes one exactly-sized allocation. Growing by
+	// append instead reallocated the whole result log2(groups) times and
+	// copied every row it had already copied, which was 47% of all bytes a
+	// full scan allocated.
 	var out []Row
+	if mergePresize {
+		total := 0
+		for _, p := range parts {
+			total += len(p)
+		}
+		if total == 0 {
+			// A nil result, not an empty non-nil one: the serial path returns
+			// nil for no matches and the two are compared for equality.
+			return nil
+		}
+		out = make([]Row, 0, total)
+	}
 	for _, p := range parts {
 		out = append(out, p...)
 	}
 	return out
 }
+
+// mergePresize selects whether runParallel sizes the merge up front. Both arms
+// compile into ONE binary so they can be benchmarked interleaved in a single
+// session -- a two-build comparison would put the 8.3% code-layout noise floor
+// between them. Production always presizes.
+var mergePresize = true
 
 // histogramParallel is Histogram fanned across groups: each worker buckets
 // its groups into a local map, merged at the end. The window at scale spans

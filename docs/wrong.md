@@ -1329,3 +1329,97 @@ stored as a log row. The four discriminators that ARE applied
 and 11 are `fixed64`, 2 is an enum, 7 is `uint32`, and none is `repeated`
 in any OTLP version from v0.7.0 on, so no packed encoding puts them at
 wire 2.
+
+## The allocation sweep: four measurements that pointed the wrong way
+
+An allocation sweep of `internal/query` and `internal/storage` landed five
+changes, each with both arms compiled into ONE binary and benchmarked
+interleaved (`-count=6`, compared on the minimum). None was rejected. What
+follows is the part worth keeping: the measurements that supported a
+conclusion nobody should have drawn.
+
+**A benchmark shape that measured a two-entry dictionary and called it
+65536.** The first `BenchmarkDictSectionAllArena` built its high-cardinality
+row from an LCG's LOW nibble:
+
+    seed = seed*1664525 + 1013904223
+    b[j] = hexChar(byte(seed & 0xf))
+
+An LCG's low four bits have period 16. The 65536 "distinct" values
+deduplicated to a two-value dictionary, and the row measured 56 B/op in 3
+allocations on both arms — reported as "no difference at high cardinality",
+which is exactly the shape the change was for. The high nibble
+(`seed >> 28`) gives the shape its name claimed, and the arms differ by 32x:
+
+    highcard-64k  arena       562,277 ns   3,538,945 B/op    2,049 allocs/op
+    highcard-64k  per-value 1,133,369 ns   3,538,945 B/op   66,561 allocs/op
+
+A benchmark shape is a claim about the data, and it needs checking like any
+other claim. The allocs/op column was the tell: 3 allocations cannot decode
+a thousand blocks.
+
+**"The decoder fills the buffer" is not the same as "the decoder writes
+every byte."** `flateDecompress` discards `io.ReadFull`'s error, so a
+truncated block leaves the tail of its output unwritten. With a fresh
+allocation per call that tail read as zero. Reusing one buffer across a
+section's blocks returns the PREVIOUS block's bytes there instead —
+characters from another dictionary value, at a place the offset table says
+is a value. Disabling the added `clear(out[n:])` and re-running the
+poisoning test returned a block whose tail was 0xDE repeated where the
+allocating form returned zeros. The reuse is worth having:
+
+    lz4/reuse   5,254 ns   22,784 B/op   12 allocs/op
+    lz4/fresh   5,856 ns   30,208 B/op   17 allocs/op
+    hex/reuse   3,348 ns   22,272 B/op   10 allocs/op
+    hex/fresh   4,569 ns   36,096 B/op   17 allocs/op
+
+but it is worth having only with the zeroing, and no wall-clock or
+allocation number would ever have shown the difference.
+
+**A pool removed 5.6 MB per operation and moved allocs/op by nothing.**
+Pooling the per-group timestamp decode, on the ten-group full scan:
+
+    pooled  min 2,329,783 ns   26,245,153 B/op   286 allocs/op
+    make    min 2,407,044 ns   31,874,165 B/op   286 allocs/op
+
+The 3.2% on wall-clock is inside the 8.3% layout noise floor, and allocs/op
+is identical at the minimum: a `sync.Pool` miss allocates too, so the pool
+trades many large allocations for fewer large allocations plus some small
+ones, and the COUNT barely moves while the BYTES fall 17.7%. Read on
+allocs/op alone this change looks like nothing. `perf stat` on the same
+binary, 500 iterations each, is what settles it:
+
+    pooled  127,578,211,079 instructions:u   32,858,150,947 cycles:u
+    make    145,627,151,353 instructions:u   35,285,059,549 cycles:u
+
+12.4% fewer instructions retired, 6.9% fewer cycles, layout- and
+load-independent.
+
+**A red `-race` gate that was not a regression.** `go test -race -short
+./...` failed on `TestGetU32LengthAndReuse` — "a 600-element request did not
+reuse the 600-element buffer just returned" — and kept failing with nothing
+else running. Nothing in the pool had changed. `sync.Pool.Put` drops the
+value at random one time in four when the race detector is enabled
+(`go/src/sync/pool.go:103`, "Randomly drop x on floor"), so a test that
+asserts reuse across a single round trip is red in a quarter of all race
+runs, by design of the runtime. The test now takes reuse within a few
+attempts. The assertion is the same; the flake is gone.
+
+**Cross-build wall-clock disagreed with itself.** Comparing the sweep's
+before and after end-to-end runs, three benchmarks looked worse and one
+looked implausibly better:
+
+    EngineNeedle         13,220 ns before    7,537 ns after   (identical 96 allocs, 40,360 B)
+    EngineFullScanCount 339,525 ns before  445,964 ns after   (+1 alloc)
+
+Five samples of the SAME build put both inside one distribution:
+
+    EngineFullScanCount  269,631 .. 390,944 ns   3,457,371 .. 3,568,654 B/op   659 .. 671 allocs/op
+    EngineCount           85,216 .. 107,873 ns     266,997 ..   276,338 B/op    34 .. 35 allocs/op
+
+A parallel group scan's allocation count is not deterministic — which
+worker gets which group decides which buffers grow — so ±1 alloc/op and a
+30% ns spread are the floor of what a single end-to-end sample can say.
+The per-change interleaved runs are the evidence; the end-to-end table is
+read for the exact columns (B/op, allocs/op) and only where the change is
+large.

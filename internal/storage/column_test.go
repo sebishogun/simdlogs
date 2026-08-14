@@ -32,6 +32,7 @@ func TestDictRoundTrip(t *testing.T) {
 }
 
 func TestTimestampRoundTrip(t *testing.T) {
+	t.Parallel()
 	rng := rand.New(rand.NewSource(2))
 	for _, n := range []int{0, 1, 100, 1_000_000} {
 		ts := make([]int64, n)

@@ -29,8 +29,13 @@ func FieldValues(s Store, field string, from, to int64) []ValueCount {
 	counts := map[string]int{}
 	sn2 := snapshotOf(s, from, to)
 	defer sn2.Close()
+	// One buffer for every group's counts: the values are read into the map
+	// before the next group overwrites it, so the per-group result slice never
+	// needs to be allocated.
+	var vcBuf []storage.ValueCount
 	for _, g := range sn2.Groups {
-		for _, vc := range g.ValueCounts(field) {
+		vcBuf = g.ValueCountsInto(vcBuf, field)
+		for _, vc := range vcBuf {
 			counts[vc.Value] += vc.Count
 		}
 	}
@@ -344,6 +349,9 @@ func StatsByField(s Store, q *Query, field string) []ValueCount {
 	counts := map[string]int{}
 	sn5 := snapshotOf(s, q.From, q.To)
 	defer sn5.Close()
+	// One buffer for every group's counts, refilled per group -- see
+	// FieldValues. The loop below reads it into the map before moving on.
+	var vcBuf []storage.ValueCount
 	for _, g := range sn5.Groups {
 		// The deadline, checked per group. These paths return counts and
 		// facets rather than rows, so MaxBytes has nothing to measure --
@@ -363,7 +371,8 @@ func StatsByField(s Store, q *Query, field string) []ValueCount {
 		// _time has no dictionary to read counts from -- it is stored as
 		// timestamps -- so it takes the scan below, which synthesizes one.
 		if len(q.Preds) == 0 && field != "_time" && g.TimeMin >= q.From && g.TimeMax < q.To {
-			for _, vc := range g.ValueCounts(field) {
+			vcBuf = g.ValueCountsInto(vcBuf, field)
+			for _, vc := range vcBuf {
 				counts[vc.Value] += vc.Count
 			}
 			continue

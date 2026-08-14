@@ -145,6 +145,9 @@ func (s *Server) tenant(acc, proj string) (*tenant, error) {
 	if s.limits.MaxLineBytes > 0 {
 		tn.w.SetMaxLineBytes(s.limits.MaxLineBytes)
 	}
+	if s.limits.MaxDecompressed > 0 {
+		tn.w.SetMaxDecompressedBytes(int(s.limits.MaxDecompressed))
+	}
 	tn.w.SetRecordLimits(s.recordLimits())
 	s.tenants[key] = tn
 	return tn, nil

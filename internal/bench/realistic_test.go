@@ -96,13 +96,29 @@ func TestRealistic(t *testing.T) {
 	}
 	sl := httptest.NewServer(srv.Handler())
 	defer sl.Close()
-	t0 := time.Now()
-	stream(func(c []byte) { post(t, sl.URL+"/insert/jsonline", c) })
-	slIngest := time.Since(t0)
+
+	// The count window has to be known before the first stream call, which is
+	// what sets lo/hi. GenRealistic starts at Unix 1700000000 and advances by
+	// at most 800us per row, so N/1000 seconds is a bound on the span with
+	// room to spare; the ten seconds of slack at the start covers the ~0.5%
+	// of records the generator backdates.
+	countFrom := int64(1_700_000_000 - 10)
+	countTo := int64(1_700_000_000 + int64(N)/1000 + 10)
+
+	slIngest, err := timeIngest(
+		func() { stream(func(c []byte) { post(t, sl.URL+"/insert/jsonline", c) }) },
+		readyAtLeast(sl.URL, countFrom, countTo, N),
+		200*time.Millisecond, 60*time.Minute)
+	if err != nil {
+		t.Fatalf("simdlogs ingest: %v", err)
+	}
+	requireRows(t, "simdlogs", sl.URL, countFrom, countTo, N)
 
 	mix := realQueries(lo, hi, needle)
 	rand.Shuffle(len(mix), func(i, j int) { mix[i], mix[j] = mix[j], mix[i] }) // randomize query order per run
-	t.Logf("simdlogs N=%d: ingest %v (%.2fM rec/s)", N, slIngest.Round(time.Millisecond), float64(N)/slIngest.Seconds()/1e6)
+	t.Logf("simdlogs N=%d: ingest accept %v (%.2fM rec/s) queryable %v (%.2fM rec/s)",
+		N, slIngest.accept.Round(time.Millisecond), float64(N)/slIngest.accept.Seconds()/1e6,
+		slIngest.queryable.Round(time.Millisecond), float64(N)/slIngest.queryable.Seconds()/1e6)
 	slT := map[string]time.Duration{}
 	for _, m := range mix {
 		slT[m.name] = timeQuery(t, func() { get(t, sl.URL+m.path+"?"+m.qs) })
@@ -125,18 +141,25 @@ func TestRealistic(t *testing.T) {
 	defer cmd.Process.Kill()
 	vl := "http://127.0.0.1:19430"
 	waitReady(t, vl+"/insert/ready", 30*time.Second)
-	t0 = time.Now()
-	stream(func(c []byte) { post(t, vl+"/insert/jsonline", c) })
-	time.Sleep(5 * time.Second)
-	vlIngest := time.Since(t0)
-	t.Logf("victorialogs N=%d: ingest %v (%.2fM rec/s)", N, vlIngest.Round(time.Millisecond), float64(N)/vlIngest.Seconds()/1e6)
+	vlIngest, err := timeIngest(
+		func() { stream(func(c []byte) { post(t, vl+"/insert/jsonline", c) }) },
+		readyAtLeast(vl, countFrom, countTo, N),
+		200*time.Millisecond, 60*time.Minute)
+	if err != nil {
+		t.Fatalf("victorialogs ingest: %v", err)
+	}
+	requireRows(t, "victorialogs", vl, countFrom, countTo, N)
+	t.Logf("victorialogs N=%d: ingest accept %v (%.2fM rec/s) queryable %v (%.2fM rec/s)",
+		N, vlIngest.accept.Round(time.Millisecond), float64(N)/vlIngest.accept.Seconds()/1e6,
+		vlIngest.queryable.Round(time.Millisecond), float64(N)/vlIngest.queryable.Seconds()/1e6)
 	for _, m := range mix {
 		vt := timeQuery(t, func() { get(t, vl+m.path+"?"+m.qs) })
 		t.Logf("  %-14s simdlogs %v vs VL %v = %.1fx", m.name, slT[m.name], vt, float64(vt)/float64(slT[m.name]))
 	}
 	slSize, vlSize := dirSize(slDir), dirSize(vlDir)
-	t.Logf("REALISTIC N=%d | ingest %.2fx | footprint simdlogs %.2fGB vs VL %.2fGB (%.2fx of VL)",
-		N, vlIngest.Seconds()/slIngest.Seconds(),
+	t.Logf("REALISTIC N=%d | ingest accept %.2fx | ingest queryable %.2fx | footprint simdlogs %.2fGB vs VL %.2fGB (%.2fx of VL)",
+		N, vlIngest.accept.Seconds()/slIngest.accept.Seconds(),
+		vlIngest.queryable.Seconds()/slIngest.queryable.Seconds(),
 		float64(slSize)/1e9, float64(vlSize)/1e9, float64(slSize)/float64(vlSize))
 }
 

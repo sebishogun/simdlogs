@@ -607,6 +607,7 @@ func TestStripBulkActions(t *testing.T) {
 // TestESBulkParallelPath drives a body over MinParallelBytes so the sharded
 // ingest branch is covered, not just the small-body writer.
 func TestESBulkParallelPath(t *testing.T) {
+	t.Parallel()
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()

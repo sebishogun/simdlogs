@@ -123,6 +123,13 @@ func hexPackBlock(raw []byte, count int) []byte {
 // raw block so blockValAt and the searches read it unchanged. The nibble->char
 // expansion is simd.HexEncode (SIMD): faster than the LZ4 kernel it replaces.
 func hexUnpackBlock(packed []byte) []byte {
+	return hexUnpackBlockInto(nil, packed)
+}
+
+// hexUnpackBlockInto is hexUnpackBlock reusing the caller's buffer. See
+// dictSec.blockInto for who may pass one. Every byte of the returned slice is
+// written: the offset table by the copy, the characters by HexEncode.
+func hexUnpackBlockInto(buf, packed []byte) []byte {
 	if len(packed) < 4 {
 		return nil
 	}
@@ -144,7 +151,7 @@ func hexUnpackBlock(packed []byte) []byte {
 	}
 	// HexEncode writes 2*nb chars; for an odd total that is one pad char past
 	// the strings, unread (offsets bound reads to total). Size raw for it.
-	raw := make([]byte, strBase+2*nb)
+	raw := fitBuf(buf, strBase+2*nb)
 	copy(raw, packed[4:4+strBase]) // offsets
 	simd.HexEncode(raw[strBase:], packed[nibBase:nibBase+nb])
 	return raw
@@ -292,6 +299,23 @@ func (d dictSec) firstVal(k int) string {
 // block decompresses block k into [k'+1 offsets][strings], dispatching on the
 // per-block codec flagged in rawLen's high bit (default LZ4, compact flate).
 func (d dictSec) block(k int) []byte {
+	return d.blockInto(k, nil)
+}
+
+// blockInto is block reusing the caller's buffer for the decompressed bytes.
+//
+// It is for a caller that walks EVERY block of a section and is finished with
+// one before it asks for the next: dictSectionAll and dictWalk convert each
+// block's string region to its own string, so the decompressed bytes are dead
+// as soon as that conversion returns. Passing the same buffer back turns one
+// allocation per block into one allocation per walk -- at 64 values per block
+// and a 131K-value dictionary that is 2048 allocations of a kilobyte-plus
+// each.
+//
+// The buffer comes back holding a PREVIOUS block's bytes, so every decoder
+// reached from here must write every byte of it. blockReuse selects the arm;
+// TestBlockReuseMatchesFresh poisons the buffer and compares.
+func (d dictSec) blockInto(k int, buf []byte) []byte {
 	if k < 0 || k*12+12 > len(d.idx) {
 		return nil
 	}
@@ -302,15 +326,34 @@ func (d dictSec) block(k int) []byte {
 	if compOff < 0 || compLen < 0 || compOff > len(d.comp) || compLen > len(d.comp)-compOff {
 		return nil
 	}
+	if !blockReuse {
+		buf = nil
+	}
 	comp := d.comp[compOff : compOff+compLen]
 	switch {
 	case rawField&dictCodecHex != 0:
-		return hexUnpackBlock(comp)
+		return hexUnpackBlockInto(buf, comp)
 	case rawField&dictCodecFlate != 0:
-		return flateDecompress(comp, rawLen)
+		return flateDecompressInto(buf, comp, rawLen)
 	default:
-		return lz4Decompress(comp, rawLen)
+		return lz4DecompressInto(buf, comp, rawLen)
 	}
+}
+
+// blockReuse selects whether the whole-section walkers hand their block buffer
+// back to be refilled. Both arms compile into ONE binary so they can be
+// benchmarked interleaved in a single session -- a two-build comparison would
+// put the 8.3% code-layout noise floor between them. Production reuses.
+var blockReuse = true
+
+// fitBuf returns a buffer of exactly n bytes, reusing buf's array when it is
+// large enough. The contents are whatever the previous user left: the caller
+// must write all n bytes before any is read.
+func fitBuf(buf []byte, n int) []byte {
+	if cap(buf) < n {
+		return make([]byte, n)
+	}
+	return buf[:n]
 }
 
 // blockValAt reads value i within a decompressed block of count vals.
@@ -413,17 +456,132 @@ func dictSectionSome(sec []byte, n int, want []bool) []string {
 	return out
 }
 
+// dictArena selects how dictSectionAll materializes a block's values: one
+// shared string per block (true) or one string per value (false). Both arms
+// compile into ONE binary so they can be benchmarked interleaved in a single
+// session -- a two-build comparison would put the 8.3% code-layout noise floor
+// between them. Production always takes the arena path.
+var dictArena = true
+
 // dictSectionAll materializes the whole dict -- the scan path, decompressing
 // every block once.
 func dictSectionAll(sec []byte, n int) []string {
 	d := parseDictSec(sec)
 	out := make([]string, 0, n)
+	// One buffer for every block: each block's values are copied into their own
+	// string before the next block overwrites it.
+	var buf []byte
 	for k := 0; k < d.numBlocks; k++ {
-		raw := d.block(k)
 		cnt := d.blockCount(k, n)
+		if dictArena {
+			raw := d.blockInto(k, buf)
+			out = appendBlockVals(out, raw, cnt)
+			buf = raw
+			continue
+		}
+		raw := d.block(k)
 		for i := 0; i < cnt; i++ {
 			out = append(out, blockValAt(raw, cnt, i))
 		}
 	}
 	return out
+}
+
+// appendBlockVals appends every value of a decompressed block, converting the
+// block's string region ONCE and slicing each value out of it.
+//
+// blockValAt does `string(raw[a:b])` per value, which is one heap allocation
+// and one copy per dict value -- 94% of all objects allocated by a
+// `top N by (host)`, at dictBlock=64 values per block. A substring of a Go
+// string shares its backing array and allocates nothing, so converting the
+// whole region once gives the same bytes in one allocation per block instead
+// of 64, and copies exactly the same number of bytes doing it.
+//
+// The values returned therefore share one backing array per block: a caller
+// that keeps ONE value keeps its block's bytes alive. dictSectionAll's callers
+// materialize the whole dictionary and were holding all of those bytes anyway
+// (in more allocations, each rounded up to a size class), so the retained
+// footprint does not grow.
+//
+// Out-of-range reads answer "" exactly as blockValAt does, including the
+// corrupt-header case where the offset table itself runs past the block --
+// that one falls back to the per-value path, which decides per value.
+func appendBlockVals(out []string, raw []byte, cnt int) []string {
+	a := newBlockArena(raw, cnt)
+	for i := 0; i < cnt; i++ {
+		out = append(out, a.at(i))
+	}
+	return out
+}
+
+// blockArena is a decompressed dict block plus its string region converted
+// once. It holds the value-slicing rules in one place for the two callers that
+// read a whole block: appendBlockVals and the dictWalk ValueCounts drives.
+type blockArena struct {
+	raw   []byte
+	vals  string
+	cnt   int
+	split bool // false: offset table runs past the block, so read per value
+}
+
+func newBlockArena(raw []byte, cnt int) blockArena {
+	base := 4 * (cnt + 1)
+	if cnt < 0 || base > len(raw) {
+		return blockArena{raw: raw, cnt: cnt}
+	}
+	return blockArena{raw: raw, vals: string(raw[base:]), cnt: cnt, split: true}
+}
+
+// at is blockValAt's answer for value i, sliced out of the shared arena.
+func (a *blockArena) at(i int) string {
+	if !a.split {
+		return blockValAt(a.raw, a.cnt, i)
+	}
+	if i < 0 || i >= a.cnt {
+		return ""
+	}
+	o0 := int(get32(a.raw, 4*i))
+	o1 := int(get32(a.raw, 4*(i+1)))
+	if o0 < 0 || o1 < o0 || o1 > len(a.vals) {
+		return ""
+	}
+	return a.vals[o0:o1]
+}
+
+// dictWalk yields a section's values in id order, decompressing each block
+// once, WITHOUT materializing the []string dictSectionAll returns. A caller
+// that consumes the dictionary in order -- ValueCounts pairing each value with
+// its posting count -- then allocates nothing for the dictionary at all.
+//
+// It yields exactly the values dictSectionAll would append, in that order, so
+// a caller that stopped at len(vals) stops when next reports false.
+type dictWalk struct {
+	d dictSec
+	n int
+	k int // next block
+	i int // next value in the current block
+	a blockArena
+}
+
+func newDictWalk(sec []byte, n int) dictWalk {
+	return dictWalk{d: parseDictSec(sec), n: n}
+}
+
+func (w *dictWalk) next() (string, bool) {
+	for w.i >= w.a.cnt {
+		if w.k >= w.d.numBlocks {
+			return "", false
+		}
+		// The previous block's buffer, refilled: every value it held was
+		// copied into the arena string (or, on the corrupt-header path, into
+		// its own string) before the walk moved off that block, so nothing
+		// still points into these bytes.
+		raw := w.d.blockInto(w.k, w.a.raw)
+		w.a = newBlockArena(raw, w.d.blockCount(w.k, w.n))
+		w.i = 0
+		w.k++
+	}
+	v := w.a.at(w.i)
+	w.i++
+	return v, true
 }

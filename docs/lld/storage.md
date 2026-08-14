@@ -86,6 +86,28 @@ bits in the rawLen field:
   char via the SIMD `HexEncode`/`HexDecode` convention, smaller than flate on
   hex and faster to decode. Trace/span ids are the target.
 
+Whole-dictionary reads — `dictSectionAll`, and the `dictWalk` that
+`ValueCounts` drives — convert a decompressed block's string region to ONE Go
+string and slice each value out of it instead of converting each value
+separately: a substring shares its backing array, so a 64-value block costs
+one allocation rather than 64. The values a block yields therefore share one
+array, which is the same set of bytes the caller was already holding. Those
+two walkers also refill a single decompressed-block buffer instead of
+allocating one per block (`dictSec.blockInto`). That is safe only because
+each block's values are copied into their own string before the next block
+overwrites it, and because every block decoder writes every byte it returns —
+`flateDecompressInto` zeroes the tail that a truncated stream leaves
+unwritten, which `flateDecompress` used to get for free from a fresh
+allocation. The sparse-read paths (`dictSectionAt`, `dictSectionSearch`,
+`dictSectionSome`) are unchanged: they touch a few values per block, where
+converting the whole region would be waste.
+
+`Reader.ValueCounts(name)` pairs each dict value with its posting count off
+that walk, without materializing the dictionary as a `[]string` first.
+`Reader.ValueCountsInto(dst, name)` is the same answer appended into a
+caller-owned buffer, for a caller looping over groups (`FieldValues`,
+`StatsByField`) that reads each group's counts before asking for the next.
+
 ### Timestamp columns
 
 `encodeTimestamps` (column.go): zig-zag varint deltas, prefixed with a
@@ -100,6 +122,18 @@ base), and the block's min/max. Consequences:
   decoding at most 512 deltas (O(tsBlock), not O(rows));
 - full scans decode via `simd.VarintDecode` with the scalar loop as the
   conformance oracle.
+
+`Reader.TimestampsRange(name, lo, hi)` allocates the slice it returns and is
+the default. `Reader.TimestampsRangeInto(dst, name, lo, hi)` writes into a
+caller-owned buffer and is opt-in, because the two are NOT interchangeable:
+`rebuild()` keeps the slice it gets as a `Column.Ts` for the lifetime of a
+group, and refilling that buffer would rewrite a group being written out.
+Only a caller that reads the times and drops them may pass a buffer — the
+group scan (`appendMatches`) and the histogram, where each time is copied
+into a row or a bucket. Those two draw theirs from a `sync.Pool`
+(`internal/query/tsscratch.go`), which is safe because `decodeTsRangeInto`
+writes every element it returns, zeroing the tail a short stream leaves
+unwritten rather than exposing the previous group's timestamps there.
 
 ### Postings (the inverted index)
 

@@ -23,6 +23,12 @@ func flateCompress(src []byte) []byte {
 }
 
 func flateDecompress(src []byte, rawLen int) []byte {
+	return flateDecompressInto(nil, src, rawLen)
+}
+
+// flateDecompressInto is flateDecompress reusing the caller's buffer. See
+// dictSec.blockInto for who may pass one.
+func flateDecompressInto(buf, src []byte, rawLen int) []byte {
 	// rawLen is four bytes of file and this allocates it up front. DEFLATE's
 	// widest expansion is a run of 258 bytes from a 48-bit match token, so
 	// anything past ~1032x the input never came from the compressor -- the
@@ -31,9 +37,17 @@ func flateDecompress(src []byte, rawLen int) []byte {
 		return nil
 	}
 	r := flate.NewReader(bytes.NewReader(src))
-	out := make([]byte, rawLen)
-	io.ReadFull(r, out)
+	out := fitBuf(buf, rawLen)
+	n, _ := io.ReadFull(r, out)
 	r.Close()
+	// A truncated stream leaves out[n:] unwritten. That was zero when this
+	// allocated a fresh buffer every time; a reused buffer would instead hand
+	// back the PREVIOUS block's bytes -- another value's characters, silently,
+	// from a decoder whose short-read error is deliberately ignored. Zeroing
+	// keeps the answer exactly what a fresh allocation gave.
+	if n < len(out) {
+		clear(out[n:])
+	}
 	return out
 }
 
@@ -119,6 +133,13 @@ func lz4Compress(src []byte) []byte {
 // lz4Decompress inflates a block into a buffer of the known original
 // length, on the simd kernel.
 func lz4Decompress(block []byte, origLen int) []byte {
+	return lz4DecompressInto(nil, block, origLen)
+}
+
+// lz4DecompressInto is lz4Decompress reusing the caller's buffer. See
+// dictSec.blockInto for who may pass one. A short decode returns nil rather
+// than the buffer, so no partially-written block is ever read.
+func lz4DecompressInto(buf, block []byte, origLen int) []byte {
 	// origLen is four bytes of file, and this allocates it before decoding a
 	// single byte -- a corrupt length is a multi-gigabyte allocation on the
 	// query path. An LZ4 block cannot expand by more than 255x (the widest
@@ -127,7 +148,7 @@ func lz4Decompress(block []byte, origLen int) []byte {
 	if origLen < 0 || origLen > 255*len(block)+16 {
 		return nil
 	}
-	dst := make([]byte, origLen)
+	dst := fitBuf(buf, origLen)
 	n := simd.LZ4BlockDecode(dst, block)
 	if n != origLen {
 		return nil

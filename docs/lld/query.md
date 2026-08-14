@@ -70,7 +70,11 @@ materializes the matched rows. `runCountFast`, `runTopFast`, `runUniqFast`
    (parallel.go): one goroutine per worker over a channel of group indices,
    results merged in group order — identical output to serial, asserted by a
    differential test. Below 4, the goroutine overhead outweighs the win (a
-   needle touches one or two groups).
+   needle touches one or two groups). The merge sizes its result from the
+   finished parts before copying: every worker has returned by then, so the
+   total is known, and growing by `append` instead reallocated the whole
+   result log2(groups) times. It still answers nil, not an empty slice, when
+   nothing matched — the serial path does, and the two are compared.
 6. `appendMatches` per survivor group:
    - bitset `SetAll`, then the time mask: when the group straddles the window,
      `TimeRangeMaskInto` skips whole 512-row blocks from the checkpoint
@@ -87,7 +91,10 @@ materializes the matched rows. `runCountFast`, `runTopFast`, `runUniqFast`
      facets path used to decode a whole 131072-row group to materialize a
      thousand; `1a85d8a`, wrong.md entry 35);
    - timestamps: point-read via checkpoint blocks when matches are sparse
-     (`cnt*512 < span`), else span-decode;
+     (`cnt*512 < span`), else span-decode into a buffer from the
+     `tsscratch.go` pool, returned before `appendMatches` does — every time
+     read is copied into a `Row.Time` first, and `histoGroup` borrows the
+     same way for its buckets;
    - materialization decodes each referenced column once (only the dict
      values matched rows reference — `DictDecodeSome`) and indexes into it;
      ≤ 64 matches take the direct per-row path (arena setup does not

@@ -12,6 +12,7 @@ import (
 )
 
 func TestServerInsertAndQuery(t *testing.T) {
+	t.Parallel()
 	srv, err := NewServer(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

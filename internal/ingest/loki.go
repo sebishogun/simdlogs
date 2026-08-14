@@ -6,8 +6,12 @@ import (
 )
 
 // lokiPush is Grafana Loki's push payload: streams of label sets, each with a
-// list of [timestamp-ns, line] pairs (an optional third element carries
-// structured metadata, which we ignore). https://grafana.com/docs/loki push API.
+// list of [timestamp-ns, line] entries. A third element carries structured
+// metadata as a JSON object -- Loki 3.x's home for the high-cardinality
+// attributes that must NOT become labels, which is exactly where a trace id or
+// a request id ends up. It used to be discarded, so those fields were accepted
+// with a 204 and then were not there.
+// https://grafana.com/docs/loki push API.
 type lokiPush struct {
 	Streams []struct {
 		Stream map[string]string   `json:"stream"`
@@ -49,10 +53,33 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 			var tsStr, line string
 			_ = json.Unmarshal(ent[0], &tsStr)
 			_ = json.Unmarshal(ent[1], &line)
+			// The optional third element: structured metadata. A malformed one
+			// is a warning against that entry, not a silent drop and not a
+			// failed batch -- the line itself is still worth storing.
+			var meta map[string]string
+			if len(ent) >= 3 {
+				if err := json.Unmarshal(ent[2], &meta); err != nil {
+					res.Warn(0, "entry's structured metadata is not an object: %v", err)
+					meta = nil
+				}
+			}
 			for k := range fields {
 				delete(fields, k)
 			}
 			for k, v := range st.Stream {
+				fields[k] = v
+			}
+			// After the labels: an entry's own metadata is more specific than
+			// its stream's labels, and the protobuf path applies it in the same
+			// order.
+			// Same guard as the protobuf path: an empty key was stored as a
+			// field with no name, and an empty value erased the stream label
+			// it collided with. Without both, the two encodings disagree on
+			// exactly the input proto3 makes most likely.
+			for k, v := range meta {
+				if k == "" || v == "" {
+					continue
+				}
 				fields[k] = v
 			}
 			fields["_msg"] = line

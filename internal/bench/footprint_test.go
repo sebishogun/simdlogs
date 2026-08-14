@@ -12,6 +12,7 @@ import (
 // column and section (index / postings / dict / bloom / timestamps), so the
 // footprint work targets the biggest chunk rather than guessing.
 func TestFootprintBreakdown(t *testing.T) {
+	t.Parallel()
 	const n = 100_000
 	ts := make([]int64, 0, n)
 	cols := map[string][]string{}

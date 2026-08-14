@@ -1,10 +1,13 @@
 package ingest
 
 import (
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"math"
 	"strconv"
+	"unicode/utf8"
 )
 
 // The OTLP/HTTP protobuf encoding of ExportLogsServiceRequest, decoded by hand:
@@ -66,6 +69,30 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 			if n != 2 || wt != 2 { // scope_logs
 				return
 			}
+			// InstrumentationScope (scope = 1): name = 1, version = 2,
+			// attributes = 3. Read before the records, because the scope may
+			// precede or follow them on the wire, and dropped entirely before
+			// this -- so every record looked like it came from the
+			// application rather than from the library that emitted it.
+			var scopeAttrs []otlpKV
+			var scopeName, scopeVersion string
+			eachField(p, func(n2, w2 int, sc []byte) {
+				if n2 != 1 || w2 != 2 { // scope
+					return
+				}
+				eachField(sc, func(n3, w3 int, sp []byte) {
+					switch {
+					case n3 == 1 && w3 == 2:
+						scopeName = string(sp)
+					case n3 == 2 && w3 == 2:
+						scopeVersion = string(sp)
+					case n3 == 3 && w3 == 2:
+						if k, v, ok := decodeKV(sp); ok {
+							scopeAttrs = append(scopeAttrs, otlpKV{Key: k, Value: v})
+						}
+					}
+				})
+			})
 			eachField(p, func(n2, w2 int, rec []byte) {
 				if n2 != 2 || w2 != 2 { // log_records
 					return
@@ -76,7 +103,19 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				for _, a := range resAttrs {
 					fields[a.Key] = a.Value.str()
 				}
+				for _, a := range scopeAttrs {
+					fields[a.Key] = a.Value.str()
+				}
+				if scopeName != "" {
+					fields["scope_name"] = scopeName
+				}
+				if scopeVersion != "" {
+					fields["scope_version"] = scopeVersion
+				}
 				var ts, observed int64
+				var sevNum int
+				var sevText, traceID, spanID, eventName string
+				var flags, dropped uint32
 				isLog := false
 				// wrongShape: field 1 present but length-delimited, which is
 				// Metric.name or Span.trace_id rather than time_unix_nano.
@@ -89,10 +128,37 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 					case fn == 11 && fw == 1: // observed_time_unix_nano
 						observed = int64(binary.LittleEndian.Uint64(fp))
 						isLog = true
-					case fn == 3 && fw == 2: // severity_text
-						if len(fp) > 0 {
-							fields["severity"] = string(fp)
+					case fn == 2 && fw == 0: // severity_number (enum, varint)
+						// Range-checked BEFORE the int conversion. A varint of
+						// 2^63 or more converts to a NEGATIVE int, which then
+						// passed a `sevNum < len(names)` test and indexed the
+						// name table out of range: a remote panic from a
+						// 31-byte body, and a 500 an OTLP exporter retries
+						// forever.
+						if v := binary.LittleEndian.Uint64(fp); v < uint64(len(severityNumberName)) {
+							sevNum = int(v)
 						}
+						isLog = true
+					case fn == 3 && fw == 2: // severity_text
+						sevText = string(fp)
+					case fn == 7 && fw == 0: // dropped_attributes_count
+						dropped = uint32(binary.LittleEndian.Uint64(fp))
+					case fn == 8 && fw == 5: // flags (fixed32)
+						flags = binary.LittleEndian.Uint32(fp)
+						isLog = true
+					// Fields 9, 10 and 12 collide with Metric.histogram,
+					// Metric.exponential_histogram and Metric.metadata, all at
+					// wire type 2 (docs/wrong.md records the collision). Length
+					// is the discriminator OTLP gives: a trace id is EXACTLY 16
+					// bytes and a span id exactly 8, which a histogram
+					// submessage is not. Without this a metrics payload posted
+					// to /v1/logs invented a trace_id out of its bucket bytes.
+					case fn == 9 && fw == 2 && len(fp) == 16: // trace_id: raw here, hex in JSON
+						traceID = hex.EncodeToString(fp)
+					case fn == 10 && fw == 2 && len(fp) == 8: // span_id
+						spanID = hex.EncodeToString(fp)
+					case fn == 12 && fw == 2 && utf8.Valid(fp): // event_name
+						eventName = string(fp)
 					case fn == 5 && fw == 2: // body
 						if v, ok := decodeAnyValue(fp); ok {
 							if msg := v.str(); msg != "" {
@@ -142,6 +208,7 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				if isLog {
 					sawLogShape = true
 				}
+				otlpRecordFields(fields, sevNum, sevText, traceID, spanID, eventName, flags, dropped)
 				if ts == 0 {
 					ts = observed
 				}
@@ -288,12 +355,21 @@ func eachField(msg []byte, fn func(num, wire int, payload []byte)) {
 
 // decodeKV reads a KeyValue message.
 func decodeKV(msg []byte) (key string, val otlpValue, ok bool) {
+	return decodeKVDepth(msg, 0)
+}
+
+// decodeKVDepth carries the nesting depth through a kvlist, so a KeyValue
+// inside a KeyValueList inside a KeyValue cannot escape the recursion bound.
+func decodeKVDepth(msg []byte, depth int) (key string, val otlpValue, ok bool) {
+	if depth > maxAnyValueDepth {
+		return "", otlpValue{}, false
+	}
 	eachField(msg, func(num, wire int, p []byte) {
 		switch {
 		case num == 1 && wire == 2:
 			key, ok = string(p), true
 		case num == 2 && wire == 2:
-			if v, vok := decodeAnyValue(p); vok {
+			if v, vok := decodeAnyValueDepth(p, depth); vok {
 				val = v
 			}
 		}
@@ -303,8 +379,30 @@ func decodeKV(msg []byte) (key string, val otlpValue, ok bool) {
 
 // decodeAnyValue reads an AnyValue into the same struct the JSON path fills,
 // so one str() renders both encodings identically.
+//
+// All seven kinds. Stopping at four meant bytes, array and kvlist attributes
+// vanished from a protobuf export -- silently, with the record still stored
+// and still answered 200, so the attribute simply was not there when someone
+// went looking. bytes is base64-encoded rather than passed through raw,
+// because base64 is what the JSON encoding of the same attribute carries and
+// the two must produce the same row.
 func decodeAnyValue(msg []byte) (otlpValue, bool) {
+	return decodeAnyValueDepth(msg, 0)
+}
+
+// maxAnyValueDepth bounds the recursion. array and kvlist nest, and the
+// nesting arrives from an untrusted exporter: without a limit, a crafted body
+// a few hundred bytes long recurses until the goroutine stack is exhausted,
+// which takes the process down rather than the request. OTLP's own semantic
+// conventions do not nest attributes more than a couple of levels, so 16 is
+// past anything real and far short of what breaks.
+const maxAnyValueDepth = 16
+
+func decodeAnyValueDepth(msg []byte, depth int) (otlpValue, bool) {
 	var out otlpValue
+	if depth > maxAnyValueDepth {
+		return out, false
+	}
 	found := false
 	eachField(msg, func(num, wire int, p []byte) {
 		switch {
@@ -320,6 +418,29 @@ func decodeAnyValue(msg []byte) (otlpValue, bool) {
 		case num == 4 && wire == 1: // double_value
 			f := math.Float64frombits(binary.LittleEndian.Uint64(p))
 			out.DoubleValue, found = &f, true
+		case num == 5 && wire == 2: // array_value: ArrayValue{ repeated AnyValue values = 1 }
+			arr := &otlpArray{}
+			eachField(p, func(n2, w2 int, e []byte) {
+				if n2 == 1 && w2 == 2 {
+					if v, ok := decodeAnyValueDepth(e, depth+1); ok {
+						arr.Values = append(arr.Values, v)
+					}
+				}
+			})
+			out.ArrayValue, found = arr, true
+		case num == 6 && wire == 2: // kvlist_value: KeyValueList{ repeated KeyValue values = 1 }
+			kvl := &otlpKvlist{}
+			eachField(p, func(n2, w2 int, e []byte) {
+				if n2 == 1 && w2 == 2 {
+					if k, v, ok := decodeKVDepth(e, depth+1); ok {
+						kvl.Values = append(kvl.Values, otlpKV{Key: k, Value: v})
+					}
+				}
+			})
+			out.KvlistValue, found = kvl, true
+		case num == 7 && wire == 2: // bytes_value
+			s := base64.StdEncoding.EncodeToString(p)
+			out.BytesValue, found = &s, true
 		}
 	})
 	return out, found

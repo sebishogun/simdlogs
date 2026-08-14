@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -115,14 +114,26 @@ func startNode(t *testing.T) (*api.Server, string, func()) {
 	return srv, ts.URL, func() { ts.Close(); srv.Close() }
 }
 
+// postNDJSON posts a body and FAILS on a non-2xx status.
+//
+// It used to discard the status entirely. TestDiskFootprint posts 73,641,033
+// bytes against config.Default()'s 64 MiB MaxBodyBytes, so every run was 413'd
+// and every run then reported "200000 rows, 0 bytes on disk, 0.00 bytes/row"
+// as a measurement. A harness that ignores the status cannot tell an ingest
+// from a rejection, and every timing built on top of it is timing an empty
+// store.
 func postNDJSON(t *testing.T, url string, body []byte) {
 	t.Helper()
-	resp, err := http.Post(url, "application/x-ndjson", bytes.NewReader(body))
+	resp, err := benchHTTP.Post(url, "application/x-ndjson", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
-	io.Copy(io.Discard, resp.Body)
+	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		t.Fatalf("POST %s: %s (%d bytes posted): %s",
+			url, resp.Status, len(body), strings.TrimSpace(string(rb)))
+	}
 }
 
 // minGet returns the minimum latency over n requests and the response size.
@@ -132,7 +143,7 @@ func minGet(t *testing.T, url string, n int) (time.Duration, int) {
 	size := 0
 	for i := 0; i < n; i++ {
 		t0 := time.Now()
-		resp, err := http.Get(url)
+		resp, err := benchHTTP.Get(url)
 		if err != nil {
 			t.Fatal(err)
 		}

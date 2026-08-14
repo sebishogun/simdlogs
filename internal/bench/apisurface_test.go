@@ -30,7 +30,7 @@ func TestAPISurface(t *testing.T) {
 	postNDJSON(t, slURL+"/insert/jsonline", body)
 
 	if _, err := os.Stat("victoria-logs"); err != nil {
-		t.Skip("victoria-logs binary not staged")
+		skipNoVL(t, "the API-surface probe")
 	}
 	vlDir, _ := os.MkdirTemp("", "surface-vl-")
 	defer os.RemoveAll(vlDir)
@@ -44,7 +44,8 @@ func TestAPISurface(t *testing.T) {
 	vl := "http://127.0.0.1:19450"
 	waitReadyCompat(t, vl+"/insert/ready", 30*time.Second)
 	postNDJSON(t, vl+"/insert/jsonline", body)
-	time.Sleep(2 * time.Second)
+	waitFor(t, readyAtLeast(vl, compatFrom, compatTo, compatRows), time.Minute,
+		"victoria-logs never made the compatibility corpus queryable")
 
 	q := url.QueryEscape("*")
 	esc := url.QueryEscape("level:=error")

@@ -46,6 +46,7 @@ func blockTenantGroupIDs(t *testing.T, dir string, n int) {
 // function, but only a handler test proves the error is not dropped between
 // them -- which is exactly what used to happen.
 func TestInsertJSONLineFailsWhenWritesFail(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	blockTenantGroupIDs(t, dir, 64)
 	srv, err := NewServer(dir)
@@ -80,6 +81,7 @@ func TestInsertJSONLineFailsWhenWritesFail(t *testing.T) {
 // Same contract on the Elasticsearch bulk path, which has its own copy of the
 // branch.
 func TestESBulkFailsWhenWritesFail(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	blockTenantGroupIDs(t, dir, 64)
 	srv, err := NewServer(dir)
@@ -110,6 +112,7 @@ func TestESBulkFailsWhenWritesFail(t *testing.T) {
 // above the threshold stores the same schema a small one does. This is the
 // combination parallelCfg exists for, and nothing exercised it end to end.
 func TestLargeAndSmallIngestAgreeOnSchema(t *testing.T) {
+	t.Parallel()
 	streamsFor := func(t *testing.T, body string) []string {
 		t.Helper()
 		srv, err := NewServer(t.TempDir())

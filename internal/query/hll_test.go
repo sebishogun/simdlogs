@@ -6,6 +6,7 @@ import (
 )
 
 func TestHLLAccuracy(t *testing.T) {
+	t.Parallel()
 	// Small cardinality: linear counting is effectively exact.
 	h := newHLL()
 	for _, s := range []string{"a", "b", "c", "a", "b"} {

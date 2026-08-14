@@ -10,6 +10,7 @@ import (
 // Parallel output must equal the serial path exactly, rows in the same
 // order, for a query spanning many groups.
 func TestParallelEqualsSerial(t *testing.T) {
+	t.Parallel()
 	s, _ := storage.OpenStore(t.TempDir())
 	var ts []int64
 	var sv []string

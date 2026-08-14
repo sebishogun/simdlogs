@@ -29,7 +29,7 @@ func TestEndpointShapes(t *testing.T) {
 
 	vlBin, _ := filepath.Abs("victoria-logs")
 	if _, err := os.Stat(vlBin); err != nil {
-		t.Skip("victoria-logs binary not staged")
+		skipNoVL(t, "the query-shape differential")
 	}
 	vlDir, _ := os.MkdirTemp("", "shapes-vl-")
 	defer os.RemoveAll(vlDir)
@@ -42,7 +42,8 @@ func TestEndpointShapes(t *testing.T) {
 	vl := "http://127.0.0.1:19470"
 	waitReadyCompat(t, vl+"/insert/ready", 30*time.Second)
 	postNDJSON(t, vl+"/insert/jsonline", body)
-	time.Sleep(2 * time.Second)
+	waitFor(t, readyAtLeast(vl, compatFrom, compatTo, compatRows), time.Minute,
+		"victoria-logs never made the compatibility corpus queryable")
 
 	// compatCorpus spans 2024-05-01T00:00:00Z for 500 seconds.
 	const win = "&start=1714521600&end=1714522200"
@@ -104,7 +105,7 @@ func TestParamsHonoured(t *testing.T) {
 
 	vlBin, _ := filepath.Abs("victoria-logs")
 	if _, err := os.Stat(vlBin); err != nil {
-		t.Skip("victoria-logs binary not staged")
+		skipNoVL(t, "the query-shape differential")
 	}
 	vlDir, _ := os.MkdirTemp("", "params-vl-")
 	defer os.RemoveAll(vlDir)
@@ -117,7 +118,8 @@ func TestParamsHonoured(t *testing.T) {
 	vl := "http://127.0.0.1:19475"
 	waitReadyCompat(t, vl+"/insert/ready", 30*time.Second)
 	postNDJSON(t, vl+"/insert/jsonline", body)
-	time.Sleep(2 * time.Second)
+	waitFor(t, readyAtLeast(vl, compatFrom, compatTo, compatRows), time.Minute,
+		"victoria-logs never made the compatibility corpus queryable")
 
 	const win = "&start=1714521600&end=1714522200"
 	all := url.QueryEscape("*")
