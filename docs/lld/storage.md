@@ -14,13 +14,43 @@ rows where VictoriaLogs touches 8M.
 On-disk layout:
 
 ```
-header:  magic u32 ("slog" 0x736C6F67), version u32 (7), rows u32, columns u32
+header:  magic u32 ("slog" 0x736C6F67), version u32 (8), rows u32, columns u32
 columns: per column: name, type, width, rows, data
 footer:  timeMin i64, timeMax i64, per-column meta records, footer-len u32
+v8 only: crc32c u32 over every preceding byte
 ```
 
-The footer is read first (its length is the last four bytes), so a query
-consults skip metadata without decoding any column.
+The footer is read first (its length is the four bytes before the checksum in
+v8, the last four in v7), so a query consults skip metadata without decoding
+any column.
+
+**Versions.** The writer emits **v8**; `ReadGroup` reads v7 and v8 and rejects
+anything else by version rather than by crashing on its layout. v7 is the
+pre-checksum body and stays readable indefinitely -- an operator upgrading a
+binary must not have to rewrite a disk of groups.
+`internal/storage/testdata/v7/` holds five golden v7 blobs captured from the
+last v7 writer, and `TestV7FixturesStillRead` fails if any stops parsing.
+Those files are only regenerated under `SIMDLOGS_WRITE_V7_FIXTURES=1`, so a
+normal run cannot silently rewrite the compatibility evidence with v8 bytes.
+
+**v8 adds integrity.** A CRC32C (Castagnoli, hardware-accelerated on the
+targeted architectures) over the whole body is verified before any structure
+is parsed, so a flipped bit is an error rather than a wrong answer.
+
+**Parsing is bounds-checked** (`group_read.go`). Every footer read goes
+through a cursor that validates the remaining length, and every column's
+data/postings/dict span is checked to lie inside the data region, with the
+sum tested as `off > limit || length > limit-off` so a wrapping `off+len`
+cannot pass. Row count, column count, bloom words and name length are capped
+before any allocation, because those counts come from the file: a corrupt
+column count of 4e9 otherwise becomes a 4-billion-element `make` and an OOM
+kill before a single value is validated.
+
+The previous parser advanced a raw offset and indexed the slice directly, so
+any corrupt length panicked and took the process down. `FuzzReadGroup` pins
+the new contract -- no panic, and a parse that succeeds has spans inside the
+blob -- seeded with the v7 goldens and a fresh v8. A truncated or corrupt
+file now fails `OpenStore` with a message naming what failed.
 
 Column types (`column.go`):
 

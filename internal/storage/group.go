@@ -2,8 +2,8 @@ package storage
 
 import (
 	"encoding/binary"
-	"sync/atomic"
 	"errors"
+	"hash/crc32"
 	"math"
 )
 
@@ -19,8 +19,11 @@ import (
 // structures at this size vs the reference's 8M-row blocks.
 
 const (
-	magic   = 0x736C6F67 // "slog"
-	version = 7          // v7: block-compressed postings (no raw byte-offset table)
+	magic = 0x736C6F67 // "slog"
+	// version is the layout the writer emits. v7 was block-compressed
+	// postings with no integrity check; v8 is the same body plus a trailing
+	// CRC32C. Readers accept both (group_read.go).
+	version = versionV8
 	// MaxRows is the group ceiling; ingest flushes at or before it.
 	MaxRows = 128 * 1024
 )
@@ -67,7 +70,7 @@ type colMeta struct {
 func (g *Group) Marshal() []byte {
 	var b []byte
 	b = appU32(b, magic)
-	b = appU32(b, version)
+	b = appU32(b, versionV8)
 	b = appU32(b, uint32(g.Rows))
 	b = appU32(b, uint32(len(g.Columns)))
 
@@ -148,73 +151,14 @@ func (g *Group) Marshal() []byte {
 		b = appU32(b, uint32(m.DictLen2))
 	}
 	b = appU32(b, uint32(len(b)-footStart))
+	// v8: CRC32C over every preceding byte. It is the last word, so the
+	// footer-length word it follows stays at a fixed offset from the end for
+	// each version and the reader can find both without parsing anything.
+	b = appU32(b, crc32.Checksum(b, crc32c))
 	return b
 }
 
 var errCorrupt = errors.New("storage: corrupt group")
-
-// ReadGroup parses a marshaled group. The footer is read first (its
-// length is the last four bytes) so a query can consult skip metadata
-// without decoding any column.
-func ReadGroup(b []byte) (*Reader, error) {
-	if len(b) < 20 {
-		return nil, errCorrupt
-	}
-	if get32(b, 0) != magic || get32(b, 4) != version {
-		return nil, errCorrupt
-	}
-	r := &Reader{blob: b, Rows: int(get32(b, 8))}
-	ncol := int(get32(b, 12))
-	flen := int(get32(b, len(b)-4))
-	if flen > len(b)-4 {
-		return nil, errCorrupt
-	}
-	f := b[len(b)-4-flen : len(b)-4]
-	r.TimeMin = int64(binary.LittleEndian.Uint64(f[0:]))
-	r.TimeMax = int64(binary.LittleEndian.Uint64(f[8:]))
-	p := 16
-	r.cols = make([]colMeta, ncol)
-	r.idxCache = make([]atomic.Pointer[[]uint32], ncol)
-	r.emptyCache = make([]atomic.Int32, ncol)
-	for i := range r.emptyCache {
-		r.emptyCache[i].Store(-1) // -1: not yet asked
-	}
-	for i := 0; i < ncol; i++ {
-		var m colMeta
-		m.Name, p = getStr(f, p)
-		m.Type = ColumnType(f[p])
-		p++
-		m.Width = int(get32(f, p))
-		p += 4
-		m.DictLen = int(get32(f, p))
-		p += 4
-		m.MinIdx = get32(f, p)
-		p += 4
-		m.MaxIdx = get32(f, p)
-		p += 4
-		m.DataOff = int(get32(f, p))
-		p += 4
-		m.DataLen = int(get32(f, p))
-		p += 4
-		m.PostOff = int(get32(f, p))
-		p += 4
-		m.PostLen = int(get32(f, p))
-		p += 4
-		nb := int(get32(f, p))
-		p += 4
-		m.Bloom = make([]uint64, nb)
-		for j := 0; j < nb; j++ {
-			m.Bloom[j] = binary.LittleEndian.Uint64(f[p:])
-			p += 8
-		}
-		m.DictOff = int(get32(f, p))
-		p += 4
-		m.DictLen2 = int(get32(f, p))
-		p += 4
-		r.cols[i] = m
-	}
-	return r, nil
-}
 
 func appU32(b []byte, v uint32) []byte { return binary.LittleEndian.AppendUint32(b, v) }
 func appU64(b []byte, v uint64) []byte { return binary.LittleEndian.AppendUint64(b, v) }
