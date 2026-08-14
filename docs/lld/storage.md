@@ -163,9 +163,44 @@ directory afterwards holds either the complete new bytes or the previous
 ones, and never a leftover temp file. On Windows `syncDir` is a documented
 no-op — there is no directory handle to flush — so the durability guarantee
 stated here is weaker there.
-- `OpenStore` globs `group-*.bin`, maps and parses each, and skips anything
-  unreadable (a truncated partial flush); readers are safe for concurrent
-  queries.
+- `OpenStore` takes the directory lock, replays the manifest, and maps the
+  groups the manifest names. A `group-*.bin` the manifest does not name never
+  committed and is left on disk untouched; a group the manifest names whose
+  file is missing is an error, not a silent short store.
+
+**One writer per directory** (`lock_unix.go`, `lock_windows.go`). `OpenStore`
+holds an exclusive `flock` on `LOCK` for the life of the store. Two processes
+on one directory each allocate group ids from their own `nextID`, so both
+write `group-7.bin` and one destroys the other's data with nothing to detect
+it. flock is advisory but process-scoped and released by the kernel on exit,
+so a crashed writer does not leave the directory permanently locked. On
+Windows the held handle is the lock (Go opens without share-delete) and a
+crash does leave a stale `LOCK` needing manual removal -- stated here rather
+than papered over, since deleting a lock file whose owner may be alive is the
+failure the lock exists to prevent.
+
+**The manifest is the commit point** (`manifest.go`). Group visibility used to
+be whatever the `group-*.bin` glob returned, which is not a commit point, and
+two failures came straight out of it: retention that unlinked after dropping
+its in-memory entry resurrected the group when the unlink failed, and a group
+was visible the instant its rename landed, before anything recorded that it
+should be.
+
+`MANIFEST` is an append-only log of length-prefixed, CRC32C-checked records,
+each naming added ids, removed ids, a sequence number and an optional write
+receipt (reserved for cluster idempotency, task 8.2). Replay applies records
+in order and stops at the first that is incomplete or fails its checksum --
+the shape a crash mid-append leaves. A torn tail is truncated at open, because
+appending after garbage would make the next replay stop at the garbage and
+lose everything written since.
+
+`AppendGroup` commits before the group becomes visible, so a crash between
+rename and commit leaves a file nothing reads. `CommitRemoval` commits first
+and unlinks second, so a removal that is committed stays removed even if the
+unlink fails. `compact()` rewrites the log as one record naming the live set
+through the atomic helper, keeping replay proportional to the live group set
+rather than to every change ever made. A legacy directory with groups and no
+manifest is validated and bootstrapped with a single snapshot record.
 - `Groups(from, to)` returns readers whose `[TimeMin, TimeMax)` overlaps the
   window — the first skip, before any column is touched. `TailCursor` /
   `GroupsAfterID` are the live-tail watermark.

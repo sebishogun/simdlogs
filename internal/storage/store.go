@@ -19,6 +19,8 @@ type Store struct {
 	nextID   uint64
 	closed   bool
 	openHook func(uint64)
+	lock     *dirLock
+	man      *manifest
 	retired  []retiredMap // mappings replaced by Recompact, unmapped after a grace period
 }
 
@@ -44,25 +46,82 @@ func OpenStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir}
+	// Exclusive for the life of the store. Two processes on one directory
+	// each allocate ids from their own nextID, so both write group-7.bin and
+	// one destroys the other's data with nothing to detect it.
+	lock, err := lockDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	man, err := openManifest(dir)
+	if err != nil {
+		lock.unlock()
+		return nil, err
+	}
+	s := &Store{dir: dir, lock: lock, man: man}
+
 	files, _ := filepath.Glob(filepath.Join(dir, "group-*.bin"))
+	onDisk := make(map[uint64]string, len(files))
 	for _, f := range files {
-		b, unmap, err := mmapFile(f)
+		if id, ok := groupIDFromName(f); ok {
+			onDisk[id] = f
+		}
+	}
+	// A directory with groups and no manifest predates it. Validate what is
+	// there and commit one snapshot naming it, so from here on visibility is
+	// a committed fact rather than whatever the glob returned.
+	if len(man.visible) == 0 && len(onDisk) > 0 {
+		ids := make([]uint64, 0, len(onDisk))
+		for id, path := range onDisk {
+			b, unmap, err := mmapFile(path)
+			if err != nil {
+				continue
+			}
+			_, rerr := ReadGroup(b)
+			unmap()
+			if rerr == nil {
+				ids = append(ids, id)
+			}
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		if err := man.bootstrap(ids); err != nil {
+			man.close()
+			lock.unlock()
+			return nil, err
+		}
+	}
+
+	for _, id := range man.visibleIDs() {
+		path, ok := onDisk[id]
+		if !ok {
+			// Committed but absent: the file was removed behind the
+			// manifest's back. Reported rather than skipped, because a
+			// silently short store answers queries with missing data.
+			man.close()
+			lock.unlock()
+			return nil, fmt.Errorf("storage: group %d is committed but its file is missing", id)
+		}
+		b, unmap, err := mmapFile(path)
 		if err != nil {
+			man.close()
+			lock.unlock()
 			return nil, err
 		}
 		r, err := ReadGroup(b)
 		if err != nil {
 			unmap()
-			return nil, err // a truncated partial flush is skipped by the index, see AppendGroup
+			man.close()
+			lock.unlock()
+			return nil, err
 		}
-		var id uint64
-		fmt.Sscanf(filepath.Base(f), "group-%d.bin", &id)
 		if id >= s.nextID {
 			s.nextID = id + 1
 		}
-		s.groups = append(s.groups, &groupEntry{id: id, path: f, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax, unmap: unmap})
+		s.groups = append(s.groups, &groupEntry{id: id, path: path, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax, unmap: unmap})
 	}
+	// Any group file the manifest does not name never committed -- a crash
+	// between the rename and the commit. It stays on disk untouched; nothing
+	// reads it, and an operator can inspect it.
 	s.sortGroups()
 	return s, nil
 }
@@ -94,6 +153,14 @@ func (s *Store) AppendGroup(g *Group) (uint64, error) {
 		return 0, err
 	}
 	s.mu.Lock()
+	// Commit before the group is visible. A crash between the rename and this
+	// point leaves an uncommitted file that the next open ignores, which is
+	// the difference between "not written" and "half written but queryable".
+	if err := s.man.commit([]uint64{id}, nil, nil); err != nil {
+		s.mu.Unlock()
+		unmap()
+		return 0, err
+	}
 	s.groups = append(s.groups, &groupEntry{id: id, path: final, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax, unmap: unmap})
 	s.sortGroups()
 	s.mu.Unlock()
@@ -116,7 +183,23 @@ func (s *Store) Close() error {
 		}
 	}
 	s.groups = nil
+	if err := s.man.close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.lock.unlock(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	return firstErr
+}
+
+// CommitRemoval records that groups are no longer part of the store. The
+// manifest is the commit point, so a removal that is committed stays removed
+// across a restart even if the unlink afterwards fails -- which is what let
+// retention resurrect a group it had already dropped.
+func (s *Store) CommitRemoval(ids ...uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.man.commit(nil, ids, nil)
 }
 
 func (s *Store) sortGroups() {

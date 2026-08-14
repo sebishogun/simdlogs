@@ -99,7 +99,12 @@ func TestRecompactPreservesDataAndShrinks(t *testing.T) {
 		t.Errorf("second Recompact rewrote %d groups, want 0 (not idempotent)", n2)
 	}
 
-	// Reopening the store must see the recompacted data.
+	// Reopening the store must see the recompacted data. Close first: the
+	// directory lock allows one writer, so a reopen while the first store is
+	// still open is the collision the lock exists to prevent.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 	s2, err := OpenStore(dir)
 	if err != nil {
 		t.Fatal(err)
