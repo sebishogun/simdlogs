@@ -154,6 +154,26 @@ type Config struct {
 	Limits       Limits
 	StreamFields []string
 	Compact      bool
+
+	// CorruptionPolicy is what a tenant store does with a committed group it
+	// cannot read: "fail" (the default) refuses to open it, "quarantine" moves
+	// the group aside and opens degraded.
+	//
+	// A string rather than the storage package's enum, because config must not
+	// depend on storage -- the dependency runs the other way -- and because
+	// this value comes from a flag or a file, where it is a string anyway. The
+	// server parses it once at startup, so a typo is a startup failure and not
+	// a silent fall back to the default.
+	CorruptionPolicy string
+
+	// DirRereadInterval is how often the readiness probe re-reads the store
+	// directories of degraded tenants that are not open, to notice that an
+	// operator has dealt with the evidence.
+	//
+	// Zero means the built-in default (250ms); negative means every call. A
+	// deployment probing every 30 seconds can afford a larger window, and one
+	// running a recovery drill wants no window at all.
+	DirRereadInterval time.Duration
 }
 
 // Default returns a Config with production limits and no data directory.
@@ -164,5 +184,17 @@ func (c *Config) Validate() error {
 	if c.Dir == "" {
 		return fmt.Errorf("config: no data directory")
 	}
+	// The corruption policy is NOT checked here at all.
+	//
+	// storage.ParseCorruptionPolicy owns the accepted set, and config must not
+	// import storage -- the dependency runs the other way. Two checks meant
+	// two answers: first they duplicated the set, so a third policy would have
+	// been accepted by one and rejected by the other; then a shape check here
+	// rejected the surrounding whitespace the parser deliberately trims, so
+	// `-corruption-policy=" quarantine "` was a startup error for a value
+	// storage considers valid.
+	//
+	// NewServerConfig calls Validate and then the parser, so an unknown policy
+	// is still a startup failure -- from the one place that knows the set.
 	return c.Limits.Normalize()
 }

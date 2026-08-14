@@ -129,9 +129,21 @@ func (s *Server) tenant(acc, proj string) (*tenant, error) {
 			}
 		}
 	}
-	st, err := storage.OpenStore(filepath.Join(s.dir, "tenant-"+acc+"-"+proj))
+	st, err := storage.OpenStoreWith(filepath.Join(s.dir, "tenant-"+acc+"-"+proj),
+		storage.OpenOptions{Policy: s.corruptionPolicy})
 	if err != nil {
 		return nil, err
+	}
+	// Whether this tenant is degraded is recorded on the SERVER, not only on
+	// the store, and it survives eviction. forEachTenant iterates open tenants
+	// only, so readiness read "no degraded tenant among those currently open"
+	// -- evicting an idle degraded tenant turned a 503 into a 200 while the
+	// data was still missing, and a store never opened in this process was
+	// invisible to it from the start.
+	if h := st.Health(); h.Degraded() {
+		s.degradedLocked(key, h)
+	} else {
+		delete(s.degraded, key)
 	}
 	tn := &tenant{key: key, store: st, w: ingest.NewWriter(st)}
 	tn.touch()
@@ -355,4 +367,15 @@ func (s *Server) recordLimits() ingest.RecordLimits {
 		MaxNameBytes:  s.limits.MaxFieldNameBytes,
 		MaxValueBytes: s.limits.MaxFieldValueBytes,
 	}
+}
+
+// tenantDir is the store directory for a tenant key ("account:project"). It
+// mirrors the join in tenant(); a key that is not in that form gives a path
+// that does not exist, which every caller treats as "nothing to do".
+func (s *Server) tenantDir(key string) string {
+	acc, proj, ok := strings.Cut(key, ":")
+	if !ok {
+		return filepath.Join(s.dir, "tenant-"+key)
+	}
+	return filepath.Join(s.dir, "tenant-"+acc+"-"+proj)
 }

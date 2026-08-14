@@ -36,7 +36,8 @@ wrapper that swallowed it would break live tailing.
 | `/v1/logs`, `/insert/opentelemetry/v1/logs` | OTLP/HTTP logs JSON |
 | `/insert/journald` | journald export |
 | `/insert/syslog` | syslog over HTTP (native transport: `-syslog` UDP+TCP) |
-| `/insert/ready`, `/insert/datadog/api/v1/validate` | 200 probes |
+| `/-/ready` | the query-side readiness probe. It answers 503 with the degraded tenants named, and it MUTATES: it re-reads the quarantine directory of any degraded tenant that is not open and drops the record when the evidence is gone, which is how an operator's remediation takes effect. A GET with a write side effect is unusual enough to say out loud |
+| `/insert/ready`, `/insert/datadog/api/v1/validate` | 200 probes. `/insert/ready` stays unconditional even for a degraded store: the degradation is read-side and writes still land, so failing it would take the node out of the ingest Service for a query-side problem. `/-/ready` is the probe that reflects storage health |
 
 `/insert/<vendor>/...` prefixed spellings exist so agents configured against
 VictoriaLogs' layout work unchanged.
@@ -200,7 +201,10 @@ code change).
 
 `metrics.go`. Own names (`simdlogs_tenants`, `simdlogs_groups`,
 `simdlogs_rows`, `simdlogs_insert_requests_total`,
-`simdlogs_query_requests_total`, `simdlogs_uptime_seconds`) plus the same
+`simdlogs_query_requests_total`, `simdlogs_uptime_seconds`,
+`simdlogs_storage_corrupt_groups`, `simdlogs_storage_quarantined_groups`,
+`simdlogs_storage_degraded_tenants`,
+`simdlogs_storage_degraded_unacknowledged_tenants`) plus the same
 numbers under the reference's names (`vl_rows_ingested_total`,
 `vl_bytes_ingested_total`, `vl_rows_dropped_total`, `vl_http_requests_total`,
 `vl_http_errors_total`, `vl_live_tailing_requests`, `vl_partitions`,

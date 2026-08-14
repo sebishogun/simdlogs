@@ -364,3 +364,164 @@ session measurement, not a fresh scale/current-release measurement — no
 current-footprint claim exists beyond it, and the roadmap requires fresh
 realistic and scale-vs-VL measurements before any current-facing footprint
 statement.
+
+
+## Corruption policy and storage health
+
+One unreadable group used to make `OpenStore` return an error, which made the
+whole tenant unopenable. That is the right default and was the wrong *only*
+behaviour: an operator with one bad group out of ten thousand had no way to
+read the other 9,999.
+
+Two policies, chosen in `config.Config.CorruptionPolicy` (the
+`-corruption-policy` flag) and parsed once at startup so a typo fails the
+process rather than falling back silently:
+
+| Policy | Behaviour |
+|---|---|
+| `fail` (default) | the first unreadable committed group is an error; nothing on disk is touched |
+| `quarantine` | each unreadable group is moved to `<store>/quarantine/`, dropped from the manifest, and the store opens with what remains |
+
+The policy applies to a **legacy directory** as well, and to a group that
+cannot be MAPPED as much as one that cannot be parsed. Both loops used to treat
+`mmapFile`'s error as a bare `continue` (legacy) or a hard error under both
+policies (main) — so `fail` reported "healthy: 2 groups" for a legacy directory
+with an unopenable group, and `quarantine` could not quarantine the one kind of
+damage most likely to need it. The checksum in the record is best-effort for
+the same reason: refusing to move a group because its bytes cannot be read
+leaves the store unopenable under the policy chosen to keep it open.
+
+**Quarantine ordering.** The record is written first, under the quarantine
+name; then the file is renamed; then both directories are fsynced. Removals
+are collected and committed to the manifest **once**, after the loop — one
+commit per corrupt group is one fsync and one crash window per corrupt group.
+
+The record goes first because the record is the point: a quarantined file
+nobody can identify is evidence destroyed, where a record naming a file still
+in the store is something an operator can act on and the next open re-does.
+
+The window that leaves — file moved, manifest still naming it — is
+**recovered**, not argued away. A committed group whose file is absent *and*
+which has a record in `quarantine/` is treated as a completed quarantine and
+removed from the manifest, under either policy. Without that, quarantine could
+not recover from its own crash window: every later open returned "committed but
+its file is missing" and the store never opened again. A missing group with no
+quarantine record is still a hard error.
+
+**Names carry the checksum.** Group ids are reused, so `quarantine/group-2.bin`
+is not a unique name: a second quarantine of id 2 renamed over the first one's
+file and wrote over the first one's record. Quarantined files are
+`group-<id>-<crc32c>.bin`.
+
+**A quarantined id is never reissued.** `nextID` starts above every id the
+store has ever committed, which is not the same as every id the manifest still
+names — the quarantining open REMOVES the id, so taking the maximum of
+`visibleIDs()` regressed past it on the next open and the store handed that id
+to new data. It is the maximum over the group files on disk (including
+uncommitted ones) and the quarantine directory.
+
+That is not every id ever issued — retention unlinks, so a store whose groups
+have all been dropped restarts its ids from 0. The narrower property is the one
+that matters and does hold: a quarantined id is never reissued, because a
+quarantined file is always in `quarantine/`. A retention-removed id cannot be
+laundered by the recovery gate either, since it leaves no record and the gate
+requires one.
+
+**The recovery gate reads the record, not the filename.** A committed group
+whose file is absent is treated as a completed quarantine only when a record in
+`quarantine/` parses, names that id, and names a file that is there. Matching
+on the filename alone meant one empty `group-1-00000000.bin.json` made a
+genuinely missing group open clean under the `fail` policy, reported as
+"quarantined by an earlier open" with nothing quarantined and no record listed.
+
+**The record** carries the group id, the original path, the quarantined name,
+the reason, the byte count, and a CRC32C **of the bytes as they were at the
+moment of the move** — or `-1` and `0` with the reason saying so, when the file
+could not be read at all. The move still happens: refusing to quarantine a
+group because its bytes are unreadable leaves the store unopenable under the
+policy chosen to keep it open, and a moved file with a record beats a committed
+group dropped with none. That checksum separates "already corrupt on disk" from
+"changed after we moved it", which is the first question asked when another
+copy of the same group reads fine.
+
+**Health and readiness.** `Store.Health()` reports groups served, corrupt
+count, quarantined count, the last error, the policy, and whether an operator
+has acknowledged the state.
+
+`Degraded()` is `Corrupt > 0 || Quarantined > 0`. Both, because `Corrupt` is
+what *this* open found and is zero on the next one — the quarantining open
+removed the group from the manifest, so the restart sees a consistent store.
+The data is still gone. A signal that cleared on restart read healthy one
+restart after permanent loss, with the alert metric at zero.
+
+`Ready()` is `!Degraded() || Acknowledged`, because a degraded store *works* —
+it opens, it serves, its queries return — and every query touching a
+quarantined group comes back with fewer rows and nothing in the response says
+so.
+
+Acknowledgement **persists**, in `quarantine/ACKNOWLEDGED`, together with the
+count it accepted: a restart with the same count stays acknowledged, and one
+more quarantined group makes the counts differ and the store is unacknowledged
+again. `POST /admin/acknowledge-degraded` is the operator surface; without it
+the only way to clear a readiness failure was a restart.
+
+**Probes.** `/-/ready` answers 503 with the degraded tenants named.
+`/health`, `/-/healthy` and **`/insert/ready`** stay unconditional: restarting
+the process fixes nothing a quarantined group suffers from, and the degradation
+is read-side — the store takes writes normally, so failing the ingest probe
+would convert a read-side loss into an ingest outage and take the node out of
+the ingest Service.
+
+Degradation is recorded on the **server**, keyed by tenant, and survives
+eviction. Every tenant directory on disk is scanned at startup — a `ReadDir`
+per tenant, no store opened — because a tenant is marked degraded when its
+store OPENS and `NewServerConfig` opens only the default one: a replica
+restarted onto a disk with a degraded tenant nobody had queried reported ready
+until traffic arrived, which is the wrong way round for a probe whose job is
+keeping traffic off. Walking the open tenants answered "no degraded tenant among those
+currently open", so evicting an idle degraded tenant turned a 503 into a 200
+while the data was still missing. An evicted tenant is acknowledged by writing
+the marker into its directory rather than reopening it, which would evict
+something else.
+
+Four metrics, because they answer different questions:
+`simdlogs_storage_corrupt_groups`, `_quarantined_groups`, `_degraded_tenants`,
+`_degraded_unacknowledged_tenants`. The last is the one to alert on.
+
+They and `/-/ready` derive from ONE snapshot, so the two endpoints cannot
+disagree about a tenant. Their population is **not** `simdlogs_tenants`':
+that counts open tenants, and these count open plus evicted plus scanned. A
+dashboard dividing one by the other can exceed 1, which is a property of the
+two denominators and not a bug in either.
+
+`simdlogs_storage_corrupt_groups` counts groups. A quarantine directory that
+cannot be READ sets a separate `Unreadable` marker rather than incrementing it
+— a permissions problem on one directory is not one corrupt group, and the
+gauge's help text says "committed groups that could not be read at open".
+
+**Clearing the state.** Emptying `quarantine/` is the remediation: the snapshot
+re-reads the directory for any tenant it names that is not open, so the next
+probe sees the evidence gone and the record is dropped. Deleting the tenant
+directory clears it the same way; a directory that merely cannot be READ does
+not, because an error is a problem to report and never an absence.
+
+The re-read is throttled to `DirRereadInterval` (default 250ms,
+`-readiness-reread-interval`), which caps what an unauthenticated probe can
+cost. It saves nothing at an ordinary probe cadence — every probe re-reads —
+and what it closes is the amplification: 2000 probes at 19.4µs each rather than
+2000 x N directory reads. A fresh read is written back into the record, so the
+answer does not depend on which side of the window a probe lands. Without that re-read
+the startup record kept a replica at 503 and the alert at 1 for an empty
+directory, with no escape but a restart — three individually-correct fixes
+interacting, and the only one of them a test could have caught in isolation was
+none.
+
+**What is and is not tested about the syncs.**
+`TestQuarantineSyncsBothDirectories` counts the `faultDirSync` calls the
+quarantine path makes and requires an error from one of them to reach the
+caller — so deleting either `syncDirNamed` turns it red. What it does NOT prove
+is durability: showing that the kernel actually drops unsynced entries needs a
+power-loss rig this repository does not have, the same limit the crash matrix
+has for the fsync boundary (`docs/wrong.md`). An earlier version of this
+paragraph said the mutation could not be caught at all, which was wrong —
+`syncDir` already carries a fault point.

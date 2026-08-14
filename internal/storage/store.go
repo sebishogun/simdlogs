@@ -29,6 +29,9 @@ type Store struct {
 	// set, do IO, then swap; overlapping two of them lets a stale candidate
 	// recreate a group another one removed.
 	structMu sync.Mutex
+
+	// health carries the corruption policy and what it has seen.
+	health healthState
 }
 
 type groupEntry struct {
@@ -49,7 +52,27 @@ type groupEntry struct {
 
 // OpenStore opens or creates a store rooted at dir, loading any groups
 // already present in time order.
+// OpenOptions configures how a store opens. The zero value is the safe
+// default: refuse to open on any unreadable group.
+type OpenOptions struct {
+	// Policy is what to do with a committed group that cannot be read.
+	Policy CorruptionPolicy
+}
+
+// OpenStore opens dir with the default options, which refuse to open when any
+// committed group is unreadable.
 func OpenStore(dir string) (*Store, error) {
+	return OpenStoreWith(dir, OpenOptions{})
+}
+
+// OpenStoreWith opens dir under an explicit policy.
+//
+// Under CorruptionQuarantine an unreadable group is moved into the store's
+// quarantine directory with a record of where it was, why it moved, and its
+// checksum, and the store opens with what remains -- DEGRADED, and not ready
+// until [Store.AcknowledgeDegraded] is called. Under CorruptionFail, the
+// default, the first unreadable group is an error and nothing is moved.
+func OpenStoreWith(dir string, opts OpenOptions) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -66,6 +89,7 @@ func OpenStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{dir: dir, lock: lock, man: man}
+	s.health.policy = opts.Policy
 
 	files, _ := filepath.Glob(filepath.Join(dir, "group-*.bin"))
 	onDisk := make(map[uint64]string, len(files))
@@ -97,13 +121,50 @@ func OpenStore(dir string) (*Store, error) {
 		for id, path := range onDisk {
 			b, unmap, err := mmapFile(path)
 			if err != nil {
+				// A group that cannot be MAPPED is as unreadable as one that
+				// cannot be parsed, and this was a bare `continue` one line
+				// above the branch that applies the policy -- so a legacy
+				// directory with one unopenable group opened clean under
+				// `fail` and reported "healthy: 2 groups".
+				if opts.Policy != CorruptionQuarantine {
+					man.close()
+					lock.unlock()
+					return nil, fmt.Errorf("storage: group %d cannot be opened: %w", id, err)
+				}
+				if qerr := quarantineGroup(dir, path, id, err.Error()); qerr != nil {
+					man.close()
+					lock.unlock()
+					return nil, fmt.Errorf("storage: group %d cannot be opened (%v) and could not be quarantined: %w",
+						id, err, qerr)
+				}
+				s.health.recordCorrupt(fmt.Sprintf("group %d: %s", id, err))
 				continue
 			}
 			_, rerr := ReadGroup(b)
 			unmap()
 			if rerr == nil {
 				ids = append(ids, id)
+				continue
 			}
+			// An unreadable group in a legacy directory is the same event as
+			// one in a committed store and gets the same policy. It used to be
+			// dropped silently: the group never reached the visibleIDs loop,
+			// so `fail` did not fail and Health reported a clean store missing
+			// data. Measured on a three-group directory with the MANIFEST
+			// removed and one group corrupted: OpenStore succeeded, Health
+			// said "healthy: 2 groups", Corrupt was 0.
+			if opts.Policy != CorruptionQuarantine {
+				man.close()
+				lock.unlock()
+				return nil, fmt.Errorf("storage: group %d is unreadable: %w", id, rerr)
+			}
+			if qerr := quarantineGroup(dir, path, id, rerr.Error()); qerr != nil {
+				man.close()
+				lock.unlock()
+				return nil, fmt.Errorf("storage: group %d is unreadable (%v) and could not be quarantined: %w",
+					id, rerr, qerr)
+			}
+			s.health.recordCorrupt(fmt.Sprintf("group %d: %s", id, rerr.Error()))
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 		if err := man.bootstrap(ids); err != nil {
@@ -132,39 +193,177 @@ func OpenStore(dir string) (*Store, error) {
 		return nil, err
 	}
 
+	// nextID starts above EVERY id the store has ever committed, which is not
+	// the same as every id the manifest still names.
+	//
+	// The quarantining open removes the id from the manifest, so the next
+	// open's visibleIDs() no longer holds it and nextID regressed past it.
+	// The store then reissued that id to real data -- and if that file later
+	// went missing, the stale quarantine record made a genuine loss read as
+	// "quarantined by an earlier open", under the fail policy. A committed id
+	// is never reused, and "committed" has to include what was committed and
+	// then quarantined.
+	//
+	// The maximum over the group files on disk (the glob above, which includes
+	// uncommitted ones) and the quarantine directory.
+	//
+	// That is not "every id ever issued" -- retention UNLINKS, so a store
+	// whose groups have all been dropped restarts its ids from 0. The property
+	// that matters is narrower and does hold: a QUARANTINED id is never
+	// reissued, because a quarantined file is always in quarantine/. And a
+	// retention-removed id cannot be laundered by the recovery gate either,
+	// since it leaves no record and the gate requires one.
+	for id := range onDisk {
+		if id >= s.nextID {
+			s.nextID = id + 1
+		}
+	}
+	for _, id := range quarantinedIDs(dir) {
+		if id >= s.nextID {
+			s.nextID = id + 1
+		}
+	}
+
+	// Removals are collected and committed ONCE, after the loop. One commit
+	// per corrupt group is one fsync per corrupt group, and a directory-wide
+	// loss makes that N synchronous commits at open -- with N crash windows
+	// instead of one.
+	var removals []uint64
 	for _, id := range man.visibleIDs() {
+		// nextID must advance past EVERY committed id, including one that is
+		// about to be quarantined. Skipping it left nextID behind the id and
+		// the store reissued it, so a second quarantine of "group 2" renamed
+		// over the first one's evidence.
+		if id >= s.nextID {
+			s.nextID = id + 1
+		}
+
 		path, ok := onDisk[id]
 		if !ok {
-			// Committed but absent: the file was removed behind the
-			// manifest's back. Reported rather than skipped, because a
-			// silently short store answers queries with missing data.
+			// Committed but absent. Two very different situations:
+			//
+			// A quarantine that was interrupted between the rename and the
+			// manifest commit leaves exactly this state, and the record in
+			// quarantine/ says so. Refusing it made quarantine unable to
+			// recover from its own crash window -- the store never opened
+			// again, under EITHER policy, which is the opposite of what the
+			// policy was chosen for.
+			//
+			// Anything else is a file removed behind the manifest's back, and
+			// a silently short store answers queries with missing data.
+			if quarantineRecordExists(dir, id) {
+				removals = append(removals, id)
+				s.health.recordCorrupt(fmt.Sprintf("group %d: quarantined by an earlier open", id))
+				continue
+			}
 			man.close()
 			lock.unlock()
 			return nil, fmt.Errorf("storage: group %d is committed but its file is missing", id)
 		}
 		b, unmap, err := mmapFile(path)
 		if err != nil {
-			man.close()
-			lock.unlock()
-			return nil, err
+			// The mirror of the legacy-path bug: here a group that could not
+			// be mapped was a HARD error under both policies, so quarantine
+			// could not quarantine the one kind of damage most likely to need
+			// it. Both branches take the policy now.
+			if opts.Policy != CorruptionQuarantine {
+				man.close()
+				lock.unlock()
+				return nil, fmt.Errorf("storage: group %d cannot be opened: %w", id, err)
+			}
+			// Quarantined like any other unreadable group, so it leaves a
+			// record. Removing it from the manifest without moving it would
+			// drop a committed group with no evidence, which is the shape
+			// that let a stray file launder a missing group.
+			if qerr := quarantineGroup(dir, path, id, err.Error()); qerr != nil {
+				man.close()
+				lock.unlock()
+				return nil, fmt.Errorf("storage: group %d cannot be opened (%v) and could not be quarantined: %w",
+					id, err, qerr)
+			}
+			s.health.recordCorrupt(fmt.Sprintf("group %d: %s", id, err))
+			removals = append(removals, id)
+			continue
 		}
 		r, err := ReadGroup(b)
 		if err != nil {
 			unmap()
-			man.close()
-			lock.unlock()
-			return nil, err
-		}
-		if id >= s.nextID {
-			s.nextID = id + 1
+			if opts.Policy != CorruptionQuarantine {
+				man.close()
+				lock.unlock()
+				return nil, fmt.Errorf("storage: group %d is unreadable: %w", id, err)
+			}
+			// Quarantine: move it aside, and record the removal for the one
+			// commit after the loop.
+			//
+			// The record is written before the rename because the record is
+			// the point: a quarantined file nobody can identify is evidence
+			// destroyed, where a record naming a file still in the store is
+			// something an operator can act on and the next open re-does.
+			//
+			// The manifest commit comes after the move, and the window that
+			// leaves -- file moved, manifest still naming it -- is recovered
+			// by the branch above rather than argued away.
+			reason := err.Error()
+			if qerr := quarantineGroup(dir, path, id, reason); qerr != nil {
+				man.close()
+				lock.unlock()
+				return nil, fmt.Errorf("storage: group %d is unreadable (%v) and could not be quarantined: %w",
+					id, err, qerr)
+			}
+			removals = append(removals, id)
+			s.health.recordCorrupt(fmt.Sprintf("group %d: %s", id, reason))
+			continue
 		}
 		s.groups = append(s.groups, &groupEntry{id: id, path: path, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax, unmap: unmap})
+	}
+	if len(removals) > 0 {
+		if cerr := man.commit(nil, removals, nil); cerr != nil {
+			man.close()
+			lock.unlock()
+			return nil, fmt.Errorf("storage: %d groups were quarantined but the manifest could not record them: %w",
+				len(removals), cerr)
+		}
 	}
 	// Any group file the manifest does not name never committed -- a crash
 	// between the rename and the commit. It stays on disk untouched; nothing
 	// reads it, and an operator can inspect it.
 	s.sortGroups()
+	qn, readable := countQuarantined(dir)
+	s.health.setQuarantined(qn, readable)
+	s.health.setAcknowledged(readAcknowledgement(dir, qn))
 	return s, nil
+}
+
+// Health is the store's current health. A value copy, so a readiness probe
+// reading it holds no lock while it writes a response.
+func (s *Store) Health() Health {
+	s.mu.RLock()
+	groups := len(s.groups)
+	s.mu.RUnlock()
+	return s.health.snapshot(groups)
+}
+
+// AcknowledgeDegraded records that an operator has accepted the store's
+// degraded state, which makes it ready.
+//
+// It is deliberately not automatic: a store that acknowledged itself would be
+// a store that quarantined a group and carried on, which is the failure this
+// surface exists to make visible.
+//
+// It IS persisted, in the quarantine directory, together with the count it
+// accepted. A restart with the same count stays acknowledged; one more
+// quarantined group makes the counts differ and the store is unacknowledged
+// again. The alternative -- not persisting, so a restart re-asks -- sounded
+// safer and was not: the restart also cleared Corrupt, so instead of being
+// re-asked the operator was told the store was healthy.
+func (s *Store) AcknowledgeDegraded() error {
+	h := s.Health()
+	if err := writeAcknowledgement(s.dir, h.Quarantined); err != nil {
+		return err
+	}
+	s.health.setAcknowledged(true)
+	return nil
 }
 
 // AppendGroup writes a group crash-safely: the bytes go to a temp file,

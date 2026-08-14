@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,24 +35,40 @@ import (
 // tenant (AccountID:ProjectID headers, default 0:0) selects an isolated store;
 // see tenant.go.
 type Server struct {
-	dir        string
-	mu         sync.Mutex
-	tenants    map[string]*tenant
-	def        *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
-	strmFlds   []string
-	compact    bool     // compact mode default for new tenants (flate dict)
-	backends   []string // peer node base URLs; when set, selects fan out and merge (vmselect role)
-	replicas   int      // replication factor: backends group into shards of this many replicas
-	maxRows    int      // cap on a bare (no-pipe) select's rows. Errors, never truncates.
-	limits     config.Limits
-	started    time.Time
-	nIngestReq int64 // ingest requests (atomic)
-	nQueryReq  int64 // query requests (atomic)
-	nRowsIn    int64 // log entries ingested (atomic)
-	nBytesIn   int64 // bytes of log data ingested (atomic)
-	nRowsDrop  int64 // entries rejected as malformed (atomic)
-	nHTTPErrs  int64 // responses with a 4xx/5xx status (atomic)
-	nTails     int64 // live tail requests currently open (atomic)
+	dir      string
+	mu       sync.Mutex
+	tenants  map[string]*tenant
+	def      *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
+	strmFlds []string
+	compact  bool // compact mode default for new tenants (flate dict)
+	// corruptionPolicy is what a tenant store does with an unreadable group.
+	// The zero value is storage.CorruptionFail, so a server configured with
+	// nothing refuses to open a damaged tenant rather than serving it short.
+	corruptionPolicy storage.CorruptionPolicy
+	// degraded is every tenant key whose store reported degraded when it was
+	// opened, and what it reported. Guarded by mu. It outlives the tenant so
+	// eviction cannot turn readiness green.
+	degraded map[string]storage.Health
+	// lastDirReread is when the snapshot last re-read the store directories of
+	// the degraded tenants that are not open. Guarded by mu.
+	lastDirReread time.Time
+	// dirRereadEvery is the throttle window. A field rather than the constant
+	// so a test can assert the re-read SEMANTICS at zero and the throttle
+	// itself separately -- a test that sleeps out a window is measuring the
+	// clock, and one that cannot set the window has to.
+	dirRereadEvery time.Duration
+	backends       []string // peer node base URLs; when set, selects fan out and merge (vmselect role)
+	replicas       int      // replication factor: backends group into shards of this many replicas
+	maxRows        int      // cap on a bare (no-pipe) select's rows. Errors, never truncates.
+	limits         config.Limits
+	started        time.Time
+	nIngestReq     int64 // ingest requests (atomic)
+	nQueryReq      int64 // query requests (atomic)
+	nRowsIn        int64 // log entries ingested (atomic)
+	nBytesIn       int64 // bytes of log data ingested (atomic)
+	nRowsDrop      int64 // entries rejected as malformed (atomic)
+	nHTTPErrs      int64 // responses with a 4xx/5xx status (atomic)
+	nTails         int64 // live tail requests currently open (atomic)
 
 	szMu    sync.Mutex // guards the cached store footprint
 	szBytes int64
@@ -152,7 +169,20 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	srv := &Server{dir: dir, tenants: map[string]*tenant{}, started: time.Now()}
+	pol, err := storage.ParseCorruptionPolicy(c.CorruptionPolicy)
+	if err != nil {
+		return nil, err
+	}
+	srv := &Server{dir: dir, tenants: map[string]*tenant{},
+		degraded: map[string]storage.Health{}, dirRereadEvery: DefaultDirRereadEvery,
+		started: time.Now()}
+	if c.DirRereadInterval != 0 {
+		srv.dirRereadEvery = c.DirRereadInterval
+		if c.DirRereadInterval < 0 {
+			srv.dirRereadEvery = 0 // negative means "every call", like zero
+		}
+	}
+	srv.corruptionPolicy = pol
 	srv.limits = c.Limits
 	// Concurrency budgets. A nil channel means unbounded.
 	if n := c.Limits.MaxConcurrentQuery; n > 0 {
@@ -193,6 +223,11 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	// evictable.
 	def.inFlight.Add(-1)
 	srv.def = def
+	// Every tenant already on disk that is degraded, so readiness is right
+	// from the first probe rather than from the first request that happens to
+	// open one.
+	srv.scanDegradedTenants()
+
 	return srv, nil
 }
 
@@ -452,6 +487,13 @@ func (s *Server) Handler() http.Handler {
 	handle("/insert/syslog", in(nd, s.insertSyslog))                                  // syslog over HTTP (native transport: ListenSyslog)
 	handle("/v1/logs", in(specForPath("/v1/logs"), s.insertOTLPLogs))                 // OpenTelemetry OTLP/HTTP logs
 	handle("/insert/journald", in(specForPath("/insert/journald"), s.insertJournald)) // systemd journal export
+	// /insert/ready stays UNCONDITIONAL. A quarantined group is old data and
+	// the store takes writes normally, so failing the ingest probe converts a
+	// read-side loss into an ingest outage: agents stop shipping to a node
+	// that would have accepted the writes, and the pod leaves the ingest
+	// Service. docs/lld/api.md lists this path under "200 probes" and
+	// cluster.go calls it a liveness probe; only /-/ready reflects storage
+	// health.
 	handle("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	// VictoriaLogs serves every third-party ingest protocol under /insert/<vendor>/.
 	// An agent whose config was written against VictoriaLogs sends the prefixed
@@ -467,12 +509,23 @@ func (s *Server) Handler() http.Handler {
 	handle("/insert/datadog/api/v1/validate",
 		in(specForPath("/insert/datadog/api/v1/validate"), func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	handle("/insert/opentelemetry/v1/logs", in(specForPath("/insert/opentelemetry/v1/logs"), s.insertOTLPLogs))
-	handle("/admin/backup", adm(s.backup))                                                          // tar snapshot for offline restore
+	handle("/admin/backup", adm(s.backup)) // tar snapshot for offline restore
+	// Exempt from the query budget, for opsSpec's own argument with one word
+	// changed: a scraper that gets 429 under load loses the telemetry that
+	// explains the load, and an operator who gets 429 under load loses the
+	// button that ENDS it. 32 in-flight queries is enough to make this return
+	// "too many concurrent requests", and the replica it would have restored
+	// is the one under that load.
+	handle("/admin/acknowledge-degraded", func() http.HandlerFunc {
+		sp := adminSpec()
+		sp.nosem = true
+		return s.requireAuth(config.RoleAdmin, sp, s.guard(sp, s.acknowledgeDegraded))
+	}()) // accept a degraded store
 	handle("/metrics", s.requireAuth(config.RoleMetrics, opsSpec(), s.guard(opsSpec(), s.metrics))) // Prometheus text exposition
 	handle("/alerts", rd(s.alertsHandler))                                                          // alerting rule state
 	handle("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
 	handle("/-/healthy", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
-	handle("/-/ready", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
+	handle("/-/ready", s.readiness)
 	handle("/flags", adm(s.flagsHandler)) // flag dump: administrative
 	handle("/vmui", rd(s.ui))             // web UI (vmui equivalent); same gate as /select/vmui
 	handle("/select/vmui", rd(s.ui))
@@ -1463,4 +1516,444 @@ func hexdig(n byte) byte {
 		return '0' + n
 	}
 	return 'a' + n - 10
+}
+
+// readiness answers whether this server should serve QUERIES.
+//
+// Liveness and readiness are different questions and used to give the same
+// answer. /health and /-/healthy stay unconditional: the process is up, and a
+// liveness probe that fails restarts it, which fixes nothing that a degraded
+// store suffers from. /insert/ready stays unconditional too, because the
+// degradation is on the read side and the store takes writes normally.
+//
+// /-/ready is the query-side probe, so a tenant serving less than it was given
+// takes this replica out of rotation until an operator acknowledges it.
+//
+// That is deliberately conservative. A degraded store WORKS -- it opens, it
+// serves, its queries return -- and that is exactly what makes it dangerous:
+// every query touching a quarantined group returns fewer rows and nothing in
+// the response says so. A replica silently answering short is worse than a
+// replica out of rotation, so the default is out.
+//
+// The body names every degraded tenant, because "not ready" without a reason
+// sends an operator to the logs of the wrong process.
+func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
+	var bad []tenantHealth
+	for _, t := range s.degradedSnapshot() {
+		if !t.health.Ready() {
+			bad = append(bad, t)
+		}
+	}
+	if len(bad) == 0 {
+		w.Write([]byte("OK"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	fmt.Fprintf(w, "NOT READY: %d degraded tenant(s)\n", len(bad))
+	for _, d := range bad {
+		fmt.Fprintf(w, "%s: %s\n", d.key, d.health)
+	}
+}
+
+// The corruption policy is set through config.Config and nowhere else.
+//
+// A setter existed briefly. It was removed because the policy has to be in
+// force before any store opens and there is no moment after construction that
+// is reliably before that: NewServerConfig opens the default tenant, and every
+// other tenant opens on its first request. A setter would have worked for the
+// lazily-opened ones and silently missed the default one -- which is the shape
+// of API that is worse than none.
+
+// AcknowledgeDegraded records operator acceptance of every degraded tenant and
+// reports how many were acknowledged. A server-wide acknowledgement, because
+// that is the granularity an operator acts at: they have looked at the alert,
+// they know what is quarantined, and they are putting the replica back in
+// rotation.
+func (s *Server) AcknowledgeDegraded() (int, error) {
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.degraded))
+	for k := range s.degraded {
+		keys = append(keys, k)
+	}
+	s.mu.Unlock()
+
+	n := 0
+	var firstErr error
+	for _, key := range keys {
+		s.mu.Lock()
+		tn, open := s.tenants[key]
+		s.mu.Unlock()
+		if !open {
+			// Evicted. The acknowledgement is a file in the store's own
+			// quarantine directory, so it is written where the store will
+			// read it at its next open rather than reopening the tenant here
+			// -- reopening to acknowledge would evict something else.
+			// Skip one already acknowledged: AcknowledgeDegradedDir ran
+			// unconditionally, so a second call counted the same evicted
+			// tenant again and reported "acknowledged 1" twice.
+			s.mu.Lock()
+			known, ok := s.degraded[key]
+			s.mu.Unlock()
+			if ok && known.Acknowledged {
+				continue
+			}
+			if err := storage.AcknowledgeDegradedDir(s.tenantDir(key)); err != nil {
+				// Nothing quarantined is not a failure and is not an
+				// acknowledgement: counting it would report a tenant accepted
+				// with no marker written, and it would be unacknowledged again
+				// at the next open.
+				if storage.ErrNothingToAcknowledge(err) {
+					// The quarantine directory is empty: the operator has
+					// dealt with the evidence, which is the remediation the
+					// LLD documents. Drop the record rather than skipping --
+					// skipping left the replica at 503 and the alert metric at
+					// 1 for an empty directory, with no escape but a restart.
+					s.mu.Lock()
+					if _, open := s.tenants[key]; !open {
+						delete(s.degraded, key)
+					}
+					s.mu.Unlock()
+					continue
+				}
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			n++
+			s.mu.Lock()
+			if h, ok := s.degraded[key]; ok {
+				h.Acknowledged = true
+				s.degraded[key] = h
+			}
+			s.mu.Unlock()
+			continue
+		}
+		if h := tn.store.Health(); h.Degraded() && !h.Acknowledged {
+			if err := tn.store.AcknowledgeDegraded(); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			n++
+			s.mu.Lock()
+			h.Acknowledged = true
+			s.degraded[key] = h
+			s.mu.Unlock()
+		}
+	}
+	return n, firstErr
+}
+
+// degradedLocked records a tenant's degraded health. s.mu must be held.
+func (s *Server) degradedLocked(key string, h storage.Health) {
+	if s.degraded == nil {
+		s.degraded = map[string]storage.Health{}
+	}
+	s.degraded[key] = h
+}
+
+// acknowledgeDegraded is the operator's accept button: POST it and every
+// degraded tenant becomes ready.
+//
+// Administrative, because it silences a readiness failure. It reports how many
+// tenants it accepted and what is still degraded, so the operator sees what
+// they just took responsibility for rather than a bare 200.
+func (s *Server) acknowledgeDegraded(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		w.Header().Set("Allow", "POST, PUT")
+		http.Error(w, "acknowledging a degraded store is a POST", http.StatusMethodNotAllowed)
+		return
+	}
+	n, err := s.AcknowledgeDegraded()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "acknowledged %d tenant(s), then failed: %v\n", n, err)
+		return
+	}
+	fmt.Fprintf(w, "acknowledged %d degraded tenant(s)\n", n)
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.degraded))
+	for k, h := range s.degraded {
+		if h.Degraded() {
+			keys = append(keys, fmt.Sprintf("%s: %s", k, h))
+		}
+	}
+	s.mu.Unlock()
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintln(w, k)
+	}
+}
+
+// scanDegradedTenants records every tenant directory already holding
+// quarantined groups, without opening a store.
+//
+// A tenant is marked degraded when its store OPENS, and NewServerConfig opens
+// only the default one — every other tenant opens on its first request. So a
+// replica restarted onto a disk with a degraded tenant nobody had queried yet
+// reported ready, and only went 503 once a request happened to touch it. That
+// is the wrong way round: the probe exists to keep traffic off, and it went
+// green until traffic arrived.
+//
+// It reads directories rather than opening stores, so the cost is one ReadDir
+// per tenant and no mmap, no lock, and no manifest replay.
+func (s *Server) scanDegradedTenants() {
+	ents, err := os.ReadDir(s.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		rest, ok := strings.CutPrefix(e.Name(), "tenant-")
+		if !ok {
+			continue
+		}
+		acc, proj, ok := strings.Cut(rest, "-")
+		if !ok {
+			continue
+		}
+		dir := filepath.Join(s.dir, e.Name())
+		h, ok := storage.HealthOfDir(dir)
+		if !ok || !h.Degraded() {
+			continue
+		}
+		key := acc + ":" + proj
+		s.mu.Lock()
+		if _, open := s.tenants[key]; !open {
+			s.degradedLocked(key, h)
+		}
+		s.mu.Unlock()
+	}
+}
+
+// storageHealthTotals sums the storage-health gauges across every tenant the
+// server knows to be degraded, open or not, plus the healthy open ones.
+//
+// It reads s.degraded, which readiness reads, so the two cannot disagree. The
+// map is copied under the lock and the live stores are read outside it, for
+// the reason readiness does the same: s.mu is held across a cold tenant open.
+// degradedSnapshot is every tenant the server knows to be degraded, plus the
+// healthy open ones, with each one's current health.
+//
+// ONE implementation, because readiness and /metrics both need it and having
+// two was the shape docs/wrong.md names: a fix that changes where a fact comes
+// from has to change every reader of that fact. They differed in their
+// population -- inert, because an open tenant absent from s.degraded is Ready
+// -- and that is the next drift, not a safe difference.
+//
+// The map and the store pointers are copied under s.mu and the health is read
+// outside it: s.mu is held across a cold tenant open, which mmaps and parses
+// every group, and a readiness probe queued behind that fails and pulls the
+// pod.
+//
+// A tenant the record names but nothing has open is RE-READ from its
+// directory. That is what makes the documented remediation work: an operator
+// who empties quarantine/ has dealt with the evidence, and without the re-read
+// the startup record kept the replica at 503 and the alert metric at 1 for an
+// empty directory, with no escape but a restart. One ReadDir, the same cost
+// the startup scan already pays.
+func (s *Server) degradedSnapshot() []tenantHealth {
+	type entry struct {
+		key   string
+		h     storage.Health
+		store *storage.Store
+	}
+	s.mu.Lock()
+	// Whether this call re-reads the directories, decided once for the whole
+	// snapshot and recorded under the same lock, so concurrent probes do not
+	// each pay for it.
+	now := time.Now()
+	reread := now.Sub(s.lastDirReread) >= s.dirRereadEvery
+	if reread {
+		s.lastDirReread = now
+	}
+	snap := make([]entry, 0, len(s.degraded)+len(s.tenants))
+	seen := make(map[string]bool, len(s.degraded))
+	for key, h := range s.degraded {
+		e := entry{key: key, h: h}
+		if tn, ok := s.tenants[key]; ok {
+			e.store = tn.store
+		}
+		snap = append(snap, e)
+		seen[key] = true
+	}
+	// Open tenants the record does not name. They are healthy by construction
+	// -- an open store with anything quarantined is in s.degraded, because
+	// Degraded() reads Quarantined -- so they contribute zeros. They are here
+	// so a caller counting tenants from this snapshot sees all of them.
+	for key, tn := range s.tenants {
+		if !seen[key] {
+			snap = append(snap, entry{key: key, store: tn.store})
+		}
+	}
+	s.mu.Unlock()
+
+	out := make([]tenantHealth, 0, len(snap))
+	type staleKey struct {
+		key string
+		was storage.Health
+	}
+	type freshKey struct {
+		key      string
+		was, now storage.Health
+	}
+	var stale []staleKey
+	var fresher []freshKey
+
+	for _, e := range snap {
+		h := e.h
+		if e.store != nil {
+			// The live store is the freshest answer.
+			out = append(out, tenantHealth{key: e.key, health: e.store.Health()})
+			continue
+		}
+		// Not open: re-read the directory, skipping the read when the
+		// quarantine directory has not changed since the last one. The
+		// recorded Health is a snapshot from startup or from the last time the
+		// tenant closed, and the operator's remediation happens on disk.
+		if !reread {
+			// Inside the throttle window: the recorded answer stands. Open
+			// tenants are never throttled -- their health is in memory -- so
+			// this only delays noticing a change an operator made on disk, by
+			// at most dirRereadEvery.
+			out = append(out, tenantHealth{key: e.key, health: h})
+			continue
+		}
+		dir := s.tenantDir(e.key)
+		fresh, ok := storage.HealthOfDir(dir)
+		switch {
+		case ok:
+			h = fresh
+		case dirGone(dir):
+			// The tenant directory is GONE. Deleting a tenant is an ordinary
+			// operator action -- more common than emptying one quarantine
+			// directory -- and treating "not a store" as "keep the recorded
+			// answer" left the probe reporting a quarantined group for a
+			// directory that does not exist, recoverable only through the
+			// acknowledge endpoint, which reported acknowledging nothing
+			// while doing it.
+			h = storage.Health{}
+		}
+		if !h.Degraded() {
+			stale = append(stale, staleKey{key: e.key, was: e.h})
+		} else if h != e.h {
+			// Still degraded and CHANGED: write it back, or the record never
+			// advances past what startup recorded and every throttled probe
+			// reverts to it. Same on-disk state, back to back: the re-reading
+			// call answered 200 and the throttled one 503 -- and /-/ready and
+			// /metrics disagreed with each other, which is the invariant the
+			// one-snapshot change exists to hold.
+			fresher = append(fresher, freshKey{key: e.key, was: e.h, now: h})
+		}
+		out = append(out, tenantHealth{key: e.key, health: h})
+	}
+	// Drop the tenants whose evidence is gone, so the next probe does not pay
+	// the ReadDir again.
+	if len(stale) > 0 || len(fresher) > 0 {
+		s.mu.Lock()
+		for _, f := range fresher {
+			// Guarded the same way the delete is: the record must be the one
+			// the re-read was taken against.
+			if cur, ok := s.degraded[f.key]; ok && cur == f.was {
+				s.degraded[f.key] = f.now
+			}
+		}
+		for _, e := range stale {
+			// The record must be the SAME one the re-read was taken against.
+			// Between releasing s.mu and reacquiring it a tenant can open
+			// degraded -- repopulating the record with fresh health -- and
+			// then be evicted, at which point "is it open" answers no and a
+			// correct record would be deleted on the strength of a read that
+			// predates it. Health is comparable, so the check is exact.
+			if cur, ok := s.degraded[e.key]; ok && cur == e.was {
+				delete(s.degraded, e.key)
+			}
+		}
+		s.mu.Unlock()
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
+	return out
+}
+
+// tenantHealth pairs a tenant key with its health, for the readers of
+// degradedSnapshot.
+type tenantHealth struct {
+	key    string
+	health storage.Health
+}
+
+// storageHealthTotals sums the storage-health gauges over the same snapshot
+// readiness reads, so the two endpoints cannot disagree.
+func (s *Server) storageHealthTotals() (corrupt, quarantined, degraded, unacked int64) {
+	for _, t := range s.degradedSnapshot() {
+		corrupt += int64(t.health.Corrupt)
+		quarantined += int64(t.health.Quarantined)
+		if t.health.Degraded() {
+			degraded++
+			if !t.health.Acknowledged {
+				unacked++
+			}
+		}
+	}
+	return corrupt, quarantined, degraded, unacked
+}
+
+// dirGone reports whether a tenant directory is ABSENT, which is the only
+// condition that may drop a degraded record.
+//
+// It used to be `err == nil && fi.IsDir()`, read as "deleted" for ANY error --
+// and EACCES is an error. `chmod 000` on the data directory therefore deleted
+// every degraded record, reported the server READY, and did not recover when
+// the permissions were restored, because the record was gone and only a
+// restart rebuilds it.
+//
+// That is the same anti-pattern this task has now fixed three times:
+// countQuarantined returning 0 on any error, HealthOfDir synthesising a
+// corrupt count for an unreadable directory, and this. It is worse than
+// either, because misreporting is recoverable and destroying the record is
+// not. An unreadable directory is a problem to report, never an absence.
+func dirGone(path string) bool {
+	_, err := os.Stat(path)
+	return os.IsNotExist(err)
+}
+
+// dirRereadEvery throttles how often the readiness snapshot re-reads the store
+// directories of degraded tenants that are not open.
+//
+// A per-directory mtime cache was the first attempt and is unsound twice over.
+// Part of the cached answer is the CONTENTS of quarantine/ACKNOWLEDGED, an
+// exported operator-visible file: rewriting it in place changes the answer and
+// not the directory. And an equal mtime is not proof of an unchanged
+// directory -- one second is the natural timestamp granularity on ext3, ext4
+// with 128-byte inodes, HFS+ and many NFS servers, and two on exFAT, so "the
+// last probe and the operator's rm land in the same second" is a routine
+// coincidence. Measured by forcing the collision: 503 and a gauge of 1 for an
+// empty directory, permanently, because no probe ever re-reads.
+//
+// A time window has neither problem: it depends on no filesystem property and
+// caches nothing per file. 250ms against a probe interval of one to ten
+// seconds keeps the "the answer changes the moment the operator acts"
+// requirement -- an operator cannot observe a quarter second -- and takes the
+// steady-state cost of a degraded fleet from every probe to four per second.
+const DefaultDirRereadEvery = 250 * time.Millisecond
+
+// SetDirRereadInterval sets how often the readiness snapshot re-reads the
+// store directories of degraded tenants that are not open. Zero means every
+// call.
+//
+// The ordinary way to set it is config.Config.DirRereadInterval, which the
+// -readiness-reread-interval flag fills in. This setter exists for a caller
+// that embeds the server and wants to change it at run time; it was briefly
+// the ONLY way, which made it an exported API reachable from nothing but the
+// tests -- the shape docs/wrong.md already names for this task.
+func (s *Server) SetDirRereadInterval(d time.Duration) {
+	s.mu.Lock()
+	s.dirRereadEvery = d
+	s.mu.Unlock()
 }

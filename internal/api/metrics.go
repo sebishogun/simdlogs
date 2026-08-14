@@ -57,6 +57,15 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		rows += int64(tn.store.TotalRows())
 		tenants++
 	})
+	// Storage health comes from the SERVER's record, the same source
+	// readiness reads -- not from a walk of the open tenants.
+	//
+	// This walked forEachTenant, which is open tenants only, and so was blind
+	// to exactly the case the startup scan was added for: a degraded tenant no
+	// request has touched made /-/ready answer 503 while every one of these
+	// gauges read 0. The probe pulled the pod and the alert never fired, and
+	// two endpoints on one server disagreed about one tenant.
+	corrupt, quarantined, degraded, unacked := s.storageHealthTotals()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	m := func(name, help, typ string, v int64) {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", name, help, name, typ, name, v)
@@ -67,6 +76,19 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	m("simdlogs_insert_requests_total", "Ingest requests received.", "counter", atomic.LoadInt64(&s.nIngestReq))
 	m("simdlogs_query_requests_total", "Query requests received.", "counter", atomic.LoadInt64(&s.nQueryReq))
 	m("simdlogs_uptime_seconds", "Process uptime in seconds.", "gauge", int64(time.Since(s.started).Seconds()))
+
+	// Storage health. Four numbers rather than one, because they answer
+	// different questions and an operator needs all four: how much data is
+	// unreadable right now (corrupt), how much has ever been set aside
+	// (quarantined), how many tenants are serving less than they were given
+	// (degraded), and how many of those nobody has looked at yet
+	// (unacknowledged). The last is the one to alert on: a degraded tenant an
+	// operator has accepted is a known state, and one nobody has accepted is
+	// silently answering queries with missing rows.
+	m("simdlogs_storage_corrupt_groups", "Committed groups that could not be read at open.", "gauge", corrupt)
+	m("simdlogs_storage_quarantined_groups", "Groups moved into quarantine, over the store's history.", "gauge", quarantined)
+	m("simdlogs_storage_degraded_tenants", "Tenants serving less than their committed data.", "gauge", degraded)
+	m("simdlogs_storage_degraded_unacknowledged_tenants", "Degraded tenants no operator has acknowledged.", "gauge", unacked)
 
 	// The same numbers under the reference's names, so a dashboard written for
 	// it graphs this server unchanged. Only the metrics whose meaning we can

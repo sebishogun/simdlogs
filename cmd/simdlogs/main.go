@@ -28,6 +28,14 @@ func main() {
 	tierDropPost := flag.Bool("recompact-drop-postings", false, "when recompacting, also drop the per-column inverted index (35% smaller total vs 8% for flate alone, but cold equality queries fall back to a scan -- what VictoriaLogs does for every query)")
 	tierAfter := flag.Duration("recompact-after", 0, "re-encode groups older than this with flate dictionaries (~17% smaller, slower value reads on cold data); 0 disables")
 	streamFields := flag.String("stream-fields", "", "comma-separated fields that identify a log stream (synthesizes _stream)")
+	readinessReread := flag.Duration("readiness-reread-interval", 0,
+		"how often /-/ready re-reads the store directory of a degraded tenant that is not open, "+
+			"to notice that an operator has cleared the quarantine (0 = the built-in 250ms, "+
+			"negative = every probe)")
+	corruptionPolicy := flag.String("corruption-policy", "fail",
+		"what to do with a stored group that cannot be read: fail (refuse to open the tenant) "+
+			"or quarantine (move it aside, serve the rest, and report the tenant degraded and "+
+			"not ready until POST /admin/acknowledge-degraded)")
 	syslogAddr := flag.String("syslog", "", "also listen for syslog on this UDP/TCP address (e.g. :514)")
 	backends := flag.String("select-backends", "", "comma-separated peer node URLs; when set this node is a select router (vmselect role)")
 	compact := flag.Bool("compact", false, "compact mode: flate dictionaries for ~15% smaller groups, but 2-10x slower value-reading queries -- for cold archival only, not a queryable store")
@@ -90,6 +98,8 @@ func main() {
 	}
 
 	cfg := config.Default()
+	cfg.CorruptionPolicy = *corruptionPolicy
+	cfg.DirRereadInterval = *readinessReread
 	cfg.Dir = *dir
 	cfg.Compact = *compact
 	if *streamFields != "" {

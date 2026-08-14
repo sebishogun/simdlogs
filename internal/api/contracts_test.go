@@ -251,6 +251,10 @@ func routeContracts() []contract {
 		// --- backup: a tar, and the body is bytes rather than a shape ---
 		{method: "GET", path: "/admin/backup", token: tokAdmin, wantStatus: 200,
 			wantCT: "application/x-tar"},
+		// --- acknowledging a degraded store: administrative, and a POST,
+		// because it silences a readiness failure ---
+		{method: "POST", path: "/admin/acknowledge-degraded", token: tokAdmin, wantStatus: 200,
+			wantCT: "text/plain"},
 	}
 }
 

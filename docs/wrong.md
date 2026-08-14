@@ -1624,3 +1624,495 @@ Three tests pin it, and all three fail against the old gate:
 `TestCrashRecoveryMatrixFirstBatch` (at `dir-open` and `dir-sync`).
 `TestLegacyDirectoryWithNoManifestIsAdopted` passes both ways and exists to
 stop the fix from being an over-correction.
+
+## A corruption policy whose own crash window made the store permanently unopenable
+
+Task 3.5 added a `quarantine` policy: move an unreadable group aside, open with
+what remains. The move writes the record, renames the file, then commits the
+manifest removal — and the missing-file check ran BEFORE the policy check, so
+a crash in that window left the manifest naming a group now in `quarantine/`
+and every later open returned:
+
+```
+storage: group 1 is committed but its file is missing
+```
+
+Under **both** policies, forever. Quarantine could not recover from its own
+crash window, which is the one failure it exists to survive. Reproduced with
+the package's own fault injector at `faultManifestWrite`, which is exactly that
+window. A committed group whose file is absent and which has a record in
+`quarantine/` is now treated as a completed quarantine and removed from the
+manifest; a missing group with no record is still a hard error.
+
+The comment justifying the ordering was also false. It said the reverse order
+would leave "the state OpenStore's legacy-directory gate has already been wrong
+about twice" — but that gate is `!man.preexisted && len(onDisk) > 0`, and in
+every quarantine scenario the manifest exists, so the gate cannot fire. The
+order is right for a different reason, which is now the one written down: a
+quarantined file with no record is evidence destroyed, and the record is the
+entire point of quarantining rather than deleting.
+
+## A degradation signal that read zero one restart after permanent data loss
+
+`Degraded()` was `Corrupt > 0`. `Corrupt` is what *this* open found, and the
+quarantining open removes the group from the manifest — so the next open sees a
+consistent store, finds nothing corrupt, and reports healthy. Measured through
+the API, after a restart following a quarantine:
+
+```
+simdlogs_storage_corrupt_groups 0
+simdlogs_storage_quarantined_groups 1
+simdlogs_storage_degraded_tenants 0
+simdlogs_storage_degraded_unacknowledged_tenants 0
+/-/ready = 200
+```
+
+`_degraded_unacknowledged_tenants` is documented as "the one to alert on", and
+it read 0 with a group permanently gone. The degradation was process-lifetime
+while the loss was durable.
+
+Compounding it, acknowledgement was deliberately NOT persisted, on the
+reasoning that a restart should re-ask the operator. It never re-asked: the
+restart cleared the degradation too, so instead of being asked again the
+operator was told the store was healthy.
+
+`Degraded()` is `Corrupt > 0 || Quarantined > 0` now, and the acknowledgement
+is a marker in the quarantine directory carrying the count it accepted — same
+count, still acknowledged; one more quarantined group, unacknowledged again.
+
+## Four more ways the surface was reachable only in tests
+
+None of these is subtle, and all four survived writing the feature and its
+thirteen tests:
+
+- **No flag.** `config.Config.CorruptionPolicy` had no `-corruption-policy`
+  flag, so an operator running the shipped binary could only get `fail`. The
+  policy was configurable for embedders and tests.
+- **No endpoint.** `Server.AcknowledgeDegraded` had no route. The only way to
+  clear a 503 was a restart — which, per the entry above, also erased the
+  degradation.
+- **Eviction reset it.** Readiness walked the OPEN tenants, so evicting an idle
+  degraded tenant turned 503 into 200 while the data was still missing.
+  Measured with `MaxOpenTenants: 2`. Degradation is recorded on the server now,
+  keyed by tenant, and survives eviction.
+- **`/insert/ready` answered 503.** A quarantined group is old data and the
+  store takes writes normally, so failing the ingest probe converted a
+  read-side loss into an ingest outage and took the node out of the ingest
+  Service. It also contradicted two documents that call it a 200 probe. Only
+  `/-/ready` reflects storage health.
+
+The pattern across all four: the feature was built and tested from the inside,
+where every surface is reachable by calling the method.
+
+## The `fail` policy did not fail on a legacy directory
+
+`OpenStore`'s bootstrap loop — the one-time migration for directories written
+before the manifest existed — excluded any group it could not read, silently.
+The group never reached the loop that applies the policy, so `fail` neither
+failed nor reported. Measured on a three-group directory with the MANIFEST
+removed and one group corrupted:
+
+```
+OpenStore (default policy) succeeded
+Health: "healthy: 2 groups"   Corrupt: 0   Ready: true
+```
+
+A silent drop with a clean health report, from the policy whose entire purpose
+is to refuse rather than serve short.
+
+## Three mutations that left the suite green, and one that still does
+
+A reviewer broke the feature three ways and ran the full suite:
+
+| Mutation | Before | Now |
+|---|---|---|
+| invert the quarantine order: rename, then write the record | green | caught |
+| flip the server's default policy from `fail` to `quarantine` | green | caught |
+| delete both `syncDirNamed` calls from the quarantine path | green | caught |
+
+The first two are pinned by `TestQuarantineWritesTheRecordBeforeMovingTheFile`
+and `TestServerDefaultPolicyRefusesACorruptTenant`.
+
+The third was recorded here as uncatchable — "proving a directory sync needs
+the unsynced entries actually dropped, which is a power-loss rig this
+repository does not have". That conflated two claims. Proving the KERNEL drops
+something does need a rig; proving the CALLS HAPPEN does not, and `syncDir`
+already carries `fault(faultDirSync)`, the same injection point the crash
+matrix uses one entry above. `TestQuarantineSyncsBothDirectories` counts the
+calls and requires an error from one to reach the caller, and goes red with
+either `syncDirNamed` deleted.
+
+Recorded because it is the second time in this task that "cannot be tested"
+turned out to mean "I did not look for the injection point that was already
+there".
+
+Also caught by the same review: group ids are reused, so two quarantines of one
+id renamed onto one name and one record wrote over the other — destroying the
+evidence quarantine exists to keep. Quarantined files carry the checksum in
+their name now, and `nextID` advances past a quarantined id.
+
+## Six more, four of them in the code that fixed the last four
+
+The review of the round above found six new defects. Four are in the code
+written to fix findings from the round before it, which is the part worth
+recording: a fix made under time pressure to close a hole is written by someone
+thinking about that hole, and it opens adjacent ones.
+
+**A filename check authorized dropping a committed group.** The recovery gate
+for an interrupted quarantine matched `group-<id>-*.json` and never opened the
+file. One empty `quarantine/group-1-00000000.bin.json` dropped into a store,
+with `group-1.bin` deleted:
+
+```
+degraded (unacknowledged, policy fail): 2 groups serving, 1 corrupt,
+0 quarantined: group 1: quarantined by an earlier open
+QuarantinedGroups lists 0 records
+```
+
+Under the **default** policy. A store reporting a completed quarantine with
+nothing quarantined has laundered a missing group into a clean state, and the
+token that authorized it is invisible to the operator listing. The gate reads
+the record now, requires it to name that id, and requires the file it says it
+moved to be there — which also makes it agree with `QuarantinedGroups` and
+`countQuarantined`, which read the same directory and disagreed with it.
+
+**A quarantined id was reissued, and the stale record then laundered a real
+loss.** `nextID` advanced past every id in `visibleIDs()`, and the quarantining
+open REMOVES the id from the manifest — so the next open regressed past it.
+Entirely from the store's own behaviour:
+
+```
+quarantine the top id (2) -> restart -> AppendGroup returns id 2 again, real data
+-> that file goes missing behind the manifest's back
+-> OpenStore (DEFAULT policy): "degraded ... 1 corrupt, 1 quarantined:
+   group 2: quarantined by an earlier open"
+```
+
+A genuine loss reported as an old quarantine. The LLD's claim that "`nextID`
+advances past a quarantined id so the store does not reissue it" was true only
+inside the open that quarantines. It is now the maximum over the group files on
+disk and the quarantine directory, both of which carry every id ever issued.
+
+**`fail` still did not fail when the file could not be MAPPED.** One line above
+the `ReadGroup` branch that had just been fixed, `mmapFile`'s error was a bare
+`continue`. Measured with mode 000 on one group of a three-group legacy
+directory: `OpenStore` under `fail` returned `healthy: 2 groups`, `Corrupt: 0`.
+The mirror in the main loop was a hard error under **both** policies, so
+quarantine could not quarantine the one kind of damage most likely to need it.
+Both take the policy now, and the record's checksum became best-effort —
+refusing to move a group because its bytes cannot be read leaves the store
+unopenable under the policy chosen to keep it open.
+
+**Concurrent acknowledgement returned 500.** `writeFileAtomic` uses a fixed
+`path + ".tmp"`, so two writers race on one temp name and the loser's rename
+finds nothing. Through HTTP, three runs of 100 concurrent POSTs returned 9, 22
+and 25 failures:
+
+```
+500: acknowledged 0 tenant(s), then failed: rename .../ACKNOWLEDGED.tmp
+     .../ACKNOWLEDGED: no such file or directory
+```
+
+The contents were never wrong — every writer writes the same bytes — so this
+was availability, on the one endpoint whose job is clearing a readiness
+failure.
+
+**Readiness still missed a tenant no request had touched.** Degradation is
+recorded when a store OPENS, and `NewServerConfig` opens only the default
+tenant. `/-/ready` answered 200 at startup with a degraded tenant on disk and
+503 after one request to it — a probe whose job is keeping traffic off, going
+green until traffic arrived. Every tenant directory is scanned at startup now,
+one `ReadDir` each, no store opened.
+
+**`Sscanf("%d")` ignored trailing input**, so an `ACKNOWLEDGED` marker reading
+`"1 and whatever else"` acknowledged 1. Empty, `"yes"`, `"-1"` and a 23-digit
+overflow were already refused. `strconv.Atoi` on the trimmed contents closes
+it.
+
+And the config check, wrong for the third time in three rounds: it duplicated
+storage's policy set (round one), then rejected the surrounding whitespace the
+parser deliberately trims (round two), so `-corruption-policy=" quarantine "`
+was a startup error for a value storage considers valid. It is gone. The parser
+owns the set, `NewServerConfig` calls it, and an unknown policy is still a
+startup failure — from the one place that knows the answer.
+
+## The readiness fix left /metrics behind, so the alert metric was blind to exactly the case it was added for
+
+The round above moved readiness onto the server's own record of degraded
+tenants, so an evicted or never-opened one still counts. `/metrics` was left
+walking `forEachTenant`, which is open tenants only — the same walk that was
+just replaced. Measured on a server whose `tenant-7-0` is degraded on disk and
+untouched in this process:
+
+```
+/-/ready: 503
+NOT READY: 1 degraded tenant(s)
+7:0: degraded (unacknowledged, from the store directory): 1 quarantined
+
+/metrics:
+simdlogs_storage_corrupt_groups 0
+simdlogs_storage_quarantined_groups 0
+simdlogs_storage_degraded_tenants 0
+simdlogs_storage_degraded_unacknowledged_tenants 0
+```
+
+The probe pulls the pod out of rotation and the alert never fires.
+`docs/lld/storage.md` names `_degraded_unacknowledged_tenants` as "the one to
+alert on", so an operator following the LLD is blind to the failure the whole
+scan exists to surface — and two endpoints on one server disagree about one
+tenant.
+
+Both now read `s.degraded` through one function.
+`TestMetricsAgreeWithReadinessAboutAnUntouchedTenant` asserts they agree before
+and after acknowledgement, and fails against the old walk.
+
+The shape is the one this task keeps producing: a fix that changes where a
+fact comes from has to change **every** reader of that fact, and the one that
+gets missed is the one nobody was looking at while fixing the bug.
+
+### Three smaller ones from the same review
+
+- **`HealthOfDir` reported unknowns as zeroes.** It reads a store directory
+  without opening it, so Groups, Corrupt and Policy are unknown — and
+  `Health.String()` printed them anyway: `0 groups serving, 0 corrupt, policy
+  fail` for a store with several groups on a server running `quarantine`. It
+  carries a `FromDirectory` flag now and prints only what it knows.
+
+- **The `nextID` justification overclaimed.** The comment and the LLD said the
+  group files and the quarantine directory "carry every id ever issued".
+  Retention unlinks: three groups, `DropGroupsBefore` removes all three,
+  reopen, and the first new id is 0. The property that matters is narrower and
+  does hold — a *quarantined* id is never reissued, because a quarantined file
+  is always in `quarantine/` — and a retention-removed id cannot be laundered
+  either, since it leaves no record and the recovery gate requires one. The
+  claim was wrong, not the code.
+
+- **The best-effort checksum duplicated its own error.** A group that cannot be
+  mapped usually cannot be read either, so the reason read `permission denied
+  (checksum unavailable: permission denied)`. And the comment on `ackMu` said
+  cross-process races are "prevented by the store lock", which is false in the
+  one case that matters: `AcknowledgeDegradedDir` never takes the lock, and it
+  exists for directories whose store is not open.
+
+## The documented remediation stranded the replica, and "one function" was two
+
+Two more from the review of the round above, both in the code that fixed it.
+
+**Emptying the quarantine directory did not clear anything.** `docs/lld/storage.md`
+says degradation "clears when the quarantine directory is emptied, which is an
+operator deciding the evidence has been dealt with". Doing exactly that, for a
+tenant not currently open:
+
+```
+after emptying the quarantine directory: AcknowledgeDegraded = 0, <nil>
+/-/ready = 503
+7:0: degraded (unacknowledged, from the store directory): 1 quarantined
+metrics: degraded=1 unacked=1 quarantined=1
+```
+
+No escape but a process restart. It is the interaction of three fixes that are
+each right on their own: the server's record was made to survive without an
+open store, so eviction and restart could not hide a degraded tenant; "nothing
+quarantined" was made a skip rather than an acknowledgement, so a store
+degraded by Corrupt alone could not go ready with no marker; and the gauges
+were pointed at that same record so they could not disagree with readiness.
+Together they made a stale record unclearable.
+
+The snapshot re-reads the directory for any tenant it names that is not open —
+one ReadDir, the cost the startup scan already pays — and drops the record when
+the evidence is gone. `AcknowledgeDegradedDir` returning "nothing to
+acknowledge" now deletes the key rather than skipping it.
+
+No test could have caught this from any one of the three changes. It needed the
+question "what does the remediation this document promises actually do", asked
+against all three at once.
+
+**And the claim that readiness and /metrics "now read `s.degraded` through one
+function" was false when I wrote it.** There were two implementations of the
+snapshot — one inline in `readiness`, one in `storageHealthTotals` — differing
+in their population. The difference was inert, because an open tenant absent
+from the record is `Ready()` and readiness would ignore it either way. That is
+the same "inert difference" the entry above this one calls the next drift
+waiting to happen, written one entry later by the same hand.
+
+One helper now, and both derive from it.
+
+**Two smaller ones.** `simdlogs_tenants` counts open tenants while the degraded
+gauges count open plus evicted plus scanned, so a dashboard dividing one by the
+other can exceed 1 — recorded in the LLD rather than unified, because the two
+denominators are both wanted. And `HealthOfDir` synthesised `Corrupt = 1` for a
+quarantine directory it could not read, which `/metrics` summed into a gauge
+documented as "committed groups that could not be read at open". A permissions
+problem on one directory is not one corrupt group; it is an `Unreadable` marker
+now, and `Degraded()` reads it.
+
+## A flaky gate that measured the wrong thing, and the button that 429s under load
+
+**The concurrency test was red one run in three, for a reason unrelated to what
+it tested.** `TestConcurrentAcknowledgementDoesNotFail` fired 50 POSTs and
+required all 200. `/admin/acknowledge-degraded` went through `adminSpec()`,
+which is charged the QUERY semaphore, and the default budget is 32:
+
+```
+MaxConcurrentQuery = 32
+200 requests -> map[200:184 429:16]
+body: "too many concurrent requests; retry after a moment"
+```
+
+So it did not pin the fix it was written for: on a machine where 50 requests
+never collided it passed whether or not the serialization existed, and where
+they did it failed for the budget. It asserts no 500 now — the failure mode the
+fix is about — and separately that nothing is throttled.
+
+**And the endpoint really was charged the budget.** 32 in-flight queries is
+enough to make the button that puts a replica back in rotation answer 429 —
+the same class of failure as the temp-name race, from a different cause, on the
+same endpoint. `/metrics` already carries `nosem` with the argument written
+out: "a scraper that gets 429 under load takes away the telemetry that explains
+the load". One word changes: an operator who gets 429 under load loses the
+button that ENDS it, and the replica it would have restored is the one under
+that load.
+
+## Three more from the same review
+
+**A deleted tenant directory stranded the probe.** The re-read added for the
+emptied-quarantine case treats "not a store" as "keep the recorded answer", and
+a deleted tenant has no MANIFEST:
+
+```
+after rm -rf tenant-7-0:
+/-/ready = 503
+7:0: degraded (unacknowledged, from the store directory): 1 quarantined
+metrics: degraded=1 unacked=1 quarantined=1
+```
+
+`simdlogs_storage_quarantined_groups` reporting 1 for a directory that does not
+exist. Deleting a tenant is a more ordinary operator action than emptying one
+quarantine directory. "Absent" and "present but not a store" are distinguished
+now.
+
+**The probe did a ReadDir plus a ReadFile per degraded tenant, per request, on
+an unauthenticated path with no concurrency budget.** Measured at 200 probes:
+5.34 ms for one degraded tenant against 67.3 ms for eighty, 12.6x, on tmpfs —
+a cold dentry cache is worse. The quarantine directory's mtime changes exactly
+when the answer changes, so one `Stat` now decides whether the read is needed.
+
+A time-based TTL was the other option and is worse here: the answer has to
+change the moment the operator acts, and any TTL long enough to save work is
+long enough to leave the replica out of rotation after the fix.
+
+**The stale-record guard was not airtight.** It dropped a record when the
+tenant was "not open", and between releasing the lock and reacquiring it a
+tenant can open degraded — repopulating the record with fresh health — and then
+be evicted, at which point a correct record is deleted on the strength of a
+read that predates it. Not reproduced in 16 tenants racing three probe loops,
+and one line to close: `storage.Health` is comparable, so the delete requires
+the record to be the same value the re-read was taken against.
+
+## An mtime cache that was unsound twice, and an error read as an absence
+
+Three more, all in the two fixes from the round above.
+
+**`os.Stat` failing is not "the tenant was deleted".** The check added to
+distinguish a deleted tenant from a directory that is not a store was
+`err == nil && fi.IsDir()`, and EACCES is an error. `chmod 000` on the DATA
+directory:
+
+```
+with the data directory unreadable: /-/ready = 200 "OK"
+metrics: degraded=0 unacked=0 quarantined=0
+after permissions are restored:     /-/ready = 200 "OK"
+```
+
+The record was DELETED, so restoring the permissions did not bring the signal
+back — only a restart rebuilds it. This is the third time in this task that an
+error has been read as a clean answer (`countQuarantined` returning 0, then
+`HealthOfDir` synthesising a corrupt count) and the first where it destroyed
+state rather than misreporting it. Misreporting is recoverable.
+
+Only `os.IsNotExist` may drop a record now. Worth noting for anyone writing the
+test: `os.Stat` on a mode-000 DIRECTORY still succeeds — stat needs `+x` on the
+parent, not read on the thing itself — so a test that chmods the tenant
+directory exercises none of this, and passes against the broken version.
+
+**The mtime cache was unsound twice.** It skipped the directory read when the
+quarantine directory's modification time was unchanged.
+
+Part of the cached answer is the *contents* of `quarantine/ACKNOWLEDGED`, an
+exported, documented, operator-visible file holding a plain integer. Rewriting
+it in place changes the answer and not the directory:
+
+```
+mtime before 22:33:50.492873315, after the in-place rewrite 22:33:50.492873315
+/-/ready = 200, though the marker no longer accepts the quarantined count
+```
+
+And an equal mtime is not proof of an unchanged directory. One second is the
+natural timestamp granularity on ext3, ext4 with 128-byte inodes, HFS+ and many
+NFS servers; two on exFAT. Forcing the collision those produce on their own:
+
+```
+quarantine emptied, mtime unchanged: /-/ready = 503, quarantined=1
+```
+
+Permanently, because no probe ever re-reads — the same stranding the cache was
+layered on top of a fix for, reintroduced conditionally on the filesystem.
+
+Replaced by a time window on the whole snapshot: 250ms, no per-file staleness
+and no dependence on any filesystem property. It is a `Server` field rather
+than a constant, so the tests that assert the remediation takes effect set it
+to zero and measure the semantics, and one test measures the throttle. A test
+that sleeps out a window measures the clock.
+
+The general point, which is the fourth time this task has produced it: **a
+cache is a claim that two things are equivalent.** Here the claim was "the
+directory's mtime determines the answer", and the answer depended on a file's
+bytes and on a timestamp with coarser resolution than the events it was
+distinguishing. Neither is visible from the call site.
+
+## The throttle read the disk and never wrote it down
+
+One defect, one line, and it broke an invariant this task already has a test
+for.
+
+The re-read that replaced the mtime cache fed its result to the response and
+never wrote it back into the server's record, so the record stayed at whatever
+startup found. The answer then depended on which side of the throttle window a
+probe landed on. Same on-disk state, back to back:
+
+```
+re-read:   /-/ready = 200, unacknowledged = 0
+throttled: /-/ready = 503, unacknowledged = 1
+```
+
+And the two endpoints disagreed with each other, which is the invariant the
+one-snapshot change exists to hold:
+
+```
+/-/ready = 200 (ready), metrics unacknowledged = 1
+```
+
+It needs no setter to reach: with the 250ms default, any two snapshot calls
+closer than that where the disk differs from the record — a Prometheus scrape
+shortly after a kubelet probe, two load balancers probing. The trigger is a
+marker written by something other than this process, which is the ordinary case
+where the record and the disk diverge, because the acknowledge endpoint is the
+only thing that updates the record.
+
+Written back now, in the same second-lock pass that drops the stale keys and
+guarded the same way: the record must be the one the read was taken against.
+
+**And the knob was exported and unreachable.** `SetDirRereadInterval` had no
+flag, no config field, and no caller but the tests — the shape the round-one
+entry above already names ("the feature was built and tested from the inside,
+where every surface is reachable by calling the method"), reproduced four
+rounds later in the fix for something else. It runs through
+`config.Config.DirRereadInterval` and `-readiness-reread-interval` now.
+
+**What the throttle actually bought, stated plainly.** At any probe interval
+above 250ms it saves nothing in steady state — every probe re-reads — so the
+12.6x cost measured for the per-tenant read is unchanged for an ordinary
+deployment. What it closes is the sharp half: the unauthenticated
+amplification. 2000 unauthenticated `/-/ready` probes cost 19.4µs each instead
+of scaling with the degraded-tenant count on every request. Worth not recording
+the steady-state cost as solved.
