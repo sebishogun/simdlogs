@@ -46,6 +46,8 @@ func main() {
 	// first documentation said. Either turns it on.
 	insecureTLS := flag.Bool("tls.insecure", false, "serve plaintext on a non-loopback address (log data travels in clear text)")
 	insecureHTTP := flag.Bool("insecure-http", false, "alias for -tls.insecure")
+	syslogTLS := flag.Bool("syslog.tls", false,
+		"serve RFC 5425 syslog-over-TLS on the syslog TCP listener, using -tls.certFile/-tls.keyFile (UDP stays plaintext)")
 	flag.Parse()
 
 	// Validate the listener configuration before anything is acquired. It
@@ -61,16 +63,26 @@ func main() {
 	if err := tlsCfg.CheckListen(*addr); err != nil {
 		log.Fatal(err)
 	}
-	// The syslog listener is plaintext by construction and unauthenticated,
-	// writing to the default tenant. Exempting it would make the refusal a
-	// half-truth: the larger hole would be the one left open.
-	if *syslogAddr != "" {
+	// The syslog listener is unauthenticated and writes to the default tenant,
+	// so a plaintext one on a non-loopback address is refused for the same
+	// reason the HTTP listener is. -syslog.tls turns the TCP half into RFC
+	// 5425 syslog-over-TLS using the same certificate, which is what makes
+	// that refusal something an operator can actually satisfy rather than
+	// only work around with -tls.insecure.
+	//
+	// UDP stays plaintext: RFC 5425 is TLS over TCP, and RFC 5426's UDP
+	// transport has no TLS form at all.
+	if *syslogAddr != "" && !*syslogTLS {
 		// CheckPlaintextListen, not CheckListen: the syslog port is plaintext
 		// whatever the HTTP listener does, so a certificate on the HTTP side
 		// must not exempt it.
 		if err := tlsCfg.CheckPlaintextListen(*syslogAddr); err != nil {
-			log.Fatalf("syslog: %v", err)
+			log.Fatalf("syslog: %v (or pass -syslog.tls to serve RFC 5425 "+
+				"syslog-over-TLS on the TCP half)", err)
 		}
+	}
+	if *syslogTLS && !tlsCfg.Enabled() {
+		log.Fatal("-syslog.tls needs -tls.certFile and -tls.keyFile")
 	}
 	tc, err := tlsCfg.Build()
 	if err != nil {
@@ -152,7 +164,14 @@ func main() {
 		// Both closers are kept. Discarding them left the UDP and TCP
 		// listeners accepting data all the way through shutdown, into writers
 		// that were being flushed and stores that were being unmapped.
-		udpC, tcpC, err := srv.ListenSyslog(*syslogAddr)
+		syslogCfg := api.DefaultSyslogConfig()
+		if *syslogTLS {
+			// The same certificate the HTTP listener uses. A separate one
+			// would be a second thing to rotate for no gain: both are this
+			// process's identity on this host.
+			syslogCfg.TLS = tc
+		}
+		udpC, tcpC, err := srv.ListenSyslogConfig(*syslogAddr, syslogCfg)
 		if err != nil {
 			log.Fatalf("syslog listen %s: %v", *syslogAddr, err)
 		}

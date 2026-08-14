@@ -12,6 +12,12 @@ import (
 	"github.com/sebishogun/simdlogs/internal/ingest"
 )
 
+// maxUDPDatagram is the largest UDP payload IPv4 can carry: 65535 total minus
+// a 20-byte IP header and an 8-byte UDP header. The kernel refuses a send
+// larger than this ("message too long"), so it is the real ceiling and not a
+// choice this package makes.
+const maxUDPDatagram = 65507
+
 // SyslogConfig bounds the native syslog transport.
 //
 // Every field here closes a hole the listener shipped with: no read deadline
@@ -160,7 +166,14 @@ func (s *Server) serveSyslogUDP(c net.PacketConn, cfg SyslogConfig) {
 	// One buffer for the life of the listener: a datagram is copied out of the
 	// kernel into it and fully consumed before the next ReadFrom, so
 	// allocating per datagram would be one allocation per message.
-	buf := make([]byte, 64*1024) // max practical syslog datagram
+	//
+	// Sized ONE BYTE OVER the largest datagram the kernel will deliver
+	// (65507 = 65535 - 20 IP - 8 UDP), so a full buffer is proof of
+	// truncation rather than a coincidence. It used to be 65536, which is
+	// larger than anything the kernel accepts -- the truncation branch below
+	// could therefore never fire, and the test that claimed to exercise it
+	// sent only one good datagram.
+	buf := make([]byte, maxUDPDatagram+1)
 	fallback := s.def.fallbackTS()
 	batch := 0
 	// An ABSOLUTE next-flush instant, not now+FlushEvery per iteration.
@@ -193,12 +206,14 @@ func (s *Server) serveSyslogUDP(c net.PacketConn, cfg SyslogConfig) {
 		if n == 0 {
 			continue
 		}
-		if n == len(buf) {
-			// ReadFrom fills the buffer and DISCARDS the rest of an oversized
-			// datagram, so the message stored would be a silent truncation.
-			// Counted and dropped instead of stored wrong.
+		if n > maxUDPDatagram {
+			// ReadFrom fills the buffer and DISCARDS the remainder, so what
+			// would be stored is a silently shortened message. Counted and
+			// dropped instead of stored wrong. Reachable now that the buffer
+			// is one byte larger than the kernel's own ceiling.
 			atomic.AddInt64(&s.nHTTPErrs, 1)
-			log.Printf("syslog udp: datagram of %d bytes or more truncated by the receive buffer; dropped", n)
+			log.Printf("syslog udp: datagram over %d bytes truncated by the receive buffer; dropped",
+				maxUDPDatagram)
 			continue
 		}
 		// ONE datagram is ONE message (RFC 5426), newlines included. The

@@ -19,7 +19,7 @@ parallelism as the box has cores.
 | Loki push | `/loki/api/v1/push`, `/insert/loki/api/v1/push` | JSON and snappy-protobuf; see below |
 | Datadog | `/api/v2/logs`, `/v1/input`, `/insert/datadog/api/v2/logs` | array or single object; `validate` answers 200 |
 | OTLP/HTTP logs | `/v1/logs`, `/insert/opentelemetry/v1/logs` | JSON and protobuf; see below |
-| journald export | `/insert/journald` | systemd-journal-upload |
+| journald export | `/insert/journald` | systemd-journal-upload; truncation reported, see below |
 | syslog | `/insert/syslog`; `-syslog` listens UDP+TCP | RFC3164/5424; both RFC6587 framings; see below |
 
 The `/insert/<vendor>/...` spellings exist so an agent configured against
@@ -126,8 +126,20 @@ close. An over-limit connection is closed immediately rather than queued:
 holding an unbounded number of accepted sockets waiting for a slot is the same
 exhaustion one level down. The octet count is bounded **as it is read**, so a
 sender writing digits forever cannot overflow the accumulator into a small
-positive number that then passes the size check. TLS wraps the TCP listener
-when configured (RFC 5425 is TLS over TCP only; UDP is unaffected).
+positive number that then passes the size check. TLS wraps the TCP listener when configured — RFC 5425 syslog-over-TLS,
+reachable from the binary as `-syslog.tls`, which reuses `-tls.certFile`/
+`-tls.keyFile`. UDP stays plaintext: RFC 5425 is TLS over TCP, and RFC 5426's
+UDP transport has no TLS form. Without `-syslog.tls` a syslog listener on a
+non-loopback address is refused for the same reason a plaintext HTTP one is —
+it is unauthenticated and writes to the default tenant — and the flag is what
+makes that refusal something an operator can satisfy rather than only work
+around with `-tls.insecure`.
+
+The UDP receive buffer is **one byte larger** than the largest datagram the
+kernel will deliver (65507 = 65535 − 20 IP − 8 UDP), so a full buffer is proof
+of truncation rather than a coincidence. It used to be 65536, larger than
+anything the kernel accepts, so the truncation branch could never fire and the
+test that claimed to exercise it sent only one good datagram.
 
 **Flushing is batched**, by count and by time. It used to flush once per LINE,
 which is an fsync per syslog message. Measured on one TCP connection, 2000
@@ -155,6 +167,30 @@ is no response to fail, so an unreported failure there is silent loss with no
 signal anywhere; on TCP one bad frame does not end a good connection, but a
 flush failure does — the server can at least stop reading from a sender whose
 data is not landing.
+
+## systemd journal export
+
+The format systemd-journal-upload sends: entries are blocks of fields
+separated by a blank line, and a field is either `NAME=value\n` or `NAME\n`
+followed by a little-endian uint64 length and that many RAW bytes. The binary
+form exists so a value can contain newlines, which is why this parses bytes
+rather than lines.
+
+A **malformed length discards the rest of the upload**, so it is reported. Both
+the "fewer than 8 bytes of length prefix" and the "length exceeds what remains"
+branches used to set the cursor to the end and fall out of the loop with no
+rejection count and no warning: every entry after the bad field was lost and
+the request answered 202. `IngestJournald` could not return a failure at all,
+which is why the listener's error handling for it was unreachable. The entries
+that parsed BEFORE the bad field are kept and counted; the caller is told the
+remainder is unreadable.
+
+The declared length is compared against the remaining bytes **as a uint64**, so
+a length near 2^64 cannot wrap when it is narrowed to `int` on a 32-bit build.
+
+An entry carrying a timestamp and no storable field is rejected and reported
+rather than dropped, which used to give a sender a 202 for records that were
+not there.
 
 ## Elasticsearch bulk
 

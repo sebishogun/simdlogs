@@ -1,8 +1,15 @@
 package api
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"strings"
 	"sync"
@@ -312,13 +319,36 @@ func TestSyslogUDPOversizedDatagramIsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	// One good datagram, then one at the buffer size.
 	if _, err := io.WriteString(c, msg5424); err != nil {
 		t.Fatal(err)
 	}
 	waitRows(t, srv, 1)
 	if got := rowCountOf(t, srv); got != 1 {
 		t.Fatalf("the good datagram stored %d rows, want 1", got)
+	}
+
+	// And the truncation case the branch exists for. The kernel refuses a
+	// send over 65507, so THAT is the ceiling: a datagram exactly at it fills
+	// a 65507-byte buffer and is indistinguishable from a truncated one --
+	// which is why the buffer is one byte larger. The old buffer was 65536,
+	// so `n == len(buf)` could never be true and the branch was dead. This
+	// test claimed to cover it and sent only the good datagram above.
+	if _, err := c.Write(make([]byte, maxUDPDatagram+1)); err == nil {
+		t.Error("the kernel accepted a datagram over its own ceiling; " +
+			"maxUDPDatagram is wrong")
+	}
+	big := make([]byte, maxUDPDatagram)
+	copy(big, msg5424)
+	for i := len(msg5424); i < len(big); i++ {
+		big[i] = 'x'
+	}
+	if _, err := c.Write(big); err != nil {
+		t.Fatalf("a datagram at the kernel ceiling was refused: %v", err)
+	}
+	// It is at the ceiling, not over it, so it is stored rather than dropped.
+	waitRows(t, srv, 2)
+	if got := rowCountOf(t, srv); got != 2 {
+		t.Errorf("stored %d rows, want 2: a datagram AT the ceiling is not truncated", got)
 	}
 }
 
@@ -465,4 +495,67 @@ func TestSyslogUDPDatagramWithNewlineIsOneMessage(t *testing.T) {
 	if got := rowCountOf(t, srv); got != 1 {
 		t.Errorf("one datagram containing a newline stored %d rows, want 1", got)
 	}
+}
+
+// RFC 5425: syslog over TLS on the TCP half. The option existed only as a
+// struct field with no test and no way to reach it from the binary -- the
+// shipped main called ListenSyslog, which is DefaultSyslogConfig with a nil
+// TLS. There is now a -syslog.tls flag; this pins the listener half.
+func TestSyslogOverTLS(t *testing.T) {
+	cert := selfSignedCert(t)
+	srv, addr := syslogTestServer(t, SyslogConfig{
+		FlushLines: 1,
+		TLS:        &tls.Config{Certificates: []tls.Certificate{cert}},
+	})
+
+	// A plaintext client must NOT be able to write logs into a TLS listener.
+	plain, err := net.Dial("tcp", addr)
+	if err == nil {
+		io.WriteString(plain, msg5424+"\n")
+		plain.Close()
+	}
+
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatalf("TLS dial: %v", err)
+	}
+	if _, err := io.WriteString(conn, msg5424+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+
+	waitRows(t, srv, 1)
+	if got := rowCountOf(t, srv); got != 1 {
+		t.Errorf("stored %d rows over TLS, want 1", got)
+	}
+	if f := srv.defaultTenantFields(); f != nil && f["hostname"] != "myhost" {
+		t.Errorf("hostname = %q over TLS, want myhost", f["hostname"])
+	}
+}
+
+// selfSignedCert builds an in-memory certificate for the TLS listener test.
+// In memory rather than on disk: the listener takes a *tls.Config, so there is
+// nothing for a file to add except a temp directory to clean up.
+func selfSignedCert(t *testing.T) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "simdlogs-syslog-test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }

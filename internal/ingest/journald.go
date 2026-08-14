@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"encoding/binary"
+	"errors"
 	"strconv"
 	"strings"
 )
@@ -33,6 +34,14 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 	}
 	emit := func() {
 		if len(fields) == 0 {
+			// An entry whose fields all failed to store -- most often one
+			// carrying only a __REALTIME_TIMESTAMP -- was dropped with no
+			// count, so a sender saw a 202 for records that were not there.
+			if haveTS {
+				res.Rejected++
+				res.Warn(0, "entry carries a timestamp and no storable field")
+			}
+			reset()
 			return
 		}
 		if !haveTS {
@@ -86,15 +95,27 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 			}
 		case i < n && data[i] == '\n': // binary field: length-prefixed value
 			i++
+			// A malformed length DISCARDS THE REST OF THE UPLOAD, so it must
+			// be reported. Both of these branches used to set i = n and fall
+			// out of the loop with no rejection count and no warning: every
+			// entry after the bad field was lost and the request answered
+			// success. IngestJournald could not return a failure at all, which
+			// is why the listener's error handling was unreachable.
 			if i+8 > n {
-				i = n
-				break
+				res.Rejected++
+				res.Warn(int64(i), "binary field %q: %d bytes of length prefix, need 8; "+
+					"the remainder of the upload is not parseable", name, n-i)
+				return res, envelopeErr(errJournaldTruncated)
 			}
 			ln := binary.LittleEndian.Uint64(data[i : i+8])
 			i += 8
+			// Compared as uint64 against the REMAINING bytes, so a length near
+			// 2^64 cannot wrap when it is narrowed to int on a 32-bit build.
 			if ln > uint64(n-i) {
-				i = n
-				break
+				res.Rejected++
+				res.Warn(int64(i), "binary field %q declares %d bytes, %d remain; "+
+					"the remainder of the upload is not parseable", name, ln, n-i)
+				return res, envelopeErr(errJournaldTruncated)
 			}
 			set(name, data[i:i+int(ln)])
 			i += int(ln)
@@ -102,9 +123,21 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 				i++
 			}
 		default:
+			// A name that ends at EOF with neither '=' nor a newline: the
+			// upload was cut mid-field. Same treatment -- reported, not
+			// silently dropped.
+			if len(trimSpace(data[ns:])) > 0 {
+				res.Rejected++
+				res.Warn(int64(ns), "field %q ends without a value separator; "+
+					"the upload is truncated", name)
+				emit()
+				return res, envelopeErr(errJournaldTruncated)
+			}
 			i = n
 		}
 	}
 	emit() // trailing entry with no closing blank line
 	return res, nil
 }
+
+var errJournaldTruncated = errors.New("journal export is truncated")
