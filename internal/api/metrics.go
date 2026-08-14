@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
 // countRequest tallies a request as ingest or query by path, so /metrics can
@@ -88,6 +90,13 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	if free := freeDiskBytes(s.dir); free >= 0 {
 		m("vl_free_disk_space_bytes", "Free bytes on the storage filesystem.", "gauge", free)
 	}
+	// Retention health. A removal is committed to the manifest before the
+	// unlink, so a failing unlink costs disk rather than correctness -- but it
+	// costs disk silently unless it is counted.
+	m("simdlogs_retention_failures_total", "Group unlinks that failed during retention.",
+		"counter", storage.RetentionFailures())
+	m("simdlogs_retention_tombstones", "Groups committed as removed whose file is still on disk.",
+		"gauge", storage.PendingTombstones())
 	s.writeRuleMetrics(w) // metrics-from-logs rules
 }
 

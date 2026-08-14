@@ -179,6 +179,22 @@ crash does leave a stale `LOCK` needing manual removal -- stated here rather
 than papered over, since deleting a lock file whose owner may be alive is the
 failure the lock exists to prevent.
 
+**Retention order** (`retention.go`). Commit the removal to the manifest,
+retire the group version, then unlink. Each step is in that order for a
+reason: committing first means a failed unlink costs disk rather than
+correctness, retiring means the mapping is released when the last snapshot
+holding it closes, and unlinking last means no reader ever loses bytes it is
+reading. The previous order dropped the in-memory entry, discarded the unmap
+callback and unlinked ignoring the error, which both leaked the mapping (an
+unlinked file's blocks stayed allocated until process exit) and resurrected
+the group at the next start whenever the unlink failed.
+
+A failed unlink leaves a tombstone retried on every later pass and counted in
+`simdlogs_retention_tombstones`; `simdlogs_retention_failures_total` counts
+the failures. If the manifest commit itself fails, nothing is removed --
+dropping from the index anyway would make the store answer short until a
+restart brought the groups back.
+
 **The manifest is the commit point** (`manifest.go`). Group visibility used to
 be whatever the `group-*.bin` glob returned, which is not a commit point, and
 two failures came straight out of it: retention that unlinked after dropping

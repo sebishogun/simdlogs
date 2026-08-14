@@ -21,7 +21,10 @@ type Store struct {
 	openHook func(uint64)
 	lock     *dirLock
 	man      *manifest
-	retired  []retiredMap // mappings replaced by Recompact, unmapped after a grace period
+	// tombstones are files whose group is committed as removed but whose
+	// unlink failed; retried on every later retention pass.
+	tombstones []string
+	retired    []retiredMap // mappings replaced by Recompact, unmapped after a grace period
 }
 
 type groupEntry struct {
