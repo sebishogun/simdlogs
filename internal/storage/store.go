@@ -69,21 +69,7 @@ func (s *Store) AppendGroup(g *Group) (uint64, error) {
 
 	blob := g.Marshal()
 	final := filepath.Join(s.dir, fmt.Sprintf("group-%d.bin", id))
-	tmp := final + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return 0, err
-	}
-	if _, err := f.Write(blob); err != nil {
-		f.Close()
-		return 0, err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return 0, err
-	}
-	f.Close()
-	if err := os.Rename(tmp, final); err != nil {
+	if err := writeFileAtomic(final, blob, DataFileMode); err != nil {
 		return 0, err
 	}
 	// Map the freshly written file rather than keeping the marshaled blob on

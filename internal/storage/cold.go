@@ -28,11 +28,10 @@ func (c LocalCold) Put(name string, data []byte) error {
 	if err := os.MkdirAll(c.Dir, 0o755); err != nil {
 		return err
 	}
-	tmp := c.path(name) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, c.path(name)) // atomic
+	// Durable replacement, same as the hot tier: the cold copy is the only
+	// copy once demotion unlinks the local group, so a rename whose directory
+	// entry never reached disk loses it.
+	return writeFileAtomic(c.path(name), data, DataFileMode)
 }
 
 func (c LocalCold) Get(name string) ([]byte, error) { return os.ReadFile(c.path(name)) }
@@ -95,11 +94,7 @@ func (s *Store) Promote(name string, cold ColdStore) error {
 		return err
 	}
 	final := filepath.Join(s.dir, filepath.Base(name))
-	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, final); err != nil {
+	if err := writeFileAtomic(final, data, DataFileMode); err != nil {
 		return err
 	}
 	b, unmap, err := mmapFile(final)

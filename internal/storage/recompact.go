@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"os"
 	"time"
 )
 
@@ -143,29 +142,12 @@ func (s *Store) Recompact(cutoff int64, dropPostings bool) (groups int, before, 
 	return groups, before, after, nil
 }
 
-// writeGroupFile replaces path atomically: temp file, fsync, rename. A crash
-// leaves either the old group or the new one, never a torn file.
+// writeGroupFile replaces path durably: temp file, fsync, rename, then an
+// fsync of the parent directory. A crash leaves either the old group or the
+// new one, never a torn file and never a directory entry that outlived the
+// data it names.
 func writeGroupFile(path string, blob []byte) error {
-	tmp := path + ".recompact"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(blob); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeFileAtomic(path, blob, DataFileMode)
 }
 
 // sweepRetired unmaps replaced mappings whose grace period has passed.

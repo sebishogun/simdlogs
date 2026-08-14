@@ -20,8 +20,7 @@ footer:  timeMin i64, timeMax i64, per-column meta records, footer-len u32
 ```
 
 The footer is read first (its length is the last four bytes), so a query
-consults skip metadata without decoding any column. `ReadGroup` validates
-magic/version and bounds; a truncated file fails `OpenStore` and is skipped.
+consults skip metadata without decoding any column.
 
 Column types (`column.go`):
 
@@ -105,10 +104,35 @@ rejected before any decode.
 `store.go`. A directory of `group-<id>.bin` files, indexed in memory by
 `timeMin` order.
 
-- `AppendGroup`: marshal → temp file → `fsync` → `rename` into place
-  (atomic) → mmap the fresh file → append to the index. Crash between temp
-  and rename leaves a `.tmp` file `OpenStore` ignores. mmap-append is racy,
-  so a group is written whole and never mutated.
+- `AppendGroup`: marshal → `writeFileAtomic` → mmap the fresh file → append
+  to the index. Crash between temp and rename leaves nothing: the helper
+  removes its temp file on every failure path, so `OpenStore`'s glob has no
+  partial to ignore. mmap-append is racy, so a group is written whole and
+  never mutated.
+
+**The fsync policy** (`atomicfile.go`). Every file this package publishes
+goes through one helper: write the temp file beside the destination, `fsync`
+the file, `close` and *check the close*, `rename`, then **`fsync` the parent
+directory**.
+
+That last step is a durability requirement, not a formality. A rename is
+atomic with respect to a concurrent reader, but atomicity is not durability:
+until the directory is synced, the entry naming the new inode lives only in
+the page cache, and power loss can leave the directory naming the old file
+while the new data blocks sit safely on disk. Syncing the file without its
+directory guarantees the contents of a file that may not be there.
+
+Every write/rename site goes through the helper — `AppendGroup`,
+recompaction's `writeGroupFile`, cold `Put`, and `Promote`. Files are created
+`0600`: the payload is log data, and a store directory should not become
+world-readable because the process umask was `022`.
+
+The helper carries fault points (create, write, sync, close, rename,
+directory open, directory sync) that tests fail one at a time to assert the
+directory afterwards holds either the complete new bytes or the previous
+ones, and never a leftover temp file. On Windows `syncDir` is a documented
+no-op — there is no directory handle to flush — so the durability guarantee
+stated here is weaker there.
 - `OpenStore` globs `group-*.bin`, maps and parses each, and skips anything
   unreadable (a truncated partial flush); readers are safe for concurrent
   queries.
