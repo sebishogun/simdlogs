@@ -173,7 +173,81 @@ claims are amd64/AVX-512 only.
 - Graceful shutdown (SIGINT/SIGTERM): stop accepting, drain in-flight (15 s),
   flush writers, unmap stores — no buffered rows lost, no mmap leaks.
 - Restore: `storage.RestoreTar` unpacks a `/admin/backup` tar into a fresh
-  directory with entry names flattened so an archive cannot escape.
+  directory with entry names flattened so an archive cannot escape, and only
+  entries named as group files are written -- an archive can place group files
+  and nothing else. A `MANIFEST` entry would otherwise be honoured by the
+  legacy-directory gate and make every restored group invisible.
+
+### The process-kill matrix
+
+`internal/storage/crash_test.go` re-execs the test binary as a child that
+writes batches into a store and **SIGKILLs itself** at a named persistence
+phase, then reopens the directory and asserts what survived. A subprocess and a
+signal, not an injected error: an injected error unwinds every defer — the temp
+file is removed, the manifest truncated back to a record boundary — which tests
+the *error handling*. Only a kill shows what is actually on disk.
+
+Two matrices, over the three callers of the durable write that they cover —
+`AppendGroup`, `manifest.compact` and `Store.Recompact`:
+
+| Matrix | Phases | Contract |
+|---|---|---|
+| `TestCrashRecoveryMatrix` — `AppendGroup` | 11: `buffering`, `temp-create`, `partial-write`, `file-sync`, `file-close`, `rename`, `dir-open`, `dir-sync`, `manifest-append`, `manifest-sync`, `post-ack` | no partial group adopted; every acknowledged batch present exactly once; no uncommitted batch visible; no duplicate rows |
+| `TestCrashDuringRewriteIsVisibilityNeutral` — `manifest.compact` and `Store.Recompact` | the 7 `writeFileAtomic` phases | **visibility-neutral at every phase**: all batches present, each exactly once, no partial group, no duplicate rows |
+
+The rewrite matrix has no per-phase expectation table on purpose. Neither
+operation adds or removes a row — compaction folds the record log to one record
+naming the same groups, and recompaction re-encodes a group file under the same
+path and ID with **no manifest record at all**, so the rename is the whole
+commit. A crash that changes what is readable is a defect wherever it lands.
+
+Two tests exist to stop the matrix going vacuously green:
+
+- `TestRewritePhaseCoverageIsComplete` runs the four `AppendGroup`-only phases
+  against both rewrite paths and fails if one becomes reachable — that would
+  mean the rewrite gained a commit step the matrix does not cover.
+  `manifest-append` and `manifest-sync` are the two that carry signal, since
+  they have call sites in the manifest commit; `buffering` and `post-ack` have
+  no `fault()` call site at all and are markers the child checks.
+- `TestCrashRecompactFixtureIsActuallyRecompacted` fails if the fixture stops
+  qualifying for recompaction. `Recompact` skips any group whose flate rewrite
+  is not smaller, so a too-small fixture makes every recompact subtest pass
+  without the code under test writing a byte.
+
+**What is not in the matrix.** Seven paths write durably or commit; three are
+covered. `Store.Promote` (`cold.go`) is structurally identical to
+`AppendGroup` — write the group, then commit an add. `Store.Demote` and
+retention's `dropGroups` commit a REMOVE and then unlink, which is the
+ordering the manifest was introduced for. `manifest.bootstrap` rewrites a
+legacy directory's manifest from `OpenStore`. None of the four has a crash
+matrix; extending the harness to them is a `crashEnvOp` per path and nothing
+more.
+
+The append matrix runs at **two batch counts**. Three is the default, so that
+"present exactly once" has something to say. One is there because three hid a
+live defect: with three batches the crash always lands on the last, two commit
+first, and the store's visible set is never empty at recovery — which is
+exactly the state in which `OpenStore` used to adopt uncommitted group files.
+`TestCrashRecoveryMatrixFirstBatch` reaches it;
+`TestUncommittedGroupIsInvisibleWhenNothingElseIsCommitted`,
+`TestRemovedGroupStaysRemovedWhenItWasTheLastOne` and
+`TestLegacyDirectoryWithNoManifestIsAdopted` pin the same boundary without a
+crash. `docs/wrong.md` records the defect.
+
+`partial-write` is named for the boundary, not for the artifact: the fault
+fires *before* `f.Write`, so the temp file is zero bytes. No phase in either
+matrix produces a torn file or a manifest with a partial record, so the
+torn-tail replay path in `openManifest` is not exercised here either.
+
+**What a process kill cannot establish.** SIGKILL destroys the process, not the
+page cache. A `write()` that returned but was never fsynced is still held by the
+kernel, so the next open reads it back — which is why `manifest-append` expects
+the last batch *visible*. The matrix therefore proves no-partial-adoption,
+no-lost-acknowledgement and no-duplication, and does **not** prove the fsync
+boundary. That needs the unsynced writes actually dropped: `dm-flakey` with
+`drop_writes`, a filesystem image discarded at the block layer, or an
+`LD_PRELOAD` turning `fsync` into a no-op. Recorded in `docs/wrong.md` rather
+than left as a passing test that appears to cover it.
 
 ## Compatibility corpus
 

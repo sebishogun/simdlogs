@@ -59,7 +59,22 @@ func RestoreTar(r io.Reader, dir string) error {
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
-		out, err := os.Create(filepath.Join(dir, filepath.Base(hdr.Name)))
+		// Only group files. The name is flattened so an archive cannot escape
+		// the directory, and now it cannot place an arbitrary FILE in it
+		// either -- which matters for exactly one name: an archive carrying a
+		// MANIFEST entry used to be harmless, and since OpenStore started
+		// deciding "is this a legacy directory" on whether MANIFEST exists, an
+		// empty or truncated one restores a directory full of groups that the
+		// next open reports as EMPTY, with no error.
+		//
+		// BackupTar writes only group files, so no archive this package
+		// produces is affected. A hand-assembled archive, an operator's own
+		// tar of a store directory, or a truncated transfer is.
+		name := filepath.Base(hdr.Name)
+		if _, ok := groupIDFromName(name); !ok {
+			continue
+		}
+		out, err := os.Create(filepath.Join(dir, name))
 		if err != nil {
 			return err
 		}

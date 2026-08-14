@@ -1423,3 +1423,204 @@ worker gets which group decides which buffers grow — so ±1 alloc/op and a
 The per-change interleaved runs are the evidence; the end-to-end table is
 read for the exact columns (B/op, allocs/op) and only where the change is
 large.
+
+## A process kill cannot test the fsync boundary: the page cache outlives it
+
+Task 3.4's crash matrix SIGKILLs a child at eleven persistence phases and
+reopens the store. The `manifest-append` phase — the commit record written but
+deliberately **not** fsynced — was written expecting the batch to be
+INVISIBLE after recovery. It is visible, at `-count=20`, every time.
+
+That is not a defect. SIGKILL destroys the **process**; it does not destroy the
+**page cache**. A `write()` that returned put the bytes in the kernel's cache,
+and the next `open()` reads them straight back. Only a power loss or a kernel
+crash discards those pages. The expectation was wrong, not the store.
+
+What the matrix therefore does and does not establish:
+
+| Claim | Established by a process kill? |
+|---|---|
+| No partial group adopted | yes |
+| No leftover `.tmp` adopted | yes |
+| No acknowledged batch lost | yes |
+| No batch duplicated | yes |
+| A group file with no commit record stays invisible | yes |
+| **An unsynced commit record is discarded on replay** | **no** |
+
+The last row needs the unsynced writes actually dropped: `dm-flakey` with
+`drop_writes`, a filesystem image discarded at the block layer, or an
+`LD_PRELOAD` that turns `fsync` into a no-op and then crashes the process.
+None of those are in this repository, so the claim is not made.
+
+The phase stays in the matrix with the corrected expectation, because the other
+three clauses still apply to it and because a change that made this batch
+invisible after a process kill WOULD be a regression — it would mean replay
+discarded a record the kernel still held.
+
+The cost of getting this wrong the other way is the reason it is recorded: a
+matrix that asserted invisibility here would have failed for a correct store,
+and the obvious "fix" — making replay drop unsynced-looking records — would
+have been a data-loss bug shipped to satisfy a bad test.
+
+## Recompaction has no commit record, so its crash contract is stronger
+
+Extending the matrix to `manifest.compact` and `Store.Recompact` (task 3.4
+step 4) started from the assumption that they would need the same per-phase
+expectation table as `AppendGroup`: some phases before the commit point, some
+after. They do not, and the reason is worth writing down.
+
+`Store.Recompact` re-encodes a group file **under the same path and the same
+ID** and writes **no manifest record at all**. There is no commit point to be
+on either side of — the rename is the entire commit, and it swaps one encoding
+of the same rows for another. `manifest.compact` is the same shape: it folds
+the record log down to a single record naming exactly `visibleIDs()`.
+
+So the contract is not per-phase, it is uniform: **visibility-neutral at every
+phase**. All batches present, each exactly once, no partial group, no duplicate
+rows, wherever the kill lands. That is a sharper assertion than the append
+matrix's, and it is cheaper to state.
+
+Four things nearly made it vacuous, and an adversarial review found the last
+three after the first was already fixed:
+
+- The hook closure reads the outer `crashOnBatch`, and the clean setup loop
+  leaves `batch` past it — so the hook could never match during the operation
+  under test. Every rewrite subtest would have passed without a single crash.
+  Caught because the subtest fails when the child does not crash.
+
+- "The child did not crash" was not the same as "the child ran to completion".
+  `runCrashChildOp` classified the exit two ways, signalled or not, and
+  discarded the code — so every `CHILD_*` error exit read as "did not crash",
+  which is exactly what `TestRewritePhaseCoverageIsComplete` asserts. With
+  `Recompact` stubbed to return an error immediately, all four of its subtests
+  PASSED, with a `t.Logf` line as the only evidence. The test written to stop
+  the matrix going vacuously green was itself vacuous. It now fails on any
+  non-zero exit that is not a SIGKILL and reports the code and the child's
+  last line.
+
+- The append matrix's expectation was derived entirely from what the child
+  acknowledged, which left it with no lower bound. With the crash moved to
+  batch 0, `acked` is empty, the presence loop runs zero times, and **eight of
+  the eleven subtests passed** — `buffering`, `temp-create`, `partial-write`,
+  `file-sync`, `file-close`, `rename`, `dir-open`, `dir-sync`; only the three
+  manifest-side phases failed. The acknowledged set is now asserted exactly,
+  and the same break fails **eleven**.
+
+  An earlier revision of this bullet said fifteen. Measured: 11 with the guard,
+  8-of-11 passing without it. It also said the eight passed "against a
+  directory holding a 0-byte MANIFEST and nothing else", which is true of
+  `buffering` and `temp-create` only — four phases leave a `.tmp` alongside,
+  and two leave a group file.
+
+- A partial batch fired neither branch of the presence loop. `countOf` returns
+  `-1` for a batch present in part, which is neither `0` nor `> 1`, so the
+  `if n == 0 / else if n > 1` pair let a torn group adopted for an
+  ACKNOWLEDGED batch pass in silence — clause one of the contract the file
+  opens with. The interrupted-batch check had the mirror hole: `count(...) > 0`
+  read `-1` as absent, which passes at the eight phases where absence is what
+  is wanted. Both are three-way now, the way the rewrite matrix already was.
+
+- Whether the fixture qualifies for recompaction at all. The first version of
+  this entry said the 4-row fixture "never qualifies", so `writeFileAtomic` was
+  never reached and no phase was live. That was written from reading
+  `Recompact`, not from running it, and it is false: the child passes
+  `dropPostings=true`, and a group carrying postings is a candidate on that
+  alone, whatever its size. Measured, three batches, `Recompact(1<<62, drop)`:
+
+  | rows | dropPostings | groups rewritten | bytes |
+  |---|---|---|---|
+  | 4 | false | 0 | — |
+  | 4 | true | 3 | 1110 → 942 |
+  | 256 | false | 3 | 13725 → 11948 |
+  | 256 | true | 3 | 13725 → 10868 |
+
+  The fixture stayed at 256 rows, for the reason the table shows rather than
+  the one first claimed: at 4 rows only the postings check makes it a
+  candidate, so the size test `Recompact` applies to every candidate is never
+  reached; at 256 the flate rewrite is itself smaller and that test runs.
+  `TestCrashRecompactFixtureIsActuallyRecompacted` fails if it stops
+  qualifying. The byte figures are totals across three groups, not one fixture.
+
+  An entry in this file recording a non-measurement is the exact failure the
+  file exists to prevent. The correction is appended rather than edited over
+  the original, because the original is the finding.
+
+## The manifest's bootstrap gate adopted uncommitted groups, and no crash phase could reach it
+
+`OpenStore` adopts every group file on disk when a directory predates the
+manifest — a one-time migration for stores written before commit records
+existed. The gate was:
+
+```go
+if len(man.visible) == 0 && len(onDisk) > 0 {   // -> bootstrap(everything on disk)
+```
+
+"The visible set is empty" is true of a legacy directory. It is also true of
+two states that are its exact opposite, and both were adopted. Measured:
+
+| Setup | MANIFEST | Result |
+|---|---|---|
+| `OpenStore`+`Close`, then a valid `group-0.bin` with no commit record | 0 bytes | **adopted** — an unacknowledged batch became readable |
+| Append id 0, `CommitRemoval(0)`, file left on disk | 72 bytes, visible empty | **resurrected** — a committed removal came back |
+
+The second is verbatim the failure `manifest.go`'s own header says the manifest
+was introduced to prevent. It is reached by a crash between retention's
+commit-remove and its unlink, or by an unlink that failed and left a tombstone,
+whenever the victims are the last live groups.
+
+**Why eleven crash phases could not see it.** `crashBatches` is 3 and the crash
+always lands on the last batch, so batches 0 and 1 commit first and the visible
+set is never empty at recovery. `TestCrashUncommittedGroupFileIsInvisible`
+missed it for the same reason — it commits batch 0 before planting the orphan.
+Set the batch count to 1 and `dir-open` and `dir-sync` fail immediately, with
+no other change. A matrix can be green across every phase and still never
+construct the state the defect needs.
+
+**The fix, and the trap inside the fix.** The gate is now "the MANIFEST file
+was not there", recorded by `openManifest` before it touches anything. That
+needs the file NOT to be created during the decision, so the append handle
+became lazy — and that first attempt was wrong in the other direction: with
+nothing creating the file, a fresh store that wrote its first group and crashed
+before committing it is byte-identical on disk to a legacy directory. Adopting
+came straight back, and `TestUncommittedGroupIsInvisibleWhenNothingElseIsCommitted`
+caught it.
+
+The ordering that satisfies both: read the file's existence, decide, and only
+then create it — last in `OpenStore`, but still before any group file can be
+written. A legacy directory whose previous open died mid-validation still has
+no manifest and is still adopted; a store that has been opened once always has
+one, so its uncommitted groups are never mistaken for legacy data.
+
+**And the fix's own second defect, found by the review of the fix.** `bootstrap`
+reported failure through `m.reopen()`, and `reopen` opens with `O_CREATE`. On a
+legacy directory the MANIFEST does not exist, so a FAILED bootstrap created a
+0-byte one -- precisely the fact the new gate reads. Measured, two valid legacy
+groups, an error injected at `faultWrite`:
+
+```
+first open failed as designed: injected ENOSPC
+MANIFEST now EXISTS, 0 bytes, after the FAILED bootstrap
+legacy batch 0 present 0 times, want 1
+legacy batch 1 present 0 times, want 1
+```
+
+Every later open saw a manifest that existed, skipped the bootstrap, replayed
+nothing, and returned a store with zero groups **and no error**, on a directory
+holding the only copy of the data. Under the old gate the next open
+re-bootstrapped and recovered; the fix turned a transient, self-healing disk
+error into permanent silent loss. The `reopen()` call is deleted -- every
+writer goes through `ensureOpen`, so it was redundant as well as harmful --
+and `TestFailedBootstrapLeavesTheLegacyDirectoryRecoverable` injects the fault
+and fails without it.
+
+That is three consecutive wrong answers on one gate: the original
+empty-visible-set test, the lazy-handle fix that made a fresh store
+indistinguishable from a legacy directory, and the error path that created the
+file the gate reads. Each was found by a reviewer who did not write it.
+
+Three tests pin it, and all three fail against the old gate:
+`TestUncommittedGroupIsInvisibleWhenNothingElseIsCommitted`,
+`TestRemovedGroupStaysRemovedWhenItWasTheLastOne`, and
+`TestCrashRecoveryMatrixFirstBatch` (at `dir-open` and `dir-sync`).
+`TestLegacyDirectoryWithNoManifestIsAdopted` passes both ways and exists to
+stop the fix from being an over-correction.

@@ -74,10 +74,25 @@ func OpenStore(dir string) (*Store, error) {
 			onDisk[id] = f
 		}
 	}
-	// A directory with groups and no manifest predates it. Validate what is
-	// there and commit one snapshot naming it, so from here on visibility is
-	// a committed fact rather than whatever the glob returned.
-	if len(man.visible) == 0 && len(onDisk) > 0 {
+	// A directory with groups and NO MANIFEST FILE predates the manifest.
+	// Validate what is there and commit one snapshot naming it, so from here
+	// on visibility is a committed fact rather than whatever the glob
+	// returned.
+	//
+	// The gate is "the file was not there", not "the visible set is empty".
+	// The visible set is empty in two states that must be treated as
+	// opposites: a legacy directory, where every group on disk is real data
+	// to adopt, and a directory whose groups were written and never committed,
+	// where every one of them must stay invisible. Gating on the empty set
+	// adopted both, so:
+	//
+	//   - a crash between AppendGroup's rename and its commit record made the
+	//     uncommitted batch READABLE at the next open, whenever it was the
+	//     only batch;
+	//   - a crash between retention's commit-remove and its unlink RESURRECTED
+	//     the removed group, whenever it was the last live one -- the exact
+	//     failure the manifest was introduced to prevent.
+	if !man.preexisted && len(onDisk) > 0 {
 		ids := make([]uint64, 0, len(onDisk))
 		for id, path := range onDisk {
 			b, unmap, err := mmapFile(path)
@@ -96,6 +111,25 @@ func OpenStore(dir string) (*Store, error) {
 			lock.unlock()
 			return nil, err
 		}
+	}
+	// The MANIFEST file must exist from here on, and creating it is the last
+	// step of opening rather than the first.
+	//
+	// Last, because the bootstrap decision above reads whether it was there,
+	// and creating it first would answer "yes" for a legacy directory whose
+	// previous open crashed during validation -- every legacy group silently
+	// invisible.
+	//
+	// But it must exist BEFORE any group file can be written, or the two
+	// states become identical on disk again: a directory holding groups and no
+	// manifest is a legacy directory to adopt, and a store that wrote its
+	// first group and crashed before committing it must adopt nothing. With
+	// the file created here, the second case always has an empty manifest to
+	// distinguish it.
+	if err := man.ensureOpen(); err != nil {
+		man.close()
+		lock.unlock()
+		return nil, err
 	}
 
 	for _, id := range man.visibleIDs() {

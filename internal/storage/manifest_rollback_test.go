@@ -77,6 +77,12 @@ func TestCommitRollbackKeepsEarlierRecords(t *testing.T) {
 // test above.
 func (m *manifest) rollbackOffset(t *testing.T) int64 {
 	t.Helper()
+	// openManifest leaves the handle nil so the file's existence is still
+	// readable when OpenStore decides whether to bootstrap; anything reaching
+	// for the handle opens it first.
+	if err := m.ensureOpen(); err != nil {
+		t.Fatal(err)
+	}
 	fi, err := m.f.Stat()
 	if err != nil {
 		t.Fatal(err)

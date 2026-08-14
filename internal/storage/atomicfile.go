@@ -25,7 +25,36 @@ const (
 	faultRename
 	faultDirOpen
 	faultDirSync
+
+	// The manifest's own two steps. They are the commit point: a record that
+	// is written but not synced is not a commit, and a record that is synced
+	// IS one even if the process dies immediately after. The crash matrix
+	// needs to stop between them, which no fault point covered.
+	faultManifestWrite
+	faultManifestSync
+
+	// Points outside the durable write entirely, so the matrix can also stop
+	// with rows buffered and nothing on disk, and after a batch has been
+	// acknowledged to its caller.
+	faultBuffered
+	faultPostAck
 )
+
+// faultPointName is for test output and for the crash matrix's subprocess
+// protocol, which names the phase on the command line.
+var faultPointName = map[faultPoint]string{
+	faultCreate:        "temp-create",
+	faultWrite:         "partial-write",
+	faultSync:          "file-sync",
+	faultClose:         "file-close",
+	faultRename:        "rename",
+	faultDirOpen:       "dir-open",
+	faultDirSync:       "dir-sync",
+	faultManifestWrite: "manifest-append",
+	faultManifestSync:  "manifest-sync",
+	faultBuffered:      "buffering",
+	faultPostAck:       "post-ack",
+}
 
 var (
 	faultMu   sync.RWMutex

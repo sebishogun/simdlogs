@@ -115,9 +115,13 @@ type manifest struct {
 	seq     uint64
 	records int // records appended since the last compaction
 	visible map[uint64]bool
+
+	// preexisted is whether the MANIFEST file was on disk when this manifest
+	// was opened. It is the bootstrap discriminator; see openManifest.
+	preexisted bool
 }
 
-// openManifest replays dir's manifest and opens it for appending. Records are
+// openManifest replays dir's manifest. Records are
 // applied in order and replay stops at the first record that is incomplete or
 // fails its checksum: everything after a torn record is unreachable, because
 // the sequence it belongs to never committed.
@@ -129,6 +133,12 @@ func openManifest(dir string) (*manifest, error) {
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
+	// Whether the file was ALREADY THERE, which is the only thing that
+	// distinguishes a directory predating the manifest from one whose groups
+	// were written and never committed. OpenStore adopts every group on disk
+	// in the first case and must adopt none in the second, and it used to
+	// decide with "the visible set is empty" -- true of both.
+	m.preexisted = err == nil
 	truncateAt := 0
 	for off := 0; off < len(b); {
 		rec, n, ok := decodeManifestRecord(b[off:])
@@ -148,12 +158,29 @@ func openManifest(dir string) (*manifest, error) {
 		}
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, DataFileMode)
+	// The append handle is NOT opened here, and that is the point: opening it
+	// with O_CREATE creates the file, which destroys the very fact the
+	// bootstrap decision reads. Creating it here left a window -- the whole
+	// mmap-and-validate pass over a legacy directory -- in which a crash made
+	// the next open see a manifest that existed and was empty, and every
+	// legacy group silently invisible. ensureOpen creates it at the first
+	// write, by which time the decision has been made.
+	return m, nil
+}
+
+// ensureOpen opens the append handle, creating the file if it is not there.
+// Every path that writes a record calls it, so no caller has to know that
+// openManifest leaves the handle nil.
+func (m *manifest) ensureOpen() error {
+	if m.f != nil {
+		return nil
+	}
+	f, err := os.OpenFile(m.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, DataFileMode)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	m.f = f
-	return m, nil
+	return nil
 }
 
 func (m *manifest) apply(rec manifestRecord) {
@@ -184,6 +211,9 @@ func (m *manifest) commit(add, remove []uint64, receipt []byte) error {
 	// manifest, and OpenStore's legacy path re-adopted every group file on
 	// disk, resurrecting exactly the removals this log exists to make
 	// durable. ENOSPC during a retention pass is the ordinary way to hit it.
+	if err := m.ensureOpen(); err != nil {
+		return err
+	}
 	fi, err := m.f.Stat()
 	if err != nil {
 		return err
@@ -195,6 +225,12 @@ func (m *manifest) commit(add, remove []uint64, receipt []byte) error {
 		m.truncateTo(off)
 		return werr
 	}
+	// Between the write and the sync: the record is in the page cache and is
+	// NOT a commit. A crash here must leave the group invisible.
+	if ferr := fault(faultManifestWrite); ferr != nil {
+		m.truncateTo(off)
+		return ferr
+	}
 	if serr := m.f.Sync(); serr != nil {
 		m.truncateTo(off)
 		return serr
@@ -203,6 +239,29 @@ func (m *manifest) commit(add, remove []uint64, receipt []byte) error {
 	m.seq = seq
 	m.apply(rec)
 	m.records++
+	// After the sync: the record IS durable, so a crash here must leave the
+	// group visible even though nothing has returned to the caller yet. These
+	// two points are the commit boundary, and the crash matrix has to be able
+	// to stop on either side of it.
+	//
+	// The fault fires AFTER the in-memory state advances, not before. A
+	// synced record cannot be truncated away, so a fault before the update
+	// left memory permanently behind the disk: the injected error reported
+	// batch N rejected, the store showed it absent, the NEXT commit reused
+	// its sequence number, and a reopen made the rejected batch appear. Two
+	// records carrying one Seq, from one injected error. A crash reaches this
+	// point either way -- the process dies before the return -- so the matrix
+	// is unaffected and only the injected-error path changes.
+	//
+	// This point is CRASH-ONLY in production: nothing installs a hook, and
+	// there is no real error between Sync succeeding and the return. An
+	// injected error here still leaves the store's two in-memory structures
+	// disagreeing -- m.visible holds the id, s.groups does not, because
+	// AppendGroup unmaps and returns -- which is a trap for anyone extending
+	// TestInjectedManifestFaultKeepsMemoryAndDiskAgreeing up to the Store.
+	if ferr := fault(faultManifestSync); ferr != nil {
+		return ferr
+	}
 	// Fold the log down once it is long. Without a caller, compact() was
 	// dead code and replay stayed proportional to every change ever made.
 	if m.records >= compactThreshold {
@@ -221,6 +280,11 @@ func (m *manifest) commit(add, remove []uint64, receipt []byte) error {
 // A failure here is reported by leaving the manifest as it is: the next open
 // truncates the torn tail, which is the same repair one restart later.
 func (m *manifest) truncateTo(off int64) {
+	// A write path, so it opens the handle the same way commit does: a caller
+	// may roll back a manifest it has not written to in this process.
+	if err := m.ensureOpen(); err != nil {
+		return
+	}
 	if err := m.f.Truncate(off); err != nil {
 		return
 	}
@@ -247,16 +311,36 @@ func (m *manifest) visibleIDs() []uint64 {
 // helper rather than appended, so a crash leaves either no manifest or a
 // complete one.
 func (m *manifest) bootstrap(ids []uint64) error {
-	if err := m.f.Close(); err != nil {
-		m.f = nil
-		m.reopen()
-		return err
+	// The handle may be nil: openManifest no longer creates the file, and
+	// bootstrap is exactly the caller that runs before the first write. In
+	// this tree it is ALWAYS nil, so this branch is dead -- kept because a
+	// future caller with an open handle would need it, and correct for that
+	// caller: a non-nil handle means the file exists, so reopen's O_CREATE
+	// cannot manufacture the fact OpenStore's gate reads. That is why this one
+	// reopen survives while the one below was deleted.
+	if m.f != nil {
+		if err := m.f.Close(); err != nil {
+			m.f = nil
+			m.reopen()
+			return err
+		}
 	}
 	m.f = nil
 	m.seq = 1
 	rec := manifestRecord{Seq: 1, Add: ids}
 	if err := writeFileAtomic(m.path, rec.encode(), DataFileMode); err != nil {
-		m.reopen()
+		// NO reopen() here. reopen opens with O_CREATE, and on a legacy
+		// directory the MANIFEST does not exist yet -- so a FAILED bootstrap
+		// created a 0-byte one, which is exactly the fact OpenStore's gate
+		// reads to decide whether the directory is legacy. Every later open
+		// then saw a manifest that existed, skipped the bootstrap, replayed
+		// nothing, and returned a store with zero groups AND NO ERROR, on a
+		// directory holding the only copy of the data.
+		//
+		// A transient ENOSPC turned into permanent silent loss, which is the
+		// shape reopen's own doc comment exists for, one branch over. Leaving
+		// the handle nil is correct and sufficient: every writer goes through
+		// ensureOpen, and the next open re-decides and re-bootstraps.
 		return err
 	}
 	m.visible = map[uint64]bool{}
@@ -280,6 +364,13 @@ const compactThreshold = 4096
 
 func (m *manifest) compact() error {
 	ids := m.visibleIDs()
+	// The same guard commit and truncateTo take. Not reachable through Store
+	// today -- OpenStore always ensureOpens before returning -- but this is a
+	// write path, and the next caller added here would inherit a nil-handle
+	// Close returning ErrInvalid and falling into the reopen below.
+	if err := m.ensureOpen(); err != nil {
+		return err
+	}
 	if err := m.f.Close(); err != nil {
 		// Clear the handle first. Returning with m.f non-nil but closed made
 		// reopen()'s nil check a no-op, so every later commit failed with
