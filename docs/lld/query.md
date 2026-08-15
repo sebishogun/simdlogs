@@ -340,10 +340,35 @@ vector).
 
 ## Subqueries and joins
 
-`subquery.go`. `join` (stream-scoped), `union`, `in (subquery)` (resolved at
-run time, `Pred.Sub`), `stream_context` (bounded by `streamContextCap =
-2,000,000` rows). `stream_context` runs the parent's filter over the window
-expanded by the before/after rows.
+`subquery.go`. `join`, `union`, `in (subquery)` (resolved at run time,
+`Pred.Sub`), `stream_context` (bounded by `streamContextCap = 2,000,000` rows,
+or `-search.maxPipeRows` when that is smaller).
+
+### stream_context is scoped to the stream
+
+`before N after N` returns the N rows around a match **in the match's own
+`_stream`**. Scoped to the query window instead — which is what it did — the
+neighbours of an error on one host are whatever other hosts happened to write
+at the same moment: on a busy server `before 5 after 5` returned ten lines from
+ten unrelated processes and none of the ten from the process that failed. Not a
+smaller answer, a different one, and indistinguishable from a correct one.
+
+A row with no stream fields configured is in `EmptyStream`, which is one
+stream, so an unconfigured deployment gets the window-scoped behaviour it had —
+because there genuinely is only one stream to scope to.
+
+Matches are re-identified in the context scan by their **content** — timestamp
+and every field — not by timestamp. Matching by timestamp meant any row written
+in the same millisecond as a match got its own N lines of context, and a row in
+a *different* stream at the same instant pulled in a second stream's worth of
+rows nobody asked for.
+
+The context scan goes through `ScanPage` (see `order.go`), so equal timestamps
+have the defined `(time, group id, row index)` neighbour order rather than
+whichever the scan happened to produce. A match at its stream's edge is clamped
+to that stream, never padded from the window. Overlapping ranges collapse: two
+matches three rows apart with `before 5` share most of their neighbours, and
+each shared row is emitted once, in time order.
 
 ## SQL and vector surfaces
 

@@ -3,15 +3,42 @@ package query
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
 
 // StreamContextPipe is `stream_context before N after N` -- around each matched
-// row, also return the N rows before and after it in time order. Without a
-// first-class stream model it scopes context to the query window, not a single
-// stream; matches are located by timestamp.
+// row, also return the N rows before and after it FROM THE SAME STREAM.
+//
+// # Why the stream matters
+//
+// Context is a debugging tool: you found the error and you want the lines
+// around it. "Around it" means around it in the log that produced it. Scoped
+// to the query window instead, the neighbours of an error on one host are
+// whatever other hosts happened to write at the same moment -- on a busy
+// server, `before 5 after 5` returns ten lines from ten unrelated processes
+// and none of the ten from the process that failed. That is not a smaller
+// answer, it is a different one, and it looks exactly like a correct one.
+//
+// So neighbours are taken within a row's own `_stream` label set. A row with
+// no stream fields configured is in EmptyStream, which is one stream -- so an
+// unconfigured deployment gets the window-scoped behaviour it had, because
+// there genuinely is only one stream to scope to.
+//
+// # Why identity is a tuple and not a timestamp
+//
+// The matches arriving here were located in the ORIGINAL scan; the pipe has to
+// find them again in the context scan. Matching them by timestamp is what the
+// pipe used to do, and timestamps collide constantly: an unrelated row written
+// in the same millisecond was treated as a match and got its own ten lines of
+// context. Rows are identified by their content -- timestamp and every field
+// -- which is exact, and two rows identical in all of those are the same row
+// for any purpose a caller has.
+//
+// Ordering within the context scan uses the (time, group id, row index) tuple
+// from order.go, so equal timestamps have a defined neighbour order rather
+// than whichever the scan happened to produce.
 type StreamContextPipe struct{ Before, After int }
 
 // streamContextCap bounds the context scan's materialized rows.
@@ -20,7 +47,7 @@ type StreamContextPipe struct{ Before, After int }
 // returned context computed over the first two million and nothing said so:
 // a neighbour that exists gets dropped because a row far away in the window
 // used up the budget, and the answer is wrong in a way the caller cannot see.
-// It is a MaxRows now -- the query errors instead.
+// It is a ceiling now -- the query errors instead.
 const streamContextCap = 2_000_000
 
 func (p *StreamContextPipe) apply(rows []Row) []Row { return rows }
@@ -29,70 +56,121 @@ func (p *StreamContextPipe) run(s Store, parent *Query, matches []Row) []Row {
 	if len(matches) == 0 || (p.Before == 0 && p.After == 0) {
 		return matches
 	}
-	// The N neighbors sit next to each match in time, so the context scan needs
-	// the window's rows in time order. MaxRows, not Limit: a Limit truncates
-	// and the pipe then computes context over a prefix of the window, which
-	// drops neighbours that exist because rows elsewhere in the window spent
-	// the budget. A window too big to hold is a query to refuse, not one to
-	// answer differently.
-	cap := streamContextCap
-	if parent.maxPipeRows > 0 && parent.maxPipeRows < cap {
-		cap = parent.maxPipeRows
+	budget := streamContextCap
+	if parent.maxPipeRows > 0 && parent.maxPipeRows < budget {
+		budget = parent.maxPipeRows
 	}
+	// The whole window, unfiltered: a neighbour is by definition a row the
+	// query did NOT match, so the context scan cannot carry the parent's
+	// filter.
 	ctxQ := &Query{From: parent.From, To: parent.To, Now: parent.Now,
-		Filter: &Expr{Op: OpAnd}, MatAll: true, MaxRows: cap}
+		Filter: &Expr{Op: OpAnd}, MatAll: true}
 	applyBudget(ctxQ, parent)
 	// Its OWN stop reason, then translated. applyBudget shares the parent's so
 	// the first stop anywhere in the query tree is the one reported -- right
-	// everywhere else, and wrong here: this scan's row cap is not the caller's
-	// row budget, it is "the window does not fit in memory", and reporting
-	// ErrRowLimit would send the caller to raise -search.maxRows, which is not
-	// the knob.
+	// everywhere else, and wrong here: this scan's row ceiling is not the
+	// caller's row budget, it is "the window does not fit in memory", and
+	// reporting ErrRowLimit would send the caller to raise -search.maxRows,
+	// which is not the knob.
 	ctxQ.stopReason = new(atomic.Pointer[error])
-	all := Run(s, ctxQ)
-	overflowed := len(all) > cap
-	if err := ctxQ.stopErr(); err != nil {
-		if errors.Is(err, ErrRowLimit) {
-			overflowed = true
-		} else {
+	// ScanPage rather than Run: it returns the (time, group, row) tuple with
+	// each row, which is what gives equal timestamps a defined neighbour
+	// order. One page of budget+1 -- More means the window overflowed.
+	page, err := ScanPage(s, ctxQ, nil, Oldest, budget)
+	if err != nil {
+		if !errors.Is(err, ErrRowLimit) {
 			parent.stop(err) // cancellation, deadline, bytes: the caller's, unchanged
 			return nil
 		}
+		page = &Page{More: true}
 	}
-	if overflowed {
-		parent.stop(fmt.Errorf(
-			"%w: stream_context needs the whole window in time order and it holds more "+
-				"than %d rows; narrow the window", ErrPipeRowLimit, cap))
+	if e := ctxQ.stopErr(); e != nil && !errors.Is(e, ErrRowLimit) {
+		parent.stop(e)
 		return nil
 	}
-	sort.SliceStable(all, func(i, j int) bool { return all[i].Time < all[j].Time })
-	matchTime := map[int64]bool{}
+	if page.More {
+		parent.stop(fmt.Errorf(
+			"%w: stream_context needs the whole window in time order and it holds more "+
+				"than %d rows; narrow the window", ErrPipeRowLimit, budget))
+		return nil
+	}
+
+	// Matches by content, not by timestamp. Real strings here because the set
+	// is built once and is the size of the match set; the lookups below use
+	// map[string(buf)], which the compiler does without allocating.
+	wanted := make(map[string]bool, len(matches))
+	var buf []byte
 	for _, m := range matches {
-		matchTime[m.Time] = true
+		buf = appendRowIdentity(buf[:0], m)
+		wanted[string(buf)] = true
 	}
-	include := make([]bool, len(all))
-	for i := range all {
-		if !matchTime[all[i].Time] {
-			continue
-		}
-		lo, hi := i-p.Before, i+p.After
-		if lo < 0 {
-			lo = 0
-		}
-		if hi >= len(all) {
-			hi = len(all) - 1
-		}
-		for k := lo; k <= hi; k++ {
-			include[k] = true
+
+	// Positions within each stream, in the total order ScanPage returned. The
+	// slice per stream is what makes "the N before" mean the N before IN THIS
+	// STREAM rather than the N before in the window.
+	byStream := map[string][]int{}
+	for i, r := range page.Rows {
+		st := rowField(r, "_stream")
+		byStream[st] = append(byStream[st], i)
+	}
+
+	include := make([]bool, len(page.Rows))
+	for _, idxs := range byStream {
+		for pos, i := range idxs {
+			buf = appendRowIdentity(buf[:0], page.Rows[i])
+			if !wanted[string(buf)] {
+				continue
+			}
+			lo, hi := pos-p.Before, pos+p.After
+			if lo < 0 {
+				lo = 0
+			}
+			if hi >= len(idxs) {
+				hi = len(idxs) - 1
+			}
+			// Overlapping context ranges collapse here: two matches three
+			// rows apart with `before 5` share most of their neighbours, and
+			// a bool per row is the dedup.
+			for k := lo; k <= hi; k++ {
+				include[idxs[k]] = true
+			}
 		}
 	}
+
 	out := make([]Row, 0, len(matches))
-	for i := range all {
+	for i := range page.Rows {
 		if include[i] {
-			out = append(out, all[i])
+			out = append(out, page.Rows[i])
 		}
+	}
+	if parent.maxPipeRows > 0 && len(out) > parent.maxPipeRows {
+		parent.stop(fmt.Errorf("%w: stream_context produced %d rows, ceiling is %d",
+			ErrPipeRowLimit, len(out), parent.maxPipeRows))
+		return nil
 	}
 	return out
+}
+
+// appendRowIdentity writes a row's identity -- its timestamp and every field --
+// into dst.
+//
+// Appended into a caller-supplied buffer rather than built with Sprintf or a
+// strings.Builder, because this runs once per row of the context window and
+// the window is bounded at two million. Field values are length-prefixed so a
+// row with fields {"ab","c"} cannot collide with one holding {"a","bc"}.
+func appendRowIdentity(dst []byte, r Row) []byte {
+	dst = strconv.AppendInt(dst, r.Time, 10)
+	for _, f := range r.Fields {
+		dst = append(dst, 0)
+		dst = strconv.AppendInt(dst, int64(len(f.Key)), 10)
+		dst = append(dst, ':')
+		dst = append(dst, f.Key...)
+		dst = append(dst, 0)
+		dst = strconv.AppendInt(dst, int64(len(f.Value)), 10)
+		dst = append(dst, ':')
+		dst = append(dst, f.Value...)
+	}
+	return dst
 }
 
 // Subquery pipes: join and union run a nested LogsQL query and combine it with
