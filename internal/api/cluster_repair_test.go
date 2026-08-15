@@ -377,3 +377,91 @@ func TestAdjacentGroupsFromOneReplicaAreNotBlocked(t *testing.T) {
 			"asserting nothing")
 	}
 }
+
+// A peer answering something that parses but is not a replica state is refused.
+//
+// The guard used to be `bytes.Contains(body, []byte("\"groups\""))`, which
+// matches the quoted token anywhere -- including inside a VALUE. Two reviewers
+// bypassed it with `{"note":"groups"}`, one on the first attempt, and a third
+// found that the key check had been described in a commit message and never
+// written. A peer that passes reads as an EMPTY replica, and repair then
+// copies the whole shard into a node that never reported a state, which is the
+// outcome ReplicaState.Err's own doc exists to prevent.
+func TestABodyThatParsesButIsNotAStateIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		refuse     bool
+	}{
+		{"a real empty state", `{"groups":[],"highWatermark":0}`, false},
+		{"a real state with groups", `{"groups":[{"digest":"a","timeMin":1,"timeMax":2}]}`, false},
+		{"null", `null`, true},
+		{"empty object", `{}`, true},
+		{"groups as a VALUE", `{"note":"groups"}`, true},
+		{"groups inside a longer value", `{"msg":"no groups here"}`, true},
+		{"groups as a nested key", `{"inner":{"groups":[]}}`, true},
+		{"an array", `[]`, true},
+		{"a bare string", `"groups"`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writeEnvelope(w.Header(), 0, 0, true, 1, "")
+				w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(peer.Close)
+
+			srv, err := NewServer(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { srv.Close() })
+			srv.SetBackends([]string{peer.URL})
+			srv.SetReplicas(1)
+
+			req := httptest.NewRequest("GET", "/", nil)
+			st := srv.askReplicaState(req, 0, 0, peer.URL)
+			if refused := st.Err != ""; refused != tc.refuse {
+				t.Errorf("body %s gave Err=%q; want refused=%v.\n"+
+					"A body that is not a state must not read as an EMPTY one: "+
+					"repair would copy the whole shard into it",
+					tc.body, st.Err, tc.refuse)
+			}
+		})
+	}
+}
+
+// A replica holding overlapping groups of its own cannot certify a pair.
+//
+// The holder-sharing exemption rests on "one store cannot hold two groups with
+// the same rows", and that is FALSE: ingesting one time range twice without a
+// write id leaves a store holding [T0,T0], [T0,T9] and [T1,T9] at once. A
+// reviewer built it with an ordinary retried ingest, and the result was worse
+// than the stall the exemption replaced -- every pair exempted, a CLEAN replica
+// copied onto, all of its rows duplicated, and the pass reporting
+// complete: true. Loud-and-intact became silent-and-destroyed.
+func TestASelfOverlappingReplicaCannotCertifyAPair(t *testing.T) {
+	clean := []storage.GroupDigest{
+		{Digest: "c1", TimeMin: 0, TimeMax: 10},
+		{Digest: "c2", TimeMin: 11, TimeMax: 20},
+	}
+	doubled := []storage.GroupDigest{
+		{Digest: "d1", TimeMin: 0, TimeMax: 0},
+		{Digest: "d2", TimeMin: 0, TimeMax: 9}, // the re-ingest, covering d1 and d3
+		{Digest: "d3", TimeMin: 1, TimeMax: 9},
+	}
+
+	if got := selfOverlap(clean); got != "" {
+		t.Errorf("two disjoint groups reported as overlapping: %s", got)
+	}
+	if got := selfOverlap(doubled); got == "" {
+		t.Fatal("a store holding [0,0], [0,9] and [1,9] was not reported as " +
+			"self-overlapping; those three cover the same rows twice")
+	}
+	if got := selfOverlap(nil); got != "" {
+		t.Errorf("an empty inventory reported as overlapping: %s", got)
+	}
+
+	// A single group can never overlap itself, however wide.
+	if got := selfOverlap(doubled[:1]); got != "" {
+		t.Errorf("one group reported as overlapping: %s", got)
+	}
+}

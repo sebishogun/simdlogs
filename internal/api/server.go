@@ -1113,17 +1113,30 @@ func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 		buf = append(buf, '"')
 		first = false
 	}
-	stream := ""
-	sawStreamID := false
+	stream, streamID := "", ""
+	sawStream, sawStreamID := false, false
 	for _, f := range row.Fields {
 		if f.Key == "_time" {
 			continue
 		}
-		if f.Key == "_stream" {
-			stream = f.Value
+		// A NON-EMPTY value counts as present. The store materializes a column
+		// for the whole group, so a row that never carried _stream_id comes
+		// back with "" once any row in its flush did -- and treating that as
+		// present suppressed the synthesis for every other row in the flush.
+		// One client-supplied value blanked the field group-wide, at HTTP 200,
+		// on the field a client groups and colours by.
+		if f.Key == "_stream" && f.Value != "" {
+			stream, sawStream = f.Value, true
 		}
-		if f.Key == "_stream_id" {
-			sawStreamID = true
+		if f.Key == "_stream_id" && f.Value != "" {
+			streamID, sawStreamID = f.Value, true
+		}
+		if withStream && (f.Key == "_stream" || f.Key == "_stream_id") {
+			// Emitted once, below, from the row's value or the synthesized
+			// one. Emitting it here as well is what produced the duplicate
+			// key; skipping it here and synthesizing unconditionally is what
+			// dropped the ingested value at the shard. One place decides.
+			continue
 		}
 		if !first {
 			buf = append(buf, ',')
@@ -1140,44 +1153,35 @@ func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 	// stream -- that is still a stream, and omitting the pair left a client's
 	// stream column blank rather than uniform.
 	if withStream {
-		if stream == "" {
+		// Exactly one _stream and one _stream_id, the row's own value when it
+		// has one and the synthesized value when it does not.
+		//
+		// Both were guarded, differently, and both were wrong: _stream tested
+		// the VALUE (`stream == ""`) and duplicated the key for a row carrying
+		// an empty one; _stream_id tested PRESENCE and blanked the field for
+		// every row sharing a group with one that carried it. Four lines apart,
+		// in one function.
+		if !sawStream {
 			stream = query.EmptyStream
-			if !first {
-				buf = append(buf, ',')
-			}
-			first = false
-			buf = append(buf, `"_stream":"`...)
-			buf = appendJSONString(buf, stream)
-			buf = append(buf, '"')
 		}
-		// Not written when the ROW already carried one.
-		//
-		// _stream_id is not a reserved ingest name, so a client can send a
-		// field of that name, and emitting the synthesized pair on top of it
-		// produced an object with the key TWICE: Go's json.Unmarshal takes the
-		// last, a first-wins parser takes the other, and a projection -- which
-		// runs with withStream false and so never synthesized -- gave a third
-		// answer.
-		//
-		// Skipping the SYNTHESIS rather than the row's field is what makes the
-		// cluster and the node agree. The first version of this skipped the
-		// field instead, and a shard runs the bare `*` with withStream true --
-		// so the ingested value was dropped AT THE SHARD and never crossed the
-		// wire, while a node's projection kept it. The duplicate-key bug became
-		// a differing-value bug, and `| filter _stream_id:="..."` matched on a
-		// node and could not match on a cluster.
+		if !first {
+			buf = append(buf, ',')
+		}
+		first = false
+		buf = append(buf, `"_stream":"`...)
+		buf = appendJSONString(buf, stream)
+		buf = append(buf, '"')
 		if !sawStreamID {
-			if !first {
-				buf = append(buf, ',')
-			}
-			buf = append(buf, `"_stream_id":"`...)
 			if stream == query.EmptyStream {
-				buf = append(buf, emptyStreamID...) // hashed once, not per row
+				streamID = string(emptyStreamID) // hashed once, not per row
 			} else {
-				buf = append(buf, query.StreamID(stream)...)
+				streamID = query.StreamID(stream)
 			}
-			buf = append(buf, '"')
 		}
+		buf = append(buf, ',')
+		buf = append(buf, `"_stream_id":"`...)
+		buf = appendJSONString(buf, streamID)
+		buf = append(buf, '"')
 	}
 	buf = append(buf, '}', '\n')
 	return buf

@@ -536,13 +536,39 @@ func bufStr(buf *[]byte, off int) string {
 // decodes. A shard emitting that is a protocol violation this router cannot
 // detect without paying for a parse on every row of every read.
 func looksLikeJSONObject(line []byte) bool {
+	return plausibleRowLine(line, true)
+}
+
+// plausibleRowLine is looksLikeJSONObject with the expensive half optional.
+//
+// `full` walks the line balancing braces, string-aware, and requires nothing
+// after the close -- which is what separates a TRUNCATED row from a whole one,
+// because a response cut after an inner `}` ends in the right byte. Measured at
+// 19x on 90-byte lines and 232x on 980-byte ones against the shape check
+// alone, and +24.4% wall on a 60,000-row bare select, which is the path that
+// exists to avoid parsing.
+//
+// So it is paid on the LAST line of a shard body and nowhere else: a response
+// is truncated at its end, so no earlier line can be cut. Every line still
+// gets the O(1) check, which is what catches an HTML error page, a plain-text
+// error and an empty body -- the cases this was written for.
+func plausibleRowLine(line []byte, full bool) bool {
 	i := skipWS(line, 0)
 	if i >= len(line) || line[i] != '{' {
 		return false
 	}
-	// Balanced, string-aware, and nothing after the closing brace. That is
-	// what separates a truncated row from a whole one: a response cut after an
-	// inner `}` ends in the right byte and is not an object.
+	if !full {
+		for j := len(line) - 1; j > i; j-- {
+			switch line[j] {
+			case ' ', '\t', '\r':
+				continue
+			case '}':
+				return true
+			}
+			return false
+		}
+		return false
+	}
 	end, ok := scanComposite(line, i)
 	return ok && skipWS(line, end) == len(line)
 }

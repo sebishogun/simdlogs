@@ -44,8 +44,17 @@ func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
 	// same reason: a field that is constant on one shard and varied across the
 	// cluster is dropped by each shard before the coordinator can see it.
 	shardReq, ok := withoutLimits(r, map[string]string{
-		"limit":             "0",
-		"keep_const_fields": "1",
+		"limit": "0",
+		// The sibling parameter, and the same reason: FacetList reads it as
+		// intParam(r, "max_values_per_field", DefaultFacetMaxValues), so
+		// DELETING it means 1000, not unlimited. A field with 1200 distinct
+		// values per shard was dropped by every shard and the cluster answered
+		// {"facets":[]} at HTTP 200 for a caller asking for 5000 -- with _time
+		// gone too, because timeFacet bounds its own scan to maxPerField+1.
+		// This was left on one of the two parameters the round that documented
+		// the rule for the other.
+		"max_values_per_field": "0",
+		"keep_const_fields":    "1",
 	})
 	if !ok {
 		s.refuseUnparseableQuery(w, r)

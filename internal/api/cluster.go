@@ -539,7 +539,18 @@ func (s *Server) mergeRows(
 				// became _msg="<html>...". mergeDecode covers the eight
 				// envelope merges; this is the primary read path and had
 				// nothing.
-				if !looksLikeJSONObject(line) {
+				// The cheap check on every line; the balance check on the LAST
+				// line of the body only.
+				//
+				// Balancing is 19x on 90-byte lines and 232x on 980-byte ones
+				// -- measured +186.6% instructions and +24.4% wall on a
+				// 60,000-row bare select, which is the path whose whole point
+				// is not parsing. And it buys nothing in the middle of a body:
+				// a response is truncated at its END, so only the last line can
+				// be cut. Every other line gets the O(1) shape check that
+				// catches an HTML page or a plain-text error.
+				last := start >= len(body)
+				if !plausibleRowLine(line, last) {
 					if bad == nil {
 						bad = line
 					}

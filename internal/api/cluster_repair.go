@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -237,6 +236,10 @@ type ShardRepair struct {
 	Remaining int            `json:"remaining"`
 	Blocked   int            `json:"blocked"`
 	Declined  int            `json:"declined"`
+	// SelfOverlapping is replicas whose own inventory contains two groups
+	// covering the same time span. Such a store already holds duplicate rows,
+	// and it is not trusted to certify that two groups differ.
+	SelfOverlapping int `json:"selfOverlapping"`
 	// Divergent is how many groups were not held by every reachable replica
 	// when the pass started. Zero means the shard was already in step.
 	Divergent int `json:"divergent"`
@@ -293,6 +296,38 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 			}
 			for _, g := range st.Groups {
 				union[g.Digest] = g
+			}
+		}
+		// A replica may CERTIFY a pair as non-duplicate only if its own
+		// inventory is internally non-overlapping.
+		//
+		// The exemption rests on "one store cannot hold two groups with the
+		// same rows", and that is false: ingesting one time range twice
+		// without a write id leaves a store holding [T0,T0], [T0,T9] and
+		// [T1,T9] at once. A reviewer built that with an ordinary retried
+		// ingest, and the consequence was worse than the stall the exemption
+		// replaced -- every pair got exempted, a CLEAN replica was copied onto,
+		// every one of its rows was duplicated, and the pass reported
+		// complete: true. Loud-and-intact became silent-and-destroyed.
+		//
+		// So the premise is checked rather than assumed, per replica, once.
+		// A replica that fails is still a source and still a destination; it
+		// just cannot vouch for anything.
+		for _, st := range states {
+			if st.Err != "" {
+				continue
+			}
+			if bad := selfOverlap(st.Groups); bad != "" {
+				sr.SelfOverlapping++
+				rep.Errors = append(rep.Errors, fmt.Sprintf(
+					"shard %d replica %d holds overlapping groups of its own (%s): it "+
+						"is not trusted to certify that two groups differ, and its own "+
+						"duplication needs an operator",
+					shardIdx, st.Replica, bad))
+				rep.Complete = false
+				continue
+			}
+			for _, g := range st.Groups {
 				if holders[g.Digest] == nil {
 					holders[g.Digest] = map[int]bool{}
 				}
@@ -509,10 +544,22 @@ func (s *Server) askReplicaState(r *http.Request, shard, replica int, u string) 
 	// it as empty would make repair try to copy the whole shard into a node
 	// that already has it" -- and that is exactly what this produced, because
 	// the guard covered the unmarshal error and not this. `groups` is present
-	// and non-null in every real answer, including an empty replica's, so its
-	// absence is the discriminator.
-	if !bytes.Contains(resp.Body, []byte(`"groups"`)) {
-		st.Err = "the answer parsed but is not a replica state (no groups field)"
+	// in every real answer, including an empty replica's, so its absence is
+	// the discriminator -- checked as a KEY.
+	//
+	// This was `bytes.Contains(resp.Body, []byte("\"groups\""))`, which matches
+	// the quoted token anywhere, including inside a value: `{"note":"groups"}`
+	// passed it and read as an empty replica, so repair proceeded to copy the
+	// whole shard into a peer that never reported a state. Two reviewers
+	// bypassed it, one of them on the first attempt, and a third confirmed the
+	// key check had been described in a commit message and never written.
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(resp.Body, &keys); err != nil {
+		st.Err = "the answer is not a JSON object: " + err.Error()
+		return st
+	}
+	if _, ok := keys["groups"]; !ok {
+		st.Err = "the answer parsed but is not a replica state (no groups key)"
 		return st
 	}
 	got.Shard, got.Replica, got.URL = shard, replica, u
@@ -633,8 +680,25 @@ func shortDigest(d string) string {
 // already has rows from that range. It may hold them as the groups g was
 // compacted from, or it may have dropped them to retention. Either way the
 // digests differ for a reason other than a missed write, and copying is unsafe.
+func overlapping(have []storage.GroupDigest, g storage.GroupDigest) string {
+	for _, h := range have {
+		// Closed intervals: a group whose max equals another's min shares a
+		// timestamp, and a duplicate row at the boundary is still a duplicate.
+		if g.TimeMin <= h.TimeMax && h.TimeMin <= g.TimeMax {
+			return h.Digest
+		}
+	}
+	return ""
+}
+
 // overlappingFrom is overlapping, skipping any group that shares a holder
 // with g.
+//
+// Placed BELOW overlapping rather than above it: inserting a helper directly
+// above an existing function silently re-heads that function's doc comment,
+// and this commit series has now done exactly that three times -- bodiesOf's
+// text ended up heading mergeDecode, and this comment and rowsBytes' each took
+// over the function below them.
 //
 // The overlap guard is a heuristic for "these two spellings may be the same
 // rows", and it is right about a compacted group against its pieces. It is
@@ -666,6 +730,26 @@ func overlappingFrom(have []storage.GroupDigest, g storage.GroupDigest,
 	return overlapping(candidates, g)
 }
 
+// selfOverlap returns a description of the first overlapping pair within one
+// replica's own inventory, or "" when there is none.
+//
+// O(n^2) over one shard's groups, run once per replica per pass. A shard holds
+// tens to hundreds of groups, and this decides whether that replica may exempt
+// pairs from the duplication guard, so the cost is the point.
+func selfOverlap(groups []storage.GroupDigest) string {
+	for i := range groups {
+		for j := i + 1; j < len(groups); j++ {
+			a, b := groups[i], groups[j]
+			if a.TimeMin <= b.TimeMax && b.TimeMin <= a.TimeMax {
+				return fmt.Sprintf("%s [%d,%d] and %s [%d,%d]",
+					shortDigest(a.Digest), a.TimeMin, a.TimeMax,
+					shortDigest(b.Digest), b.TimeMin, b.TimeMax)
+			}
+		}
+	}
+	return ""
+}
+
 // holdersShare reports whether one replica holds both groups.
 func holdersShare(a, b map[int]bool) bool {
 	for r := range a {
@@ -674,15 +758,4 @@ func holdersShare(a, b map[int]bool) bool {
 		}
 	}
 	return false
-}
-
-func overlapping(have []storage.GroupDigest, g storage.GroupDigest) string {
-	for _, h := range have {
-		// Closed intervals: a group whose max equals another's min shares a
-		// timestamp, and a duplicate row at the boundary is still a duplicate.
-		if g.TimeMin <= h.TimeMax && h.TimeMin <= g.TimeMax {
-			return h.Digest
-		}
-	}
-	return ""
 }

@@ -410,3 +410,32 @@ func TestATruncatedShardLineIsRefused(t *testing.T) {
 		})
 	}
 }
+
+// A row whose _stream field is the EMPTY STRING does not get a second one.
+//
+// The _stream guard tested the VALUE (`if stream == ""`) and the _stream_id
+// guard tested PRESENCE, four lines apart in one function. So an empty
+// _stream read as "no _stream" and a second pair was synthesized: the object
+// carried the key twice, json.Unmarshal took the synthesized value and a
+// first-wins parser took the empty one -- the identical divergence the
+// _stream_id fix closed, still open beside it.
+func TestAnEmptyStreamFieldDoesNotDuplicateTheKey(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fields []query.Field
+	}{
+		{"empty _stream", []query.Field{{Key: "_msg", Value: "a"}, {Key: "_stream", Value: ""}}},
+		{"non-empty _stream", []query.Field{{Key: "_msg", Value: "a"}, {Key: "_stream", Value: "{h=1}"}}},
+		{"no _stream at all", []query.Field{{Key: "_msg", Value: "a"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			line := appendRowJSON(nil, query.Row{Time: 1, Fields: tc.fields}, true)
+			if n := strings.Count(string(line), `"_stream"`); n != 1 {
+				t.Errorf("_stream appears %d times: %s", n, line)
+			}
+			if n := strings.Count(string(line), `"_stream_id"`); n != 1 {
+				t.Errorf("_stream_id appears %d times: %s", n, line)
+			}
+		})
+	}
+}

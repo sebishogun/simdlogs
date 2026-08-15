@@ -1452,15 +1452,6 @@ func PipesProject(pipes []Pipe) bool {
 // stream_context each run a subquery against a store, and a coordinator has
 // none: skipping them would answer the query as if the pipe were not there,
 // which is the silent-wrong-answer shape this whole area is about.
-// rowsBytes is the materialized size of a row set.
-func rowsBytes(rows []Row) int64 {
-	var n int64
-	for i := range rows {
-		n += rowBytes(rows[i])
-	}
-	return n
-}
-
 func ApplyPipes(q *Query, rows []Row) []Row {
 	// The materialized size, passed to exceeded rather than a literal zero.
 	//
@@ -1515,4 +1506,13 @@ func ApplyPipes(q *Query, rows []Row) []Row {
 		}
 	}
 	return rows
+}
+
+// rowsBytes is the materialized size of a row set.
+func rowsBytes(rows []Row) int64 {
+	var n int64
+	for i := range rows {
+		n += rowBytes(rows[i])
+	}
+	return n
 }

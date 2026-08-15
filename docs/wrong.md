@@ -4617,3 +4617,72 @@ was written down correctly in its own commit message, and the code did
 something else — three times, in one sitting, by the person who had just
 written the rule. Reading did not find any of it. Two live clusters and an
 adversarial reader did.
+
+## 47. Round four: a fix that was only in the commit message, and an exemption broken by a retried ingest
+
+**A claim with no code.** Entry 46 says the not-a-state guard "unmarshals to
+`map[string]json.RawMessage` and tests the KEY now". It did not. The edit was
+one half of a script whose first assertion failed; only the second half was
+re-run, and the commit message described the whole thing. Three reviewers
+found it independently — two by reading the file, one by running
+`{"note":"groups"}` against a live router and getting `copied=2,
+complete=true` on both binaries.
+
+There is no interesting lesson about the guard. The lesson is that a commit
+message is not evidence, and this one had been read twice by me before it
+shipped.
+
+**The exemption was broken by an ordinary retried ingest.** Entry 46's repair
+fix rests on "two groups held by one replica came from one store and cannot
+contain the same rows". False. Ingesting one time range twice without a write
+id leaves a store holding, at once:
+
+    fccec81c [T0,T0]  rows=1
+    121191e6 [T0,T9]  rows=10      <- the re-ingest
+    9e36b98a [T1,T9]  rows=9
+
+With that replica in the union, `holdersShare` is true for every pair, the
+guard's candidate list empties, and a CLEAN replica is copied onto:
+
+    HEAD    R1=20 R2=10 -> copied 1, blocked 0, complete TRUE  -> R2=20,
+                           10 distinct rows, all ten duplicated
+    BEFORE  R1=20 R2=10 -> copied 0, blocked 1, complete false -> R2=10
+
+Worse than what it replaced in the exact dimension that matters: the stall was
+loud and left data intact; this was silent and destroyed it. Fixed by checking
+the premise instead of assuming it — a replica may certify a pair only if its
+own inventory is internally non-overlapping, verified once per pass, and one
+that fails is reported and still used as a source and destination.
+
+**And the same asymmetry, twice, four lines apart.** `_stream` tested the
+VALUE and `_stream_id` tested PRESENCE, so a row carrying an empty `_stream`
+got the key twice, and — because the store materializes a column for the whole
+group — one client-supplied `_stream_id` anywhere in a flush blanked the field
+for every other row in it. Entry 46 fixed one direction of this and shipped
+the other. Both fields are emitted exactly once now, from the row's value when
+it has one.
+
+**Measured, and a cost that had to be put back.** `looksLikeJSONObject`'s
+brace balancing is correct and costs 19× on 90-byte lines, 232× on 980-byte
+ones, +186.6% instructions and +24.4% wall on a 60,000-row bare select — the
+path whose whole point is not parsing. Truncation can only be at the END of a
+response, so the balance check now runs on the last line of a shard body and
+the O(1) shape check on every line, which is what catches an HTML error page.
+
+`ApplyPipes` measured 9.9% → 6.2% after carrying the size forward: four pipes
+cost five passes rather than eight, and 5/8 = 62.5% against 22.4/36.2 = 61.9%
+measured. The remaining pass is the one that cannot be removed.
+
+`max_values_per_field` was still DELETED rather than overridden, so each shard
+fell back to its default of 1000 — a field with 1200 distinct values per shard
+disappeared from a cluster answer that a single node answered with 2400, at
+HTTP 200. That is the identical defect entry 45 documents for `limit`, left on
+the sibling parameter by the commit that wrote the rule.
+
+**The shape.** Entry 45: the correct behaviour was written down and the code
+did something else. Entry 46: the FIX was written down and the code did
+something else. This one: the fix was written down, the code did nothing at
+all, and the fix that WAS written rested on an invariant a retried ingest
+breaks. Four rounds, and every round's defects were found by running a cluster
+or by an adversary reading with intent — never by the person who wrote them
+reading them again.
