@@ -27,9 +27,6 @@ func runParallel(groups []*storage.Reader, q *Query) []Row {
 	want := len(groups)
 	workers, releaseWorkers := scanWorkers(want)
 	defer releaseWorkers()
-	if workers > len(groups) {
-		workers = len(groups)
-	}
 	parts := make([][]Row, len(groups))
 	var wg sync.WaitGroup
 	ch := make(chan int, len(groups))
@@ -122,9 +119,6 @@ func histogramParallel(groups []*storage.Reader, q *Query, step int64) map[int64
 	want := len(groups)
 	workers, releaseWorkers := scanWorkers(want)
 	defer releaseWorkers()
-	if workers > len(groups) {
-		workers = len(groups)
-	}
 	parts := make([]map[int64]int, len(groups))
 	var wg sync.WaitGroup
 	ch := make(chan int, len(groups))
@@ -169,9 +163,6 @@ func countParallel(groups []*storage.Reader, q *Query) int {
 	want := len(groups)
 	workers, releaseWorkers := scanWorkers(want)
 	defer releaseWorkers()
-	if workers > len(groups) {
-		workers = len(groups)
-	}
 	var total int64
 	var wg sync.WaitGroup
 	ch := make(chan int, len(groups))

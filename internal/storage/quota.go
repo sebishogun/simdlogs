@@ -227,21 +227,31 @@ func (s *Store) cachedUsage() (DiskUsage, error) {
 		if u := s.usage.Load(); u != nil {
 			return *u, nil
 		}
-		// A cached FAILURE: the sample is fresh and it is that the filesystem
-		// could not be measured. Reported as such rather than falling through
-		// to another syscall.
+		// The sample is fresh and there has never been a good one: the
+		// filesystem has not been measurable since the store opened.
 		return DiskUsage{}, errUnmeasured
 	}
 	u, err := (*diskUsageFn.Load())(s.dir)
 	if err != nil {
-		// The FAILURE is cached too, and for the same reason the success is.
-		// Returning early without stamping meant a filesystem that cannot be
-		// measured -- ESTALE on a vanished NFS mount, a directory that went
-		// away -- was re-measured on every write rather than every two
-		// seconds, which is the syscall storm this cache exists to prevent,
-		// reached through the one condition that makes the syscall slow.
-		s.usage.Store(nil)
+		// The failure is cached -- but the last GOOD sample is kept.
+		//
+		// Not stamping at all meant a filesystem that cannot be measured was
+		// re-measured on every write rather than every two seconds: the
+		// syscall storm this cache exists to prevent, reached through the one
+		// condition that makes the syscall slow. Stamping and DISCARDING the
+		// sample was worse: QuotaState treats an unmeasurable filesystem as
+		// "do not refuse writes", so it turned one failed statfs into a
+		// two-second window with the reject reserve switched off on a full
+		// disk. Measured at 2.0 s against 0 s before the caching went in.
+		//
+		// So the interval is respected and the reserve keeps enforcing against
+		// the last reading. The reserve already tolerates one interval of
+		// staleness -- that is what makes it a RESERVE -- and one interval of
+		// a stale-but-real number beats one interval of no number.
 		s.usageAt.Store(now)
+		if u := s.usage.Load(); u != nil {
+			return *u, nil
+		}
 		return DiskUsage{}, err
 	}
 	s.usage.Store(&u)

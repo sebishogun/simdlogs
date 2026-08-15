@@ -3995,3 +3995,79 @@ committed while writing the fix for it: a count nobody counts, a claim nobody
 compiles, a parity fixed on one side, a classification asserted in the
 direction that was already believed. The review that found them is the only
 reason any of them is in this file rather than in production.
+
+## Two reviews of the same three commits, and the shape they share
+
+Reviewer A took 6.2/6.3 and reviewer B refused sign-off on the storage-budget
+fixes. Between them: one reproduced memory-unsafety, one regression that made a
+failure worse than the thing it replaced, one whole feature that nothing ever
+configured, and four claims in shipped source that are false.
+
+**`wg.Wait()` was a statement, not a defer.** Its own comment says *"not
+tidiness: the snapshot is unmapped when ScanEach returns, and a producer still
+reading a group's blob after that is a use-after-unmap"* — and it was skipped
+on the one return path that does not reach it, a panic or `runtime.Goexit` out
+of the sink, while `defer sn.Close()` still ran. Reproduced at 64 groups ×
+4000 rows: **SIGSEGV 5/5 runs** in `lz4BlockDecodeAVX512`, and 2/3 via
+`t.Fatalf` inside a sink. Deleting the line entirely left the whole suite
+green, so the invariant the comment describes had **zero** coverage. One
+keyword.
+
+**Streaming made the byte budget worse than materializing.** `emitter.bytes`
+accumulated across groups while the walk held one. A scan holding 8,156 B at a
+time was refused by a 32,624 B ceiling; over HTTP, where the same counter is
+`-search.maxQueryBytes`, a 6.6 MB answer got **200, 4.5 MB and `unexpected
+EOF`** where the materialized path returned a clean 413 with nothing on the
+wire. `engine.go` had predicted it in a comment — *"when a streaming sink lands
+this has to become the live figure rather than the running one"* — and the sink
+landed without it.
+
+**Half of `Admission` was never configured.** `NewAdmission` was called with
+`MaxPerTenant` and `Wait`, never `MaxConcurrent`, so the global channel was
+always nil: `Stats` reported `len(nil chan)` = 0 in flight however many queries
+were admitted, `-query-queue-wait` was read only on the branch that returned at
+`global == nil` (a refusal in **7.1 µs** with the wait set to an hour), and
+`ErrQueueTimeout` could not be produced by the server at all. The
+documentation described a path with no flag behind it. This is the repo's own
+named failure — "a limit that is configuration nothing reads" — shipped in the
+commit whose subject was governing limits.
+
+**Four false claims in source, not just in commit messages.**
+*"The other order deadlocks"*: `acquireKey` never blocked, so the deadlock
+described could not occur, and swapping the order left the suite green.
+*"lock_unix.go handles exactly this errno"* about EAGAIN: `lockDir` wraps it
+into `storage.ErrLocked` and **drops** the errno, so the one case the errno
+list was written for was the one it did not catch — `ErrLocked` answered 400,
+the code an agent drops the batch on. *"the literal boxed six syscall.Errno
+values to the heap on every call"*: measured **0.00 allocs/op** both ways, with
+no `runtime.newobject` site in either disassembly — the constants are below 256
+so the conversions resolve through `runtime.staticuint64s`. *"the server's
+absolute path in the body"* written in the past tense while the body still
+carried it: only the status code had changed.
+
+**Caching a statfs failure opened a two-second hole in the reject reserve.**
+`s.usage.Store(nil)` discarded the last good sample, and `QuotaState` treats an
+unmeasurable filesystem as "do not refuse writes" — so one failed statfs turned
+the reserve off for the whole interval on a full disk. Measured **2.0 s against
+0 s** before the caching. Keeping the last reading gets the syscall fix without
+the hole.
+
+**Smaller, all measured:** an aborted stream was counted as a successful
+streamed select and as no error (`panic(http.ErrAbortHandler)` bypasses the
+`sw.code >= 400` accounting); three of five new metrics were absent from a
+default server while two documents listed them unconditionally; a cancelled
+client was counted as a rejection; live tails were exempt from admission on a
+clause justified by the argument for exempting *writes*, which is the opposite
+of true for the longest-lived read there is; the `if workers > len(groups)`
+clamp was dead at all four sites; and `MaxQueriesPerTenant`, `QueryQueueWait`
+and `MaxScanWorkers` were absent from `config.fields()` — whose own doc says
+*"so a new limit cannot be added to the struct and forgotten by both"* — so
+`-5` passed `Normalize()` for all three.
+
+**The shape.** Every one of these is a claim that was written and never
+executed: a comment that describes a guarantee the code does not make, a
+config field nothing reads, a count nobody counts, a platform tag nobody
+compiles. The tests were green throughout. What found them was two independent
+adversaries running mutations — and the single most useful signal in both
+reports is the revert-probe list, because a guard you can delete with the suite
+still green is a guard that was never doing anything.

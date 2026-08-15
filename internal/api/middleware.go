@@ -200,17 +200,44 @@ func (s *Server) guard(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 			defer release()
-			// Per-tenant admission, after the global class limit and only for
-			// reads. A global limit alone lets one tenant fill it: on a shared
+			// Per-tenant admission, after the class limit and for every READ.
+			// A process-wide limit alone lets one tenant fill it: on a shared
 			// server the tenant with the most aggressive dashboard takes every
 			// slot and every other tenant sees 429 for work the server had
 			// room to do.
 			//
-			// After, not before: the global gate is the cheaper check and the
-			// one that protects the process, and taking a tenant slot only to
-			// be refused globally would hold it for the length of the refusal.
-			if s.admission != nil && !spec.write && !spec.stream {
-				rel, err := s.admission.Acquire(r.Context(), tenantKeyOf(r))
+			// Live tails included. They were exempt on the `!spec.stream`
+			// clause, justified by the argument for exempting WRITES -- "an
+			// ingest request does not hold memory for the length of a scan" --
+			// which is the exact opposite of true for a tail, the longest-lived
+			// read the server has. One tenant could hold every tail slot
+			// indefinitely and admission would not see it.
+			//
+			// After the class semaphore, not before: that is the cheaper check
+			// and the one that protects the process.
+			if s.admission != nil && !spec.write {
+				// The key is CLASSED, so tails and ordinary reads have
+				// independent per-tenant pools.
+				//
+				// Two contracts meet here and one key cannot serve both. Tails
+				// must not consume query slots -- a live tail is open for
+				// hours by design, and a tenant with four of them must still
+				// be able to run a dashboard. And a tail must not be exempt
+				// from admission either: it is the longest-lived read the
+				// server has, so one tenant holding every tail slot
+				// indefinitely is exactly what a per-tenant limit is for. It
+				// WAS exempt, on the `!spec.stream` clause, justified by the
+				// argument for exempting writes -- "an ingest request does not
+				// hold memory for the length of a scan" -- which is the
+				// opposite of true for a tail.
+				//
+				// A prefix on the key gives each class its own pool of
+				// MaxQueriesPerTenant, which satisfies both.
+				key := tenantKeyOf(r)
+				if spec.stream {
+					key = "tail\x00" + key
+				}
+				rel, err := s.admission.Acquire(r.Context(), key)
 				if err != nil {
 					s.writeErr(w, r, spec, query.HTTPStatus(err), err.Error())
 					return

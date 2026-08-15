@@ -315,6 +315,20 @@ func (s *Server) withTenant(h http.Handler) http.Handler {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="simdlogs"`)
 			}
 			atomic.AddInt64(&s.nHTTPErrs, 1)
+			// A storage failure's message is the SERVER's -- "mkdir
+			// /var/lib/simdlogs/tenant-42-0: permission denied" -- and
+			// returning it hands an unauthenticated client the data
+			// directory's absolute path and the process's uid situation. The
+			// client is told what it can act on; the detail goes to the log,
+			// where the operator who can act on it is looking.
+			//
+			// Only for the storage classes: an auth or parse failure's message
+			// is about the REQUEST and is what makes it fixable.
+			if k := storageErrKind(err); k != storageNotAnError {
+				log.Printf("tenant %s: store unavailable: %v", tenantKeyOf(r), err)
+				http.Error(w, storageErrMessage(k), code)
+				return
+			}
 			http.Error(w, err.Error(), code)
 			return
 		}

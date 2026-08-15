@@ -239,7 +239,22 @@ each group's rows to `fn`. Peak rows held is one group's matches, or a bounded
 window of them when the scan fans out — regardless of how many rows match. The
 slice `fn` receives is only valid for the call: the serial walk reuses one
 backing array, which is what makes a million-row select allocate like a
-one-group one.
+one-group one. `wg.Wait` is **deferred**, not a statement — as a statement it
+was skipped on a panic or `runtime.Goexit` out of the sink while `defer
+sn.Close()` still ran, so the mapping went away with producers inside it. A
+sink that panics over 64 groups segfaulted 5/5 runs before that was a `defer`.
+
+On the streamed path `MaxBytes` and `MaxMemory` bound the **working set** — the
+current batch — not a running total. They coincide on the materialized path,
+where every row produced is still in the answer; on a stream the rows are
+handed to the sink and released. Accumulating meant a walk holding 8 KiB at a
+time was refused by a 32 KiB ceiling, and over HTTP (where the same counter is
+`-search.maxQueryBytes`) a large answer got 200, a truncated body and
+`unexpected EOF` — where the materialized path had returned a clean 413 with
+nothing on the wire. Streaming made the failure worse than the thing it
+replaced. A stream is therefore unbounded in *total* bytes, which is the point;
+the wall-clock deadline still bounds it, so with `-search.maxRows=-1` an answer
+a client cannot drain within `-search.maxDuration` is cut off mid-body.
 
 `Streamable(q)` is the whole decision, and it refuses three things:
 
@@ -285,21 +300,44 @@ that waited for its full share would stall behind another scan for no gain, it
 can make progress with fewer — and never grants zero, because a scan with no
 workers cannot finish.
 
-**Whether a query starts at all.** `Admission` bounds reads per tenant
-(`-max-queries-per-tenant`) and, optionally, globally. Per tenant as well as
-globally because a process-wide limit alone lets one tenant fill it: the tenant
-with the most aggressive dashboard takes every slot and everyone else sees 429
-for work the server had room to do. The per-tenant slot is taken **first** and
-the global one second; the other order deadlocks, since a query holding a
-global slot while waiting for a tenant slot blocks the query that would have
-released it.
+That floor is **per caller**, not one in total: with the budget empty every
+concurrent acquirer takes its own floor, so 500 callers against a budget of 2
+report 500 in use. What bounds it is the class semaphore — at most
+`MaxConcurrentQuery + MaxConcurrentWrite` scans exist at once — not this
+budget. `simdlogs_scan_workers_in_use` can therefore legitimately exceed
+`simdlogs_scan_workers_total`, and the excess is the count of scans that found
+the budget empty.
 
-Applied in `guard` (`middleware.go`), after the class semaphore and only for
-reads — the global gate is the cheaper check, and taking a tenant slot only to
-be refused globally would hold it for the length of the refusal. Writes are
-never refused by it: an ingest request does not hold memory for the length of a
-scan, and dropping data an agent cannot re-send is a worse failure than a slow
-query.
+**Whether a query starts at all.** `Admission` bounds reads **per tenant**
+(`-max-queries-per-tenant`, default 16). A process-wide limit alone lets one
+tenant fill it: the tenant with the most aggressive dashboard takes every slot
+and everyone else sees 429 for work the server had room to do.
+
+Per tenant and *only* per tenant. The first version also had a global gate,
+and nothing ever configured it — `NewAdmission` was called with `MaxPerTenant`
+and `Wait`, never `MaxConcurrent`, so the channel was always nil. Everything
+hanging off it was dead: `Stats` reported `len(nil chan)` = 0 in flight however
+many queries were admitted, `-query-queue-wait` was read only on the branch
+that returned at `global == nil` (a refusal came back in 7 µs with the wait set
+to an hour), and `ErrQueueTimeout` could not be produced at all. The
+process-wide gate is the class semaphore in `middleware.go` and always was; a
+second one in front of it is two numbers an operator has to keep consistent for
+no gain. The queue wait moved to where the waiting happens, and a queued query
+holds **no** slot — it used to take the tenant slot and then wait, so
+`MaxPerTenant` bounded "in flight or queued" while its own doc said "in
+flight".
+
+Applied in `guard` (`middleware.go`) after the class semaphore, for every read.
+The key is **classed**: a live tail draws from `tail\0<tenant>` and an ordinary
+read from `<tenant>`, so each class has its own pool. Two contracts meet here
+and one key cannot serve both — a tail is open for hours by design and must not
+consume query slots, and a tail must not be exempt either, being the
+longest-lived read the server has. It *was* exempt, on a `!spec.stream` clause
+justified by the argument for exempting writes.
+
+Writes are never refused by it: an ingest request does not hold memory for the
+length of a scan, and dropping data an agent cannot re-send is a worse failure
+than a slow query.
 
 | Outcome | Error | Status |
 | --- | --- | --- |
@@ -308,6 +346,7 @@ query.
 | a pipe produced too many rows | `ErrPipeRowLimit` | 413 |
 | tenant at its limit | `ErrRejected` | 429 |
 | queue wait elapsed | `ErrQueueTimeout` (wraps `ErrRejected`) | 429 |
+| client hung up while queued | `ErrCanceled` | 499 — **not** counted as a rejection; the server did not decline it |
 | execution deadline | `ErrDeadlineExceeded` | 504 |
 
 A queue timeout is 429 and not 504: the server never started the query, so

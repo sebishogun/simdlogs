@@ -1,4 +1,4 @@
-//go:build plan9 || solaris || aix || js
+//go:build plan9 || solaris || aix || js || wasip1
 
 package storage
 

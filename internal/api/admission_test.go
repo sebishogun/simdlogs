@@ -147,13 +147,18 @@ func TestAdmissionAndWorkerCountersAreExposed(t *testing.T) {
 // Nothing configured admits everything, so a deployment that has not decided
 // behaves as it did before this existed.
 func TestNoAdmissionConfiguredAdmitsEverything(t *testing.T) {
+	// Explicitly unlimited. The DEFAULT is 16 per tenant -- every limit in
+	// this repo has a finite default, which is what config's own
+	// TestDefaultsAreAllFinite enforces -- so "no limit configured" has to be
+	// asked for rather than obtained by leaving the field alone.
 	c := config.Config{Dir: t.TempDir(), Limits: config.DefaultLimits()}
+	c.Limits.MaxQueriesPerTenant = config.Unlimited
 	srv, err := NewServerConfig(c)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if srv.admission != nil {
-		t.Fatal("an admission controller was built with no limit configured")
+		t.Fatal("an admission controller was built with the limit explicitly unlimited")
 	}
 	// The worker budget IS installed unconditionally: the default it replaces
 	// -- every query taking GOMAXPROCS of its own -- is the pathological one.

@@ -108,11 +108,12 @@ func ScanEach(s Store, q *Query, fn func(rows []Row) error) error {
 	return scanPipelined(survivors, q, fn)
 }
 
-// emitter carries the state that both walks share: the byte total the budget
-// is expressed in, and how many rows have been delivered against Limit.
+// emitter carries the state that both walks share: the batch's byte figure the
+// budget is expressed in, and how many rows have been delivered against Limit.
 type emitter struct {
-	q     *Query
-	fn    func([]Row) error
+	q  *Query
+	fn func([]Row) error
+	// bytes is the CURRENT batch's size, not a running total. See emit.
 	bytes int64
 	sent  int
 }
@@ -128,6 +129,28 @@ func (e *emitter) emit(rows []Row) (stop bool, err error) {
 		rows = rows[:e.q.Limit-e.sent]
 		stop = true
 	}
+	// The WORKING SET, not a running total.
+	//
+	// MaxBytes and MaxMemory both bound "how much this query holds", and on the
+	// materialized path those coincide: every row produced is still in the
+	// answer. On a stream they do not -- the rows are handed to the sink and
+	// released, so a walk that holds one group at a time holds one group's
+	// bytes however many it has delivered.
+	//
+	// Accumulating was measured doing exactly the harm streaming exists to
+	// prevent: a scan holding 8,156 B at a time was refused by a 32,624 B
+	// ceiling, and over HTTP the same counter is -search.maxQueryBytes, so a
+	// large answer got 200, 4.5 MB and `unexpected EOF` where the materialized
+	// path had returned a clean 413 with nothing on the wire. Streaming made
+	// the failure worse than the thing it replaced.
+	//
+	// engine.go's own comment predicted this: "when a streaming sink lands the
+	// two stop coinciding and this has to become the live figure rather than
+	// the running one". It landed and this was not changed.
+	//
+	// A stream is therefore unbounded in TOTAL bytes, which is the point: the
+	// answer can exceed memory. The wall-clock deadline still bounds it.
+	e.bytes = 0
 	if e.q.countsBytes() {
 		for _, r := range rows {
 			e.bytes += rowBytes(r)
@@ -180,9 +203,6 @@ func scanSerial(survivors []*storage.Reader, q *Query, fn func([]Row) error) err
 func scanPipelined(survivors []*storage.Reader, q *Query, fn func([]Row) error) error {
 	workers, releaseWorkers := scanWorkers(len(survivors))
 	defer releaseWorkers()
-	if workers > len(survivors) {
-		workers = len(survivors)
-	}
 
 	slots := make(chan chan []Row, workers)
 	done := make(chan struct{})
@@ -215,10 +235,23 @@ func scanPipelined(survivors []*storage.Reader, q *Query, fn func([]Row) error) 
 		}
 	}()
 
+	// DEFERRED, not a statement at the end.
+	//
+	// The snapshot is unmapped when ScanEach returns, so a producer still
+	// reading a group's blob after that is a use-after-unmap -- and as a
+	// plain statement this was skipped on the one return path that does not
+	// reach it: a panic or runtime.Goexit out of the sink. `defer
+	// sn.Close()` still runs on that path, so the mapping went away with
+	// producers inside it. Reproduced: a sink that panics over 64 groups
+	// segfaulted 5/5 runs in lz4BlockDecodeAVX512, and t.Fatalf inside a sink
+	// (which is runtime.Goexit) hit it 2/3.
+	//
+	// Deleting this line left the whole suite green, so the invariant its
+	// comment describes had no coverage at all.
+	defer wg.Wait()
+
 	// Every producer writes to a buffered channel and so never blocks, which
-	// is what lets the consumer walk away. wg.Wait below is not tidiness: the
-	// snapshot is unmapped when ScanEach returns, and a producer still reading
-	// a group's blob after that is a use-after-unmap.
+	// is what lets the consumer walk away.
 	var err error
 	stopped := false
 	e := &emitter{q: q, fn: fn}
@@ -234,7 +267,6 @@ func scanPipelined(survivors []*storage.Reader, q *Query, fn func([]Row) error) 
 			closeDone.Do(func() { close(done) })
 		}
 	}
-	wg.Wait()
 	if err != nil {
 		return err
 	}

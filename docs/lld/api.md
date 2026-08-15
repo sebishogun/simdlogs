@@ -272,10 +272,21 @@ The HTTP mux is not every write path. The native syslog listeners take bytes
 off a socket with no middleware anywhere near them; they call the budget
 themselves (`syslogAdmits`). Neither transport can answer — RFC 5426 has no
 reply and the TCP framing carries no ack — so a refused message is dropped,
-counted as a skipped row, and logged at most once every 30 seconds. A tenant
-whose store cannot even be opened (no space, no permission, EIO) answers 507
-too: that failure happens in the resolver, before the budget middleware runs,
-and used to fall through to a 400.
+counted by `simdlogs_writes_rejected_disk_total`/`_quota_total`, and logged at
+most once every 30 seconds. It is deliberately **not** counted as an ingested
+byte or a malformed row: an earlier version added it to
+`vl_bytes_ingested_total` and `vl_rows_dropped_total`, which said bytes were
+ingested that never were and called a well-formed message malformed — and the
+HTTP path counts neither for the identical event.
+
+A tenant whose store cannot be opened is classified by whether a retry could
+survive it. Transient (`ENOSPC`, `EDQUOT`, `EMFILE`, `ENFILE`, `ENOMEM`,
+`EAGAIN`, `EBUSY`, `EINTR`, `ESTALE`, `EIO`, and `storage.ErrLocked` — the
+store lock held by another process) is **507**; permanent (`EACCES`, `EPERM`,
+`EROFS`, `ENOTDIR` — a directory the process may never write to, a read-only
+mount) is **500**, because no retry and no change by the client fixes it.
+Anything else stays 400. The client is told the class; the server's own
+message names the data directory's absolute path and goes to the log.
 
 The free-space sample is cached for about two seconds, so a burst of small
 writes is not a burst of `statfs` calls. That staleness is why the threshold is

@@ -260,12 +260,12 @@ func authStatus(err error) int {
 	}
 	// A tenant resolves by opening its store, so a filesystem that refuses --
 	// no space, no permission, an I/O error -- fails HERE, before any storage
-	// budget check the middleware would have run. The default used to answer
-	// 400: a client error code for a server storage condition, with the
-	// server's absolute path in the body. An agent treats 400 as permanent
-	// and drops the batch it cannot re-send, so the one condition that is
-	// certain to be transient was reported as the one that is certain not to
-	// be.
+	// budget check the middleware would have run. The default answered 400: a
+	// client error code for a server storage condition. An agent treats 400 as
+	// permanent and drops the batch it cannot re-send, so a transient
+	// condition was reported as the one thing it is not.
+	//
+	// The caller sees the CLASS, not the message: see storageErrMessage.
 	switch storageErrKind(err) {
 	case storageTransient:
 		return http.StatusInsufficientStorage
@@ -304,7 +304,14 @@ func storageErrKind(err error) storageErrClass {
 	if err == nil {
 		return storageNotAnError
 	}
-	if errors.Is(err, storage.ErrDiskFull) || errors.Is(err, storage.ErrQuotaExceeded) {
+	if errors.Is(err, storage.ErrDiskFull) || errors.Is(err, storage.ErrQuotaExceeded) ||
+		errors.Is(err, storage.ErrLocked) {
+		// ErrLocked by SENTINEL, not by errno. lockDir wraps EWOULDBLOCK into
+		// storage.ErrLocked and drops the errno, so errors.Is(err,
+		// syscall.EAGAIN) is false -- and this function's own comment named
+		// EAGAIN as the case it was added for. "The store lock is held by
+		// another process" answered 400, and an agent drops the batch on 400.
+		// The one condition this mapping exists for was the one it missed.
 		return storageTransient
 	}
 	for _, e := range transientStorageErrnos {
@@ -327,6 +334,15 @@ var permanentStorageErrnos = []error{
 	syscall.EACCES, syscall.EPERM, syscall.EROFS, syscall.ENOTDIR,
 }
 
+// storageErrMessage is what the CLIENT is told. The server's own message names
+// the data directory and is written to the log instead.
+func storageErrMessage(k storageErrClass) string {
+	if k == storagePermanent {
+		return "simdlogs: this tenant's storage is not writable; the server's log has the detail"
+	}
+	return "simdlogs: this tenant's storage is temporarily unavailable; retry"
+}
+
 // transientStorageErrnos are the failures a retry could survive.
 //
 // The set is what 507 MEANS: come back and it may work. The first version got
@@ -335,14 +351,24 @@ var permanentStorageErrnos = []error{
 // telling an agent to retry them forever trades "drops the batch" for "retries
 // a permission bug until someone notices". And it omitted every errno by which
 // a per-tenant store open actually fails under load: EMFILE and ENFILE (fd
-// exhaustion), ENOMEM (the mmap of a new group), EAGAIN (the store lock held
-// by another process -- lock_unix.go handles exactly this errno), EBUSY,
-// EINTR and ESTALE. Those answered 400, and an agent drops a batch on 400,
-// which is the defect the 507 mapping was added to close.
+// exhaustion), ENOMEM (the mmap of a new group), EAGAIN, EBUSY, EINTR and
+// ESTALE. Those answered 400, and an agent drops a batch on 400, which is the
+// defect the 507 mapping was added to close.
 //
-// A package-level slice rather than a literal in the function: the literal
-// boxed six syscall.Errno values to the heap on every call, on the error path
-// of a server already under storage pressure.
+// The store lock held by another process is storage.ErrLocked, matched by
+// sentinel above: lockDir wraps the errno into the sentinel and DROPS it, so
+// errors.Is(err, syscall.EAGAIN) is false for it. An earlier version of this
+// comment named EAGAIN as the case the list was added for, and the case it
+// named was the one it did not catch.
+//
+// A package-level slice rather than a literal in the function, for
+// readability. An earlier version claimed the literal "boxed six syscall.Errno
+// values to the heap on every call"; measured, both shapes are 0.00 allocs/op
+// and neither has a runtime.newobject site in the disassembly -- the constants
+// are below 256 so the interface conversions resolve through
+// runtime.staticuint64s, and a non-escaping literal never reaches the heap
+// anyway. The claim was written from reading -gcflags=-m output rather than
+// from a benchmark.
 var transientStorageErrnos = []error{
 	syscall.ENOSPC, syscall.EDQUOT,
 	syscall.EMFILE, syscall.ENFILE, syscall.ENOMEM,

@@ -154,14 +154,18 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		m("simdlogs_scan_workers_in_use", "Scan worker slots currently held.",
 			"gauge", int64(s.workers.InUse()))
 	}
-	if s.admission != nil {
-		inFlight, queuedQ, rejectedQ := s.admission.Stats()
-		m("simdlogs_query_admission_in_flight", "Queries admitted and running.", "gauge", inFlight)
-		m("simdlogs_query_admission_queued", "Queries waiting for an admission slot.",
-			"gauge", queuedQ)
-		m("simdlogs_query_admission_rejected_total", "Queries refused by admission.",
-			"counter", rejectedQ)
-	}
+	// Emitted unconditionally, zeroed when admission is not configured.
+	//
+	// They used to be inside `if s.admission != nil`, so a default server's
+	// /metrics had none of them while two documents listed them without
+	// qualification -- and a dashboard panel that silently has no series looks
+	// exactly like a server with nothing to report.
+	inFlight, queuedQ, rejectedQ := s.admission.Stats()
+	m("simdlogs_query_admission_in_flight", "Queries admitted and running.", "gauge", inFlight)
+	m("simdlogs_query_admission_queued", "Queries waiting for an admission slot.",
+		"gauge", queuedQ)
+	m("simdlogs_query_admission_rejected_total", "Queries refused by admission.",
+		"counter", rejectedQ)
 	m("simdlogs_query_streamed_total",
 		"Bare selects answered a group at a time, without materializing the result.",
 		"counter", atomic.LoadInt64(&s.nStreamedSelects))

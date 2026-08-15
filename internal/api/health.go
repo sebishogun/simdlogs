@@ -214,6 +214,11 @@ func (s *Server) storagePressureConditions() []HealthCondition {
 			// operator's response to "the machine is full" and "this tenant is
 			// over its share" are different actions, and the state alone
 			// cannot say which.
+			// The cause that REFUSED is first. With warn and quota both
+			// tripped the line read "writes REJECTED: 500 bytes free, below
+			// the warn reserve; ..." -- leading with the one condition that
+			// does not reject, so the first thing an operator reads is the
+			// wrong reason for the outage.
 			var why []string
 			if st.Reject {
 				why = append(why, fmt.Sprintf("%d bytes free, below the reject reserve",
@@ -222,12 +227,21 @@ func (s *Server) storagePressureConditions() []HealthCondition {
 			if st.OverQuota {
 				why = append(why, fmt.Sprintf("%d bytes used, at its quota", st.StoreBytes))
 			}
+			if st.Warn && !st.Reject {
+				why = append(why, fmt.Sprintf("%d bytes free, below the warn reserve",
+					st.Usage.Free))
+			}
+			// The state word is part of the detail, because the detail is what
+			// both renderings print. Without it a tenant whose writes are
+			// REFUSED read identically to one that is merely degraded, and an
+			// operator cannot tell an outage from a warning.
 			out = append(out, HealthCondition{State: StateDiskFull,
-				Detail:    fmt.Sprintf("tenant %s: %s", tn.key, strings.Join(why, "; ")),
+				Detail: fmt.Sprintf("tenant %s: writes REJECTED: %s",
+					tn.key, strings.Join(why, "; ")),
 				Transient: true})
 		case st.Warn:
 			out = append(out, HealthCondition{State: StateDiskLow,
-				Detail: fmt.Sprintf("tenant %s: %d bytes free, below the warn reserve",
+				Detail: fmt.Sprintf("tenant %s: degraded: %d bytes free, below the warn reserve",
 					tn.key, st.Usage.Free),
 				Transient: true})
 		}
@@ -351,6 +365,7 @@ func (s *Server) writeHealthText(w http.ResponseWriter, rep HealthReport, ok boo
 	if ok {
 		fmt.Fprintf(w, "OK (%s)\n", rep.State)
 	}
+
 	if n := len(byState[StateShuttingDown]); n > 0 {
 		fmt.Fprintf(w, "NOT READY: shutting down\n")
 	}

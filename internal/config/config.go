@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"runtime"
 	"time"
 )
 
@@ -128,6 +129,34 @@ func DefaultLimits() Limits {
 		MaxConcurrentWrite: 32,
 		MaxConcurrentTail:  64,
 		MaxOpenTenants:     1024,
+
+		// Half the process-wide read limit: one tenant may take half the
+		// server's concurrent reads and no more, so a second tenant always has
+		// room. A per-tenant limit at or above the process-wide one is not a
+		// per-tenant limit.
+		MaxQueriesPerTenant: 16,
+		// The machine's parallelism. Not a constant: the right number of scan
+		// workers is a property of the host, and a constant would be wrong on
+		// every machine but one. Snapshotted here rather than read at scan
+		// time so `-max-scan-workers` and the default go through the same
+		// validation.
+		MaxScanWorkers: runtime.GOMAXPROCS(0),
+
+		// A million distinct `by` keys is a stats result no dashboard renders
+		// and an accumulator map of hundreds of MB. Ten million pipe rows is
+		// the same judgement for a join's fanout.
+		MaxGroupKeys: 1_000_000,
+		MaxPipeRows:  10_000_000,
+
+		// A thousand nearest neighbours is far past what any ranking UI shows;
+		// 16384 dimensions is the hard ceiling ingest enforces, so the query
+		// side cannot be asked for a vector the store could never hold; ten
+		// million candidates is roughly a second of brute-force cosine on this
+		// class of machine, which is the point past which a query should be
+		// narrowed rather than waited on.
+		MaxVectorK:          1000,
+		MaxVectorDim:        16384,
+		MaxVectorCandidates: 10_000_000,
 	}
 }
 
@@ -145,6 +174,12 @@ func TestLimits() Limits {
 	l.MaxConcurrentWrite = 4
 	l.MaxConcurrentTail = 4
 	l.MaxOpenTenants = 8
+	l.MaxQueriesPerTenant = 4
+	l.MaxScanWorkers = 4
+	l.MaxGroupKeys = 10_000
+	l.MaxPipeRows = 100_000
+	l.MaxVectorK = 100
+	l.MaxVectorCandidates = 100_000
 	return l
 }
 
@@ -165,6 +200,20 @@ func fields() []field {
 		{"max-field-name-bytes", func(l *Limits) int64 { return int64(l.MaxFieldNameBytes) }, func(l *Limits, v int64) { l.MaxFieldNameBytes = int(v) }},
 		{"max-field-value-bytes", func(l *Limits) int64 { return int64(l.MaxFieldValueBytes) }, func(l *Limits, v int64) { l.MaxFieldValueBytes = int(v) }},
 		{"max-query-rows", func(l *Limits) int64 { return int64(l.MaxQueryRows) }, func(l *Limits, v int64) { l.MaxQueryRows = int(v) }},
+		// Added late and forgotten by this table, which is the failure the
+		// table exists to prevent -- its own doc says "so a new limit cannot
+		// be added to the struct and forgotten by both". Until this line,
+		// -max-scan-workers=-5 silently became GOMAXPROCS and
+		// -max-queries-per-tenant=-5 silently disabled admission, while
+		// Normalize's doc said "silently turning -5 into a default hides the
+		// bug".
+		{"max-queries-per-tenant", func(l *Limits) int64 { return int64(l.MaxQueriesPerTenant) }, func(l *Limits, v int64) { l.MaxQueriesPerTenant = int(v) }},
+		{"max-scan-workers", func(l *Limits) int64 { return int64(l.MaxScanWorkers) }, func(l *Limits, v int64) { l.MaxScanWorkers = int(v) }},
+		{"max-group-keys", func(l *Limits) int64 { return int64(l.MaxGroupKeys) }, func(l *Limits, v int64) { l.MaxGroupKeys = int(v) }},
+		{"max-pipe-rows", func(l *Limits) int64 { return int64(l.MaxPipeRows) }, func(l *Limits, v int64) { l.MaxPipeRows = int(v) }},
+		{"max-vector-k", func(l *Limits) int64 { return int64(l.MaxVectorK) }, func(l *Limits, v int64) { l.MaxVectorK = int(v) }},
+		{"max-vector-dim", func(l *Limits) int64 { return int64(l.MaxVectorDim) }, func(l *Limits, v int64) { l.MaxVectorDim = int(v) }},
+		{"max-vector-candidates", func(l *Limits) int64 { return int64(l.MaxVectorCandidates) }, func(l *Limits, v int64) { l.MaxVectorCandidates = int(v) }},
 		{"max-query-bytes", func(l *Limits) int64 { return l.MaxQueryBytes }, func(l *Limits, v int64) { l.MaxQueryBytes = v }},
 		{"max-concurrent-query", func(l *Limits) int64 { return int64(l.MaxConcurrentQuery) }, func(l *Limits, v int64) { l.MaxConcurrentQuery = int(v) }},
 		{"max-concurrent-write", func(l *Limits) int64 { return int64(l.MaxConcurrentWrite) }, func(l *Limits, v int64) { l.MaxConcurrentWrite = int(v) }},

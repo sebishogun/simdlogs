@@ -59,7 +59,7 @@ func TestWorkerBudgetReleaseIsIdempotent(t *testing.T) {
 // Concurrent acquisitions never exceed the total, which is what a channel of
 // tokens would get wrong under contention: two queries each asking for half
 // would interleave and get uneven, arbitrary shares.
-func TestWorkerBudgetIsNeverOversubscribedByMoreThanOne(t *testing.T) {
+func TestWorkerBudgetOversubscribesOnlyByItsPerCallerFloor(t *testing.T) {
 	const total = 8
 	b := NewWorkerBudget(total)
 	var peak atomic.Int64
@@ -129,18 +129,26 @@ func TestTheScanUsesTheInstalledBudget(t *testing.T) {
 	}
 }
 
-// Global concurrency: the (n+1)th query is refused, and refusals are counted.
-func TestAdmissionGlobalConcurrency(t *testing.T) {
-	a := NewAdmission(AdmissionConfig{MaxConcurrent: 2})
+// The (n+1)th query for a tenant is refused, and refusals are counted.
+//
+// This tested a GLOBAL gate until a review found the gate was never
+// configured: NewAdmission was only ever called with MaxPerTenant and Wait, so
+// the global channel was nil, Stats reported len(nil chan) = 0 in flight
+// however many queries were admitted, and -query-queue-wait was read only on
+// the branch that returned at `global == nil`. The gate is gone -- the HTTP
+// class semaphore is the process-wide one and always was -- and this tests the
+// limit that exists.
+func TestAdmissionPerTenantLimit(t *testing.T) {
+	a := NewAdmission(AdmissionConfig{MaxPerTenant: 2})
 	r1, err := a.Acquire(context.Background(), "t1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, err := a.Acquire(context.Background(), "t2")
+	r2, err := a.Acquire(context.Background(), "t1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Acquire(context.Background(), "t3"); !errors.Is(err, ErrRejected) {
+	if _, err := a.Acquire(context.Background(), "t1"); !errors.Is(err, ErrRejected) {
 		t.Fatalf("%v, want ErrRejected", err)
 	}
 	if _, _, rejected := a.Stats(); rejected != 1 {
@@ -148,7 +156,7 @@ func TestAdmissionGlobalConcurrency(t *testing.T) {
 	}
 	r1()
 	// A slot came back, so the next one is admitted.
-	r3, err := a.Acquire(context.Background(), "t3")
+	r3, err := a.Acquire(context.Background(), "t1")
 	if err != nil {
 		t.Fatalf("%v after a release; the slot was not returned", err)
 	}
@@ -162,7 +170,7 @@ func TestAdmissionGlobalConcurrency(t *testing.T) {
 // Per-tenant concurrency, which a global limit alone cannot express: one
 // tenant's dashboard must not take every slot on a shared server.
 func TestAdmissionPerTenantConcurrency(t *testing.T) {
-	a := NewAdmission(AdmissionConfig{MaxConcurrent: 10, MaxPerTenant: 2})
+	a := NewAdmission(AdmissionConfig{MaxPerTenant: 2})
 	var rels []func()
 	for i := 0; i < 2; i++ {
 		r, err := a.Acquire(context.Background(), "noisy")
@@ -174,7 +182,7 @@ func TestAdmissionPerTenantConcurrency(t *testing.T) {
 	if _, err := a.Acquire(context.Background(), "noisy"); !errors.Is(err, ErrRejected) {
 		t.Fatalf("%v, want the noisy tenant refused at its own limit", err)
 	}
-	// Another tenant is unaffected: eight global slots are still free.
+	// Another tenant is unaffected: the limit is per tenant.
 	r, err := a.Acquire(context.Background(), "quiet")
 	if err != nil {
 		t.Fatalf("a quiet tenant was refused because another one was busy: %v", err)
@@ -188,14 +196,14 @@ func TestAdmissionPerTenantConcurrency(t *testing.T) {
 // Queueing: with a wait configured a query blocks for a slot and is admitted
 // when one frees, and is rejected when none does.
 func TestAdmissionQueueTimeout(t *testing.T) {
-	a := NewAdmission(AdmissionConfig{MaxConcurrent: 1, Wait: 50 * time.Millisecond})
+	a := NewAdmission(AdmissionConfig{MaxPerTenant: 1, Wait: 50 * time.Millisecond})
 	r1, err := a.Acquire(context.Background(), "t")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Nobody releases: the queued query times out.
 	start := time.Now()
-	if _, err := a.Acquire(context.Background(), "t2"); !errors.Is(err, ErrQueueTimeout) {
+	if _, err := a.Acquire(context.Background(), "t"); !errors.Is(err, ErrQueueTimeout) {
 		t.Fatalf("%v, want ErrQueueTimeout", err)
 	}
 	if waited := time.Since(start); waited < 40*time.Millisecond {
@@ -211,7 +219,7 @@ func TestAdmissionQueueTimeout(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		r1()
 	}()
-	r2, err := a.Acquire(context.Background(), "t3")
+	r2, err := a.Acquire(context.Background(), "t")
 	if err != nil {
 		t.Fatalf("a freed slot did not admit the waiter: %v", err)
 	}
@@ -221,7 +229,7 @@ func TestAdmissionQueueTimeout(t *testing.T) {
 // A caller that goes away while queued is reported as ITS cancellation, not as
 // the server rejecting it: the server did not decline the query.
 func TestAdmissionReportsCallerCancellation(t *testing.T) {
-	a := NewAdmission(AdmissionConfig{MaxConcurrent: 1, Wait: time.Second})
+	a := NewAdmission(AdmissionConfig{MaxPerTenant: 1, Wait: time.Second})
 	r, err := a.Acquire(context.Background(), "t")
 	if err != nil {
 		t.Fatal(err)
@@ -233,17 +241,26 @@ func TestAdmissionReportsCallerCancellation(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		cancel()
 	}()
-	if _, err := a.Acquire(ctx, "t2"); !errors.Is(err, ErrCanceled) {
+	if _, err := a.Acquire(ctx, "t"); !errors.Is(err, ErrCanceled) {
 		t.Fatalf("%v, want ErrCanceled", err)
+	}
+	// And it is NOT counted as a rejection: the server did not decline it, the
+	// client went away. Every error from Acquire used to increment the
+	// counter, so a hung-up client showed up as a refusal the server never
+	// made.
+	if _, _, rejected := a.Stats(); rejected != 0 {
+		t.Errorf("a cancellation was counted as %d rejection(s)", rejected)
 	}
 }
 
-// A rejected acquisition holds nothing: the per-tenant slot taken on the way
-// in is given back when the global one is refused. Without that, a tenant that
-// is refused globally leaks its own slot and can never run again.
-func TestARejectedAcquisitionLeaksNothing(t *testing.T) {
-	a := NewAdmission(AdmissionConfig{MaxConcurrent: 1, MaxPerTenant: 4})
-	r, err := a.Acquire(context.Background(), "a")
+// A refused acquisition holds nothing.
+//
+// The refusal path must not have taken a slot on the way in -- a tenant
+// refused ten times and left holding ten slots is permanently locked out by
+// the mechanism that was supposed to bound it.
+func TestARefusedAcquisitionLeaksNothing(t *testing.T) {
+	a := NewAdmission(AdmissionConfig{MaxPerTenant: 1})
+	r, err := a.Acquire(context.Background(), "b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,26 +270,20 @@ func TestARejectedAcquisitionLeaksNothing(t *testing.T) {
 		}
 	}
 	r()
-	// Tenant b was refused ten times and must still have all four of its own
-	// slots: if the global refusal had leaked them it would be permanently
-	// locked out.
-	var rels []func()
-	for i := 0; i < 1; i++ {
-		rb, err := a.Acquire(context.Background(), "b")
-		if err != nil {
-			t.Fatalf("tenant b is locked out after %d global refusals: %v", 10, err)
-		}
-		rels = append(rels, rb)
+	rb, err := a.Acquire(context.Background(), "b")
+	if err != nil {
+		t.Fatalf("tenant b is locked out after 10 refusals: %v", err)
 	}
-	for _, rel := range rels {
-		rel()
+	rb()
+	if in, _, _ := a.Stats(); in != 0 {
+		t.Fatalf("%d in flight after every release", in)
 	}
 }
 
 // Release is idempotent here too, and the per-tenant map does not grow: a
 // server that has seen a million tenants must not hold a million entries.
 func TestAdmissionReleaseIsIdempotentAndDoesNotLeakKeys(t *testing.T) {
-	a := NewAdmission(AdmissionConfig{MaxConcurrent: 4, MaxPerTenant: 2})
+	a := NewAdmission(AdmissionConfig{MaxPerTenant: 2})
 	for i := 0; i < 100; i++ {
 		r, err := a.Acquire(context.Background(), fmt.Sprintf("tenant-%d", i))
 		if err != nil {
@@ -309,7 +320,7 @@ func TestANilAdmissionAdmits(t *testing.T) {
 // Admission under concurrency never admits more than its limit.
 func TestAdmissionRespectsItsLimitUnderContention(t *testing.T) {
 	const limit = 4
-	a := NewAdmission(AdmissionConfig{MaxConcurrent: limit})
+	a := NewAdmission(AdmissionConfig{MaxPerTenant: limit})
 	var cur, peak atomic.Int64
 	var wg sync.WaitGroup
 	for i := 0; i < 64; i++ {
@@ -317,7 +328,7 @@ func TestAdmissionRespectsItsLimitUnderContention(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				r, err := a.Acquire(context.Background(), fmt.Sprintf("t%d", i%3))
+				r, err := a.Acquire(context.Background(), "one-tenant")
 				if err != nil {
 					continue
 				}

@@ -88,7 +88,21 @@ func (b *WorkerBudget) Acquire(want int) (granted int, release func()) {
 			n = free
 		}
 		if n < 1 {
-			// Oversubscribed by exactly one, deliberately: see above.
+			// The floor. Never zero, because a scan with no workers cannot
+			// finish and a budget that deadlocks a query is worse than one
+			// that oversubscribes.
+			//
+			// It is one PER CALLER, not one in total: with the budget empty,
+			// every concurrent acquirer takes its floor, so 500 callers
+			// against a budget of 2 report 500 in use. The comment here used
+			// to say "oversubscribed by exactly one", which is true of one
+			// caller and of no realistic load. What bounds it in the server is
+			// the class semaphore -- at most MaxConcurrentQuery +
+			// MaxConcurrentWrite scans exist at once -- not this budget, so
+			// simdlogs_scan_workers_in_use can legitimately exceed
+			// simdlogs_scan_workers_total and an operator reading it should
+			// treat the excess as the count of scans that found the budget
+			// empty.
 			n = 1
 		}
 		if b.inUse.CompareAndSwap(used, used+n) {
@@ -144,88 +158,140 @@ func scanWorkers(want int) (int, func()) {
 	return max1(want), func() {}
 }
 
-// Admission bounds how many queries run at once, globally and per tenant.
+// Admission bounds how many queries one tenant runs at once.
 //
-// Per tenant as well as globally, because a global limit alone lets one tenant
-// fill it: on a shared server the tenant with the most aggressive dashboard
-// takes every slot and every other tenant sees 429 for work the server had
-// room to do.
+// Per tenant, and ONLY per tenant. A process-wide gate already exists -- the
+// class semaphore in the HTTP middleware, sized by -max-concurrent-query -- and
+// the first version of this type had a second one that nothing ever configured:
+// NewAdmission was called with MaxPerTenant and Wait, never MaxConcurrent, so
+// `global` was always nil. Everything hanging off it was dead. `Stats` reported
+// `len(nil chan)` = 0 in-flight however many queries were admitted;
+// -query-queue-wait was read only on the path that returned at `global == nil`,
+// so a refusal came back in 7 microseconds with the wait set to an hour; and
+// ErrQueueTimeout could not be produced by the server at all. That is this
+// repo's own named failure -- "a limit that is configuration nothing reads" --
+// shipped in the commit whose subject was governing limits.
+//
+// So the global half is gone rather than wired up: a second process-wide gate
+// in front of the one that already works is two numbers an operator has to keep
+// consistent for no gain. The queue wait moved to where the waiting actually
+// happens.
 type Admission struct {
-	global  chan struct{}
-	perKey  int
-	wait    time.Duration
-	mu      sync.Mutex
-	byKey   map[string]int
-	rejects atomic.Int64
-	queued  atomic.Int64
+	perKey int
+	wait   time.Duration
+
+	mu    sync.Mutex
+	byKey map[string]int
+	// waiters is a signal channel per key, closed when a slot frees. A
+	// condition variable would be simpler and cannot be selected on alongside
+	// a context, and a waiter that cannot notice its client hanging up is a
+	// slot held for the length of the wait by a query nobody is reading.
+	waiters map[string]chan struct{}
+
+	inFlight atomic.Int64
+	queued   atomic.Int64
+	rejects  atomic.Int64
 }
 
 // AdmissionConfig configures Admission. The zero value admits everything,
 // which is what a single-tenant deployment with its own front end wants.
 type AdmissionConfig struct {
-	// MaxConcurrent bounds queries in flight across the server. 0 is
-	// unbounded.
-	MaxConcurrent int
 	// MaxPerTenant bounds queries in flight for one tenant. 0 is unbounded.
 	MaxPerTenant int
-	// Wait is how long a query may queue for a slot before being rejected. 0
+	// Wait is how long a query may wait for a slot before being rejected. 0
 	// rejects immediately, which is the right default for an interactive
 	// endpoint: a client that waited would rather be told now.
+	//
+	// It bounds time in the QUEUE, and a queued query holds no slot -- the
+	// first version took the tenant slot and then waited, so MaxPerTenant
+	// bounded "in flight or queued" while its own documentation said "in
+	// flight", and a tenant could hold every slot while running nothing.
 	Wait time.Duration
 }
 
 // NewAdmission returns an admission controller.
 func NewAdmission(c AdmissionConfig) *Admission {
-	a := &Admission{perKey: c.MaxPerTenant, wait: c.Wait, byKey: map[string]int{}}
-	if c.MaxConcurrent > 0 {
-		a.global = make(chan struct{}, c.MaxConcurrent)
+	return &Admission{
+		perKey:  c.MaxPerTenant,
+		wait:    c.Wait,
+		byKey:   map[string]int{},
+		waiters: map[string]chan struct{}{},
 	}
-	return a
 }
 
 // Acquire admits a query for the given tenant key, or reports why not.
-//
-// The per-tenant slot is taken FIRST and the global one second. The other
-// order deadlocks under load: a query holding a global slot while waiting for
-// a tenant slot blocks a query that would have released the tenant slot it is
-// waiting for, and with the global limit reached nothing ever moves.
 func (a *Admission) Acquire(ctx context.Context, key string) (release func(), err error) {
-	if a == nil {
+	if a == nil || a.perKey <= 0 {
 		return func() {}, nil
 	}
-	relKey, err := a.acquireKey(key)
-	if err != nil {
-		a.rejects.Add(1)
-		return nil, err
+	deadline := time.Time{}
+	if a.wait > 0 {
+		deadline = time.Now().Add(a.wait)
 	}
-	relGlobal, err := a.acquireGlobal(ctx)
-	if err != nil {
-		relKey()
-		a.rejects.Add(1)
-		return nil, err
+	for {
+		a.mu.Lock()
+		if a.byKey[key] < a.perKey {
+			a.byKey[key]++
+			a.mu.Unlock()
+			a.inFlight.Add(1)
+			return a.releaseFor(key), nil
+		}
+		n := a.byKey[key]
+		if a.wait <= 0 {
+			a.mu.Unlock()
+			a.rejects.Add(1)
+			return nil, fmt.Errorf("%w: tenant %s already has %d queries running (limit %d)",
+				ErrRejected, key, n, a.perKey)
+		}
+		// Register for the next free slot BEFORE releasing the lock, or a
+		// release between the check and the wait is a wakeup that never
+		// arrives and a query that waits the whole timeout for a slot that
+		// freed immediately.
+		w := a.waiters[key]
+		if w == nil {
+			w = make(chan struct{})
+			a.waiters[key] = w
+		}
+		a.mu.Unlock()
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			a.rejects.Add(1)
+			return nil, ErrQueueTimeout
+		}
+		a.queued.Add(1)
+		t := time.NewTimer(remaining)
+		select {
+		case <-w:
+			// A slot freed; loop and try to take it. Not handed over
+			// directly, because the waiter that wakes is not necessarily the
+			// one that gets the slot and pretending otherwise would be a
+			// fairness claim this does not implement.
+		case <-t.C:
+			a.queued.Add(-1)
+			t.Stop()
+			a.rejects.Add(1)
+			return nil, ErrQueueTimeout
+		case <-ctx.Done():
+			a.queued.Add(-1)
+			t.Stop()
+			// NOT counted as a rejection: the server did not decline it, the
+			// client went away. The first version counted every error from
+			// this function, so a hung-up client incremented
+			// simdlogs_query_admission_rejected_total and an operator reading
+			// it saw refusals the server never made.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, ErrDeadlineExceeded
+			}
+			return nil, ErrCanceled
+		}
+		a.queued.Add(-1)
+		t.Stop()
 	}
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			relGlobal()
-			relKey()
-		})
-	}, nil
 }
 
-func (a *Admission) acquireKey(key string) (func(), error) {
-	if a.perKey <= 0 {
-		return func() {}, nil
-	}
-	a.mu.Lock()
-	if a.byKey[key] >= a.perKey {
-		n := a.byKey[key]
-		a.mu.Unlock()
-		return nil, fmt.Errorf("%w: tenant %s already has %d queries running (limit %d)",
-			ErrRejected, key, n, a.perKey)
-	}
-	a.byKey[key]++
-	a.mu.Unlock()
+// releaseFor returns the slot and wakes anything waiting for this key.
+func (a *Admission) releaseFor(key string) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -239,48 +305,28 @@ func (a *Admission) acquireKey(key string) (func(), error) {
 				// hold a million entries forever.
 				delete(a.byKey, key)
 			}
+			if w := a.waiters[key]; w != nil {
+				// Close wakes every waiter for this key; they race for the
+				// slot and the losers re-register. Broadcast rather than a
+				// single send because a send on an unbuffered channel with no
+				// receiver ready would block under the lock.
+				close(w)
+				delete(a.waiters, key)
+			}
 			a.mu.Unlock()
+			a.inFlight.Add(-1)
 		})
-	}, nil
-}
-
-func (a *Admission) acquireGlobal(ctx context.Context) (func(), error) {
-	if a.global == nil {
-		return func() {}, nil
-	}
-	select {
-	case a.global <- struct{}{}:
-		return a.releaseGlobal, nil
-	default:
-	}
-	if a.wait <= 0 {
-		return nil, fmt.Errorf("%w: %d queries already running", ErrRejected, cap(a.global))
-	}
-	a.queued.Add(1)
-	defer a.queued.Add(-1)
-	t := time.NewTimer(a.wait)
-	defer t.Stop()
-	select {
-	case a.global <- struct{}{}:
-		return a.releaseGlobal, nil
-	case <-t.C:
-		return nil, ErrQueueTimeout
-	case <-ctx.Done():
-		// The caller went away while queued. Reported as their cancellation
-		// rather than as a rejection: the server did not decline it.
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, ErrDeadlineExceeded
-		}
-		return nil, ErrCanceled
 	}
 }
-
-func (a *Admission) releaseGlobal() { <-a.global }
 
 // Stats reports admission counters for /metrics.
+//
+// inFlight is counted, not derived from a channel's length. It used to be
+// len(a.global), and a.global was always nil, so it reported 0 however many
+// queries were admitted.
 func (a *Admission) Stats() (inFlight, queued, rejected int64) {
 	if a == nil {
 		return 0, 0, 0
 	}
-	return int64(len(a.global)), a.queued.Load(), a.rejects.Load()
+	return a.inFlight.Load(), a.queued.Load(), a.rejects.Load()
 }
