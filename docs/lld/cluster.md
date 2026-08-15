@@ -74,6 +74,49 @@ was refused" — and the merge treated all three as an empty contribution.
 `bodiesOf` keeps the old `[][]byte` shape for merges that have not yet learned
 to report completeness (task 8.3).
 
+## Merges, per endpoint
+
+Fixture-tested in `cluster_envelope_test.go` against the **exact bodies a
+storage node emits today**, so a merge written against a remembered envelope
+fails in a test rather than in a cluster. Four were stale; all four are fixed.
+
+**Shared values envelope.** Every one of `streams`, `stream_ids`,
+`field_names`, `field_values`, `stream_field_names` and `stream_field_values`
+answers through `writeValues` on a storage node, which emits `{"values":
+[...]}`. The router asked for `"streams"` and `"stream_ids"` on their
+respective paths — keys **no backend has ever sent** — so both merged an absent
+field and answered an empty list, under a key a storage node does not use
+either. The same path returned a different shape depending on deployment mode.
+The key parameter is gone rather than corrected: a parameter that must always
+take one value is a way to get it wrong again.
+
+**Hits.** The router decoded `{"_time": ..., "hits": ...}`, a bag of
+`{time, count}` objects, against an endpoint that returns the dense
+`{fields, timestamps[], values[], total}` shape — so every field was absent and
+a cluster histogram answered one bogus series, `[{"_time":"","hits":0}]`. The
+*same* stale shape was in the embedded UI (7.4): two independent readers of one
+endpoint, both written against a remembered envelope. Series now merge by label
+set, then buckets sum per timestamp.
+
+**Stats range.** Series were concatenated, so one present on three shards
+appeared three times with identical labels. That is not a valid matrix — a
+Prometheus client draws three lines, every point repeatedly, and any
+aggregation counts each shard as a separate series. Every number was
+individually correct and the answer was wrong. Identical label sets merge and
+points at a timestamp sum.
+
+> **Additive statistics only.** Summing shards is correct for counts and
+> wrong for averages, quantiles and distinct counts. `stats_query_range` over a
+> cluster is meaningful only for additive aggregates; a non-additive one merged
+> this way returns a confident wrong number, and this is stated rather than
+> papered over by summing something that must not be summed.
+
+**Elasticsearch `_search`.** Hits were concatenated and returned whole, so
+`size: 10` across three shards returned thirty documents — an ES client that
+renders `size` results shows three pages on one, and one that paginates by
+`from` skips two thirds of the corpus per step. `from`/`size` now apply to the
+merged hits; `hits.total` was already the cluster-wide count and stays it.
+
 ## Read completeness
 
 Every merge consumed a `[][]byte` with a nil entry for a shard that did not

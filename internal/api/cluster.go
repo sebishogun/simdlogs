@@ -610,9 +610,40 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 			hits = append(hits, v.Hits.Hits...)
 		}
 	}
+	// from/size applied to the MERGED hits.
+	//
+	// The shards' hits were concatenated and returned whole, so `size: 10`
+	// across three shards returned thirty documents -- and an ES client that
+	// renders `size` results shows three pages' worth on one page, while one
+	// that paginates by `from` skips two thirds of the corpus on every step.
+	// The total was already cluster-wide; only the page was not.
+	var body2 esQuery
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	_ = dec.Decode(&body2) // already validated by the storage nodes
+	if body2.From > 0 {
+		if body2.From >= len(hits) {
+			hits = nil
+		} else {
+			hits = hits[body2.From:]
+		}
+	}
+	size := body2.Size
+	if size <= 0 {
+		size = esDefaultSize
+	}
+	if len(hits) > size {
+		hits = hits[:size]
+	}
+	if hits == nil {
+		hits = []json.RawMessage{}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"hits": map[string]any{
+			// The cluster-wide count of MATCHING documents, which is what
+			// hits.total means -- not the number returned. Every ES client
+			// renders it as "N results".
 			"total": map[string]any{"value": total, "relation": "eq"},
 			"hits":  hits,
 		},
