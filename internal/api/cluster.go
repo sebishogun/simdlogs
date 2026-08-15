@@ -700,27 +700,110 @@ func (s *Server) federatedStrings(w http.ResponseWriter, r *http.Request, path, 
 
 // federatedMatrix merges stats_query_range across storage nodes by concatenating
 // each shard's series (shards hold disjoint groups, so a series is one shard's).
+// matrixSeries is one Prometheus matrix series: a label set and [ts, "value"]
+// pairs.
+type matrixSeries struct {
+	Metric map[string]string `json:"metric"`
+	Values [][2]any          `json:"values"`
+}
+
+// federatedMatrix merges stats-range series, combining identical label sets.
+//
+// It CONCATENATED the shards' results, so a series present on three shards
+// appeared three times with the same labels. That is not a valid matrix: a
+// Prometheus client renders them as three lines, every point is drawn
+// repeatedly, and any aggregation over the result counts each shard's
+// contribution as a separate series. The numbers are individually correct and
+// the answer is wrong.
+//
+// Points at the same timestamp are SUMMED, because these are counts over
+// disjoint shards and the cluster's value for a bucket is the total. A
+// non-additive statistic (an average, a quantile) cannot be merged this way at
+// all, which is why stats_query_range over a cluster is restricted to additive
+// aggregates -- see the LLD.
 func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	var result []json.RawMessage
 	srBodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/stats_query_range", nil)
 	if !ok {
 		return
 	}
+	type acc struct {
+		metric map[string]string
+		points map[string]float64
+		order  []string // timestamps in first-seen order, sorted before output
+	}
+	byLabels := map[string]*acc{}
+	var labelOrder []string
 	for _, b := range srBodies {
 		var v struct {
 			Data struct {
-				Result []json.RawMessage `json:"result"`
+				Result []matrixSeries `json:"result"`
 			} `json:"data"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			result = append(result, v.Data.Result...)
+		if json.Unmarshal(b, &v) != nil {
+			continue
+		}
+		for _, se := range v.Data.Result {
+			key := labelKey(se.Metric)
+			a := byLabels[key]
+			if a == nil {
+				a = &acc{metric: se.Metric, points: map[string]float64{}}
+				if a.metric == nil {
+					a.metric = map[string]string{}
+				}
+				byLabels[key] = a
+				labelOrder = append(labelOrder, key)
+			}
+			for _, pt := range se.Values {
+				ts := fmt.Sprint(pt[0])
+				if _, seen := a.points[ts]; !seen {
+					a.order = append(a.order, ts)
+				}
+				a.points[ts] += matrixValue(pt[1])
+			}
 		}
 	}
+
+	sort.Strings(labelOrder)
+	out := make([]matrixSeries, 0, len(labelOrder))
+	for _, key := range labelOrder {
+		a := byLabels[key]
+		stamps := append([]string(nil), a.order...)
+		sort.Slice(stamps, func(i, j int) bool {
+			return matrixStamp(stamps[i]) < matrixStamp(stamps[j])
+		})
+		pts := make([][2]any, 0, len(stamps))
+		for _, ts := range stamps {
+			// The value is a STRING in the Prometheus wire format, and it goes
+			// back as one: a client that parses it expects to.
+			pts = append(pts, [2]any{matrixStamp(ts),
+				strconv.FormatFloat(a.points[ts], 'f', -1, 64)})
+		}
+		out = append(out, matrixSeries{Metric: a.metric, Values: pts})
+	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"status": "success",
-		"data":   map[string]any{"resultType": "matrix", "result": result},
+		"data":   map[string]any{"resultType": "matrix", "result": out},
 	})
+}
+
+// matrixValue reads a point's value, which the wire format carries as a
+// string.
+func matrixValue(v any) float64 {
+	switch x := v.(type) {
+	case string:
+		f, _ := strconv.ParseFloat(x, 64)
+		return f
+	case float64:
+		return x
+	}
+	return 0
+}
+
+// matrixStamp reads a point's timestamp, which is a number.
+func matrixStamp(s string) float64 {
+	f, _ := strconv.ParseFloat(s, 64)
+	return f
 }
 
 // federatedStatsQuery merges stats across storage nodes: a total count is
