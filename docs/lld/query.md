@@ -165,6 +165,51 @@ the answer. `MaxMemory` shares the byte accounting, which is gated on
 zero and the ceiling could never be reached, which is a limit that is
 configuration nothing reads.
 
+## Streaming a bare select (`iterator.go`)
+
+`Run` returns `[]Row`: every matching row is in memory before the first byte
+reaches the client, so peak memory is the size of the ANSWER rather than of the
+working set — and an answer that does not fit is not slow, it is impossible.
+`-search.maxRows` was the response to that: refuse a bare select whose result
+exceeds a cap. The right refusal to have and the wrong thing to need, because
+the query it refuses is one the machine could answer a group at a time.
+
+`ScanEach(store, q, fn)` walks matching rows in group (time) order and hands
+each group's rows to `fn`. Peak rows held is one group's matches, or a bounded
+window of them when the scan fans out — regardless of how many rows match. The
+slice `fn` receives is only valid for the call: the serial walk reuses one
+backing array, which is what makes a million-row select allocate like a
+one-group one.
+
+`Streamable(q)` is the whole decision, and it refuses three things:
+
+| refused | why |
+| --- | --- |
+| any pipe | `stats`/`sort`/`uniq` are defined over the whole result — a sort cannot emit its first row until it has seen its last. The row-wise pipes are applied by `RunPipeline` to a materialized slice, so streaming past them means re-implementing each as an operator. |
+| `LastN` (`limit=`) | `runNewest` walks groups BACKWARDS and keeps each one's last n; its order is not group order and its early stop depends on rows already kept. |
+| `MaxRows` in force | the cap must be decided before the first byte; a stream that discovered the overflow at row n+1 has already sent n rows. Those stay materialized — the cap is what makes materializing them safe. |
+
+So over HTTP the streamed path is exactly the uncapped bare select
+(`-search.maxRows=-1`), which was the configuration with no bound at all.
+`simdlogs_query_streamed_total` counts them; the two bodies are byte-identical
+by construction, so the counter is the only way to tell which path answered.
+
+Above `parallelMinGroups` the walk stays parallel. One channel per group,
+handed to the consumer in group order through a window of `workers` slots: a
+producer cannot start group n+workers until the consumer has taken group n, so
+the window is the memory bound and the order needs no sort at the end. A serial
+walk would have made big uncapped selects slower than they were, which is
+memory bought with throughput.
+
+**Failure after the first byte.** An NDJSON body that stops early parses line
+for line and carries no length and no terminator, so a short answer is
+indistinguishable from a complete one. `streamSelect` tracks whether any byte
+reached the `ResponseWriter`: before that a failure is a normal status with the
+normal remedy text; after it, the handler panics with `http.ErrAbortHandler`
+and the client sees a broken stream. `wg.Wait` before returning is not
+tidiness — the snapshot is unmapped when `ScanEach` returns, and a producer
+still reading a group's blob after that is a use-after-unmap.
+
 ## Admission and the worker budget (`budget.go`)
 
 Two separate questions with two separate mechanisms.
@@ -254,5 +299,6 @@ optimization, not a claim.
 - Query: per-group worker pool at ≥ 4 groups, drawn from the process-wide
   `WorkerBudget` rather than sized at `GOMAXPROCS` per query; Count/Histogram
   have their own parallel paths (partial maps/counts merged at the end).
+  `ScanEach` keeps the same fan-out behind a bounded in-order window.
 - Cluster: fan-out per shard with one live replica each (see
   `lld/cluster.md`).

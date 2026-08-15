@@ -162,6 +162,9 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		m("simdlogs_query_admission_rejected_total", "Queries refused by admission.",
 			"counter", rejectedQ)
 	}
+	m("simdlogs_query_streamed_total",
+		"Bare selects answered a group at a time, without materializing the result.",
+		"counter", atomic.LoadInt64(&s.nStreamedSelects))
 	rejDisk, rejQuota := storage.RejectedWrites()
 	m("simdlogs_writes_rejected_disk_total", "Writes refused because free space is below the reserve.",
 		"counter", rejDisk)

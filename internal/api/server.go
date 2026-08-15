@@ -39,6 +39,8 @@ type Server struct {
 	mu      sync.Mutex
 	tenants map[string]*tenant
 	def     *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
+	// nStreamedSelects counts bare selects answered without materializing.
+	nStreamedSelects int64
 	// lastSyslogRefusal throttles the native transport's budget-refusal log.
 	// Nanos, atomic: written from every listener goroutine.
 	lastSyslogRefusal int64
@@ -789,6 +791,92 @@ func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
 
 // selectQuery runs a parsed LogsQL query and streams matched rows as
 // NDJSON, the reference's /select/logsql/query response shape.
+// wroteSpy records whether any byte reached the ResponseWriter.
+//
+// It decides whether a failure can still be reported as a status. Once the
+// first byte is out the status line is gone and a 4xx is no longer available;
+// before that it still is, and the difference is not observable from the
+// bufio.Writer in front of it, which may hold everything written so far.
+type wroteSpy struct {
+	w     io.Writer
+	wrote bool
+}
+
+func (f *wroteSpy) Write(p []byte) (int, error) {
+	f.wrote = true
+	return f.w.Write(p)
+}
+
+// streamSelect answers a bare select without materializing it.
+//
+// Peak memory is one row group's matches (or a bounded window of them when the
+// scan fans out), not the size of the answer. See internal/query/iterator.go.
+//
+// The hard part is not the streaming, it is the failure. An NDJSON body that
+// stops early is indistinguishable from a complete one -- there is no length,
+// no terminator, and every line already written parses. So a scan that fails
+// after the first byte is out does NOT return: it aborts the connection, and
+// the client sees a broken stream rather than a short answer it would have
+// believed. Before the first byte the status is still available and the error
+// is reported properly.
+func (s *Server) streamSelect(w http.ResponseWriter, r *http.Request, q *query.Query, stopped *atomic.Bool) {
+	// Counted, and exposed. Which path answered is not visible from the body
+	// -- the two are byte-identical by construction -- so without a counter an
+	// operator cannot tell whether raising -search.maxRows moved anything, and
+	// a test cannot tell that it exercised this function at all rather than
+	// the materialized one returning the same rows.
+	atomic.AddInt64(&s.nStreamedSelects, 1)
+	spy := &wroteSpy{w: w}
+	// 64 KiB rather than bufio's default 4 KiB: this is a bulk transfer, and
+	// the syscall count is the only thing the buffer size changes.
+	bw := bufio.NewWriterSize(spy, 64<<10)
+	w.Header().Set("Content-Type", ndjsonContentType)
+
+	var buf []byte
+	err := query.ScanEach(s.tn(r).store, q, func(rows []query.Row) error {
+		for _, row := range rows {
+			buf = appendRowJSON(buf[:0], row, q.MatAll)
+			if _, werr := bw.Write(buf); werr != nil {
+				// The client hung up. Returned rather than swallowed, so the
+				// scan stops instead of filling a buffer nobody reads.
+				return werr
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		err = bw.Flush()
+	}
+	// ScanEach returns the query's own stop reason, so a budget or
+	// cancellation stop arrives as err. The atomic is checked too because it
+	// is the signal the materialized path uses and the two must not disagree.
+	if err == nil && stopped != nil && stopped.Load() {
+		if e := q.StopErr(); e != nil {
+			err = e
+		} else {
+			err = query.ErrDeadlineExceeded
+		}
+	}
+	if err == nil {
+		return
+	}
+	if !spy.wrote {
+		// Nothing is on the wire yet, so the status line is still available
+		// and the failure is reported the same way the materialized path
+		// reports it -- same codes, same remedies.
+		s.queryStoppedErr(w, r, stopped, q)
+		if stopped == nil || !stopped.Load() {
+			s.writeErr(w, r, readSpec(), query.HTTPStatus(err), err.Error())
+		}
+		return
+	}
+	// Bytes are already out. An NDJSON body that stops early parses line for
+	// line and carries no length and no terminator, so returning here would
+	// hand the client a short answer it has no way to tell from a complete
+	// one. Aborting the connection is the only signal left.
+	panic(http.ErrAbortHandler)
+}
+
 func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 { // select-router: fan out to the storage nodes and merge
 		s.federatedSelect(w, r)
@@ -816,6 +904,16 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	stopped := s.applyQueryBudget(r, q)
+	if query.Streamable(q) {
+		// No pipes, no `limit=`, and no row cap in force -- so nothing has to
+		// see the whole answer before the first byte can go out. That is
+		// exactly the query that used to be dangerous: with
+		// -search.maxRows=-1 a bare select materialized every matching row
+		// before writing any of them, so an answer that did not fit was not
+		// slow, it was impossible.
+		s.streamSelect(w, r, q, stopped)
+		return
+	}
 	rows := query.RunPipeline(s.tn(r).store, q) // applies the pipe chain; == Run when there are none
 	if s.queryStoppedErr(w, r, stopped, q) {
 		return

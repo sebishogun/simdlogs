@@ -281,7 +281,7 @@ code change).
 `simdlogs_writes_rejected_disk_total`, `simdlogs_writes_rejected_quota_total`,
 `simdlogs_scan_workers_total`, `simdlogs_scan_workers_in_use`,
 `simdlogs_query_admission_in_flight`, `simdlogs_query_admission_queued`,
-`simdlogs_query_admission_rejected_total`) plus the same
+`simdlogs_query_admission_rejected_total`, `simdlogs_query_streamed_total`) plus the same
 numbers under the reference's names (`vl_rows_ingested_total`,
 `vl_bytes_ingested_total`, `vl_rows_dropped_total`, `vl_http_requests_total`,
 `vl_http_errors_total`, `vl_live_tailing_requests`, `vl_partitions`,
