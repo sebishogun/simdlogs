@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	obs "github.com/sebishogun/simdlogs/internal/observability"
@@ -73,6 +74,11 @@ type ShardBackup struct {
 	// Replicas is how many replicas this shard had when the backup was taken.
 	// A restore into a different topology is refused on this.
 	Replicas int `json:"replicas"`
+	// ReplicasConsulted is how many of them answered when the source was
+	// chosen. A backup is refused unless it equals Replicas, so this is a
+	// record rather than a condition -- but it is the field that makes the
+	// archive say which it was instead of leaving a reader to assume.
+	ReplicasConsulted int `json:"replicasConsulted"`
 	// HighWatermark is the newest timestamp this shard's data covered.
 	// Recorded per shard because the archives are taken at different moments,
 	// and the spread between them is the thing an operator needs to see.
@@ -117,6 +123,32 @@ func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
 		for j, u := range replicas {
 			states = append(states, s.askReplicaState(r, i, j, u))
 		}
+		// An UNREACHABLE replica is refused, not skipped.
+		//
+		// completeReplica builds its union from reachable replicas only, so a
+		// replica that did not answer can never make the chosen source look
+		// short -- and the only check was `reachable == 0`. Measured: one shard,
+		// two replicas, one row written only to replica 2. With both up the
+		// backup held 3 groups / 3 rows; with replica 2 down it held 2 groups /
+		// 2 rows, HTTP 200, a valid tar that passes ValidateClusterBackup, and
+		// nothing anywhere saying a replica was never asked. repairCluster marks
+		// a shard incomplete on exactly this condition; the backup path did not.
+		var unreachable []string
+		for j, st := range states {
+			if st.Err != "" {
+				unreachable = append(unreachable, fmt.Sprintf("%d(%s)", j, st.Err))
+			}
+		}
+		if len(unreachable) > 0 {
+			s.writeErr(w, r, adminSpec(), http.StatusServiceUnavailable, fmt.Sprintf(
+				"simdlogs: shard %d has %d of %d replicas unreachable (%s). What "+
+					"those replicas hold cannot be compared against what the "+
+					"reachable ones hold, so a backup taken now could be short with "+
+					"no way to tell from the archive. Bring them back, or run "+
+					"/admin/cluster/repair once they return, and try again",
+				i, len(unreachable), len(replicas), strings.Join(unreachable, ",")))
+			return
+		}
 		src, why := completeReplica(states)
 		if src < 0 {
 			s.writeErr(w, r, adminSpec(), http.StatusServiceUnavailable, fmt.Sprintf(
@@ -128,14 +160,18 @@ func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
 		st := states[src]
 		sources[i] = st.URL
 		man.Shards = append(man.Shards, ShardBackup{
-			Shard:         i,
-			Archive:       fmt.Sprintf("shard-%d.tar", i),
-			SourceURL:     st.URL,
-			Replicas:      len(replicas),
-			HighWatermark: st.HighWatermark,
-			Groups:        len(st.Groups),
-			Rows:          st.rows(),
-			Receipts:      st.Receipts,
+			Shard:     i,
+			Archive:   fmt.Sprintf("shard-%d.tar", i),
+			SourceURL: st.URL,
+			Replicas:  len(replicas),
+			// Replicas alone could not distinguish "two replicas, both asked"
+			// from "two replicas, one asked", which is the difference between a
+			// complete archive and a short one.
+			ReplicasConsulted: len(states) - len(unreachable),
+			HighWatermark:     st.HighWatermark,
+			Groups:            len(st.Groups),
+			Rows:              st.rows(),
+			Receipts:          st.Receipts,
 		})
 	}
 

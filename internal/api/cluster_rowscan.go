@@ -523,3 +523,37 @@ func bufStr(buf *[]byte, off int) string {
 	}
 	return unsafe.String(&(*buf)[off], len(*buf)-off)
 }
+
+// looksLikeJSONObject reports whether a line could be a row: the cheap check
+// mergeRows makes before treating a shard's line as data.
+//
+// It is deliberately structural rather than a full parse. mergeRows keeps lines
+// as byte slices and only the coordinator-pipes path decodes them, so a full
+// parse here would undo that; and the case this exists for -- a proxy's HTML
+// error page, a plain-text error, an empty body -- is caught by the first byte.
+// A line that starts with '{' and ends with '}' but is not valid JSON still
+// reaches jsonLineToRow, which answers rawRow for it.
+func looksLikeJSONObject(line []byte) bool {
+	i := skipWS(line, 0)
+	if i >= len(line) || line[i] != '{' {
+		return false
+	}
+	for j := len(line) - 1; j >= i; j-- {
+		switch line[j] {
+		case ' ', '\t', '\r':
+			continue
+		case '}':
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+// truncateLine is a shard's line cut to n bytes for an error message.
+func truncateLine(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "..."
+}

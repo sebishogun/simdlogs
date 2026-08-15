@@ -36,7 +36,22 @@ func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
 	// Without the limits, for the reason in federatedValueCounts: a shard that
 	// truncated to its own top N can never contribute a value that is popular
 	// across the cluster and unremarkable on each shard.
-	bodies, w, ok := s.fanOutChecked(w, withoutLimits(r), "/select/logsql/facets", nil)
+	// `limit=0` rather than deleting the parameter.
+	//
+	// facets reads it as intParam(r, "limit", DefaultFacetLimit), so ABSENT
+	// means 10, not unlimited -- deleting it left every shard truncating to its
+	// own top 10 and the merge summing those. `keep_const_fields=1` for the
+	// same reason: a field that is constant on one shard and varied across the
+	// cluster is dropped by each shard before the coordinator can see it.
+	shardReq, ok := withoutLimits(r, map[string]string{
+		"limit":             "0",
+		"keep_const_fields": "1",
+	})
+	if !ok {
+		s.refuseUnparseableQuery(w, r)
+		return
+	}
+	bodies, w, ok := s.fanOutChecked(w, shardReq, "/select/logsql/facets", nil)
 	if !ok {
 		return
 	}
@@ -72,7 +87,13 @@ func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	maxFields := intParam(r, "limit", query.DefaultFacetLimit)
+	// `limit` truncates VALUES WITHIN A FIELD, which is what it does on a
+	// storage node (introspect.go: `if limit > 0 && len(vc) > limit`). It used
+	// to truncate FIELDS here, so `?limit=2` answered five fields of top-2
+	// values on one node and two fields of every value on a cluster -- the same
+	// parameter, two meanings, and the fields anyone is actually faceting on
+	// missing from the cluster answer.
+	limit := intParam(r, "limit", query.DefaultFacetLimit)
 	maxValues := intParam(r, "max_values_per_field", query.DefaultFacetMaxValues)
 	out := make([]query.FieldFacet, 0, len(fieldOrder))
 	for _, name := range fieldOrder {
@@ -81,19 +102,24 @@ func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
 		for _, v := range fa.order {
 			vals = append(vals, query.FacetValue{FieldValue: v, Hits: fa.hits[v]})
 		}
+		// A field with more distinct values across the CLUSTER than
+		// max_values_per_field allows is dropped whole, which is what
+		// facetKeep does on a node. Applying it here rather than at the shards
+		// is the point: a field can be under the cap on each shard and over it
+		// on the union.
+		if maxValues > 0 && len(vals) > maxValues {
+			continue
+		}
 		sort.Slice(vals, func(i, j int) bool {
 			if vals[i].Hits != vals[j].Hits {
 				return vals[i].Hits > vals[j].Hits
 			}
 			return vals[i].FieldValue < vals[j].FieldValue
 		})
-		if maxValues > 0 && len(vals) > maxValues {
-			vals = vals[:maxValues]
+		if limit > 0 && len(vals) > limit {
+			vals = vals[:limit]
 		}
 		out = append(out, query.FieldFacet{FieldName: name, Values: vals})
-	}
-	if maxFields > 0 && len(out) > maxFields {
-		out = out[:maxFields]
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"facets": out})
@@ -125,10 +151,33 @@ func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The operator per output name, from the query. Every federated stats merge
+	// used to ADD unconditionally, and mergeableAggs lists min and max as
+	// mergeable, so `stats min(n)` over two shards holding 100-105 and 106-111
+	// answered 206. No row has n=206; the value is not merely wrong, it is
+	// impossible, and it came back 200.
+	// ops is nil for a query with NO stats pipe, where there is no aggregate to
+	// get wrong and summing is the only defined behaviour. When there IS one,
+	// the operator comes from it and an output the pipe does not name is
+	// refused.
+	ops, opsOK := query.MergeOps(r.FormValue("query"))
+	if query.HasStatsPipe(r.FormValue("query")) && !opsOK {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+			"simdlogs: this query's aggregates cannot be combined across shards. "+
+				"The router reads from the stats pipe whether each output is summed "+
+				"or taken extremally, and this build does not know for at least one "+
+				"of them, so the query is refused rather than summed by default")
+		return
+	}
+	if !opsOK {
+		ops = nil
+	}
 	type acc struct {
 		metric map[string]string
 		stamp  any
-		sum    float64
+		val    float64
+		seen   bool
+		op     query.MergeOp
 	}
 	byLabels := map[string]*acc{}
 	var order []string
@@ -153,7 +202,23 @@ func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
 				if m == nil {
 					m = map[string]string{}
 				}
-				a = &acc{metric: m, stamp: se.Value[0]}
+				// The output name is __name__, which is the aggregate's alias.
+				// A series whose name is not in the query's stats pipe is one
+				// this router cannot combine: refusing beats picking an
+				// operator for it.
+				op, known := query.MergeSum, true
+				if ops != nil {
+					op, known = ops[m["__name__"]]
+				}
+				if !known {
+					s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+						"simdlogs: a shard returned a series named %q, which is not an "+
+							"output of this query's stats pipe, so the router does not "+
+							"know whether to sum it or take its extreme",
+						m["__name__"]))
+					return
+				}
+				a = &acc{metric: m, stamp: se.Value[0], op: op}
 				byLabels[key] = a
 				order = append(order, key)
 			}
@@ -171,7 +236,8 @@ func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
 				unparseable++
 				continue
 			}
-			a.sum += f
+			a.val = a.op.Combine(a.val, f, !a.seen)
+			a.seen = true
 		}
 	}
 	res := make([]vectorSeries, 0, len(order))
@@ -181,14 +247,15 @@ func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
 			Metric: a.metric,
 			// A string, as the Prometheus wire format requires: a client that
 			// parses it expects one.
-			Value: [2]any{a.stamp, strconv.FormatFloat(a.sum, 'f', -1, 64)},
+			Value: [2]any{a.stamp, strconv.FormatFloat(a.val, 'f', -1, 64)},
 		})
 	}
 	if unparseable > 0 {
 		s.writeErr(w, r, adminSpec(), http.StatusBadGateway, fmt.Sprintf(
 			"simdlogs: %d shard value(s) could not be read, so this total would be "+
 				"missing terms. A sum short of a term is a different number, not a "+
-				"smaller one", unparseable))
+				"smaller one, and a min or max short of a term is a different "+
+				"extreme", unparseable))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

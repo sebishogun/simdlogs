@@ -509,12 +509,18 @@ func (s *Server) mergeRows(
 	}
 	var mu sync.Mutex
 	var all []row
+	// badLine is the first line no shard should have sent, reported after the
+	// fan-in so the refusal names the shard and the bytes.
+	var badShard = -1
+	var badLine []byte
+
 	var wg sync.WaitGroup
 	for _, a := range answers {
 		wg.Add(1)
 		go func(shardOf int, body []byte) {
 			defer wg.Done()
 			local := make([]row, 0, bytes.Count(body, []byte{'\n'}))
+			var bad []byte
 			for start := 0; start < len(body); {
 				e := bytes.IndexByte(body[start:], '\n')
 				var line []byte
@@ -526,6 +532,19 @@ func (s *Server) mergeRows(
 				if len(line) == 0 {
 					continue
 				}
+				// Every line a storage node emits is one JSON object. A line
+				// that is not one is not a row, and mergeRows used to carry it
+				// through: a proxy's HTML error page in a 200 body came back to
+				// the caller AS A LOG LINE, and with a coordinator half it
+				// became _msg="<html>...". mergeDecode covers the eight
+				// envelope merges; this is the primary read path and had
+				// nothing.
+				if !looksLikeJSONObject(line) {
+					if bad == nil {
+						bad = line
+					}
+					continue
+				}
 				local = append(local, row{
 					t: rowLineTime(bytesToString(line)), line: line, shard: shardOf,
 					seq: len(local),
@@ -533,10 +552,26 @@ func (s *Server) mergeRows(
 			}
 			mu.Lock()
 			all = append(all, local...)
+			if bad != nil && (badShard < 0 || shardOf < badShard) {
+				badShard, badLine = shardOf, bad
+			}
 			mu.Unlock()
 		}(a.shard, a.body)
 	}
 	wg.Wait()
+
+	if badShard >= 0 {
+		obs.L().Error("cluster read refused: a shard sent a line that is not a row",
+			obs.FieldEvent, "cluster.read_not_a_row",
+			obs.FieldRoute, r.URL.Path, "shard", badShard,
+			obs.FieldErrorClass, string(obs.ClassUpstream))
+		s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+			"simdlogs: shard %d answered 200 with a line that is not a JSON row "+
+				"(%q). Returning it would put that text in front of you as a log "+
+				"line, so the answer is refused",
+			badShard, truncateLine(badLine, 120)))
+		return
+	}
 
 	// The coordinator half of the plan, applied ONCE over the merged rows.
 	if len(coordPipes) > 0 {
@@ -771,13 +806,34 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 	// 0-3 of every shard were unreachable from any page at all. A shard must
 	// return everything the coordinator might need to page over, which is the
 	// first from+size of that shard, and the paging happens once, here.
+	// Decoded with the SAME rules a single node applies, and the errors kept.
+	//
+	// This discarded both: `_ = dec0.Decode(&want)`. So the federated path
+	// accepted a body the single node rejects with 400 -- `{"from":-1,"size":3}`
+	// came back 200 with the WRONG DOCUMENTS, because need = from+size = 2 made
+	// each shard return two hits and rows 2-5 were never fetched, while
+	// "total":12 said they existed. An unknown field was swallowed the same
+	// way, and a reframe failure fell back to shipping the caller's body
+	// verbatim, which is the double-paging bug the comment above documents.
 	var want esQuery
 	dec0 := json.NewDecoder(bytes.NewReader(body))
 	dec0.DisallowUnknownFields()
-	_ = dec0.Decode(&want)
-	shardBody := body
-	if b, err := reframeESPaging(body, want); err == nil {
-		shardBody = b
+	if err := dec0.Decode(&want); err != nil {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, "simdlogs: "+err.Error())
+		return
+	}
+	if want.Size < 0 || want.From < 0 {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+			"simdlogs: size and from must not be negative")
+		return
+	}
+	shardBody, err := reframeESPaging(body, want)
+	if err != nil {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, fmt.Sprintf(
+			"simdlogs: this search body could not be reframed for the shards (%v). "+
+				"Sending it unchanged would apply from/size twice -- once on each "+
+				"shard and again here -- so it is refused", err))
+		return
 	}
 
 	var hits []json.RawMessage
@@ -874,7 +930,13 @@ func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, pa
 	//
 	// second has 6 hits cluster-wide and is displaced by one with 4, because
 	// second was third on every shard and never returned by any of them.
-	vcReq := withoutLimits(r)
+	// `limit` here defaults to 0 (unlimited) on a storage node, so deleting it
+	// is enough -- unlike facets, whose default caps at 10.
+	vcReq, wlOK := withoutLimits(r, nil)
+	if !wlOK {
+		s.refuseUnparseableQuery(w, r)
+		return
+	}
 	vcBodies, w, ok := s.fanOutChecked(w, vcReq, path, nil)
 	if !ok {
 		return
@@ -952,9 +1014,28 @@ func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The operator per output name. This merge added unconditionally, so a
+	// range query over min() summed the shards' minima -- a number in the right
+	// units, on the right axis, that no row produced.
+	// nil for a query with no stats pipe: nothing to get wrong, and summing is
+	// the only defined behaviour. See federatedVector.
+	ops, opsOK := query.MergeOps(r.FormValue("query"))
+	if query.HasStatsPipe(r.FormValue("query")) && !opsOK {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+			"simdlogs: this query's aggregates cannot be combined across shards. "+
+				"The router reads from the stats pipe whether each output is summed "+
+				"or taken extremally, and this build does not know for at least one "+
+				"of them, so the query is refused rather than summed by default")
+		return
+	}
+	if !opsOK {
+		ops = nil
+	}
 	type acc struct {
 		metric map[string]string
 		points map[string]float64
+		seen   map[string]bool
+		op     query.MergeOp
 		order  []string // timestamps in first-seen order, sorted before output
 	}
 	byLabels := map[string]*acc{}
@@ -972,19 +1053,48 @@ func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
 			key := labelKey(se.Metric)
 			a := byLabels[key]
 			if a == nil {
-				a = &acc{metric: se.Metric, points: map[string]float64{}}
-				if a.metric == nil {
-					a.metric = map[string]string{}
+				m := se.Metric
+				if m == nil {
+					m = map[string]string{}
 				}
+				op, known := query.MergeSum, true
+				if ops != nil {
+					op, known = ops[m["__name__"]]
+				}
+				if !known {
+					s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+						"simdlogs: a shard returned a series named %q, which is not an "+
+							"output of this query's stats pipe, so the router does not "+
+							"know whether to sum it or take its extreme", m["__name__"]))
+					return
+				}
+				a = &acc{metric: m, points: map[string]float64{},
+					seen: map[string]bool{}, op: op}
 				byLabels[key] = a
 				labelOrder = append(labelOrder, key)
 			}
 			for _, pt := range se.Values {
 				ts := fmt.Sprint(pt[0])
-				if _, seen := a.points[ts]; !seen {
+				if !a.seen[ts] {
 					a.order = append(a.order, ts)
 				}
-				a.points[ts] += matrixValue(pt[1])
+				// A value this router cannot read is refused, not counted as
+				// zero. matrixValue returned 0 for an unreadable value, so a
+				// term went missing from a sum and a min gained a zero that
+				// beats every positive value -- both plausible, both wrong.
+				// federatedVector refuses the identical condition; this was the
+				// odd one out.
+				f, ferr := parseMatrixValue(pt[1])
+				if ferr != nil {
+					s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+						"simdlogs: a shard returned the value %q for series %q at %s, "+
+							"which this router cannot read as a number. Counting it as "+
+							"zero would change the answer without saying so",
+						fmt.Sprint(pt[1]), a.metric["__name__"], ts))
+					return
+				}
+				a.points[ts] = a.op.Combine(a.points[ts], f, !a.seen[ts])
+				a.seen[ts] = true
 			}
 		}
 	}
@@ -994,6 +1104,15 @@ func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
 	for _, key := range labelOrder {
 		a := byLabels[key]
 		stamps := append([]string(nil), a.order...)
+		for _, ts := range stamps {
+			if _, err := strconv.ParseFloat(ts, 64); err != nil {
+				s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+					"simdlogs: a shard returned the bucket start %q for series %q, "+
+						"which this router cannot read as a number. It was silently "+
+						"sorted to the epoch and emitted as 0", ts, a.metric["__name__"]))
+				return
+			}
+		}
 		sort.Slice(stamps, func(i, j int) bool {
 			return matrixStamp(stamps[i]) < matrixStamp(stamps[j])
 		})
@@ -1015,6 +1134,21 @@ func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
 
 // matrixValue reads a point's value, which the wire format carries as a
 // string.
+// parseMatrixValue is matrixValue with the error kept.
+//
+// matrixValue substitutes 0 for anything it cannot read, which is a term
+// silently missing from a sum and a zero that wins every min. The merge uses
+// this; matrixValue stays for callers that genuinely have no way to report.
+func parseMatrixValue(v any) (float64, error) {
+	switch x := v.(type) {
+	case float64:
+		return x, nil
+	case string:
+		return strconv.ParseFloat(x, 64)
+	}
+	return strconv.ParseFloat(fmt.Sprint(v), 64)
+}
+
 func matrixValue(v any) float64 {
 	switch x := v.(type) {
 	case string:
@@ -1048,7 +1182,18 @@ func matrixStamp(s string) float64 {
 // Non-mergeable aggregates are refused here on the same rule the LogsQL
 // planner applies, so one binary does not answer the same aggregate two ways.
 func (s *Server) federatedStatsQuery(w http.ResponseWriter, r *http.Request) {
-	if r.FormValue("by") == "" {
+	// Which SHAPE the shards send is decided by whether the query has a stats
+	// pipe, not by `by=`.
+	//
+	// A storage node emits `{"stats":[...]}` only when StatsQueryInstant FAILS
+	// -- which it does exactly when the query has no stats pipe -- and `by=` is
+	// set. A query that DOES have one gets the Prometheus vector whatever `by=`
+	// says. Switching on `by=` therefore decoded `{"stats":...}` out of a
+	// vector envelope, which unmarshals cleanly into a nil slice, so
+	// `* | stats count() c` with `by=level` answered `{"stats":[]}` -- HTTP
+	// 200, empty, and mergeDecode cannot see it because nothing failed to
+	// parse. A dashboard panel grouped by a label drew nothing.
+	if query.HasStatsPipe(r.FormValue("query")) || r.FormValue("by") == "" {
 		s.federatedVector(w, r)
 		return
 	}
@@ -1168,6 +1313,19 @@ func (s *Server) federatedHits(w http.ResponseWriter, r *http.Request) {
 			// is the sum.
 			for j, ts := range se.Timestamps {
 				t, err := time.Parse(time.RFC3339Nano, ts)
+				// UnixNano is only defined for 1677-09-21 .. 2262-04-11 and
+				// wraps silently outside it, while time.Parse accepts any year:
+				// 2600-01-01 became 2015-06-13, and its count was filed on --
+				// and summed into -- a real 2015 bucket. The round trip is the
+				// check, because the wrap has no error to test.
+				if err == nil && !time.Unix(0, t.UnixNano()).UTC().Equal(t.UTC()) {
+					s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+						"simdlogs: shard %d returned the bucket timestamp %q, which is "+
+							"outside the range nanoseconds since the epoch can represent "+
+							"(1677-09-21 to 2262-04-11). Converting it wraps to an "+
+							"unrelated date, so the answer is refused", ans.shard, ts))
+					return
+				}
 				if err != nil {
 					s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
 						"simdlogs: shard %d returned bucket timestamp %q, which is not "+
@@ -1430,8 +1588,16 @@ func (s *Server) fanOutChecked(
 		"shards_total", len(peers), "shards_answered", answered,
 		"missing", strings.Join(bad, ","))
 	w.Header().Set(HdrPartial, "true")
-	s.notePartialRead()
-	return answersOf(peers), &partialWriter{ResponseWriter: w}, true
+	// The counter is NOT incremented here.
+	//
+	// PartialReads() is documented as "answers this router knowingly returned
+	// incomplete", which is what an operator alerts on. Counting at this point
+	// counts every read that was ALLOWED to be partial, including the ones a
+	// merge then refuses with 502 -- so a refused read arrived at the operator
+	// as a returned partial answer, with X-Simdlogs-Partial: true on a 502
+	// telling the client the same wrong thing. partialWriter increments when it
+	// actually writes the 206.
+	return answersOf(peers), &partialWriter{ResponseWriter: w, srv: s}, true
 }
 
 // partialWriter answers 206 on the first write.
@@ -1441,6 +1607,7 @@ func (s *Server) fanOutChecked(
 // a caller cannot accidentally treat an incomplete answer as a complete one.
 type partialWriter struct {
 	http.ResponseWriter
+	srv   *Server
 	wrote bool
 }
 
@@ -1451,13 +1618,27 @@ func (p *partialWriter) WriteHeader(code int) {
 	p.wrote = true
 	if code == http.StatusOK {
 		code = http.StatusPartialContent
+		// Counted HERE, where a partial answer is actually being returned. A
+		// merge that refuses writes a 4xx/5xx through this same writer and does
+		// not count.
+		if p.srv != nil {
+			p.srv.notePartialRead()
+		}
+	} else {
+		// Not a partial answer after all: the merge refused. The header set
+		// before the merge would otherwise tell the client it is holding one.
+		p.Header().Del(HdrPartial)
 	}
 	p.ResponseWriter.WriteHeader(code)
 }
 
 func (p *partialWriter) Write(b []byte) (int, error) {
 	if !p.wrote {
-		p.WriteHeader(http.StatusPartialContent)
+		// StatusOK, not StatusPartialContent: WriteHeader maps 200 to 206 and
+		// treats anything else as a refusal that must not be marked partial.
+		// Passing 206 here took the refusal branch and deleted the header on
+		// every successful partial answer.
+		p.WriteHeader(http.StatusOK)
 	}
 	return p.ResponseWriter.Write(b)
 }

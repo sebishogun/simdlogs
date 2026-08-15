@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -354,9 +356,25 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 				}
 				src := pickSource(states, digest, st.URL)
 				if src == "" {
+					// The one exit from this loop that used to report nothing:
+					// not Remaining, not Blocked, not Errors, and Complete
+					// stayed true. Reachable when the only holder is excluded
+					// as "not this replica" because two entries resolved to the
+					// same URL and the node flushed between the two state
+					// reads.
+					sr.Remaining++
+					rep.Remaining++
+					rep.Complete = false
 					continue
 				}
 				moved, err := s.copyGroup(r, src, st.URL, digest)
+				if errors.Is(err, errAlreadyHeld) {
+					// The destination declined because it already had the
+					// group -- its state was stale by the time the PUT landed.
+					// Nothing moved, so nothing is counted; the pass is still
+					// complete, because the group IS where it needs to be.
+					continue
+				}
 				if err != nil {
 					rep.Complete = false
 					rep.Errors = append(rep.Errors, fmt.Sprintf(
@@ -408,6 +426,20 @@ func (s *Server) askReplicaState(r *http.Request, shard, replica int, u string) 
 		st.Err = "unparseable state: " + err.Error()
 		return st
 	}
+	// A body that PARSES but is not a state reads as an empty replica.
+	//
+	// `null`, `{}`, and any object with no `groups` key all unmarshal into a
+	// ReplicaState with Groups == nil and Err == "". ReplicaState.Err's own
+	// doc says "A state that could not be read is NOT an empty state: treating
+	// it as empty would make repair try to copy the whole shard into a node
+	// that already has it" -- and that is exactly what this produced, because
+	// the guard covered the unmarshal error and not this. `groups` is present
+	// and non-null in every real answer, including an empty replica's, so its
+	// absence is the discriminator.
+	if !bytes.Contains(resp.Body, []byte(`"groups"`)) {
+		st.Err = "the answer parsed but is not a replica state (no groups field)"
+		return st
+	}
 	got.Shard, got.Replica, got.URL = shard, replica, u
 	return got
 }
@@ -435,10 +467,30 @@ func (s *Server) copyGroup(r *http.Request, src, dst, digest string) (int64, err
 	if !put.OK() {
 		return 0, fmt.Errorf("adopting at %s: %s: %v", dst, put.Class, put.Err)
 	}
+	// The destination says whether it ADOPTED the group. AdoptGroup answers
+	// 200 with {"adopted":false} when it already had it, and this used to
+	// check only put.OK() -- so a pass could report copied: N, bytes: M,
+	// complete: true having moved nothing new, which is the number an operator
+	// reads to decide the cluster is repaired.
+	var ack struct {
+		Adopted *bool `json:"adopted"`
+	}
+	if err := json.Unmarshal(put.Body, &ack); err != nil || ack.Adopted == nil {
+		return 0, fmt.Errorf("adopting at %s: the destination answered 200 with a body "+
+			"this router could not read as an adoption result (%q)",
+			dst, truncateLine(put.Body, 120))
+	}
+	if !*ack.Adopted {
+		return 0, errAlreadyHeld
+	}
 	// What CROSSED THE WIRE, which is the only number this router observed
 	// itself. Everything else here is the peer's word.
 	return int64(len(got.Body)), nil
 }
+
+// errAlreadyHeld is a copy the destination declined because it already had the
+// group. Not an error to report and not a copy to count.
+var errAlreadyHeld = errors.New("the destination already held this group")
 
 // clusterTenant authorizes the tenant a cluster-scope admin request names, and
 // stamps the RESOLVED tenant back onto the request.

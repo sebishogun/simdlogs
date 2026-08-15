@@ -4446,3 +4446,95 @@ stream, so `{"a":{"b":1}}` became a field `a` with value `"{"` followed by a
 field `b` — a row that exists nowhere. The contract is now two-sided and
 pinned: a valid JSON object decodes to exactly what the Decoder produced, and
 anything else is the whole line as `_msg`.
+
+## 45. Eight wrong answers a second reviewer reproduced against a live cluster
+
+Reviewer B ran a router over two storage nodes and a single node holding the
+same rows, and asked both the same questions. Every finding below came back
+HTTP 200 and looked like a smaller right answer.
+
+**`min()` and `max()` were SUMMED.** `mergeableAggs` has always listed
+`AggMin` and `AggMax`, and the comment above it says "Additive **or extremal**
+only" -- but all three federated stats merges added unconditionally. Only the
+additive half was ever implemented.
+
+| query, n = 100..111 split 100-105 / 106-111 | single node | router |
+|---|---|---|
+| `* \| stats min(n) m` | 100 | **206** |
+| `* \| stats max(n) m` | 111 | **216** |
+| `* \| stats count() c` (control) | 12 | 12 |
+
+206 is not a plausible wrong answer, it is an impossible one: no row has
+n = 206. And `/select/logsql/query | stats min(n)` answered 100 correctly on
+the same binary, which is the one-aggregate-two-answers inconsistency
+`rejectNonMergeableStats` exists to eliminate. Fixed with `MergeOps`, which
+reads the operator per output name from the query's stats pipe; a series a
+shard names that the pipe does not is refused rather than assigned one.
+
+**`stats_query&by=` answered `{"stats":[]}` for every query with a stats
+pipe.** A storage node emits that shape *only* in its error fallback -- when
+`StatsQueryInstant` fails, which it does exactly when there is no stats pipe --
+and the router switched on `by=` alone. The Prometheus vector envelope
+unmarshals cleanly into `struct{ Stats []vc }` with a nil slice, so
+`mergeDecode` cannot see it. A dashboard panel grouped by a label drew nothing.
+The router now switches on `HasStatsPipe`, which is what actually decides the
+shape.
+
+**A backup was well-formed and short with a replica down.** `completeReplica`
+builds its union from *reachable* replicas only, so an unreachable replica's
+groups can never make the chosen source look incomplete, and the only check was
+`reachable == 0`. One shard, two replicas, one row written only to replica 2:
+
+    both up        HTTP 200  groups:3 rows:3
+    replica 2 down HTTP 200  groups:2 rows:2
+
+The second is a valid tar that passes `ValidateClusterBackup`. `repairCluster`
+marks a shard incomplete on exactly this condition; the backup path did not.
+Now refused, and `ShardBackup.ReplicasConsulted` records what was asked.
+
+**One malformed unrelated parameter changed the answer.** `withoutLimits`
+returned the request unchanged when `url.ParseQuery` failed, so `&x=%zz`
+forwarded the caller's `limit` to every shard and the cluster's top-N became a
+merge of shard-local top-Ns. The value that was #1 cluster-wide (6 hits) and
+#11 on each shard vanished from a 200 response.
+
+**`limit` meant two different things on facets, and "without limits" meant "at
+the default".** On a node it truncates values within a field; at the
+coordinator it truncated *fields*, so `?limit=2` gave five fields of top-2
+values on one node and two fields of everything on a cluster. And facets reads
+`intParam(r, "limit", DefaultFacetLimit)`, so DELETING the parameter means 10,
+not unlimited -- `withoutLimits` bought nothing there and the merge still summed
+shard-local top-10s. Both fixed; the shards are now sent `limit=0` explicitly.
+
+**The federated ES `_search` accepted what a single node rejects.** It decoded
+into `want` and discarded the error (`_ = dec0.Decode(&want)`), so
+`{"from":-1,"size":3}` -- a 400 on one node -- came back 200 with the WRONG
+DOCUMENTS: `need = from+size = 2` made each shard return two hits, rows 2-5
+were never fetched, and `"total":12` said they existed.
+
+**The primary read path took a shard's garbage as data.** `mergeDecode` covers
+the eight envelope merges; `/select/logsql/query` and `/select/sql` go through
+`mergeRows`, which had nothing. A proxy's HTML error page in a 200 body came
+back to the caller as a log line.
+
+**A hits bucket outside 1677-09-21 .. 2262-04-11 wrapped.** `time.Parse`
+accepts any year and `UnixNano` is undefined outside that range:
+`2600-01-01T00:00:00Z` became `2015-06-13T00:25:26.290448384Z`, and its count
+was filed on -- and summed into -- a real 2015 bucket. The refusal added one
+commit earlier caught only a parse failure, which is not this.
+
+**Two more, found by tracing rather than reproduction.** A repair counted a
+group as copied when the destination answered `{"adopted":false}` (it already
+had it), so a pass could report `copied: N, complete: true` having moved
+nothing. And `askReplicaState` treated any body that *parses* as a state, so
+`null` or `{}` from a same-version peer read as an empty replica -- which
+`ReplicaState.Err`'s own doc says must never happen, because it makes repair
+copy the whole shard into a node that already holds it.
+
+**The shape.** Entry 43 was a rule enforced above the layer that can see the
+case. These are the same thing generalised: `mergeableAggs` said extremal
+aggregates were mergeable and no merge implemented extremal; `withoutLimits`
+documented a guarantee its error path abandoned; `ReplicaState.Err` documented
+a distinction its guard did not draw. In each one the correct behaviour was
+WRITTEN DOWN, in the same file, and the code did something else -- which is
+why reading did not find them and asking the cluster did.

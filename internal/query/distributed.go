@@ -310,3 +310,111 @@ func stripsTime(p Pipe) bool {
 	}
 	return false
 }
+
+// MergeOp is how a coordinator combines one aggregate's per-shard values.
+type MergeOp uint8
+
+const (
+	// MergeSum adds: count, sum, sum_len, count_empty. The union's value is
+	// the sum of the shards' values because the shards hold disjoint rows.
+	MergeSum MergeOp = iota
+	// MergeMin and MergeMax take the extreme. min of mins IS the min; the sum
+	// of mins is a number in the right units and on the right axis, which is
+	// what makes it dangerous.
+	MergeMin
+	MergeMax
+)
+
+// MergeOps maps each output name of a query's final stats pipe to the operator
+// that combines it across shards.
+//
+// mergeableAggs has always listed AggMin and AggMax as mergeable, and the
+// comment above it says "Additive OR EXTREMAL only" -- but every federated
+// stats merge added unconditionally, so `stats min(n)` over two shards holding
+// 100-105 and 106-111 answered 206 rather than 100. That is not a plausible
+// wrong answer, it is an arithmetically impossible one (no row has n=206), and
+// it came back HTTP 200.
+//
+// ok is false when raw does not parse or does not end in a stats pipe, which
+// tells a merge to refuse rather than guess an operator.
+func MergeOps(raw string) (ops map[string]MergeOp, ok bool) {
+	q, err := ParseLogsQL(raw)
+	if err != nil {
+		return nil, false
+	}
+	var sp *StatsPipe
+	for i := range q.Pipes {
+		if s, isStats := q.Pipes[i].(*StatsPipe); isStats {
+			sp = s
+		}
+	}
+	if sp == nil {
+		return nil, false
+	}
+	ops = make(map[string]MergeOp, len(sp.Aggs))
+	for i := range sp.Aggs {
+		op, known := mergeOpFor(sp.Aggs[i].Kind)
+		if !known {
+			// mergeableAggs refuses the query before it reaches a merge, so a
+			// kind arriving here means the two lists have drifted apart.
+			// Refusing keeps them from disagreeing silently.
+			return nil, false
+		}
+		ops[sp.Aggs[i].Alias] = op
+	}
+	return ops, true
+}
+
+func mergeOpFor(k AggKind) (MergeOp, bool) {
+	switch k {
+	case AggCount, AggSum, AggSumLen, AggCountEmpty:
+		return MergeSum, true
+	case AggMin:
+		return MergeMin, true
+	case AggMax:
+		return MergeMax, true
+	}
+	return 0, false
+}
+
+// Combine applies op to a running value and the next shard's value. first says
+// whether acc holds a shard's value yet, which matters for the extremal
+// operators: a zero accumulator would win every min over positive values.
+func (op MergeOp) Combine(acc, v float64, first bool) float64 {
+	if first {
+		return v
+	}
+	switch op {
+	case MergeMin:
+		if v < acc {
+			return v
+		}
+		return acc
+	case MergeMax:
+		if v > acc {
+			return v
+		}
+		return acc
+	}
+	return acc + v
+}
+
+// HasStatsPipe reports whether raw parses and contains a stats pipe.
+//
+// It is what decides which SHAPE a storage node's /select/logsql/stats_query
+// answer has: with a stats pipe it is the Prometheus instant vector, without
+// one StatsQueryInstant fails and the `by=` fallback emits this repository's
+// own `{"stats":[{value,hits}]}`. A router switching on `by=` instead decoded
+// the wrong shape for every grouped stats query.
+func HasStatsPipe(raw string) bool {
+	q, err := ParseLogsQL(raw)
+	if err != nil {
+		return false
+	}
+	for i := range q.Pipes {
+		if _, isStats := q.Pipes[i].(*StatsPipe); isStats {
+			return true
+		}
+	}
+	return false
+}

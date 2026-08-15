@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.5'
@@ -113,6 +115,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A dispatch runs against the ref it was started FROM, so a dry run
+          # of v1.2.3 launched from main would check out main, build it, and
+          # stamp it v1.2.3. The input names what to build; build that.
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           path: staged
@@ -141,15 +148,28 @@ jobs:
       # produced these bytes. Without it a checksum only proves the file has
       # not changed since someone published it, not that the right thing
       # published it.
+      #
+      # Gated on the same condition as the release below, because this is not a
+      # local step: it writes a signed entry to a public transparency log, and
+      # that entry cannot be withdrawn. A dry run that attested would have
+      # published a permanent statement that bytes were built from a tag they
+      # were not built from -- worse than the release it was meant to skip.
       - uses: actions/attest-build-provenance@v1
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         with:
           subject-path: 'staged/*.tar.gz'
 
-      # A dry run builds, checksums, SBOMs and attests, and stops here. Without
-      # this the dispatch created a GitHub release named after the branch --
-      # the input said "for a dry run" and the job published either way.
+      # A dry run builds, checksums and SBOMs, and stops here.
+      #
+      # The condition is on the EVENT, not the ref. `startsWith(github.ref,
+      # 'refs/tags/')` looks like it says the same thing and does not: the "Run
+      # workflow" dropdown lists TAGS as well as branches, so a dispatch can
+      # arrive with github.ref = refs/tags/v1.2.3 and publish -- under the ref's
+      # tag name, while the artifacts inside carry the INPUT's version. Dispatch
+      # from v1.2.3 with input v1.2.4 produced a release named v1.2.3 holding
+      # simdlogs_v1.2.4_*.tar.gz.
       - name: release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -165,6 +185,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      # The same explicit resolution the build job does, rather than an
+      # expression: `inputs.tag || ref_name` yields the BRANCH if the input is
+      # ever empty, which is the defect this workflow already had once. Empty
+      # fails the job instead.
+      - name: version
+        id: v
+        env:
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            V="${DISPATCH_TAG}"
+          else
+            V="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "${V}" ]; then
+            echo "no version to build" >&2; exit 1
+          fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - name: build (no push; publishing needs a registry decision)
         uses: docker/build-push-action@v6
@@ -173,5 +214,5 @@ jobs:
           push: false
           platforms: linux/amd64,linux/arm64
           build-args: |
-            VERSION=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+            VERSION=${{ steps.v.outputs.version }}
             COMMIT=${{ github.sha }}

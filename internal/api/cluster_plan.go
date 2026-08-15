@@ -274,17 +274,40 @@ func limitBoundsOutput(pipes []query.Pipe) bool {
 // distribution rather than its top N. That is bounded by the field's
 // cardinality, which the storage node already bounds with its own defaults, and
 // the alternative is an answer that is wrong in a way nobody can see.
-func withoutLimits(r *http.Request) *http.Request {
+//
+// DELETING a parameter is not the same as removing the bound. A handler that
+// reads it with a non-zero default -- facets does, with DefaultFacetLimit --
+// gets the default instead of "unlimited", so the merge still sums shard-local
+// top-Ns. Callers whose parameter has a capping default pass an explicit
+// unlimited value through unlimited[] instead of relying on absence.
+//
+// ok is false when the query string will not parse. This used to `return r`,
+// silently forwarding the caller's `limit` to every shard -- so one malformed
+// unrelated parameter (`&x=%zz`) turned a correct cluster top-N into a merge of
+// shard-local top-Ns, and the value that was #1 cluster-wide and #11 on each
+// shard vanished from a 200 response.
+func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request, bool) {
 	vals, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
-		return r
-	}
-	if !vals.Has("limit") && !vals.Has("max_values_per_field") {
-		return r
+		return nil, false
 	}
 	vals.Del("limit")
 	vals.Del("max_values_per_field")
+	for k, v := range unlimited {
+		vals.Set(k, v)
+	}
 	out := r.Clone(r.Context())
 	out.URL.RawQuery = vals.Encode()
-	return out
+	return out, true
+}
+
+// refuseUnparseableQuery answers the caller when withoutLimits could not read
+// the query string, and reports whether the caller should stop.
+func (s *Server) refuseUnparseableQuery(w http.ResponseWriter, r *http.Request) {
+	s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+		"simdlogs: this request's query string could not be parsed, so the "+
+			"router cannot strip the per-shard result limits from it. Forwarding "+
+			"it unchanged would build the cluster's top values out of each shard's "+
+			"own top values, which silently drops anything popular across the "+
+			"cluster and unremarkable on each shard, so it is refused instead")
 }
