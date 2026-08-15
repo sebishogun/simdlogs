@@ -22,11 +22,16 @@ router-merge ANSWER correctness: the `streams`/`stream_ids`/plain
 are documented in `docs/lld/cluster.md`, and fixture tests for them are
 planned, not shipped.
 
-A formatting gate is desired but currently fails on pre-existing
-formatting: `gofmt -l` flags `internal/storage/group.go` (untouched by this
-documentation work). Until that file is reformatted, a `gofmt` release gate
-cannot go green; the blocker is recorded here and in `docs/vl-parity.md` —
-no source edit is made from a documentation session.
+`gofmt -l .` is clean and is a release gate. It was blocked for a long time on
+pre-existing formatting in `internal/storage/group.go`, and the blocker
+outlived the condition: five documents went on describing the gate as red after
+the file was reformatted, one of them contradicting itself two hundred lines
+apart.
+
+This file is where a gate's status is maintained. Four other documents mention
+this gate and say it is clean, which is true and is one sentence each; what
+they must not carry again is a BLOCKER, because a blocker is a state that
+changes and four copies of it will not change together.
 
 Stale source comments that contradict shipped code are known
 implementation-doc defects, listed in `docs/roadmap.md` ("Known

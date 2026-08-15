@@ -62,8 +62,16 @@ func TestInsertJSONLineFailsWhenWritesFail(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status %d, want 500 when no group could be written", resp.StatusCode)
+	// 503, not 500, and not 200. A store that cannot be written to is a
+	// retryable server failure like any other, and this path used to answer a
+	// flat 500 with no Retry-After -- a different answer to the same disk
+	// failure than a smaller body got, purely because it crossed
+	// MinParallelBytes.
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503 when no group could be written", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Retry-After"); got == "" {
+		t.Fatal("no Retry-After on a retryable write failure")
 	}
 	var body map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
@@ -71,6 +79,10 @@ func TestInsertJSONLineFailsWhenWritesFail(t *testing.T) {
 	}
 	if body["error"] == nil {
 		t.Fatalf("no error field in %v", body)
+	}
+	// Every shard failed, so nothing landed and a retry cannot duplicate.
+	if dup, ok := body["duplicateOnRetry"].(bool); !ok || dup {
+		t.Fatalf("duplicateOnRetry is %v with every shard failed", body["duplicateOnRetry"])
 	}
 	// Nothing landed, so nothing may be reported durable.
 	if d, ok := body["durable"].(float64); !ok || d != 0 {
@@ -103,8 +115,11 @@ func TestESBulkFailsWhenWritesFail(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status %d, want 500 when no group could be written", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503 when no group could be written", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Retry-After"); got == "" {
+		t.Fatal("no Retry-After on a retryable write failure")
 	}
 }
 

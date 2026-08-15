@@ -70,6 +70,12 @@ type Writer struct {
 	// caller is told success for rows that failed.
 	hist    []*flushBatch
 	nextSeq uint64
+	// outcomes is what batches retired from hist left behind, oldest first,
+	// so a FlushMark arriving after its batch aged out still gets an answer.
+	// oldestAnswerable is the lowest mark that answer can cover; below it the
+	// writer says it does not know rather than saying nothing failed.
+	outcomes         []batchOutcome
+	oldestAnswerable uint64
 
 	closed    atomic.Bool
 	closeOnce sync.Once
@@ -92,6 +98,33 @@ type flushBatch struct {
 	wg   sync.WaitGroup
 	err  atomic.Pointer[error]
 	done atomic.Bool
+
+	// jobs and failed count the groups this batch handed to the pool and the
+	// ones that did not reach the store. Counted per JOB, not per batch: one
+	// batch routinely holds several groups (a caller whose rows crossed the
+	// row or byte trigger while it was adding them), so a batch-level flag
+	// cannot tell "every group failed" from "one of three failed". That is
+	// exactly the distinction a client needs, because the first means a
+	// retry is clean and the second means a retry duplicates.
+	jobs   atomic.Int32
+	failed atomic.Int32
+
+	// outstanding is jobs this batch handed to the pool that have not come
+	// back. It is what makes the counters above safe to READ.
+	//
+	// The outcome log froze a retired batch's counters, and a batch can leave
+	// the ring while its job is still running: FlushMark waits only on
+	// batches at or after its own mark, so a later caller never blocks on an
+	// older batch, and 64 later flushes retire it. The snapshot then said
+	// "one job, none failed" for a job that went on to fail with ENOSPC, and
+	// FlushMark returned nil for rows that are not in the store -- the same
+	// 200-for-lost-rows failure the outcome log was added to prevent, moved
+	// from the ring into the log.
+	//
+	// A batch is only retired at zero. The worker decrements this AFTER
+	// recording its error and its failure, so observing zero is observing
+	// counters that can no longer change.
+	outstanding atomic.Int32
 }
 
 // colBuf is one column's row values awaiting a flush.
@@ -152,7 +185,15 @@ func (w *Writer) worker() {
 		if _, err := w.store.AppendGroup(g); err != nil {
 			e := err
 			j.batch.err.CompareAndSwap(nil, &e)
+			// Counted whether or not this was the first error. The first one
+			// is what the caller is shown; the count is what says whether
+			// ANY group in the window landed, which is the fact that decides
+			// whether a retry duplicates.
+			j.batch.failed.Add(1)
 		}
+		// After the counters, before the Wait is released. A reader that sees
+		// zero here has seen every write above it.
+		j.batch.outstanding.Add(-1)
 		j.batch.wg.Done()
 	}
 }
@@ -473,13 +514,49 @@ func (w *Writer) Flush() error {
 	}
 	w.mu.Unlock()
 	if closed {
-		return ErrWriterClosed
+		// Typed like every other flush failure, so a caller that reads the
+		// retry metadata does not have to special-case shutdown.
+		//
+		// Partial, and that is not a hedge. Close FLUSHES the shared buffer
+		// before it sets closed, so the rows an in-flight handler added are
+		// routinely on disk by the time that handler gets here -- and
+		// http.Server.Shutdown letting one request finish is exactly the case
+		// ErrWriterClosed exists for. Reporting Partial: false rendered as
+		// `"duplicateOnRetry": false` for rows that were durable, which is the
+		// claim that costs a client a duplicate.
+		//
+		// Zero groups because this CALL handed none to the pool; the counts
+		// and the partial flag answer different questions.
+		return &WriteError{Err: ErrWriterClosed, Class: RetrySoon, Partial: true}
 	}
 
+	return w.awaitBatches(wait, nil)
+}
+
+// awaitBatches waits for every batch in wait, retires what has finished, and
+// turns any failure into the typed *WriteError a client can act on.
+//
+// The counters are read AFTER each Wait, and that ordering is what makes them
+// a consistent pair: both are written only by the jobs the batch is waiting
+// on, and no job can join a batch that has already been swapped out of
+// w.batch, so nothing can add to either counter once the Wait returns.
+func (w *Writer) awaitBatches(wait []*flushBatch, retired []batchOutcome) error {
 	var first error
+	var total, failed int
+	// Retired batches first, so their seqs -- which are older -- contribute
+	// their counts before the live ones and the first error is the earliest.
+	for _, o := range retired {
+		total += int(o.jobs)
+		failed += int(o.failed)
+		if o.err != nil && first == nil {
+			first = o.err
+		}
+	}
 	for _, b := range wait {
 		b.wg.Wait()
 		b.done.Store(true)
+		total += int(b.jobs.Load())
+		failed += int(b.failed.Load())
 		if e := b.err.Load(); e != nil && first == nil {
 			first = *e
 		}
@@ -500,7 +577,10 @@ func (w *Writer) Flush() error {
 	}
 	w.live = kept
 	w.mu.Unlock()
-	return first
+	if first == nil {
+		return nil
+	}
+	return newWriteError(first, failed, total)
 }
 
 // Close flushes, stops the pool, and joins the workers. After Close the
@@ -533,6 +613,8 @@ func (w *Writer) flushLocked() {
 		w.live = append(w.live, w.batch)
 	}
 	w.batch.wg.Add(1)
+	w.batch.jobs.Add(1)
+	w.batch.outstanding.Add(1)
 	w.jobs <- flushJob{ts: w.ts, colOrder: w.colOrder, vals: vals, compact: w.compact, batch: w.batch}
 
 	// Fresh buffers; the job owns the handed-off ones.
@@ -543,20 +625,172 @@ func (w *Writer) flushLocked() {
 	w.lastFlsh = nowFn()
 }
 
-// batchHistory bounds the batch ring. A caller marks, adds rows, then
-// flushes, so it is never more than a handful of batches behind; 64 is far
-// past any real interleaving and costs three words each.
-const batchHistory = 64
+// batchHistory bounds the live batch ring, and outcomeHistory bounds what a
+// retired batch leaves behind.
+//
+// The ring alone was not enough, and the way it failed is the reason for the
+// second bound. Every Flush and FlushMark installs a new batch whether or not
+// the old one carried anything, so 64 flushes from ANY caller on the tenant --
+// other requests, a syslog connection flushing per line, the FlushEvery timer,
+// Close at shutdown -- evicted the batch a marked caller's rows were in. That
+// batch was then never waited on by FlushMark and its error never seen: the
+// caller was told success for rows that are not in the store. Measured at
+// MaxConcurrentWrite 32, 64 slots is about two completed request cycles.
+//
+// Two changes close it. An outgoing batch that carried NO jobs is dropped from
+// the ring instead of aging a real one out of it, so an idle or rejected flush
+// costs nothing. And a batch that did carry jobs leaves a small outcome record
+// behind when it is retired, so a FlushMark arriving late still gets the right
+// answer rather than a nil.
+const (
+	batchHistory   = 64
+	outcomeHistory = 1024
+	// maxHistory is the hard ceiling on the ring, including batches held past
+	// batchHistory because a job of theirs is still running. Past it a stalled
+	// batch is dropped as unanswerable rather than held forever: a stalled
+	// fsync must not let client traffic grow a per-tenant slice without bound,
+	// and FlushMark walks that slice under the writer's lock.
+	//
+	// 4096 is two orders past batchHistory, so it is only reached by a stall
+	// that outlasts thousands of requests -- and at that point the writer
+	// genuinely does not know, which is what it then says.
+	maxHistory = 4096
+)
+
+// batchOutcome is what a retired batch leaves behind: enough to answer a
+// FlushMark that arrives after the batch itself is gone.
+//
+// Four words rather than a whole flushBatch with its WaitGroup, so a thousand
+// of them per writer is tens of kilobytes.
+type batchOutcome struct {
+	seq    uint64
+	jobs   int32
+	failed int32
+	err    error
+}
 
 // newBatchLocked installs the next batch and remembers it. w.mu must be held.
 func (w *Writer) newBatchLocked() *flushBatch {
+	// The outgoing batch carried nothing, so it can hold no rows and no error
+	// and there is nothing for any caller to learn from it. Dropping it here
+	// is what keeps an empty flush from aging a real batch out of the ring.
+	if n := len(w.hist); n > 0 && w.hist[n-1] == w.batch && w.batch.jobs.Load() == 0 {
+		w.hist = w.hist[:n-1]
+	}
 	w.nextSeq++
 	b := &flushBatch{seq: w.nextSeq}
 	w.hist = append(w.hist, b)
 	if len(w.hist) > batchHistory {
-		w.hist = append(w.hist[:0], w.hist[len(w.hist)-batchHistory:]...)
+		// Retire from the front, and STOP at the first batch still holding a
+		// running job. Retiring one would freeze counters that are not final
+		// yet, and the frozen answer is "nothing failed" -- the wrong
+		// direction to be wrong in.
+		//
+		// That stop is not itself a bound. The pool bounds outstanding JOBS;
+		// it bounds no number of batches, and every later job-carrying flush
+		// appends one more. One worker stalled on a slow fsync while the
+		// others drain is all it takes: measured, 5000 client requests with
+		// one job pinned left hist at 5002 entries, and FlushMark walks the
+		// whole slice under w.mu on every request. Growth is request rate
+		// times stall duration, per tenant -- driven by exactly what a client
+		// sends, which an earlier version of this comment denied.
+		//
+		// So there is a hard ceiling. Past it the stalled batch is dropped
+		// WITHOUT an outcome and oldestAnswerable moves past it, which makes
+		// every mark at or below it answer ErrDurabilityUnknown. Refusing to
+		// answer is the only safe thing to do with counters that are not
+		// final; recording them would be the frozen-zero defect again.
+		drop := 0
+		for drop < len(w.hist)-batchHistory {
+			old := w.hist[drop]
+			if old.outstanding.Load() != 0 {
+				if len(w.hist) <= maxHistory {
+					break
+				}
+				// Over the ceiling and still running: drop it unanswerable,
+				// and drop it from `live` with it.
+				//
+				// Leaving it in `live` kept two problems. Its counters --
+				// final by the time anyone read them -- were folded into the
+				// next unrelated plain Flush, so a caller whose own rows all
+				// landed was handed someone else's "1 of 2 groups failed,
+				// partial". And Flush waits on all of `live`, so every Flush
+				// blocked on the stalled job.
+				//
+				// FLUSH ONLY. An earlier version of this comment said the same
+				// of Writer.Close and of tenant eviction, and measurement says
+				// otherwise: Close runs Flush and then workers.Wait(), and a
+				// worker parked inside AppendGroup has not returned, so Close
+				// blocks on a stalled writer whether or not this branch ever
+				// fires. Eviction blocks for the same reason, one level up.
+				// The drop bounds the ring and unblocks Flush; it does not
+				// unblock a join. See docs/wrong.md.
+				//
+				// The job keeps its pointer and will still call wg.Done() and
+				// write its atomics. Nothing reads them, and nothing frees the
+				// batch until the job lets go of it.
+				if old.seq >= w.oldestAnswerable {
+					w.oldestAnswerable = old.seq + 1
+				}
+				w.dropFromLiveLocked(old)
+				drop++
+				continue
+			}
+			w.retireLocked(old)
+			drop++
+		}
+		if drop > 0 {
+			w.hist = append(w.hist[:0], w.hist[drop:]...)
+		}
 	}
 	return b
+}
+
+// dropFromLiveLocked removes one batch from w.live. w.mu must be held.
+//
+// Used only by the ceiling drop: everywhere else a batch leaves `live` by
+// being waited on and marked done, which is what makes its counters final.
+// This one is being abandoned precisely because they are not.
+func (w *Writer) dropFromLiveLocked(b *flushBatch) {
+	for i, live := range w.live {
+		if live == b {
+			w.live = append(w.live[:i], w.live[i+1:]...)
+			return
+		}
+	}
+}
+
+// retireLocked folds a batch leaving the ring into the outcome log. w.mu must
+// be held.
+func (w *Writer) retireLocked(b *flushBatch) {
+	jobs := b.jobs.Load()
+	if jobs == 0 {
+		return // held nothing; there is no outcome to remember
+	}
+	o := batchOutcome{seq: b.seq, jobs: jobs, failed: b.failed.Load()}
+	if e := b.err.Load(); e != nil {
+		o.err = *e
+	}
+	w.outcomes = append(w.outcomes, o)
+	if len(w.outcomes) > outcomeHistory {
+		drop := len(w.outcomes) - outcomeHistory
+		// oldestAnswerable rises with the log, so a mark older than anything
+		// retained is answered "unknown" rather than "fine". A wrong nil is
+		// the failure this whole mechanism exists to prevent; refusing to
+		// answer is not.
+		//
+		// It only ever RISES. This assignment was unconditional, and the
+		// ceiling path in newBatchLocked also moves it -- so a normal retire
+		// following an unanswerable drop lowered it again and un-hid the
+		// dropped batch, which is in neither the ring nor the log. Measured
+		// end to end with two stalled workers: FlushMark answered nil for a
+		// group that had failed with ENOSPC. The whole mechanism is a
+		// watermark; a watermark that can go backwards is not one.
+		if seq := w.outcomes[drop-1].seq + 1; seq > w.oldestAnswerable {
+			w.oldestAnswerable = seq
+		}
+		w.outcomes = append(w.outcomes[:0], w.outcomes[drop:]...)
+	}
 }
 
 // Mark names the point a caller is about to add rows from. Pass it to
@@ -579,6 +813,8 @@ func (w *Writer) FlushMark(mark uint64) error {
 	w.mu.Lock()
 	closed := w.closed.Load()
 	var wait []*flushBatch
+	var retired []batchOutcome
+	unanswerable := false
 	if !closed {
 		w.flushLocked()
 		for _, b := range w.hist {
@@ -586,28 +822,43 @@ func (w *Writer) FlushMark(mark uint64) error {
 				wait = append(wait, b)
 			}
 		}
+		// Batches that have already left the ring but could still hold this
+		// caller's rows. Without this a caller whose batch aged out was told
+		// success for rows that never reached the store.
+		for _, o := range w.outcomes {
+			if o.seq >= mark {
+				retired = append(retired, o)
+			}
+		}
+		unanswerable = mark < w.oldestAnswerable
 		w.batch = w.newBatchLocked()
 	}
 	w.mu.Unlock()
+	if unanswerable {
+		// Older than anything retained. The truthful answer is that this
+		// writer no longer knows, and a caller must treat that as a possible
+		// failure -- Partial, because some of the payload may well be stored.
+		return &WriteError{
+			Err:     ErrDurabilityUnknown,
+			Class:   RetrySoon,
+			Partial: true,
+		}
+	}
 	if closed {
-		return ErrWriterClosed
+		// Typed like every other flush failure, so a caller that reads the
+		// retry metadata does not have to special-case shutdown.
+		//
+		// Partial, and that is not a hedge. Close FLUSHES the shared buffer
+		// before it sets closed, so the rows an in-flight handler added are
+		// routinely on disk by the time that handler gets here -- and
+		// http.Server.Shutdown letting one request finish is exactly the case
+		// ErrWriterClosed exists for. Reporting Partial: false rendered as
+		// `"duplicateOnRetry": false` for rows that were durable, which is the
+		// claim that costs a client a duplicate.
+		//
+		// Zero groups because this CALL handed none to the pool; the counts
+		// and the partial flag answer different questions.
+		return &WriteError{Err: ErrWriterClosed, Class: RetrySoon, Partial: true}
 	}
-	var first error
-	for _, b := range wait {
-		b.wg.Wait()
-		b.done.Store(true)
-		if e := b.err.Load(); e != nil && first == nil {
-			first = *e
-		}
-	}
-	w.mu.Lock()
-	kept := w.live[:0]
-	for _, b := range w.live {
-		if !b.done.Load() {
-			kept = append(kept, b)
-		}
-	}
-	w.live = kept
-	w.mu.Unlock()
-	return first
+	return w.awaitBatches(wait, retired)
 }

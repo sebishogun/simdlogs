@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -378,6 +379,17 @@ func (s *Store) AppendGroup(g *Group) (uint64, error) {
 	blob := g.Marshal()
 	final := filepath.Join(s.dir, fmt.Sprintf("group-%d.bin", id))
 	if err := writeFileAtomic(final, blob, DataFileMode); err != nil {
+		// The last two steps of writeFileAtomic -- opening the directory and
+		// fsyncing it -- run AFTER the rename has already landed, so a failure
+		// there returns an error with group-N.bin sitting at its final name.
+		// The first version of this cleanup said the window was "every step
+		// after writeFileAtomic returns", which is where the reasoning went
+		// wrong: two steps inside it are past the point of no return. EMFILE
+		// on the open and EIO on the sync both classify retryable, so the
+		// retry loop left one full-size orphan per attempt -- the exact
+		// pathology this exists to stop. Before the rename there is no final
+		// file and the remove is a no-op.
+		s.discardUncommitted(final, id, err)
 		return 0, err
 	}
 	// Map the freshly written file rather than keeping the marshaled blob on
@@ -385,11 +397,13 @@ func (s *Store) AppendGroup(g *Group) (uint64, error) {
 	// pages the mapping in and out). The Marshal output is now free to GC.
 	mb, unmap, err := mmapFile(final)
 	if err != nil {
+		s.discardUncommitted(final, id, err)
 		return 0, err
 	}
 	r, err := ReadGroup(mb)
 	if err != nil {
 		unmap()
+		s.discardUncommitted(final, id, err)
 		return 0, err
 	}
 	s.mu.Lock()
@@ -399,12 +413,70 @@ func (s *Store) AppendGroup(g *Group) (uint64, error) {
 	if err := s.man.commit([]uint64{id}, nil, nil); err != nil {
 		s.mu.Unlock()
 		unmap()
+		s.discardUncommitted(final, id, err)
 		return 0, err
 	}
 	s.groups = append(s.groups, &groupEntry{id: id, path: final, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax, unmap: unmap})
 	s.sortGroups()
 	s.mu.Unlock()
 	return id, nil
+}
+
+// discardUncommitted removes a group file that was made durable but never
+// committed, so a failed append leaves nothing behind.
+//
+// The window is every step of AppendGroup from the rename onward: the last two
+// steps of writeFileAtomic -- opening the parent directory and fsyncing it --
+// then the mmap, the group re-read, and the manifest commit. The manifest does
+// not name the file, so no reader will ever open it and no retention pass will
+// ever remove it -- it is disk that only a human deleting files by hand can
+// reclaim.
+//
+// "After writeFileAtomic returns" is where an earlier version of this sentence
+// drew the line, and it is wrong: os.Rename has already landed by then, so a
+// dir-open or dir-sync failure returns an error with the file at its final
+// name. That was corrected at the call site, in docs/lld/ingest.md and in
+// docs/wrong.md, and left standing here -- on the function the correction is
+// about, which is the one a reader of it sees. That matters most for the failure it is most likely to follow: on
+// a full disk the group's own bytes can fit while the manifest record does
+// not, and every retry of the append then leaves another full-size file. The
+// recovery loop consumes the disk faster than the operator frees it.
+//
+// The visibility check is not belt-and-braces. m.commit truncates its record
+// away on every failure before the sync, so the id is invisible and the file
+// is genuinely an orphan -- but the fault point AFTER the sync returns an
+// error with the record durable and the id visible. Removing the file there
+// would leave a committed group with no bytes, which is worse than the leak.
+// That point is crash-only in production, and the check is what keeps it that
+// way. The crash matrix does not reach here -- it drives manifest.commit
+// directly -- but TestPostSyncCommitFailureKeepsTheGroupFile does, through
+// SetFaultHookForTest and faultManifestSync, and goes red without this check.
+// A previous version of this comment said reverting it left the suite green;
+// that was true when it was written and stopped being true when the test
+// arrived, and the sentence stayed.
+//
+// The directory sync makes the removal durable. Without it a crash can
+// resurrect the orphan, which is the same leak one power loss later.
+func (s *Store) discardUncommitted(path string, id uint64, commitErr error) {
+	// A commit that could not be rolled back leaves the record's durability
+	// unknown: it may be sitting in the page cache and reach the disk with no
+	// crash involved, in which case the manifest names a group whose file this
+	// would delete, and the next open fails with "committed but its file is
+	// missing" rather than starting. A leaked file is recoverable; a store
+	// that refuses to open is not.
+	if errors.Is(commitErr, ErrRollbackFailed) {
+		return
+	}
+	s.mu.Lock()
+	visible := s.man.isVisible(id)
+	s.mu.Unlock()
+	if visible {
+		return
+	}
+	if err := os.Remove(path); err != nil {
+		return // already gone, or a directory this process cannot write
+	}
+	_ = syncDirNamed(path)
 }
 
 // Close releases every group's mmap. The store must not be used afterward.

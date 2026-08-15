@@ -184,6 +184,19 @@ func (g *Group) Marshal() []byte {
 
 var errCorrupt = errors.New("storage: corrupt group")
 
+// ErrCorruptGroup matches any group that failed its bounds or checksum
+// checks.
+//
+// Exported because a layer above needs to tell one kind of write failure from
+// another. A group that will not read back the instant after it was written
+// means the bytes that came out are not the bytes that went in, which is a
+// filesystem or a disk rather than a payload -- so ingest classifies it as
+// needing an operator before the next attempt, not as a failure to give up
+// on. An earlier version of this comment said the opposite, that the bytes are
+// deterministic and the client should be told not to bother; that reasoning
+// told shippers to drop data a media error had corrupted.
+var ErrCorruptGroup = errCorrupt
+
 func appU32(b []byte, v uint32) []byte { return binary.LittleEndian.AppendUint32(b, v) }
 func appU64(b []byte, v uint64) []byte { return binary.LittleEndian.AppendUint64(b, v) }
 func appI64(b []byte, v int64) []byte  { return binary.LittleEndian.AppendUint64(b, uint64(v)) }

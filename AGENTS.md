@@ -315,11 +315,11 @@ before commit:
     go vet ./...
 
 Release gates add a clean `gofmt -l` and the quiet-machine (load < 1)
-discipline for anything published as a measurement. The gofmt gate is
-currently red on pre-existing formatting in `internal/storage/group.go`; the
-blocker is documented (`docs/verification.md`, `docs/roadmap.md`) and is a
-code task, not a docs one — no source edit comes from a documentation
-session.
+discipline for anything published as a measurement. `gofmt -l .` is clean
+across the repository; this paragraph described it as red on
+`internal/storage/group.go` for long enough that the description outlived the
+condition, which is the shape `docs/wrong.md` records under "a deleted
+behaviour leaves its justification behind".
 
 ## The record
 

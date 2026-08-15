@@ -196,8 +196,7 @@ number behind it does not go in a doc.
   2026-08-13-simdlogs-production.md.
 - **Verification discipline:** docs/verification.md — gates, report tests,
   benchmark contract (load < 1 policy; quiet-bench.sh's 1.5 default is a
-  looser helper default), crash recovery, cross-arch, the gofmt blocker on
-  internal/storage/group.go.
+  looser helper default), crash recovery, cross-arch.
 - **Design:** docs/design.md — the historical architecture and the
   falsifiable claim; the completed build plan is
   docs/plans/2026-08-07-simdlogs-full-build.md.
@@ -371,11 +370,11 @@ before commit:
     go vet ./...
 
 Release gates add a clean `gofmt -l` and the quiet-machine (load < 1)
-discipline for anything published as a measurement. The gofmt gate is
-currently red on pre-existing formatting in `internal/storage/group.go`; the
-blocker is documented (`docs/verification.md`, `docs/roadmap.md`) and is a
-code task, not a docs one — no source edit comes from a documentation
-session.
+discipline for anything published as a measurement. `gofmt -l .` is clean
+across the repository; this paragraph described it as red on
+`internal/storage/group.go` for long enough that the description outlived the
+condition, which is the shape `docs/wrong.md` records under "a deleted
+behaviour leaves its justification behind".
 
 ## The record
 

@@ -9,10 +9,13 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/sebishogun/simdlogs/internal/config"
+	"github.com/sebishogun/simdlogs/internal/ingest"
 )
 
 // errorFormat selects the error envelope a route answers with, so an OTLP
@@ -82,6 +85,69 @@ func (s *Server) writeErr(w http.ResponseWriter, r *http.Request, spec routeSpec
 		return
 	}
 	http.Error(w, msg, code)
+}
+
+// writeFlushErr answers a failed durable write with the retry metadata the
+// failure actually carries, rather than the flat 503 every storage failure
+// used to receive.
+//
+// Two facts leave here that a shipper cannot work out for itself:
+//
+//   - Retry-After. Every write failure this server can produce is either
+//     transient or needs an operator, so the status is always 503 and the
+//     interval is what separates "wait a second" from "someone has to fix the
+//     disk". There was a never-retry class answering 500; see
+//     ingest.WriteError.Retryable for why it is gone.
+//   - duplicateOnRetry. There is no idempotency key on the ingest path yet,
+//     so when part of a payload reached the store and part did not, resending
+//     the payload stores the landed part twice. A client that is told can
+//     choose; a client that is not told cannot.
+//
+// Retry-After is set before the body is written, because a header set after
+// WriteHeader is a header that never leaves.
+func (s *Server) writeFlushErr(w http.ResponseWriter, r *http.Request, spec routeSpec, err error) {
+	var we *ingest.WriteError
+	if !errors.As(err, &we) {
+		// Unreachable today: every call site passes Flush or FlushMark's
+		// result, and both return nil or a *WriteError. Kept because "the
+		// error type is always X" is a property of five call sites rather
+		// than of a signature, and the alternative to this branch is a nil
+		// dereference the day that stops being true.
+		s.writeErr(w, r, spec, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	after := int(we.RetryAfter() / time.Second)
+	if after > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(after))
+	}
+	code := we.HTTPStatus()
+	if spec.format != errJSON {
+		// Unreachable today: all five call sites pass ndjsonSpec() or
+		// otlpSpec(), both errJSON. A text envelope has nowhere to put the
+		// structured facts, so they go into the message -- losing them on a
+		// text route would make the answer depend on which protocol the
+		// client used, which is how a fact becomes untrustworthy. Written for
+		// the route that adds one, not for a route that exists.
+		s.writeErr(w, r, spec, code, fmt.Sprintf("%s (retryable=%t, duplicate-on-retry=%t)",
+			we.Error(), we.Retryable(), we.DuplicatesOnRetry()))
+		return
+	}
+	s.countErr()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error":             we.Error(),
+		"status":            code,
+		"retryable":         we.Retryable(),
+		"retryAfterSeconds": after,
+		"duplicateOnRetry":  we.DuplicatesOnRetry(),
+		"groupsFailed":      we.FailedGroups,
+		"groupsTotal":       we.TotalGroups,
+		// What the two counts count. On the parallel path they are shard
+		// writers, not groups, and a client parsing the body had no way to
+		// know -- the unit survived only in the message string.
+		"unit": we.Units(),
+	})
 }
 
 // guard enforces method, media type and body size for one route, and is the

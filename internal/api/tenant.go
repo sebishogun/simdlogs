@@ -29,6 +29,32 @@ type tenant struct {
 	// in-flight to know the store is not being read right now.
 	lastUse  atomic.Int64
 	inFlight atomic.Int64
+
+	// preFlushing admits one parked pre-flush goroutine per tenant.
+	//
+	// The backup's pre-flush runs in a goroutine with a timeout so a stalled
+	// writer cannot hold the endpoint; the goroutine itself is not bounded by
+	// that timeout and stays parked on the stall. backupBusy is released when
+	// the HANDLER returns, so polling /admin/backup against a stalled writer
+	// spawned one permanently parked goroutine per request, counted by
+	// nothing: Server.Close waits on the background loops and on inFlight, and
+	// this is neither.
+	//
+	// At most one. A second pre-flush would wait on the same batches as the
+	// first, so skipping it costs nothing and bounds the leak at one goroutine
+	// per tenant, released the moment the stall clears.
+	preFlushing atomic.Bool
+
+	// backupBusy admits one backup at a time for this tenant.
+	//
+	// A backup holds a Snapshot for its whole duration, which pins every group
+	// it captured against unmapping. Concurrent backups of one tenant multiply
+	// that: N streams each hold the full group set, so retention frees nothing
+	// while any of them runs, and the mappings are the store's whole footprint
+	// rather than its working set. It is also an admin endpoint with no body
+	// and a large response -- the cheapest request to issue and the most
+	// expensive to serve.
+	backupBusy atomic.Bool
 }
 
 // Tenant lifecycle counters for /metrics. They carry no tenant-id label: a

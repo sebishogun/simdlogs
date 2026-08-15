@@ -335,15 +335,96 @@ group files onto S3/GCS/filesystem; `LocalCold` is the filesystem reference
 implementation and a test stand-in. Demote uploads a group and drops it
 locally; promote restores it to be queried (Glacier-style).
 
-### Backup (`backup.go`)
+### Backup (`backup.go`, `backup_manifest.go`)
 
-`BackupTar` streams a tar of the current group files to `w`. Because groups
-are immutable, the set captured under the lock is a consistent snapshot even
-as ingest continues — the VictoriaLogs vmbackup shape minus the object store;
-a group dropped by retention between snapshot and read is skipped.
+`BackupTar` streams a self-describing tar to `w`. The HTTP surface is
+`/admin/backup` (application/x-tar), admin-only.
+
+**The archive is bracketed.** Entries are, in order:
+
+```
+BACKUP-MANIFEST      JSON, always first
+group-<id>.bin       one per group, in ascending id order
+BACKUP-COMPLETE      empty, always last
+```
+
+A bare tar of group files is well-formed whether it holds every group, some of
+them, or half of one, so `tar t` cannot tell a complete backup from a truncated
+transfer. The manifest goes first so a reader knows what to expect while it
+still has the whole stream ahead of it; the terminator goes last so a stream
+that ends early is detectable without trusting a byte count. They answer
+different questions — *is anything missing* and *did the transfer finish* — and
+an archive can fail either one alone.
+
+The manifest (`BackupFormat` 1) carries the format version, creation time,
+tenant key, the store manifest's sequence at snapshot time (the high watermark
+this backup represents), and per group: name, id, group format version, row
+count, byte size, and CRC32C over the whole file.
+
+**Every group, and the sequence, under one lock.** `BackupTarWith` takes a
+`SnapshotAllWithSeq`, not a `Snapshot(MinInt64, MaxInt64)`. The time-range
+overlap test is `TimeMin < to && TimeMax >= from` -- half-open at the top -- so
+a group whose `TimeMin` is `MaxInt64` fails it and is absent from the archive
+*and* from the manifest, since both are built from the same snapshot. The
+backup then verifies clean while missing data, which is the one thing a
+self-describing archive exists to make impossible, and a timestamp is a number
+a client sends. The manifest sequence comes from the same lock acquisition for
+the same class of reason: reading it afterwards is a different number, because
+an `AppendGroup` in between advances it, and the archive would declare a
+watermark covering a group it does not contain.
+
+**A lease, not a path list.** The previous version copied group paths out under
+the read lock and then read each with `os.ReadFile`, *skipping any that had
+gone*. A group retention removed between the two steps was dropped from the
+archive and the backup still reported success — a backup discovered to be
+incomplete at restore time, which is the one moment there is nothing to fall
+back to. `BackupTarWith` takes a `Snapshot` instead, which guarantees every
+captured group stays mapped until Close whatever retention, recompaction or
+cold demotion do. That removes the reason for the skip rather than handling it:
+any failure past the snapshot is a real failure and is returned.
+
+It also removes the copy. The bytes go from the mmap the store already holds
+straight to the tar writer, instead of one `os.ReadFile` per group allocating
+the whole file on the heap first — at the 64 MiB flush ceiling that was a
+64 MiB allocation per group, live for the length of the write.
+
+**Reading one back.** The manifest must be the FIRST entry, and that is
+enforced rather than assumed: validation runs against the manifest, so a group
+read before it is read with no size, checksum or parse check -- and the
+completeness loop afterwards passes, because those groups *had* been seen. A
+manifest-last archive carrying a wholly corrupt group verified clean and
+restored. An archive with no manifest at all is a different thing, is still
+restored, and returns `ErrBackupUnverified`; its entries are read under their
+own ceiling, since nothing sizes them.
+
+`VerifyBackup` walks an archive and checks it against its own manifest without
+writing anything, which is what a dry-run restore and a
+backup gate both need. Validation is streaming, not collect-then-check: a large
+archive must not be buffered to be verified, and a failing entry is reported
+before anything after it is written. Per group it checks the archive's declared
+size, the manifest's size, the CRC32C, and then a full `ReadGroup` parse — a
+checksum proves the bytes survived the transfer, not that they were ever a
+readable group, which is what a store opened over them needs. It also refuses
+an archive carrying a group the manifest does not name (a group nothing
+checked), a duplicate entry, and two manifests.
+
+Failure modes are distinct errors because they have distinct causes:
+`ErrBackupTruncated` for a stream that ended before its terminator or that is
+missing a group the manifest names, and `ErrBackupUnverified` for an archive
+with no manifest at all.
+
 `RestoreTar` unpacks into a directory, flattening entry names to their base so
-a crafted archive cannot escape. The HTTP surface is `/admin/backup`
-(application/x-tar).
+a crafted archive cannot escape, and writing each group through
+`writeFileAtomic`. Only `group-*` names are placed: an archive carrying a
+`MANIFEST` entry used to be harmless, and since `OpenStore` decides "is this a
+legacy directory" on whether MANIFEST exists, an empty or truncated one
+restores a directory full of groups that the next open reports as EMPTY with no
+error.
+
+A pre-format-1 archive has nothing to validate against. It is restored and
+`ErrBackupUnverified` is returned, so a caller requiring a verified restore
+fails rather than being told success with a note. This is still the unstaged
+restore; the staged, atomic one is Task 5.2.
 
 ## Disk
 

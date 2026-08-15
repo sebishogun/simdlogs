@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"errors"
 	"runtime"
 	"strconv"
 	"sync"
@@ -103,7 +104,21 @@ func IngestJSONLinesParallelCfg(store *storage.Store, data []byte, fallback func
 		cfg.apply(w)
 		r, perr := IngestJSONLinesOpts(w, data, fallback, opts)
 		if cerr := w.Close(); cerr != nil {
-			return r.Accepted, r.Rejected, &ParallelWriteError{Shards: 1, Failed: 1, Err: cerr}
+			// Partial comes off the shard's own error here too. This branch
+			// is taken whenever cfg.shards() is below 2 -- runtime.NumCPU()/3,
+			// so EVERY host with fewer than six cores -- and dropping it made
+			// As synthesize an answer strictly worse than the one it replaced:
+			// the inner *WriteError said "1 of 3 groups, partial", the
+			// synthesized one said "1 of 1 shard writers, not partial", and
+			// the client was told a retry was clean with a group on disk.
+			partial := false
+			var we *WriteError
+			if errors.As(cerr, &we) {
+				partial = we.Partial
+			}
+			return r.Accepted, r.Rejected, &ParallelWriteError{
+				Shards: 1, Failed: 1, Err: cerr, Partial: partial,
+			}
 		}
 		return r.Accepted, r.Rejected, perr
 	}
@@ -112,8 +127,10 @@ func IngestJSONLinesParallelCfg(store *storage.Store, data []byte, fallback func
 	var (
 		mu       sync.Mutex
 		firstErr error
-		failed   int
-		started  int
+		// anyPartial is set by any shard whose own failure was partial.
+		anyPartial bool
+		failed     int
+		started    int
 	)
 	var wg sync.WaitGroup
 	for _, c := range chunks {
@@ -141,6 +158,16 @@ func IngestJSONLinesParallelCfg(store *storage.Store, data []byte, fallback func
 				if firstErr == nil {
 					firstErr = cerr
 				}
+				// Partial-ness is collected from EVERY shard, not read back
+				// off the first-recorded error. Only firstErr is kept, so a
+				// shard that landed some groups before failing was invisible
+				// unless it happened to win the mutex -- and with every shard
+				// failed, the aggregate then reported "nothing landed, a retry
+				// is clean" while rows were on disk.
+				var we *WriteError
+				if errors.As(cerr, &we) && we.Partial {
+					anyPartial = true
+				}
 				mu.Unlock()
 				return
 			}
@@ -149,7 +176,9 @@ func IngestJSONLinesParallelCfg(store *storage.Store, data []byte, fallback func
 	}
 	wg.Wait()
 	if firstErr != nil {
-		return int(ing), int(skp), &ParallelWriteError{Shards: started, Failed: failed, Err: firstErr}
+		return int(ing), int(skp), &ParallelWriteError{
+			Shards: started, Failed: failed, Err: firstErr, Partial: anyPartial,
+		}
 	}
 	return int(ing), int(skp), nil
 }
@@ -162,6 +191,12 @@ type ParallelWriteError struct {
 	Shards int // shard writers started
 	Failed int // shard writers whose Close reported a failure
 	Err    error
+
+	// Partial reports that at least one FAILED shard had groups reach the
+	// store before it failed. It is collected across every shard, because
+	// only one shard's error is kept in Err and reading partial-ness off that
+	// one made the answer depend on which shard won a mutex.
+	Partial bool
 }
 
 func (e *ParallelWriteError) Error() string {
@@ -170,6 +205,44 @@ func (e *ParallelWriteError) Error() string {
 }
 
 func (e *ParallelWriteError) Unwrap() error { return e.Err }
+
+// As makes errors.As see the WHOLE parallel write rather than one shard's.
+//
+// Without it, As walks Unwrap and lands on the first failing shard's
+// *WriteError -- one shard's counts and one shard's Partial. A request split
+// across ten shards where shard 1 landed and shard 2 failed then reported
+// "1 of 1 failed, duplicateOnRetry=false", which is the opposite of the truth:
+// shard 1's rows are durable and resending the body stores them twice.
+func (e *ParallelWriteError) As(target any) bool {
+	p, ok := target.(**WriteError)
+	if !ok {
+		return false
+	}
+	*p = e.writeError()
+	return true
+}
+
+// writeError aggregates the shards into one answer.
+func (e *ParallelWriteError) writeError() *WriteError {
+	under := e.Err
+	var we *WriteError
+	if errors.As(e.Err, &we) {
+		under = we.Err
+	}
+	// Partial when some shard survived -- its rows are durable and a retry of
+	// the body stores them again -- or when ANY failing shard was itself
+	// partial, which e.Partial carries from the shard loop. With every shard
+	// failed and none of them partial, nothing landed and a retry is clean.
+	partial := (e.Failed > 0 && e.Failed < e.Shards) || e.Partial
+	return &WriteError{
+		Err:          under,
+		Class:        classify(under),
+		Partial:      partial,
+		FailedGroups: e.Failed,
+		TotalGroups:  e.Shards,
+		Unit:         "shard writers",
+	}
+}
 
 // splitLines cuts data into at most n chunks, each ending on a newline so no
 // line is split across chunks.

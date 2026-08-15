@@ -406,14 +406,36 @@ func (s *Server) parallelCfg() ingest.ParallelConfig {
 // problem, not something this handler can solve.
 func (s *Server) failIngest(w http.ResponseWriter, err error, ingested, skipped, nbytes int) {
 	s.countRows(ingested, skipped, nbytes)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusInternalServerError)
-	json.NewEncoder(w).Encode(map[string]any{
+	body := map[string]any{
 		"error":    err.Error(),
 		"ingested": ingested,
 		"skipped":  skipped,
 		"durable":  ingested,
-	})
+	}
+	// The same retry facts every other write path reports. This one answered
+	// a flat 500 with no Retry-After and none of them, so a shipper posting a
+	// body over MinParallelBytes got a different -- and less useful -- answer
+	// to the same disk failure than one posting a smaller body. A fact that
+	// depends on the size of the request is a fact a client cannot rely on.
+	code := http.StatusInternalServerError
+	var we *ingest.WriteError
+	if errors.As(err, &we) {
+		code = we.HTTPStatus()
+		if after := int(we.RetryAfter() / time.Second); after > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(after))
+			body["retryAfterSeconds"] = after
+		}
+		body["retryable"] = we.Retryable()
+		body["duplicateOnRetry"] = we.DuplicatesOnRetry()
+		body["groupsFailed"] = we.FailedGroups
+		body["groupsTotal"] = we.TotalGroups
+		// On this path they are shard writers rather than groups.
+		body["unit"] = we.Units()
+	}
+	s.countErr()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(body)
 }
 
 // splitCSV splits a comma-separated list, trimming spaces and dropping empties.
@@ -629,13 +651,21 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := tn.w.FlushMark(mark); err != nil {
-			// A closed writer dropped the rows silently, so counting them
-			// would inflate the ingested total by rows that were never
-			// stored. Every other flush failure did buffer them.
+			// Rows added AFTER Close are dropped silently -- Add returns
+			// early once closed -- so counting them would inflate the
+			// ingested total. Rows added BEFORE it are a different case:
+			// Close flushes the shared buffer before it sets closed, so
+			// those are durable and this under-counts them.
+			//
+			// Under-counting a metric is the safe side of that trade; the
+			// alternative over-states durability, which is the claim this
+			// whole task exists to stop being wrong about. The response
+			// itself does not under-claim: the WriteError carries
+			// Partial, so the client is told a retry may duplicate.
 			if !errors.Is(err, ingest.ErrWriterClosed) {
 				s.countRows(ing, skip, len(body))
 			}
-			s.writeErr(w, r, ndjsonSpec(), http.StatusServiceUnavailable, err.Error())
+			s.writeFlushErr(w, r, ndjsonSpec(), err)
 			return
 		}
 	}
@@ -660,7 +690,7 @@ func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tn.w.FlushMark(lfMark); err != nil {
-		s.writeErr(w, r, ndjsonSpec(), http.StatusServiceUnavailable, err.Error())
+		s.writeFlushErr(w, r, ndjsonSpec(), err)
 		return
 	}
 	// After the flush: a counter must not go backwards.

@@ -222,13 +222,14 @@ func (s *Server) esBulk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := tn.w.FlushMark(mark); err != nil {
-			// A closed writer dropped the rows silently, so counting them
-			// would inflate the ingested total by rows that were never
-			// stored. Every other flush failure did buffer them.
+			// Rows added after Close are dropped silently; rows added
+			// before it were flushed by Close and are durable. This
+			// under-counts the second case, which is the safe side --
+			// see insertJSONLine for the same trade.
 			if !errors.Is(err, ingest.ErrWriterClosed) {
 				s.countRows(ing, skip, len(body))
 			}
-			s.writeErr(w, r, ndjsonSpec(), http.StatusServiceUnavailable, err.Error())
+			s.writeFlushErr(w, r, ndjsonSpec(), err)
 			return
 		}
 	}

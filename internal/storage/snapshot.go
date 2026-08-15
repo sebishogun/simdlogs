@@ -138,6 +138,47 @@ func (s *Store) Snapshot(from, to int64) (*Snapshot, error) {
 	return snap, nil
 }
 
+// SnapshotAll is every group the store holds, with no time filter, each held
+// against unmapping until the returned snapshot is closed.
+//
+// A backup is not a query, and reaching for Snapshot(MinInt64, MaxInt64)
+// instead is not equivalent: the overlap test is `TimeMin < to && TimeMax >=
+// from`, which is a HALF-OPEN window, so a group whose TimeMin is MaxInt64
+// fails it. That group is then absent from the archive and absent from the
+// manifest built out of the same snapshot, so the backup verifies clean while
+// missing data -- the exact failure a self-describing archive exists to make
+// impossible. A timestamp is a number a client sends.
+func (s *Store) SnapshotAll() (*Snapshot, error) {
+	snap, _, err := s.SnapshotAllWithSeq()
+	return snap, err
+}
+
+// SnapshotAllWithSeq is SnapshotAll plus the manifest sequence at the SAME
+// instant, under one lock acquisition.
+//
+// Reading the sequence in a second acquisition is not the same number: an
+// AppendGroup between the two advances it, and the archive then declares a
+// high watermark covering a group it does not contain.
+func (s *Store) SnapshotAllWithSeq() (*Snapshot, uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, 0, ErrStoreClosed
+	}
+	snap := &Snapshot{}
+	for _, g := range s.groups {
+		if !g.acquire() {
+			continue
+		}
+		if s.openHook != nil {
+			s.openHook(g.id)
+		}
+		snap.entries = append(snap.entries, g)
+		snap.Groups = append(snap.Groups, g.reader)
+	}
+	return snap, s.man.seq, nil
+}
+
 // SnapshotAfterID is the live-tail form: every group with an ID at or above
 // cursor, held until Close, plus the next cursor to ask for.
 func (s *Store) SnapshotAfterID(cursor uint64) (*Snapshot, uint64, error) {

@@ -145,13 +145,13 @@ session):
   for flate-only recompaction, disagreeing with the 8% in the
   `-recompact-drop-postings` help and the measured -8.1%
   (`docs/wrong.md` tiering entry).
-- `docs/wrong.md` entry 37 and the gofmt blocker on
-  `internal/storage/group.go` are likewise implementation-side work queued
-  from documentation sessions.
+- `docs/wrong.md` entry 37 is likewise implementation-side work queued from
+  a documentation session. The gofmt blocker that sat beside it here is gone:
+  `gofmt -l .` is clean.
 
 The production plan maps them: `es.go`'s comment drift is owned by Task B.2
 (the exists work rewrites those comments and lands entry 37), and the
-scale-test comment, the recompact help, and the gofmt blocker are Task G.1 —
+scale-test comment and the recompact help are Task G.1 —
 see `docs/plans/2026-08-13-simdlogs-production.md`.
 
 ## Stage 5 — Release

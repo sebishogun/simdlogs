@@ -400,10 +400,205 @@ strip), so a large ES bulk gets the same sharded path.
 
 - Malformed input: skipped and counted (`skipped` in the response body,
   `vl_rows_dropped_total` in `/metrics`). Ingest is never fatal on bad lines.
-- Write failure (fsync/rename/disk): recorded in `flushErr`, surfaced as an
-  HTTP 500 on the next flush boundary; the response reports it rather than
-  pretending success.
+- Write failure (fsync/rename/disk): reported to the caller at its own flush
+  boundary as `*ingest.WriteError`, with the retry semantics below. It is never
+  a silent success.
 - Crash between temp write and rename: the `.tmp` file is ignored by
   `OpenStore`; the group is not indexed.
+- A write that fails *after* the group file is durable but before the manifest
+  commits it removes the file and fsyncs the directory. That window includes the
+  mmap, the group re-read, the commit itself, **and the last two steps of
+  `writeFileAtomic`** -- opening the parent directory and fsyncing it both run
+  after `os.Rename` has already landed, so a failure there returns an error with
+  the file at its final name. The first version of this cleanup described its
+  own window as "every step after `writeFileAtomic` returns", which is where the
+  reasoning went wrong. The manifest never names it, so no reader
+  would ever open it and no retention pass would ever remove it: without the
+  removal it is disk that only a human deleting files by hand can reclaim. It
+  matters most for the failure it most often follows. On a full disk the
+  group's own bytes can fit while the manifest record does not, and each retry
+  would otherwise leave another full-size file, consuming the disk faster than
+  an operator can free it. The removal is skipped when the manifest DOES name
+  the id, which is the one fault point that returns an error after its record
+  is durable -- deleting there would leave a committed group with no bytes. It
+  is skipped again when the commit reports `storage.ErrRollbackFailed`: a
+  commit whose record was fully written, whose sync failed, and whose rollback
+  then failed too leaves that record in the page cache, where the kernel can
+  write it back with no crash involved. Memory says invisible, disk ends up
+  saying committed, and deleting on the strength of memory produces a store
+  that fails to open with "committed but its file is missing". A leaked file is
+  recoverable; a store that refuses to start is not.
 - Shutdown: SIGINT/SIGTERM → HTTP drain (15 s) → `writer.Close()` (flush)
   → `store.Close()` (unmap). No buffered rows are lost, no mmap leaks.
+
+## Write failure and retry semantics
+
+A flush failure reaches the caller as `*ingest.WriteError`, which answers the
+two questions a log shipper actually has. `Flush` and `FlushMark` return it, so
+`err != nil` keeps its old meaning for callers that only test for nil.
+
+### Is retrying worth anything?
+
+`WriteError.Class` classifies the underlying failure. The errno survives every
+layer of wrapping, so `errors.Is` reaches it.
+
+| Class | Cause | HTTP | `Retry-After` |
+|---|---|---|---|
+| `RetryAfterRepair` | `ENOSPC`, `EROFS`, `EACCES`, `EPERM`, `EIO`, `fs.ErrPermission`, `storage.ErrCorruptGroup` | 503 | 30 s |
+| `RetrySoon` | `ErrWriterClosed` (shutdown), `EMFILE`, `ENFILE`, `ENOMEM`, `EINTR`, `EAGAIN`, and anything unrecognised | 503 | 1 s |
+
+**There is no never-retry class, and the absence is deliberate.** There was
+one, and a group that failed its own bounds and checksum checks the instant
+after being written was put in it -- 500, `retryable: false`, no `Retry-After`
+-- on the reasoning that the bytes are a pure function of the payload so every
+attempt reproduces it.
+
+That reasoning is not sound. `ReadGroup` validates a CRC32C over a blob handed
+to the filesystem seconds earlier, and a mismatch there is at least as likely to
+be the storage returning different bytes than the ones written -- which is not
+deterministic, and is fixed by a retry or by replacing the disk. Answering it
+500 told a shipper to drop data that a media error had corrupted. It also
+inverted the classification's own bias: an unrecognised failure defaults to
+retryable *because* telling a client to give up on something transient loses
+data, while a needless retry only duplicates it. So the class is gone rather
+than misapplied. If a genuinely deterministic write failure turns up, it comes
+back with the evidence that made it deterministic.
+
+### Does a retry duplicate?
+
+`WriteError.DuplicatesOnRetry()` is true exactly when the failure was
+**partial** -- some groups in the caller's window reached the store and some
+did not. There is no idempotency key on the ingest path yet (that is Phase 8),
+so resending a payload whose first half landed stores that half twice.
+
+The accounting is per **flush job**, not per batch. One batch routinely holds
+several groups, because a caller whose rows crossed the row or byte trigger
+while it was adding them gets its rows split across jobs. A batch-level flag
+cannot tell "all three groups failed" from "one of three failed", and that is
+the whole distinction: the first means a retry is clean, the second means a
+retry duplicates.
+
+It cannot be narrowed to "your rows specifically". The row buffer is shared by
+every request and every syslog connection on a tenant, so a caller does not own
+the groups its rows land in. *Some of what you sent may be stored* is the
+strongest true statement, and it is the one a client needs.
+
+### The window a mark can be answered from
+
+`FlushMark` answers from a ring of the last `batchHistory` (64) batches. On its
+own that ring loses writes, and the way it lost them is why there is a second
+structure behind it. Every `Flush` and `FlushMark` installed a new batch whether
+or not the old one carried anything, so 64 flushes from *any* caller on the
+tenant -- other requests, a syslog connection flushing per line, the
+`FlushEvery` timer, `Close` at shutdown -- evicted the batch a marked caller's
+rows were in. That batch was then never waited on and its error never seen: a
+200 for rows that are not in the store. At `MaxConcurrentWrite` 32, 64 slots is
+about two completed request cycles.
+
+Six things close it:
+
+- An outgoing batch that carried **no jobs** is dropped from the ring rather
+  than aging a real one out of it, so an idle or rejected flush costs nothing.
+- A batch that did carry jobs leaves a four-word `batchOutcome` behind when it
+  is retired -- seq, jobs, failed, error. `FlushMark` folds those in, so a late
+  caller still gets the right counts and the right `duplicateOnRetry`.
+- A batch is retired **only at zero outstanding jobs**, and the ring may run
+  over its nominal length until then -- bounded by `maxHistory`. Without that gate the outcome log
+  reproduced the defect it was added to fix: `FlushMark` waits only on batches
+  at or after its own mark, so a later caller never blocks on an older one, and
+  enough later flushes retired a batch whose job was still in flight --
+  snapshotting "one job, none failed" for a job that went on to fail with
+  ENOSPC. The worker decrements `outstanding` after recording its error, so
+  observing zero is observing counters that can no longer change.
+- **`maxHistory` is a hard ceiling on the ring, and past it a stalled batch is
+  dropped UNANSWERABLE and removed from `live` with it.** Leaving it in `live`
+  kept its counters reachable by the next unrelated plain `Flush` -- final by
+  then, and handed to a caller whose own rows had all landed -- and kept every
+  `Flush` blocked on the stalled job, since `Flush` waits on all of `live`.
+
+  It unblocks `Flush` and nothing else. `Writer.Close` runs `Flush` and then
+  joins the flush workers, and a worker parked inside `AppendGroup` has not
+  returned, so `Close` blocks on a stalled writer with the ring drained and
+  `live` empty. Tenant eviction blocks for the same reason. Both are open; see
+  `docs/wrong.md`. The zero-outstanding gate above is not itself a
+  bound: the flush pool bounds outstanding *jobs*, not *batches*, and every
+  later job-carrying flush appends one more while a stalled one pins the front.
+  Measured, 5000 client requests with one job pinned left the ring at 5002
+  entries, walked under the writer's lock on every request. Past the ceiling
+  the stalled batch leaves with no outcome and `oldestAnswerable` advances past
+  its seq, so every mark at or below it answers `ErrDurabilityUnknown`.
+  Recording counters that can still change is the frozen-zero defect again;
+  refusing to answer is not.
+- **`oldestAnswerable` only ever rises.** Two paths move it -- the outcome
+  log's overflow and the ceiling drop -- and the first assigned it
+  unconditionally, so a normal retire following an unanswerable drop lowered it
+  again and un-hid a batch that is in neither the ring nor the log. It is a
+  watermark; a watermark that can go backwards is not one.
+- Past even the outcome log (`outcomeHistory`, 1024 real batches), `FlushMark`
+  returns `ErrDurabilityUnknown` with `Partial` set. The writer says it does
+  not know, which a client must treat as a possible failure and a possible
+  duplicate. A wrong nil is the thing this whole mechanism exists to prevent;
+  refusing to answer is not.
+
+### What the client sees
+
+On a JSON route:
+
+```json
+{
+  "error": "ingest: 1 of 2 groups failed to store (partial; a retry may duplicate records): ...",
+  "status": 503,
+  "retryable": true,
+  "retryAfterSeconds": 30,
+  "duplicateOnRetry": true,
+  "groupsFailed": 1,
+  "groupsTotal": 2,
+  "unit": "groups"
+}
+```
+
+`Retry-After` is set as a header on every retryable failure, on text and JSON
+routes alike, and is written before the status line -- a header set after
+`WriteHeader` never leaves. A text-envelope route would carry the same two
+booleans in the message rather than losing them; no ingest route uses one
+today -- all five pass `ndjsonSpec()` or `otlpSpec()`, both JSON -- so that
+branch is a guarantee for a route that does not exist yet rather than a
+property any client currently observes.
+
+**The parallel path answers the same way.** A body at or above
+`ingest.MinParallelBytes` goes to `IngestJSONLinesParallelCfg`, which shards it
+across several writers when the configured shard count is at least 2 and
+otherwise runs one writer serially -- `runtime.NumCPU()/3`, so every host with
+fewer than six cores takes the serial branch. Both fail with
+`*ingest.ParallelWriteError`, and both carry `Partial`; the serial branch
+dropped it, which made `As` synthesize an answer strictly worse than the inner
+error it replaced.
+
+Both branches used to answer a flat 500 with no `Retry-After` and none of the
+fields above, so the answer to one disk failure depended on how large the
+request was. Two things fixed it: `failIngest` reads
+the same metadata every other route does, and `ParallelWriteError` implements
+`As` so `errors.As` sees the WHOLE write rather than the first failing shard.
+Without that `As`, a request where shard 1 landed and shard 2 failed reported
+`1 of 1 failed, duplicateOnRetry: false` -- the opposite of the truth, since
+shard 1's rows are durable and resending the body stores them twice. On that
+path the counts are shard writers rather than groups, which `WriteError.Unit`
+says.
+
+### Testing it
+
+`storage.SetFaultHookForTest` exposes the durable-write fault injector to the
+packages above storage, because "what does the client see when the disk fills"
+is assembled out of the writer's batch accounting and the handler's status
+code, and cannot be asked from inside the storage package.
+
+It is guarded rather than build-tagged: it panics unless `flag.Lookup("test.v")`
+resolves, which is true in every test binary and no production one. A build tag
+would put the failure suite in a lane of its own, and a lane outside
+`make verify` is a lane that goes stale -- this repository has already paid for
+one vacuously-green tagged lane.
+
+`TestEveryWriteFaultReachesTheCaller` enumerates `storage.FaultPointNames()`
+rather than listing points, so a write step added later is covered the day it
+exists. A write step whose failure is not surfaced is a write step that loses
+data behind a 200.

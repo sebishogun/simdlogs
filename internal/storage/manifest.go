@@ -222,18 +222,15 @@ func (m *manifest) commit(add, remove []uint64, receipt []byte) error {
 	seq := m.seq + 1
 	rec := manifestRecord{Seq: seq, Add: add, Remove: remove, Receipt: receipt}
 	if _, werr := m.f.Write(rec.encode()); werr != nil {
-		m.truncateTo(off)
-		return werr
+		return joinRollback(werr, m.truncateTo(off))
 	}
 	// Between the write and the sync: the record is in the page cache and is
 	// NOT a commit. A crash here must leave the group invisible.
 	if ferr := fault(faultManifestWrite); ferr != nil {
-		m.truncateTo(off)
-		return ferr
+		return joinRollback(ferr, m.truncateTo(off))
 	}
 	if serr := m.f.Sync(); serr != nil {
-		m.truncateTo(off)
-		return serr
+		return joinRollback(serr, m.truncateTo(off))
 	}
 	// Only now is the record durable, so only now does the sequence advance.
 	m.seq = seq
@@ -276,21 +273,41 @@ func (m *manifest) commit(add, remove []uint64, receipt []byte) error {
 	return nil
 }
 
-// truncateTo rolls the file back to a record boundary after a failed append.
-// A failure here is reported by leaving the manifest as it is: the next open
-// truncates the torn tail, which is the same repair one restart later.
-func (m *manifest) truncateTo(off int64) {
+// truncateTo rolls a partially-written record back off the tail, and reports
+// whether the rollback itself is durable.
+//
+// The return value is not decoration. A caller above this decides whether a
+// group file whose commit failed is an orphan to delete, and it decides by
+// asking whether the manifest names the id. That question is answered from
+// memory; the invariant it stands in for is a durability one. If the record
+// was fully written and the SYNC failed -- a dying disk returning EIO -- and
+// then the rollback's own Truncate or Sync fails too, the record stays in the
+// page cache and the kernel writes it back with no crash involved. Memory says
+// invisible, disk ends up saying committed, and deleting the file on the
+// strength of memory leaves a committed group with no bytes: the next open
+// fails with "committed but its file is missing" and the store never starts.
+//
+// So a failed rollback is reported, and the caller keeps the file. A leaked
+// group file is recoverable; a store that refuses to open is not.
+func (m *manifest) truncateTo(off int64) error {
 	// A write path, so it opens the handle the same way commit does: a caller
 	// may roll back a manifest it has not written to in this process.
 	if err := m.ensureOpen(); err != nil {
-		return
+		return err
 	}
 	if err := m.f.Truncate(off); err != nil {
-		return
+		return err
 	}
-	m.f.Seek(off, io.SeekStart)
-	m.f.Sync()
+	if _, err := m.f.Seek(off, io.SeekStart); err != nil {
+		return err
+	}
+	return m.f.Sync()
 }
+
+// ErrRollbackFailed reports a commit that failed AND could not be rolled back,
+// so whether the record is durable is unknown. A caller holding a file that
+// commit was naming must keep it.
+var ErrRollbackFailed = errors.New("storage: a failed manifest commit could not be rolled back")
 
 // isVisible reports whether the manifest says a group id is part of the
 // store.
@@ -431,4 +448,18 @@ func groupIDFromName(name string) (uint64, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+// joinRollback pairs a commit failure with the outcome of undoing it. When the
+// rollback failed the result matches ErrRollbackFailed, which is what tells a
+// caller that the record's durability is unknown and its file must be kept.
+func joinRollback(commitErr, rollbackErr error) error {
+	if rollbackErr == nil {
+		return commitErr
+	}
+	// Both wrapped, not formatted. %v flattened the commit error to text, so
+	// errors.Is could no longer reach its errno: a rollback-failed ENOSPC
+	// classified as an unrecognised failure and was answered "retry in a
+	// second" instead of "someone has to free space".
+	return fmt.Errorf("%w: %w (rollback: %w)", ErrRollbackFailed, commitErr, rollbackErr)
 }

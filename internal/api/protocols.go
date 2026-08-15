@@ -6,9 +6,20 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
+	"github.com/sebishogun/simdlogs/internal/storage"
 )
+
+// backupFlushTimeout bounds the pre-snapshot flush. Long enough that an
+// ordinary flush finishes, short enough that a stalled writer does not turn
+// "take a backup" into "wait forever".
+//
+// Declared above the handler's own doc comment rather than between it and the
+// func: inserted there, it took that whole rationale as its own godoc and left
+// `backup` undocumented.
+const backupFlushTimeout = 10 * time.Second
 
 // backup streams a tar of the tenant's group files: a consistent point-in-time
 // snapshot for offline restore via storage.RestoreTar.
@@ -27,10 +38,60 @@ import (
 // truthful "this transfer did not complete". Before any byte is written a
 // clean 500 is still possible, and that path is taken.
 func (s *Server) backup(w http.ResponseWriter, r *http.Request) {
+	tn := s.tn(r)
+	// One backup per tenant at a time. Each one holds a Snapshot for its whole
+	// duration, which pins every group it captured against unmapping, so N
+	// concurrent streams hold N copies of the store's full mapping set and
+	// retention frees nothing while any of them runs. 429 rather than a queue:
+	// a second backup is a duplicate request, not work to serialize, and a
+	// queued one would sit on its own snapshot while it waited.
+	if !tn.backupBusy.CompareAndSwap(false, true) {
+		w.Header().Set("Retry-After", "60")
+		s.writeErr(w, r, opsSpec(), http.StatusTooManyRequests,
+			"a backup of this tenant is already in progress")
+		return
+	}
+	defer tn.backupBusy.Store(false)
+
+	// Flush before the snapshot, so the archive holds what this tenant has
+	// been told is stored. Rows still in the writer's buffer are in no group
+	// yet, and a backup taken without this is missing every row since the last
+	// flush trigger -- silently, because the archive is consistent with the
+	// store and the store is simply behind its clients.
+	//
+	// A flush failure is not fatal to the backup. Whatever is already durable
+	// is still worth capturing, and this endpoint has no way to report a
+	// failure once bytes are out; the consequence of ignoring it is that the
+	// archive stops at the last durable group rather than the last
+	// acknowledged row, which is the pre-flush behaviour and no worse.
+	//
+	// BOUNDED, because Flush waits on every live batch -- including one pinned
+	// by a stalled fsync, which is the scenario the writer's own history
+	// ceiling exists for. Unbounded, it would hold backupBusy forever and make
+	// a stalled writer disable that tenant's backups entirely, which is the
+	// opposite of what a backup is for. On timeout the archive is taken
+	// anyway: that is exactly the "stops at the last durable group" case the
+	// paragraph above already accepts.
+	if tn.preFlushing.CompareAndSwap(false, true) {
+		flushed := make(chan struct{})
+		go func() {
+			defer tn.preFlushing.Store(false)
+			defer close(flushed)
+			_ = tn.w.Flush()
+		}()
+		select {
+		case <-flushed:
+		case <-time.After(backupFlushTimeout):
+		}
+	}
+	// If one is already parked, this backup skips its own: a second would wait
+	// on the same batches, and spawning it is how polling this endpoint
+	// against a stalled writer accumulated goroutines nothing counted.
+
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.Header().Set("Content-Disposition", `attachment; filename="simdlogs-backup.tar"`)
 	cw := &countingWriter{w: w}
-	if err := s.tn(r).store.BackupTar(cw); err != nil {
+	if err := tn.store.BackupTarWith(cw, storage.BackupOptions{Tenant: tn.key}); err != nil {
 		if cw.n == 0 {
 			s.writeErr(w, r, opsSpec(), http.StatusInternalServerError,
 				"backup failed before any data was written: "+err.Error())
@@ -93,7 +154,7 @@ func (s *Server) ingestBody(w http.ResponseWriter, r *http.Request, status int,
 	// whatever batches it happened to wait for -- which is routinely another
 	// request's rows. This asks about the rows THIS request added.
 	if err := tn.w.FlushMark(mark); err != nil {
-		s.writeErr(w, r, ndjsonSpec(), http.StatusServiceUnavailable, err.Error())
+		s.writeFlushErr(w, r, ndjsonSpec(), err)
 		return
 	}
 	// Counted after the flush, not before it with a subtraction on failure.
@@ -210,7 +271,7 @@ func (s *Server) insertOTLPLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tn.w.FlushMark(mark); err != nil {
-		s.writeErr(w, r, otlpSpec(), http.StatusServiceUnavailable, err.Error())
+		s.writeFlushErr(w, r, otlpSpec(), err)
 		return
 	}
 	// After the flush, like every sibling path: a counter must not go

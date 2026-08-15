@@ -2116,3 +2116,768 @@ deployment. What it closes is the sharp half: the unauthenticated
 amplification. 2000 unauthenticated `/-/ready` probes cost 19.4µs each instead
 of scaling with the degraded-tenant count on every request. Worth not recording
 the steady-state cost as solved.
+
+## A failed write kept the file it could not commit
+
+Task 3.6. `AppendGroup` writes `group-N.bin` durably, mmaps it, re-reads it,
+then commits the id to the manifest. Every step after the first can fail with
+the file already on disk, and none of them removed it.
+
+The manifest never names it, so `OpenStore` ignores it and no retention pass
+ever considers it. Invisible and undeletable is the whole shape of the bug: the
+only way to reclaim that disk is a human deleting files by hand.
+
+It is at its worst under exactly the failure it follows most often. On a full
+disk the group's own bytes can fit while the manifest record does not, so a
+retry loop leaves one full-size file per attempt — consuming the disk faster
+than the operator frees it.
+
+```
+--- FAIL: TestFailedAppendLeavesNoOrphanFile (0.00s)
+    orphan_test.go:68: a failed append left 1 group files behind, was 1:
+        [group-0.bin group-1.bin]
+```
+
+The fix is not an unconditional remove. `manifest.commit` truncates its record
+away on every failure **before** the sync, so the id is invisible and the file
+is genuinely an orphan — but the fault point **after** the sync returns an
+error with the record already durable and the id visible. Removing there would
+leave a committed group with no bytes, which is worse than the leak. So the
+removal is gated on `isVisible`, and the directory is fsynced so a crash cannot
+resurrect the orphan.
+
+## One 503 for every storage failure answered neither question a shipper has
+
+Also 3.6. Every write failure produced `503` plus the underlying error's text.
+A log shipper reading that cannot answer either of the two things it needs to
+decide:
+
+- **Is retrying worth anything?** A full disk clears when someone frees space.
+  A group that fails its own checksum the instant after being written is a pure
+  function of the payload and fails identically forever. Both were 503, so a
+  shipper retried the second one until someone noticed.
+- **Does a retry duplicate?** There is no idempotency key on the ingest path.
+  If part of a payload landed and part did not, resending stores the landed
+  part twice — and nothing said so.
+
+The second one could not even be computed before this change. `flushBatch`
+recorded the *first* error and nothing else, so "all three groups failed" and
+"one of three failed" were the same state. They are the opposite answer: the
+first means a retry is clean, the second means it duplicates. Counting per job
+(`jobs`/`failed`) is what makes the distinction exist.
+
+The classification's default is `RetrySoon`, not `RetryNever`, and that
+direction is deliberate. An unrecognised failure is one this table has not met
+yet; telling a client to give up on something transient loses data, while a
+needless retry only duplicates it.
+
+## "It cannot be tested from here" was again "the seam is one export away"
+
+Third time in this repository (see the earlier two). The plan asked for fault
+tests covering disk full, short write, sync failure, mmap-after-rename and
+manifest failure at the **writer** level, and `setFaultHook` was package-private
+to `internal/storage`.
+
+The reflex is to reach for a build tag and a separate lane. That was rejected:
+a lane outside `make verify` goes stale, and this repository has already paid
+for one vacuously-green tagged lane. `SetFaultHookForTest` is exported and
+guarded by `flag.Lookup("test.v") == nil` instead — true in every test binary
+and no production one, one map lookup at arm time, and the failure suite runs
+in the default lane.
+
+The sweep enumerates `FaultPointNames()` rather than listing points. A
+hand-written list is a list the next write step quietly falls out of, and a
+write step whose failure is not surfaced is a write step that loses data behind
+a 200.
+
+## The batch a caller marked aged out, and FlushMark answered nil
+
+Review round on 3.6. `FlushMark` answered from a 64-entry ring of batches, and
+every `Flush`/`FlushMark` installed a new batch **whether or not the old one
+carried anything**. So 64 flushes from any other caller on the tenant — other
+requests, a syslog connection flushing per line, the `FlushEvery` timer, `Close`
+at shutdown — evicted the batch a marked caller's rows were in. That batch was
+then never waited on, its error never seen, and the caller was told success.
+
+```
+--- FAIL: TestEvictedBatchIsNotReportedAsSuccess
+    FlushMark reported success; the store holds 0 groups
+```
+
+At `MaxConcurrentWrite` 32, 64 slots is about two completed request cycles.
+
+The ring predates 3.6, but 3.6 made it the authority for two new affirmative
+claims, and the second one fails in the worse direction:
+
+```
+--- FAIL: TestEvictedBatchStillReportsPartial
+    a failed group reported success after its batch aged out
+```
+
+With the batch holding a *landed* group evicted, `failed == total` over what
+remained, so `duplicateOnRetry` came back false and the client was told a retry
+was clean. It resends and stores those rows twice — the exact outcome the field
+exists to prevent. Before the change no such claim was made; the change added a
+statement the window could not support.
+
+Three things close it. An outgoing batch with **no jobs** is dropped rather than
+aging a real one out, so an idle flush costs nothing. A batch that did carry
+jobs leaves a four-word outcome behind — seq, jobs, failed, error — which
+`FlushMark` folds in. And past even that log, `FlushMark` returns
+`ErrDurabilityUnknown` with `Partial` set rather than nil.
+
+The shape worth keeping: **a bound chosen against the expected interleaving,
+where exceeding it is silent and reads as success.** "64 is far past any real
+interleaving" was in the comment. It was not, and nothing said so when it was
+exceeded.
+
+## The orphan cleanup drew its own window one step too late
+
+Same round. The fix for the orphaned-group leak said its window was "every step
+of AppendGroup **after** `writeFileAtomic` returns". Two steps *inside*
+`writeFileAtomic` are already past the point of no return: opening the parent
+directory and fsyncing it both run after `os.Rename` has landed.
+
+```
+--- FAIL: TestReviewDirSyncFailureLeavesOrphan/dir-open
+    a failed append left [group-0.bin] behind; the manifest names none of them
+--- FAIL: TestReviewDirSyncFailureLeavesOrphan/dir-sync
+    a failed append left [group-0.bin] behind; the manifest names none of them
+```
+
+Both errno shapes classify retryable, so the retry loop left one full-size file
+per attempt — precisely the pathology the cleanup was written to stop.
+
+The sweep over every fault point ran `dir-open` and `dir-sync` and passed: it
+asserted the caller got an error, never that the directory was clean. A test
+that covers a code path is not a test that covers the property.
+
+## `isVisible` answered from memory a question about durability
+
+Same round, found by inspection with no seam to test it. `discardUncommitted`
+deletes an uncommitted group file, gated on `m.visible` not holding the id. That
+gate is an in-memory fact standing in for a durability one.
+
+`manifest.commit` rolls a failed record back with `truncateTo`, which swallowed
+every error. If the record was fully written and the **sync** failed — a dying
+disk returning EIO — and the rollback's own `Truncate` or `Sync` then failed
+too, the record stays in the page cache and the kernel writes it back with no
+crash involved. Memory says invisible; disk ends up saying committed; the file
+is deleted; the next `OpenStore` fails with *group N is committed but its file
+is missing* and the store never starts.
+
+Before the orphan fix the file survived and the group was adopted intact. So the
+fix converted a recoverable leak into an unopenable store, in a narrow case.
+`truncateTo` now reports, `commit` wraps a failed rollback in
+`ErrRollbackFailed`, and `discardUncommitted` keeps the file when it sees it. A
+leaked file is recoverable; a store that refuses to start is not.
+
+## A never-retry class that told shippers to drop data a disk had corrupted
+
+Same round. 3.6 classified `storage.ErrCorruptGroup` — a group that fails its
+own bounds and checksum checks the instant after being written — as never-retry:
+HTTP 500, `retryable: false`, no `Retry-After`. The stated reason was that the
+bytes are a pure function of the payload, so every attempt reproduces it.
+
+`ReadGroup` validates a CRC32C over a blob handed to the filesystem seconds
+earlier. A mismatch there is at least as likely to be the storage returning
+different bytes than the ones written — not deterministic, and fixed by a retry
+or by replacing the disk. The answer told a shipper to give up on data a media
+error had corrupted.
+
+It also inverted the classification's own stated bias, three functions higher in
+the same file: an unrecognised failure defaults to retryable *because* telling a
+client to give up on something transient loses data while a needless retry only
+duplicates it. The class is gone rather than misapplied, and the table in
+`docs/lld/ingest.md` said so as a fact, which made it a documentation defect as
+well as a classification one.
+
+## And a test that passed with the fix it appeared to guard fully reverted
+
+`TestShortWriteLeavesNothingReadable` injected at `partial-write`, which fires
+**before** the rename — so `writeFileAtomic`'s own pre-existing deferred
+temp-file removal is what made it green. With all three `discardUncommitted`
+calls commented out it still passed. It tested something real and nothing the
+change added. It now injects at `dir-sync`, which is the post-rename case above,
+and goes red without the fix.
+
+Two others from the same file were checked the same way and are sound:
+`TestFailedAppendLeavesNoOrphanFile` and
+`TestPartialBatchFailureIsReportedAsDuplicating` both go red when their fix is
+reverted, and the second does produce two real jobs in one mark window.
+
+## The outcome log reproduced the defect it was added to fix
+
+Second review round on 3.6. The first fix for "FlushMark returns nil once a
+caller's batch ages out of the ring" was to leave a small outcome record behind
+when a batch is retired. It froze the counters at the wrong moment.
+
+`FlushMark` waits only on batches at or after its own mark, so a later caller
+never blocks on an older one — and enough later flushes retire a batch whose
+job is still in flight. The snapshot then said *one job, none failed* for a job
+that went on to fail with ENOSPC:
+
+```
+b0 still in hist: false; outcomes: 10; b0's frozen outcome: jobs=1 failed=0 err=<nil>
+b0 after its job finished: jobs=1 failed=1
+FlushMark(mark) = nil for a row whose only group failed with ENOSPC
+```
+
+Same 200-for-lost-rows failure, moved from the ring into the log. A batch is
+now retired only at zero outstanding jobs, and the ring is allowed to run over
+its nominal length until then.
+
+Two things about the round are worth more than the defect:
+
+**Both tests written for the first fix were vacuous, and vacuous in the
+direction that hid this.** They looped `w.Flush()` with an empty buffer — and
+the same fix's empty-batch drop means an empty flush retires nothing, so
+`len(hist)=2, len(outcomes)=0` after eighty of them. Nothing was evicted,
+nothing was retired, and **nothing anywhere exercised the retired-outcome
+fold-in**, which is precisely where the new defect lived. A test that cannot
+reach the code it is named for is worse than no test: it is a claim of
+coverage.
+
+**A plain `Flush` was never exposed.** It waits on every live batch, so it
+blocks on the stalled one. Only `FlushMark` — the function added to make
+per-caller durability answerable — could skip it. The mechanism built to
+answer the question precisely was the only way to get the wrong answer.
+
+## The backup's time filter dropped a group at the top of the range
+
+Task 5.1, found in the same round. `BackupTarWith` took
+`Snapshot(math.MinInt64, math.MaxInt64)`, reading "the whole range". The
+overlap test is `TimeMin < to && TimeMax >= from` — half-open at the top — so a
+group whose `TimeMin` is `math.MaxInt64` fails it.
+
+```
+TestReviewBackupDropsMaxTimestampGroup: store holds 2 groups, the backup manifest names 1
+TestReviewBackupDropsTimelessGroup:     store holds 1 groups, the backup manifest names 0
+```
+
+`VerifyBackup` passed, because the manifest is built from the same filtered
+snapshot. A self-describing archive that describes itself as smaller than it
+should be is worse than a bare tar: the manifest is what an operator would
+trust. `parseTime` on the ingest path is `strconv.ParseInt(s, 10, 64)` with no
+upper clamp, so the timestamp is a number a client sends.
+
+The replacement is `SnapshotAll`, with a `SnapshotAllWithSeq` variant that also
+reads the manifest sequence under the SAME lock acquisition — the second
+acquisition it replaced could see an `AppendGroup` land in between, making the
+archive declare a watermark covering a group it does not contain.
+
+## One disk failure, two different answers, decided by request size
+
+Also that round. A body at or above `ingest.MinParallelBytes` is sharded across
+several writers, and that path answered a flat 500 with no `Retry-After` and
+none of the retry metadata every other route reports:
+
+```
+body 1049666 bytes (>= MinParallelBytes 1048576)
+status 500, Retry-After ""
+{"durable":0,"error":"ingest: 10 of 10 shard writers failed to persist: ..."}
+```
+
+Underneath it, `errors.As` on a `ParallelWriteError` unwrapped to **one shard's**
+`*WriteError`. A request where shard 1 landed and shard 2 failed reported
+`1 of 1 failed, duplicateOnRetry: false` — the opposite of the truth, since
+shard 1's rows are durable and resending the body stores them twice.
+
+Fixed by an `As` method that aggregates the shards, and by `failIngest` reading
+the same metadata as every other route. The counts on that path are shard
+writers rather than groups, which `WriteError.Unit` now says rather than
+leaving the reader to assume.
+
+## Four more from the same round, each small and each the same shape
+
+- **`joinRollback` used `%v` where it needed `%w`.** The commit error was
+  flattened to text, so `errors.Is` could no longer reach its errno: a
+  rollback-failed ENOSPC classified as unrecognised and was answered "retry in
+  a second" instead of "someone has to free space". The wrapping was added in
+  the *previous* round specifically so a caller could tell these apart.
+- **`DisallowUnknownFields` ran before the format check**, so a format-2 backup
+  manifest carrying a new field was reported as `json: unknown field "codec"`
+  rather than as an unsupported format — while the function's own comment said
+  "the format check comes first". The comment described the intent; the code
+  did the other thing.
+- **`ErrCorruptGroup`'s doc still carried the never-retry reasoning** that the
+  same round had removed from `classify`, and `writeFlushErr`'s doc still
+  promised "a 500 instead of a 503" that `HTTPStatus` no longer returns. A
+  deleted behaviour leaves its justification behind in every comment that cited
+  it.
+- **`TestBackupIsCompleteUnderConcurrentRetention` was a measured no-op.** Over
+  40 runs it captured 12 groups every time: retention always won the start, the
+  snapshot was always taken after the drop, and the streaming-under-retention
+  path was never entered. A blocking writer that stalls the archive mid-stream
+  replaces it, with retention, an append and a recompaction each run against it
+  — the three the plan asked for and one of which existed. The no-op was
+  *deleted*; an earlier version of this bullet said it had been replaced while
+  it was still sitting in the same file beside its replacement.
+
+## Round three: the same misreport, twice more, in the paths the first two rounds did not reach
+
+Third review round on 3.6 and 5.1. The two data-loss defects round two found are
+gone — an independent pass confirmed the counter pairing sound under `-race`
+across 20 runs of 320 interleaved operations, and the backup's time filter with
+it. What it found instead were two more instances of the same class, in code the
+first two rounds had not looked at.
+
+**A shard other than the first could land rows and go unreported.**
+`ParallelWriteError` keeps only `firstErr`, so the aggregation could inspect
+exactly one shard. With every shard failed and the *partial* one not the one
+that won the mutex, `duplicateOnRetry` came back false:
+
+```
+--- FAIL: TestZZAggregationMissesNonFirstPartialShard
+    aggregated: partial=false duplicateOnRetry=false (4 of 4 shard writers)
+    a shard with rows on disk was reported as duplicateOnRetry=false
+```
+
+Partial-ness is now collected in the shard loop, from every shard, rather than
+read back off one error. The comment claiming it already covered "any failing
+shard that was itself partial" was false for more than one shard.
+
+**A closed writer claimed a retry was clean while its rows were durable.**
+`Close` flushes the shared buffer *before* it sets `closed`, so an in-flight
+handler — the case `ErrWriterClosed`'s own doc names, `http.Server.Shutdown`
+letting one request finish — got `Partial: false`:
+
+```
+--- FAIL: TestZZClosedWriterClaimsRetryIsClean
+    store holds 1 group(s)/1 row(s); FlushMark says partial=false duplicateOnRetry=false
+```
+
+Before this work that path returned a bare error and made no claim. The change
+turned "no claim" into a false one, which is the recurring shape: a new
+affirmative statement is a new thing that can be wrong, and every path that
+reaches it has to be checked, not the one it was written for.
+
+## The gate that removed the unbounded freeze made the ring unbounded
+
+Same round. Retiring only at zero outstanding jobs fixed the frozen counters and
+made `hist` grow without limit: the pool bounds outstanding *jobs*, not
+*batches*, and every later job-carrying flush appends one more while a stalled
+one pins the front.
+
+```
+after 5000 client requests with one job pinned: len(hist)=5002 (batchHistory=64)
+```
+
+Per tenant, proportional to request rate times stall duration, and `FlushMark`
+walks the whole slice under the writer's lock on every request. Per-request
+latency did not move at 5002 entries — the fsync dominates — so this was memory
+and lock-hold growth rather than a measured slowdown.
+
+The comment was the worse half: *"bounded by the flush pool and its channel, not
+by anything a client sends."* It is bounded by neither. There is a hard ceiling
+now, and past it a stalled batch is dropped as **unanswerable** rather than
+retired with counters that are not final — `ErrDurabilityUnknown` for any mark
+at or below it. Refusing to answer is the only safe thing to do with a number
+that can still change; recording it is the frozen-zero defect again.
+
+## A test that stopped being vacuous in one way and stayed vacuous in another
+
+Round two showed `TestEvictedBatchIsNotReportedAsSuccess` evicted nothing,
+because its eighty flushes were empty and an empty batch is dropped rather than
+retired. Fixed by giving them rows. Round three showed it *still* proved nothing:
+the fault hook failed **every** `temp-create`, so all eighty later batches
+carried the same ENOSPC and `FlushMark` found an error in a live ring entry
+without ever consulting the outcome log. Deleting the fold-in entirely left it
+green.
+
+Two more things had to be true for it to bite, and both are behaviours worth
+writing down. The marked row has to become its own flush job before anyone
+else's traffic starts, or the shared buffer carries it into the first foreign
+flush. And the foreign traffic has to use `FlushMark` with its own mark, not
+`Flush` — a plain `Flush` waits on every live batch and would see the marked
+caller's error, which is correct and is not what the test is about.
+
+It now asserts, before the call it is testing, that the marked batch is out of
+the ring. That is the difference between a test that exercises a mechanism and a
+test that is merely in the same file as one.
+
+## Four smaller ones, same round
+
+- **The JSON body labelled shard counts as groups.** `groupsFailed`/`groupsTotal`
+  went out with no unit, so a client parsing the body could not tell shard
+  writers from groups; the distinction survived only in the message string,
+  while `docs/lld/ingest.md` claimed `WriteError.Unit` carried it. It is a
+  `unit` field now.
+- **`/admin/backup`'s 429 and its pre-flush shipped with no test and no
+  mention in any document.** A change that turns a request which used to
+  succeed into a rejection is exactly the kind that needs one.
+- **`BackupManifest.TotalBytes` had no caller and `Store.SnapshotAll` was a
+  verbatim copy of `SnapshotAllWithSeq`** minus a return value, carrying a doc
+  comment arguing a rationale for a use it did not have. The first is gone; the
+  second delegates.
+- **`docs/architecture.md` still said the archive was "a consistent snapshot
+  because groups are immutable"** — the argument `docs/lld/storage.md` had
+  already repudiated two sections earlier, since the old path copied paths out
+  and skipped what had gone. Immutability is why a group's bytes are stable, not
+  why the archive is complete.
+
+## Round four: the watermark went backwards, and the fix for one branch skipped its sibling
+
+Fourth review round. Both of round three's fixes were correct where applied and
+both left a hole one step away.
+
+**`oldestAnswerable` was assigned unconditionally.** Two paths move it — the
+outcome log's overflow and the new ceiling drop — and only the second guarded
+the assignment. A normal retire following an unanswerable drop lowered it again
+and un-hid a batch that is in neither the ring nor the log:
+
+```
+--- FAIL: TestProbeOldestAnswerableNeverMovesBackwards
+    oldestAnswerable 5001 -> 2
+--- FAIL: TestProbeSecondStallIsUnhiddenEndToEnd
+    markB=3501 oldestAnswerable=3114 inRing=false inLog=false
+    FlushMark(markB=3501) -> <nil>
+```
+
+Nil for lost rows, reintroduced by the fix that was written to stop it. It
+takes two stalled workers to reach through the real path — one pinning the
+front, a second landing inside the newest slice of the drop window. It is a
+watermark, and a watermark that can go backwards is not one.
+
+**The serial fallback discarded `Partial`.** `IngestJSONLinesParallelCfg` takes
+a one-writer branch whenever the shard count is below 2 — `runtime.NumCPU()/3`,
+so **every host with fewer than six cores** — and that branch built its
+`ParallelWriteError` without the field the loop eleven lines below it had just
+been fixed to collect. `As` then replaced an accurate inner `*WriteError`
+("1 of 3 groups, partial") with a synthesized one ("1 of 1 shard writers, not
+partial"), so the client was told a retry was clean with a group on disk.
+
+The record said "partial-ness is now collected in the shard loop, from every
+shard". True, and the sentence stopped one branch short of the function it
+described.
+
+## Five fixes with no test, in a round whose subject was untested fixes
+
+The same review reverted each of the previous round's fixes in turn and ran the
+suite. Five stayed green: the shard-partial collection, `Partial: true` on a
+closed writer, the `unit` field, the `maxHistory` ceiling, and
+`ParallelWriteError.As` — the last of which both LLDs describe at length.
+
+That is the failure mode this file has been recording for four rounds, arriving
+as a property of the *process* rather than of any one change: every round fixed
+what the previous round's reviewer found, and shipped the fix the way the
+previous round had — without the test that would catch its regression.
+
+All five now have one, and each was verified by reverting its fix:
+
+```
+hist grew to 4354 with a stalled job; the ceiling is 4096
+the store holds 1 groups and the caller was told a retry is clean
+parallel units "groups", want shard writers
+duplicateOnRetry=false, want true (4 of 4 failed, shardPartial=true)
+oldestAnswerable fell to 1 from 5000 at flush 1087
+the writer's error was partial and the wrapper did not collect it
+Flush on a closed writer said a retry is clean; Close flushed those rows
+```
+
+The last one needed two attempts to bite. Its first version drove
+`outcomeHistory+8` flushes, and the first `batchHistory` of those only fill the
+ring without retiring anything — so the overflow branch it was written for
+never ran, and it passed against the unguarded assignment. A test that does not
+reach its own mechanism is the thing this entry is about, written into the test
+for it.
+
+## The archive's ordering was documented and never enforced
+
+Same round. `readBackup` validates a group only inside `if man != nil`, and
+nothing required the manifest to come first. A manifest-LAST archive therefore
+validated nothing — every group read with no size, checksum or parse check —
+and the completeness loop afterwards passed, because those groups *had* been
+seen:
+
+```
+--- FAIL: TestProbeManifestOrderIsNotEnforced
+    VerifyBackup on a manifest-last archive with a wholly corrupt group: err=<nil>
+    RestoreTar -> <nil>; wrote 2 files
+```
+
+Two properties had to be separated to fix it, and conflating them was the first
+attempt: an archive with **no** manifest is a pre-format-1 backup and must
+still restore, returning `ErrBackupUnverified`; an archive whose manifest
+arrives **after** its groups is refused. The distinction is only decidable at
+the end of the stream, so it is made there.
+
+The unverified branch also read entries with an unbounded `io.ReadAll` on an
+attacker-declared size — the allocation `maxBackupManifestBytes` exists to
+prevent, one entry type over, which is the "bound that exists in two of three
+places" shape this file has now recorded three times.
+
+And `/admin/backup`'s pre-flush was unbounded. It waits on every live batch,
+including one pinned by a stalled fsync — the scenario `maxHistory` exists for
+— while holding `backupBusy`, so a stalled writer disabled that tenant's
+backups entirely. It is bounded now, and a timeout takes the archive anyway,
+which is the "stops at the last durable group" case the comment already
+accepted.
+
+## Round five: the ceiling bounded the ring and not the stall
+
+Fifth review round. Round 4's `maxHistory` fix dropped a stalled batch out of
+the ring and left it in `w.live`, which kept both of the problems it was added
+to solve.
+
+Its counters — final by the time anyone read them — were folded into the next
+unrelated plain `Flush`, so a caller whose own rows all landed was handed
+someone else's *"1 of 2 groups failed, partial"*. The owner got
+`ErrDurabilityUnknown` on the stated grounds that those counters "can still
+change"; the information existed and went to the caller not entitled to it.
+
+And because `Flush` waits on all of `live`, every `Flush`, every
+`Writer.Close` and every tenant eviction still blocked on the stalled job. The
+ceiling bounded the slice; the thing it was written to survive was untouched.
+Dropping the batch from `live` alongside the ring closes both — **past the
+ceiling, and only there.**
+
+That qualifier is the correction to the first version of this paragraph, which
+said "closes both" flat. The drop is bounded by TRAFFIC, not by time: it needs
+`maxHistory` job-carrying flushes on that tenant to fire at all. Below the
+ceiling, and for a tenant that receives nothing further, `Flush` and `Close`
+block exactly as before, and a `Flush` already parked is never released. Two of
+those are recorded as open below.
+
+## The archive's refusals arrived after the bytes did
+
+Same round. Two orderings were documented and one of them was newly enforced;
+the other was not, and the enforced one fired too late.
+
+**The terminator.** `backup_manifest.go` says "a terminator goes LAST" and
+`docs/lld/storage.md` says "always last". Only its PRESENCE was checked, so an
+archive carrying `BACKUP-COMPLETE` as its FIRST entry verified clean and
+restored. The manifest-ordering entry two above this one is the same sentence
+about a different entry type, written in the round that missed this one.
+
+**The manifest-last refusal.** It fires when the manifest finally arrives — by
+which point every group before it is already on disk, and none of them had been
+checked, because validation runs inside the manifest branch:
+
+```
+RestoreTar -> storage: the archive carries groups before its BACKUP-MANIFEST
+  wrote group-0.bin (379 bytes, wholly 0xFF: true)
+  wrote group-1.bin (381 bytes, wholly 0xFF: true)
+  wrote group-2.bin (382 bytes, wholly 0xFF: true)
+```
+
+That is materially different from the truncation case already recorded, where
+every written group had passed size, CRC and `ReadGroup`. Every group is parsed
+on the way in now whether or not a manifest has been seen, so what lands is at
+least a readable group. It is still not atomic — a refused restore leaves a
+partial destination, and making it all-or-nothing is Task 5.2.
+
+## A timeout that bounded the handler and not the goroutine
+
+Round 4 bounded `/admin/backup`'s pre-flush with a ten-second timeout, in a
+goroutine. `backupBusy` is released when the HANDLER returns, so polling the
+endpoint against a stalled writer spawned one permanently parked goroutine per
+request:
+
+```
+backup 0: status 200 after 10.004s
+backup 1: status 200 after 20.013s
+goroutines 7 -> 9; parked in the backup pre-flush: 2
+```
+
+Counted by nothing: `Server.Close` waits on the background loops and on
+`inFlight`, and this is neither. At most one parked pre-flush per tenant now —
+a second would wait on the same batches, so skipping it costs nothing.
+
+## Thirty fixes with no test, and a record that said otherwise
+
+The same review reverted every fix in the uncommitted diff one at a time.
+**Thirty stayed green**, including both of round 4's own.
+
+Worse than the number: the round-4 entry above says "All five now have one, and
+each was verified by reverting its fix." Two of the five were not. The
+shard-partial collection got a test that builds a `ParallelWriteError` by hand
+and asserts the aggregation's `|| e.Partial` arm — deleting the loop that SETS
+`Partial` left the suite green. And `Partial: true` on a closed writer was
+covered at the `FlushMark` site while the `Flush` site stayed green.
+
+Both now have a test that drives the real function, and the sharded loop has
+one too. Each needed a body over `FlushRows` per shard, because a shard cannot
+be partial with fewer: one group per shard means every shard is wholly failed
+or wholly durable. Three earlier attempts passed for the wrong reason — a
+four-shard version whose fault never landed and skipped; a version where one
+shard survived, so `Failed < Shards` answered instead of the collection; and a
+watermark test the outcome log's own advance covered. Each was found by
+deleting the line it was named for and watching it stay green.
+
+Three comments in the same sweep claimed coverage that does not exist, and each
+is now corrected on the source side:
+
+- `store.go`'s "the check is what keeps it that way under the fault matrix" —
+  the matrix drives `manifest.commit` directly and never reaches
+  `discardUncommitted`.
+- `writer_failure_test.go`'s "And the file is still there" — followed by code
+  that checks the error type and nothing about the file.
+- `BackupManifest.Tenant`'s "so a restore can refuse an archive taken from a
+  different one" — nothing reads the field; `RestoreTar` takes no tenant. A
+  property described, not implemented, until Task 5.2.
+
+And two branches of `writeFlushErr` are unreachable — every call site passes a
+`*WriteError` and an `errJSON` spec — while `docs/lld/ingest.md` claimed the
+second as a cross-protocol guarantee clients observe. Both are now labelled as
+written for a route that does not exist yet.
+
+## Two stalls the ceiling cannot reach, recorded rather than fixed
+
+Round 6 measured what the ceiling actually buys, and it is less than the entry
+above first claimed.
+
+**The drop is bounded by traffic, not by time.** It fires only once the ring
+exceeds `maxHistory`, which needs 4096 job-carrying flushes on that tenant. A
+tenant with a stalled writer and no further requests never reaches it, so
+`Flush` and `Close` block indefinitely there; and a `Flush` already parked on
+the batch's WaitGroup is never released by the drop.
+
+```
+Flush is still blocked after 2s with one stalled job (the ceiling is not reached)
+Close is still blocked after 2s with one stalled job and no further traffic
+after 4352 FlushMarks: hist=64 live=0
+Flush returned promptly past the ceiling: <nil>
+```
+
+**Tenant eviction wedges the server-wide lock.** `evictIdleLocked` calls
+`victim.w.Close()` with `s.mu` held, so a stalled writer blocks every request
+for every tenant:
+
+```
+tenant B is still blocked after 3s: the eviction is inside victim.w.Close(),
+holding s.mu
+a later tenant lookup for an ALREADY-OPEN tenant is blocked too
+```
+
+And because no request can pass `s.mu`, the stalled writer receives no further
+flushes, the ring never reaches the ceiling, and the drop never runs. Permanent
+and server-wide.
+
+Not fixed here, and the reason is scope rather than difficulty: the Close is
+inside the lock because the store must be shut before another `OpenStore` on
+the same directory, so moving it out needs a per-key closing state that a
+concurrent open waits on. That is a change to tenant lifecycle, which is Task
+1.5's area and not this task's. It is pre-existing — this work did not
+introduce it — but the ceiling's own entry claimed eviction no longer blocks,
+which was true only past a threshold eviction cannot reach.
+
+## Round six: the correction was itself wrong about Close
+
+Sixth review round. Round 5's entry above says dropping the abandoned batch
+from `live` closes the `Flush`, `Close` and eviction stalls "past the ceiling,
+and only there". Measured, for `Close` the right qualifier is **never**:
+
+```
+past the ceiling: hist=64 live=0
+Flush returned promptly past the ceiling: <nil>
+Close is STILL BLOCKED 3s past the ceiling, with the ring drained
+Close returned once the stalled worker was released: <nil>
+```
+
+`Writer.Close` runs `Flush` and then joins the flush workers. A worker parked
+inside `AppendGroup` has not returned, so `Close` blocks on a stalled writer
+with `live` empty and the ring drained. The drop unblocks `Flush` and nothing
+else; eviction inherits `Close`'s behaviour one level up.
+
+The stated CAUSE was wrong, not just the scope — "because Flush waits on all of
+`live`" is true of `Flush` and irrelevant to a join — and it was wrong in three
+places at once: the source comment, the LLD, and this record. Writing the same
+sentence into three files is how one measurement error becomes three.
+
+## Two more tests that passed for a reason they were not written for
+
+Same round.
+
+**`TestManifestMustComeFirst` did not test manifest ordering.** Its archive
+carried wholly-corrupt groups, and the unverified branch's own `ReadGroup`
+parse refused the first one before the manifest was ever read — so deleting the
+ordering rule left it green. It was a second test of the parse wearing the
+ordering rule's name. The groups are valid now, the terminator is last so the
+terminator rule cannot answer either, and the assertion names the message.
+
+**`TestTerminatorMustComeLast` tested the pair, not the line.** Placing the
+terminator first puts both the manifest and the groups after it, and there are
+two checks; green with either deleted, red only with both. It now runs two
+placements, and the group check is individually covered. The manifest check is
+not, and cannot be by this route: any archive with a manifest after the
+terminator also has groups after it, unless the groups precede the manifest —
+which trips the manifest-first rule instead. Redundant by construction, and
+recorded as such rather than chased.
+
+**And `writeFlushErr`'s `duplicateOnRetry` could be hardcoded `false`** on
+every non-parallel ingest route — jsonline, logfmt, ES bulk, OTLP — with the
+suite still green. The only test that read the field asserted it was FALSE,
+which is the safe case. A test asserting TRUE existed nowhere, for the field
+this whole task exists to make trustworthy.
+
+Its first version posted to `/insert/jsonline`, which hands a body over
+`MinParallelBytes` to the sharded path and answers through `failIngest` — the
+other copy of the field, which was already covered. So it passed with
+`writeFlushErr`'s copy hardcoded, which is exactly the hole it was written for.
+It uses `/insert/logfmt` now, which has no parallel branch.
+
+## Still open, and what it would take
+
+- **`Writer.Close` and tenant eviction block on a stalled writer, always.**
+  Close joins the workers; eviction calls Close with the server-wide `s.mu`
+  held, so one stalled fsync blocks every request for every tenant. Fixing the
+  second needs a per-key closing state a concurrent open waits on, because the
+  Close is inside the lock so the store is shut before another `OpenStore` on
+  the same directory. That is tenant lifecycle, Task 1.5's area.
+- **The `ErrRollbackFailed` chain is tested only at its leaf.** `joinRollback`
+  has a direct test; nothing drives `commit → truncateTo → discardUncommitted`,
+  because there is no fault point on `Truncate`. Six single-line reverts across
+  that chain each leave the suite green, and any one of them reintroduces the
+  unopenable-store defect. It needs a fault seam inside `truncateTo`.
+- **Neither archive size ceiling is tested** — the unverified branch's or the
+  manifested one's. Both are DoS bounds rather than durability answers.
+- **The backup pre-flush is entirely untested.** Removing it, unbounding its
+  timeout, or removing the one-parked-goroutine guard each leaves the suite
+  green. `TestBackupReleasesItsAdmission` looks like it covers the first and
+  does not: the ingest request's own `FlushMark` already made the row durable.
+- **The worker's `failed`-before-`outstanding` ordering is uncovered.**
+  Decrementing `outstanding` before `failed.Add(1)` but after the error CAS
+  lets a batch retire with `failed=0` and an error set, reporting "0 of N
+  failed" with `Partial=false`. The `err` half of that ordering IS covered; the
+  `failed` half needs a hook inside the worker.
+- **`SnapshotAllWithSeq`'s single-acquisition property is uncovered** — an
+  `AppendGroup` between two lock acquisitions would make the archive declare a
+  watermark covering a group it does not hold, and nothing catches a regression
+  to two acquisitions.
+- **The manifest FORMAT refusal is uncovered.** A format-2 archive decoding as
+  format 1 and restoring while ignoring whatever the new field required is the
+  case `decodeBackupManifest`'s own comment calls "the only answer that cannot
+  be wrong".
+- **`TestCorruptGroupInBackupIsRejected` is answered by `ReadGroup`'s own v8
+  CRC, not by the manifest checksum.** Removing the manifest's size check, its
+  CRC check, or both leaves it green. That matters for one case: a **v7** group
+  has no checksum of its own, so the manifest CRC is the only integrity check
+  it gets in an archive, and nothing tests it.
+
+## The seventh one-side-only claim, on the function the retraction was about
+
+Round 8, and the last blocker in this task. `discardUncommitted`'s own doc
+comment still opened with:
+
+> The window is every step of AppendGroup after writeFileAtomic returns.
+
+That is verbatim the sentence three other places in this repository record as
+the reasoning error — the call site 43 lines above it, `docs/lld/ingest.md`, and
+the entry "The orphan cleanup drew its own window one step too late". Corrected
+on three sides, alive on the fourth: the one a reader of the function actually
+reads, and the one whose wrongness produced the round-3 defect.
+
+Seven rounds, seven instances, and the shape has not varied: a claim is
+corrected where the reviewer pointed and left standing wherever else it was
+copied. The lesson that finally sticks is not "check the other side" — it is
+that a sentence worth writing twice is a sentence that will be wrong in one
+place, so the second copy should be a pointer.
+
+Alongside it, the round-5 finding reproduced in a file written after it:
+`TestBackupAdmitsOneAtATime`'s comment said the 429 and the pre-flush "neither
+had a test" and now both do. The 429 does. Deleting the entire pre-flush block
+leaves both backup tests green — `TestBackupReleasesItsAdmission` asserts the
+posted row is in the archive, and the ingest request's own `FlushMark` put it
+there. Two sentences claiming coverage that a one-line deletion disproves, in a
+file whose subject is claims of coverage.

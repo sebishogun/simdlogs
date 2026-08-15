@@ -125,9 +125,19 @@ committed assembly; every kernel has a portable fallback) and
 - `-recompact-after` (hourly): re-encode old groups' dictionaries with flate
   (or also drop postings with `-recompact-drop-postings`); replaced mmaps are
   retired for 5 minutes before unmapping.
-- `/admin/backup`: tar of the current group files — a consistent snapshot
-  because groups are immutable; `storage.RestoreTar` unpacks it, entry names
-  flattened so an archive cannot escape the directory.
+- `/admin/backup`: a self-describing tar — `BACKUP-MANIFEST` first, the group
+  files, `BACKUP-COMPLETE` last — taken from a leased snapshot so a group
+  retention removes mid-stream is still in it. Admin-only, one at a time per
+  tenant, and the tenant is flushed before the snapshot -- with a ten-second
+  bound, and skipped entirely when another backup's pre-flush is already
+  parked on a stalled writer. Both exceptions exist so a stalled writer cannot
+  turn "take a backup" into "wait forever"; the consequence is an archive that
+  stops at the last durable group rather than the last acknowledged row.
+  `storage.RestoreTar` unpacks it, validating each group against the manifest's
+  size, checksum and a full parse, with entry names flattened so an archive
+  cannot escape the directory. Immutability is why a group's BYTES are stable,
+  not why the archive is complete: the previous version copied paths out and
+  silently skipped any that had gone. See `docs/lld/storage.md`.
 
 ## Read order
 
