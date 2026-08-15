@@ -2294,6 +2294,12 @@ well as a classification one.
 
 ## And a test that passed with the fix it appeared to guard fully reverted
 
+*(Name correction, 2026-08-15: the test named here never reached a commit under
+this name -- it was rewritten before the entry's own change landed, and is
+`TestPostRenameFailureLeavesNothingReadable` in
+`internal/ingest/writer_failure_test.go`. The entry below stands as written;
+only the name was wrong.)*
+
 `TestShortWriteLeavesNothingReadable` injected at `partial-write`, which fires
 **before** the rename — so `writeFileAtomic`'s own pre-existing deferred
 temp-file removal is what made it green. With all three `discardUncommitted`
@@ -2405,7 +2411,10 @@ leaving the reader to assume.
   promised "a 500 instead of a 503" that `HTTPStatus` no longer returns. A
   deleted behaviour leaves its justification behind in every comment that cited
   it.
-- **`TestBackupIsCompleteUnderConcurrentRetention` was a measured no-op.** Over
+- **`TestBackupIsCompleteUnderConcurrentRetention` was a measured no-op.** (Name
+  correction, 2026-08-15: never committed under this name; the replacement
+  described below is `TestBackupIsCompleteUnderConcurrentStoreChanges` in
+  `internal/storage/backup_contract_test.go`.) Over
   40 runs it captured 12 groups every time: retention always won the start, the
   snapshot was always taken after the drop, and the streaming-under-retention
   path was never entered. A blocking writer that stalls the archive mid-stream
@@ -4160,7 +4169,10 @@ subtest bites.
 
 **One claim in the test itself was never executed:** the read test skipped
 writes with a comment naming `TestARouterStoresNothingItself`, which did not
-exist. It does now, per route — all 13 — because each ingest handler decides for
+exist. It does now, per route — all 13 — under the name
+`TestARouterForwardsWritesAndStoresNothing` (name correction, 2026-08-15: this
+entry gave the intended name, not the one that landed) — because each ingest
+handler decides for
 itself whether to forward, and "kept nothing" is observed by removing the
 backends and asking the same process again rather than by reading its store.
 
