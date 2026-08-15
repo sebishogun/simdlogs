@@ -11,6 +11,69 @@ Source: `internal/api/cluster.go`.
 > `docs/plans/2026-08-13-simdlogs-production.md`, Phase D), do not treat any
 > router-mode answer as the cluster-wide answer.
 
+## The internal protocol
+
+`cluster_protocol.go`, `cluster_client.go`. Internal responses carry an
+envelope in headers — version, shard, replica, completeness, high watermark,
+error class, trace id — and the public response bodies are no longer the merge
+state.
+
+They were. A router called the same public endpoints a client calls and merged
+the public bodies, which has three consequences and all of them are bad. A
+public response has no field for "I skipped two groups because my disk is
+degraded", because a client has no use for one, so a router merging public
+bodies **reports a short answer as a whole one**. A public shape is a promise
+to clients and an internal one is a promise between versions of this binary;
+tying them together means neither can move. And there was no version at all, so
+a router talking to a node from another release silently merged whatever came
+back — a field that moved produced a plausible wrong answer rather than an
+error.
+
+An unknown version is **refused, not negotiated**, in both directions. A router
+that spoke two versions would have to write every merge twice and test it once;
+during a rolling upgrade the honest behaviour is that a node on an unknown
+version is one this router cannot use, reported as incomplete where the caller
+can see it.
+
+| class | meaning | another replica? |
+| --- | --- | --- |
+| `unavailable` | refused, timed out, TLS failed, DNS | yes |
+| `version_mismatch` | speaks a protocol this binary does not | yes — the rest of the shard may be upgraded |
+| `overloaded` | refused for a budget reason | yes |
+| `unauthorized` | this **router's** credential was refused | no — every replica refuses it identically, so retrying turns one 401 into N and delays the report |
+| `malformed` | unparseable or oversized | no — it will return the same thing |
+| `degraded` | answered from an incomplete store | — |
+
+**The client.** Every peer call used `http.DefaultClient`, which has no timeout
+at all: a peer that accepts the connection and never answers held a router
+goroutine, a pool slot and the caller's request for as long as the caller
+waited — times the number of shards. It also shares a process-wide transport
+with any other outbound HTTP and cannot carry a client certificate, so mTLS
+between nodes was not expressible. The peer client has its own transport with
+dial, TLS-handshake and response-header timeouts, its own pool, and no client
+timeout — the caller's context carries the deadline, and a second one here
+would cut a query the caller was still waiting for.
+
+The body is **bounded** (256 MiB) and an oversized one is **discarded, not
+truncated**: a truncated JSON document is unparseable and a truncated NDJSON
+stream is a partial answer indistinguishable from a complete one. Redirects are
+not followed — a peer does not redirect, and following one would send the
+router's credential to whatever host the response named.
+
+**Headers are forwarded explicitly**, not copied wholesale: the resolved
+`AccountID`/`ProjectID` and the tracing headers, and nothing else. Copying the
+set would forward the client's `Authorization` and cookies to every storage
+node, which is how one node's compromise becomes the cluster's — the router
+authenticates to peers as *itself*.
+
+Failures are **returned, not swallowed**. Every replica error was a bare
+`continue` and the whole shard a `return nil, false`, so a caller could not
+tell "this shard has no data" from "every replica is down" from "the credential
+was refused" — and the merge treated all three as an empty contribution.
+`fanOutPeers` returns one `PeerResponse` per shard including the failures;
+`bodiesOf` keeps the old `[][]byte` shape for merges that have not yet learned
+to report completeness (task 8.3).
+
 ## Roles
 
 - **Storage node** — a default node: owns tenants' stores, serves ingest and

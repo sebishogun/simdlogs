@@ -656,3 +656,27 @@ func (s *Store) GroupsAfterID(cursor uint64) (readers []*Reader, next uint64) {
 	}
 	return readers, next
 }
+
+// NewestTimestamp is the newest row timestamp this store holds, or 0 when it
+// holds none.
+//
+// It is a cluster-level answer: a router reports it as the shard's high
+// watermark, which is what lets a caller tell "no results" from "no results
+// yet". A shard that stopped ingesting yesterday reports yesterday, and
+// without it a stalled shard is indistinguishable from an up-to-date empty
+// one.
+//
+// Read from the group index rather than by scanning: every group already
+// carries its time range in the entry, so this is a walk of the index and not
+// of the data.
+func (s *Store) NewestTimestamp() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var newest int64
+	for _, g := range s.groups {
+		if g.timeMax > newest {
+			newest = g.timeMax
+		}
+	}
+	return newest
+}

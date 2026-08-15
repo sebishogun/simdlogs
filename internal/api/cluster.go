@@ -16,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/sebishogun/simdlogs/internal/config"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/query"
 	"sync/atomic"
 	"time"
@@ -57,37 +58,44 @@ func (s *Server) shards() [][]string {
 // getFromShard tries each replica in the shard in turn until one returns a
 // body, so a read tolerates a downed replica. ok is false if all replicas fail.
 func (s *Server) getFromShard(r *http.Request, shard []string, path string, post []byte) ([]byte, bool) {
-	for _, b := range shard {
-		var req *http.Request
-		var err error
-		if post != nil {
-			req, err = http.NewRequestWithContext(r.Context(), "POST", b+path, bytes.NewReader(post))
-			if req != nil {
-				req.Header.Set("Content-Type", "application/json")
-			}
-		} else {
-			req, err = http.NewRequestWithContext(r.Context(), "GET", b+path+"?"+r.URL.RawQuery, nil)
-		}
-		if err != nil {
-			continue
-		}
-		for _, h := range []string{"AccountID", "ProjectID"} {
-			if v := r.Header.Get(h); v != "" {
-				req.Header.Set(h, v)
-			}
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			continue // replica down: try the next
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode >= 500 {
-			continue
-		}
-		return body, true
+	resp := s.askShard(r, 0, shard, path, post)
+	return resp.Body, resp.OK()
+}
+
+// askShard asks one shard, trying its replicas in order, and returns the
+// PeerResponse -- including when every replica failed.
+//
+// The failure is RETURNED rather than folded into a bool. Every replica error
+// used to be a bare `continue` and the whole shard a `return nil, false`, so a
+// caller could not tell "this shard has no data" from "every replica is down"
+// from "the credential was refused" -- and the merge treated all three as an
+// empty contribution.
+//
+// Not every class is worth another replica: an unauthorized answer is the
+// ROUTER's credential being refused, so every replica refuses it identically
+// and retrying turns one 401 into N while delaying the report by the timeout.
+func (s *Server) askShard(
+	r *http.Request, shardID int, shard []string, path string, post []byte,
+) PeerResponse {
+	method := http.MethodGet
+	if post != nil {
+		method = http.MethodPost
 	}
-	return nil, false
+	var last PeerResponse
+	for i, b := range shard {
+		last = s.peers.do(r, shardID, i, b, method, path, post)
+		if last.OK() {
+			return last
+		}
+		obs.L().Warn("peer did not answer",
+			obs.FieldEvent, "cluster.peer_failed",
+			obs.FieldShard, shardID, "replica", i, "peer", b,
+			obs.FieldErrorClass, string(last.Class), "error", last.Err)
+		if !last.Class.retryAnotherReplica() {
+			return last
+		}
+	}
+	return last
 }
 
 // isWritePath reports whether a path ingests data (and so, in router mode,
@@ -315,19 +323,39 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 // fanOut sends the GET to one live replica of each shard concurrently and
 // returns the response bodies (one per shard), so replicated data is read once.
 func (s *Server) fanOut(r *http.Request, path string) [][]byte {
+	return bodiesOf(s.fanOutPeers(r, path, nil))
+}
+
+// fanOutPeers asks every shard and returns one PeerResponse each, in shard
+// order -- including the failures.
+//
+// The failures are what the old [][]byte could not carry: a nil entry meant
+// "no data", "every replica down" and "refused" alike, so a merge could not
+// report an incomplete answer because it could not see one.
+func (s *Server) fanOutPeers(r *http.Request, path string, body []byte) []PeerResponse {
 	shards := s.shards()
-	out := make([][]byte, len(shards))
+	out := make([]PeerResponse, len(shards))
 	var wg sync.WaitGroup
 	for i, sh := range shards {
 		wg.Add(1)
 		go func(i int, sh []string) {
 			defer wg.Done()
-			if body, ok := s.getFromShard(r, sh, path, nil); ok {
-				out[i] = body
-			}
+			out[i] = s.askShard(r, i, sh, path, body)
 		}(i, sh)
 	}
 	wg.Wait()
+	return out
+}
+
+// bodiesOf keeps the [][]byte shape the existing merges consume. Each merge
+// moves to the PeerResponse form as it learns to report completeness (8.3).
+func bodiesOf(rs []PeerResponse) [][]byte {
+	out := make([][]byte, len(rs))
+	for i, p := range rs {
+		if p.OK() {
+			out[i] = p.Body
+		}
+	}
 	return out
 }
 
@@ -335,20 +363,7 @@ func (s *Server) fanOut(r *http.Request, path string) [][]byte {
 // returns the response bodies -- the ES surface fans out this way, since its
 // query is a JSON body rather than URL params.
 func (s *Server) fanOutPost(r *http.Request, path string, body []byte) [][]byte {
-	shards := s.shards()
-	out := make([][]byte, len(shards))
-	var wg sync.WaitGroup
-	for i, sh := range shards {
-		wg.Add(1)
-		go func(i int, sh []string) {
-			defer wg.Done()
-			if b, ok := s.getFromShard(r, sh, path, body); ok {
-				out[i] = b
-			}
-		}(i, sh)
-	}
-	wg.Wait()
-	return out
+	return bodiesOf(s.fanOutPeers(r, path, body))
 }
 
 // federatedESCount sums the ES _count across storage nodes.
@@ -620,4 +635,14 @@ func fastRFC3339Nano(s string) (int64, bool) {
 		return 0, false
 	}
 	return ns, true
+}
+
+// SetIdentity records this node's place in the cluster: which shard it holds
+// and which replica of it this is.
+//
+// Reported in every internal response. Without it a router that got a partial
+// answer could say only that something was incomplete -- not which shard, so
+// not which machine to look at.
+func (s *Server) SetIdentity(shard, replica int) {
+	s.shardID, s.replicaID = shard, replica
 }

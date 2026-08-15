@@ -57,6 +57,18 @@ type Server struct {
 	// vecFlds is which record fields are embeddings, stamped on every tenant
 	// writer as it opens.
 	vecFlds ingest.VectorFields
+	// peers is the client for internal cluster traffic: its own transport,
+	// its own timeouts, its own pool, and a bounded response body. It replaced
+	// http.DefaultClient, which has no timeout at all -- a peer that accepts
+	// the connection and never answers held a router goroutine, a pool slot
+	// and the caller's request for as long as the caller waited, times the
+	// number of shards.
+	peers *clusterClient
+	// shardID and replicaID are this node's identity in the cluster, reported
+	// in every internal response so a router can say WHICH shard was
+	// incomplete rather than that something was.
+	shardID   int
+	replicaID int
 
 	// quota is the storage budget every tenant store opens under. Validated
 	// once at construction, so a tenant opening later cannot fail for a
@@ -210,6 +222,10 @@ func NewServerConfig(c config.Config) (*Server, error) {
 		degraded: map[string]storage.Health{}, dirRereadEvery: DefaultDirRereadEvery,
 		started: time.Now()}
 	srv.vecFlds = vecFlds
+	// Built even on a non-router: SetBackends can be called after
+	// construction, and a nil client at that point would be a nil dereference
+	// on the first peer call rather than at configuration time.
+	srv.peers = newClusterClient(nil)
 	if c.DirRereadInterval != 0 {
 		srv.dirRereadEvery = c.DirRereadInterval
 		if c.DirRereadInterval < 0 {
@@ -704,7 +720,12 @@ func (s *Server) Handler() http.Handler {
 	// In router mode, writes forward to storage nodes (outermost, before the
 	// tenant/local path); reads fall through to withTenant -> federatedSelect.
 	// recoverPanic is outermost so one bad request can never take the server down.
-	return recoverPanic(s.withPrincipal(s.routeWrites(s.withTenant(mux))))
+	// The envelope is OUTERMOST on the serving side, so it is stamped before
+	// any handler writes a byte. Headers set after the first write are
+	// silently dropped, and a dropped Complete header reads as "the peer did
+	// not say" -- which the router treats as not-complete, so a late stamp
+	// would make every answer look partial.
+	return recoverPanic(s.serveEnvelope(s.withPrincipal(s.routeWrites(s.withTenant(mux)))))
 }
 
 // recoverPanic turns a handler panic into a 500 and keeps the server serving --
