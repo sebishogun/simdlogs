@@ -470,3 +470,54 @@ func opsSpec() routeSpec {
 func adminSpec() routeSpec {
 	return routeSpec{methods: []string{http.MethodGet, http.MethodPost}, format: errText}
 }
+
+// writeIngestErr answers a failed ingest that stored part of its batch.
+//
+// The plain writeErr says only what went wrong. For a parse that failed part
+// way that is not enough: a client told "400, the upload is truncated" and
+// nothing else re-sends the whole upload, and every record that did land is
+// then stored twice. A log store has no primary key, so the duplicate is
+// invisible afterwards -- it looks exactly like the line happening twice.
+//
+// So the error body carries the counts as well as the message. `accepted` is
+// how many records are durable; a client re-sends from that offset rather than
+// from the start. It is omitted when nothing was stored, so the ordinary
+// failure keeps the shape it has today.
+func (s *Server) writeIngestErr(
+	w http.ResponseWriter, r *http.Request, spec routeSpec,
+	code int, msg string, res ingest.Result,
+) {
+	if res.Accepted == 0 {
+		s.writeErr(w, r, spec, code, msg)
+		return
+	}
+	s.countErr()
+	body := map[string]any{
+		"error":  msg,
+		"status": code,
+		// The records before the failure are stored. Re-sending them duplicates
+		// them, and a log store cannot tell a duplicate from a repeat.
+		"accepted": res.Accepted,
+		"rejected": res.Rejected,
+	}
+	if len(res.RejectedAt) > 0 {
+		body["rejectedAt"] = res.RejectedAt
+	}
+	if res.RejectedTruncated {
+		body["rejectedTruncated"] = true
+	}
+	if spec.format == errJSON {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(body)
+		return
+	}
+	// A non-JSON route still has to carry the count somewhere a client can read
+	// it, and its body is whatever that route's format is.
+	w.Header().Set(hdrAccepted, strconv.Itoa(res.Accepted))
+	http.Error(w, msg, code)
+}
+
+// hdrAccepted carries the durable record count on a route whose error body is
+// not JSON.
+const hdrAccepted = "X-Simdlogs-Accepted"

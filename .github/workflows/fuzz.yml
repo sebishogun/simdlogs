@@ -1,0 +1,101 @@
+name: fuzz
+
+# Nightly, plus on demand. Not on every push: a useful fuzz run takes minutes
+# per target, and a gate that has to finish in seconds is a gate that finds
+# nothing.
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: 'Per-target fuzz duration'
+        default: '120s'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz corpus
+    runs-on: ubuntu-latest
+    # Bounded at the job level as well as per target. A fuzz target that hangs
+    # rather than failing would otherwise hold a runner for six hours.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
+
+      # The seed corpus first, as an ordinary test. Every target's seeds run in
+      # `go test ./...` too, so a seed that fails is a normal red build -- this
+      # step exists so a failure here is attributed to fuzzing rather than
+      # buried in the package run.
+      - name: seed corpus
+        run: go test -run 'Fuzz' -timeout 300s ./...
+
+      # Targets are DISCOVERED, not listed. A hand-maintained list is how a new
+      # target gets written and never run: it would sit in the tree looking like
+      # coverage while nothing executed it.
+      - name: fuzz every target
+        env:
+          FUZZTIME: ${{ github.event.inputs.fuzztime || '120s' }}
+        run: |
+          set -o pipefail
+          # One (package, target) pair per line, into a FILE.
+          #
+          # Not piped into the loop: a `while` on the right of a pipe runs in a
+          # subshell, so the failure flag set inside it dies with that subshell
+          # and the step exits 0. This repository has had three red gates
+          # laundered into green exits that way.
+          grep -rn '^func Fuzz' --include='*_test.go' . \
+            | sed 's|/[^/]*_test.go:[0-9]*:func \(Fuzz[A-Za-z0-9_]*\).*|\t\1|' \
+            | sort -u > /tmp/fuzz-targets.tsv
+          if [ ! -s /tmp/fuzz-targets.tsv ]; then
+            echo "::error::no fuzz targets found; the discovery pattern has drifted"
+            exit 1
+          fi
+          echo "found $(wc -l < /tmp/fuzz-targets.tsv) targets"
+          status=0
+          while IFS=$'\t' read -r pkg target; do
+            echo "::group::$pkg $target"
+            # -parallel 4: the API targets open listeners, and one worker per
+            # CPU exhausts the ephemeral port range within seconds.
+            if ! go test -run "^${target}$" -fuzz "^${target}$" \
+                 -fuzztime "$FUZZTIME" -parallel 4 -timeout 600s "$pkg"; then
+              echo "::error::$target failed in $pkg"
+              status=1
+            fi
+            echo "::endgroup::"
+          done < /tmp/fuzz-targets.tsv
+          exit $status
+
+      # A crash found by fuzzing is written into testdata/fuzz and is worth
+      # keeping: it is a reproducer, and it becomes a seed for every later run.
+      - name: upload any new corpus entries
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: '**/testdata/fuzz/**'
+          if-no-files-found: ignore
+
+  # Crash recovery, repeated. One pass proves the mechanism exists; the failure
+  # this looks for is the one that needs a particular interleaving, and that
+  # only turns up across many runs.
+  crash-repetitions:
+    name: crash recovery x25
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
+      - name: repeat the crash matrix
+        run: go test -run 'Crash|Recovery|Restart|Kill' -count=25 -timeout 1800s ./...
+      - name: repeat under the race detector
+        run: go test -race -run 'Crash|Recovery|Restart|Kill|Concurrent' -count=5 -timeout 1800s ./...

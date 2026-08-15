@@ -4231,3 +4231,63 @@ merged while invisible to either.
 the interesting cases and lets the rest fall through to the success path. Every
 status nobody thought about became "fine", and the failure only surfaced when
 something downstream depended on the operation having actually happened.
+
+## 41. A position field filled with a constant, and a 400 whose rows arrived later
+
+Task 9.1 added 22 fuzz targets. Four of them failed on their seed corpus before
+any generated input ran, which is the useful kind of failure: the seeds are
+hand-written normal cases.
+
+**`Result.RejectedAt` was populated by half the ingest envelopes.** There is a
+`Result.Reject(ordinal)` helper that records the position and sets
+`RejectedTruncated` past the bound; logfmt, journald, Loki, Datadog and the OTLP
+protobuf path all bypassed it with a bare `res.Rejected++`. So a result reported
+`Rejected: 1` with no position and `RejectedTruncated: false`, and the field's
+own documentation says a caller must read that as "there were no more
+positions", not "the positions are unknown.
+
+**Five `res.Warn(0, ...)` calls passed a constant where an offset was meant**, so
+every warning from those envelopes blamed byte 0. Datadog's was in the same
+`if` as its missing rejection position.
+
+Fixing this needed the two fields kept apart, and the first attempt got it
+wrong: `RejectedAt` is a **record ordinal**, `Warning.Offset` is a **byte
+offset**. Journald's three warnings already passed real byte offsets and were
+correct; converting them to ordinals — which is what "make the units consistent"
+suggests — would have replaced right with wrong. The units differ because the
+questions differ, and the fix is per site.
+
+**A 400 whose rows arrived under someone else's request.** The journald parser
+keeps entries that parsed before a truncation, deliberately, with tests that say
+so. But `ingestBody` returned on a parse error **without flushing**, and the
+rows sit in the tenant's shared writer buffer. Measured:
+
+| Step | Response | Rows in store |
+|---|---|---|
+| journald upload, 2 entries then a cut field | 400 | 0 |
+| one unrelated jsonline write | 200 | **3** |
+
+The client was told 400 and its two records were committed moments later, by a
+request that had nothing to do with them. The 400 also said nothing about them,
+so re-sending the upload — the only thing a client can do with a bare 400 —
+duplicates exactly the part that landed, and a log store cannot tell a duplicate
+from a line that happened twice. Now the error path flushes under its own mark
+and the body carries `accepted`, `rejected` and `rejectedAt`.
+
+**CI asserted a platform that cannot compile.** `ci.yml`'s cross matrix listed
+`386`. `GOARCH=386 go build ./...` fails at `github.com/sebishogun/simdjson`,
+whose `marshal.go` writes `math.MaxUint32` as an untyped constant that overflows
+a 32-bit int. That job has never been able to pass. 386 removed from both
+workflows with the reason recorded; the upstream fix is task #424.
+
+**Three of the fuzz failures were the harness, not the code**, and saying so
+matters as much as the real findings: a `From > To` window is the empty range
+the query asked for and the scan returns zero rows (checked, not assumed); a
+cursor spliced into a URL unescaped made the *client* refuse a control
+character; and creating an `httptest` server per fuzz iteration exhausted the
+ephemeral port range across 32 workers. A fuzz target that fails for its own
+reasons is worse than none, because the next person reads it as a defect.
+
+**The shape.** Entry 40's peer-4xx was a classification that let unhandled cases
+fall through to success. This is the same thing in a data field: a position
+nobody filled in, defaulting to a value that means something specific and wrong.

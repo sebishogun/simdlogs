@@ -26,6 +26,12 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 	fields := map[string]string{}
 	var ts int64
 	haveTS := false
+	// The RECORD ordinal, for Result.RejectedAt. Distinct from Warning.Offset,
+	// which is a BYTE offset -- the two fields answer different questions and
+	// the sites below use each for its own. Four rejections here were recorded
+	// with no position at all, so a client mapping them onto its own batch had
+	// nothing to map.
+	ordinal := 0
 	reset := func() {
 		for k := range fields {
 			delete(fields, k)
@@ -38,8 +44,12 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 			// carrying only a __REALTIME_TIMESTAMP -- was dropped with no
 			// count, so a sender saw a 202 for records that were not there.
 			if haveTS {
-				res.Rejected++
+				res.Reject(ordinal)
+				// Offset 0: this parser knows the record, not the byte -- the
+				// entry ended at a blank line and its start is not carried
+				// here. Warning.Offset is "where the parser knows it".
 				res.Warn(0, "entry carries a timestamp and no storable field")
+				ordinal++
 			}
 			reset()
 			return
@@ -52,6 +62,7 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 		}
 		addWithStream(w, ts, fields, opts)
 		res.Accepted++
+		ordinal++
 		reset()
 	}
 	set := func(name string, val []byte) {
@@ -102,7 +113,7 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 			// success. IngestJournald could not return a failure at all, which
 			// is why the listener's error handling was unreachable.
 			if i+8 > n {
-				res.Rejected++
+				res.Reject(ordinal)
 				res.Warn(int64(i), "binary field %q: %d bytes of length prefix, need 8; "+
 					"the remainder of the upload is not parseable", name, n-i)
 				return res, envelopeErr(errJournaldTruncated)
@@ -112,7 +123,7 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 			// Compared as uint64 against the REMAINING bytes, so a length near
 			// 2^64 cannot wrap when it is narrowed to int on a 32-bit build.
 			if ln > uint64(n-i) {
-				res.Rejected++
+				res.Reject(ordinal)
 				res.Warn(int64(i), "binary field %q declares %d bytes, %d remain; "+
 					"the remainder of the upload is not parseable", name, ln, n-i)
 				return res, envelopeErr(errJournaldTruncated)
@@ -127,7 +138,7 @@ func IngestJournaldOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 			// upload was cut mid-field. Same treatment -- reported, not
 			// silently dropped.
 			if len(trimSpace(data[ns:])) > 0 {
-				res.Rejected++
+				res.Reject(ordinal)
 				res.Warn(int64(ns), "field %q ends without a value separator; "+
 					"the upload is truncated", name)
 				emit()

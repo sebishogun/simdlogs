@@ -40,6 +40,11 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 	if !validProtobuf(data) {
 		return res, encodingErr(errBadProtobuf)
 	}
+	// ordinal is the record's position across the whole payload, flat rather
+	// than per resource or per scope: OTLP nests records two levels deep, and a
+	// caller matching a rejection back onto what it sent counts records in
+	// order. It used to be recorded with no position at all.
+	ordinal := 0
 	sawResourceLogs := false
 	// sawLogShape is the discriminator: a LogRecord carries its timestamp as
 	// a fixed64, where Metric.name and Span.trace_id at the same field number
@@ -201,7 +206,8 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				// record whose field 1 is length-delimited is another signal
 				// wearing a log's field numbers.
 				if wrongShape {
-					res.Rejected++
+					res.Reject(ordinal)
+					ordinal++
 					res.Warn(0, "record's field 1 is not a timestamp; a metrics or traces payload, not logs")
 					return
 				}
@@ -220,6 +226,7 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				}
 				addWithStream(w, ts, fields, opts)
 				res.Accepted++
+				ordinal++
 			})
 		})
 	})

@@ -155,9 +155,72 @@ cache misses) — but the disassembly comes first.
 Every simd kernel has a portable fallback through the `simd` package, so
 missing architecture kernels affect speed, not availability. The query and
 storage tests run the scalar paths as the conformance oracle and the SIMD
-paths as the shipped path, differential-tested. Cross-arch verification is
-`go test ./...` on the target arch with the tier name recorded; wall-clock
-claims are amd64/AVX-512 only.
+paths as the shipped path, differential-tested. Wall-clock claims are
+amd64/AVX-512 only.
+
+`.github/workflows/cross.yml` is where the arch lanes run, and the distinction
+between its two jobs is the point:
+
+| Lane | How | What it can show |
+|---|---|---|
+| linux/arm64 | native runner | a real run: test, race, purego |
+| linux/s390x, ppc64le, riscv64 | qemu | correctness, slowly; **not** timing |
+
+s390x is the one that earns its runtime. It is big-endian, and this store
+writes little-endian lengths, maps files, and packs bits — every place a length
+or a checksum is read back with the wrong byte order fails there and nowhere
+else. `ci.yml` cross-**builds** the same targets on every push; a build proves
+portability in the type system's sense and says nothing about endianness, so
+the two are not substitutes.
+
+**linux/386 is not supported, and its absence is the claim.** This module
+depends on `github.com/sebishogun/simdjson`, whose `marshal.go` writes
+`math.MaxUint32` as an untyped constant; on a 32-bit target that overflows an
+int and the dependency does not compile, so `GOARCH=386 go build ./...` fails
+before any code here is reached. `ci.yml` listed 386 in its cross matrix
+anyway, which asserted a platform through a job that could not pass. Restoring
+the lane needs the constant typed upstream and a release taken.
+
+## Fuzzing
+
+`.github/workflows/fuzz.yml`, nightly, plus `workflow_dispatch` with a
+per-target duration.
+
+The targets are **discovered** from the tree rather than listed. A
+hand-maintained list is how a target gets written and never run — it sits in
+the tree looking like coverage while nothing executes it — so the job greps for
+`func Fuzz`, fails if the pattern matches nothing, and prints the count it
+found.
+
+22 targets across four packages:
+
+| Package | Covers |
+|---|---|
+| `internal/ingest` | jsonline, logfmt, syslog, journald, Loki (JSON and protobuf), Datadog, OTLP (JSON and protobuf), vector field specs and values |
+| `internal/query` | LogsQL, SQL, time-window resolution |
+| `internal/storage` | group parser, backup manifest, restore tar, adopted groups, digest lookup |
+| `internal/api` | peer envelope, Elasticsearch `_search`, cursors |
+
+What they assert, beyond "no panic":
+
+- **Determinism.** The same bytes twice must give the same counts and the same
+  error. A retry of a rejected batch cannot be reasoned about otherwise.
+- **The reported count is what landed.** Not "an error means nothing was
+  stored" — journald deliberately keeps the entries that parsed before a
+  truncation — but that `Accepted` equals the rows in the store either way. A
+  client that cannot tell what landed re-sends it and duplicates it.
+- **A refusal leaves nothing behind.** A restore that unpacked half an archive
+  before rejecting it has produced a directory the next open will read.
+- **Absent is not "yes".** A peer that sends no completeness header has not
+  said the answer is complete.
+
+The seed corpus runs in the ordinary `go test ./...`, so a seed that fails is a
+normal red build. The fuzz job runs it as a separate step first, so a failure
+is attributed rather than buried.
+
+`crash-repetitions` in the same workflow repeats the crash/recovery/restart
+tests 25 times, and 5 times under `-race`. One pass proves the mechanism
+exists; the failures worth finding need a particular interleaving.
 
 ## Malformed input
 

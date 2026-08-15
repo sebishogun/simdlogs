@@ -43,11 +43,21 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 		return res, envelopeErr(errNoStreams)
 	}
 	fields := map[string]string{}
+	// A FLAT ordinal across the whole payload, not a per-stream one. A Loki
+	// push nests entries inside streams, and a caller matching a rejection or a
+	// warning back onto what it sent counts entries in order -- so a position
+	// that restarted at each stream would name the wrong entry in every stream
+	// after the first.
+	ordinal := 0
 	for _, st := range p.Streams {
 		for _, ent := range st.Values {
 			if len(ent) < 2 {
-				res.Rejected++
+				res.Reject(ordinal)
+				// Offset 0: Warning.Offset is a BYTE offset and this parser
+				// decoded JSON into a struct, so it knows the entry's position
+				// in the batch (recorded above) and not its position in bytes.
 				res.Warn(0, "stream entry has fewer than two elements")
+				ordinal++
 				continue
 			}
 			var tsStr, line string
@@ -92,6 +102,7 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 			}
 			addWithStream(w, ts, fields, opts)
 			res.Accepted++
+			ordinal++
 		}
 	}
 	return res, nil

@@ -1,0 +1,87 @@
+name: cross
+
+# Cross-architecture, and the part CI's build-only matrix cannot give: actually
+# RUNNING the tests somewhere that is not amd64.
+#
+# A build that compiles proves the code is portable in the type system's sense.
+# It says nothing about endianness, unaligned access, or a 32-bit int -- and
+# this store writes little-endian lengths, mmaps files, and packs bits.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Native arm64 hardware. GitHub provides it, so this is a real run rather
+  # than an emulated one -- no qemu caveat attaches to these results.
+  arm64:
+    name: linux/arm64 (native)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
+      - name: test
+        run: go test -timeout 300s ./...
+      - name: race
+        run: go test -race -timeout 600s ./...
+      - name: purego
+        run: go test -tags purego -timeout 300s ./...
+
+  # Big-endian and the rest, under emulation. s390x is the one that matters
+  # most here: it is big-endian, so any place a length or a checksum is read
+  # back with the wrong byte order shows up as a failure rather than as a
+  # portability question nobody can answer.
+  emulated:
+    name: linux/${{ matrix.goarch }} (qemu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [s390x, ppc64le, riscv64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
+      - name: register qemu
+        uses: docker/setup-qemu-action@v3
+      - name: test under emulation
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          # Emulation is roughly an order of magnitude slower, so the timeout
+          # is scaled rather than the test set trimmed. A trimmed set would
+          # mean the architectures most likely to break are the ones least
+          # tested.
+          GOFLAGS: -timeout=1800s
+        run: go test ./...
+      - name: purego under emulation
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOFLAGS: -timeout=1800s
+        run: go test -tags purego ./...
+
+  # 32-bit is NOT built, and that is the accurate claim rather than an
+  # omission.
+  #
+  # This module depends on github.com/sebishogun/simdjson, whose marshal.go
+  # writes `math.MaxUint32` as an untyped constant. On a 32-bit target that
+  # overflows an int and the dependency does not compile, so nothing downstream
+  # of it can either. `GOARCH=386 go build ./...` fails at the dependency,
+  # before any code in this repository is reached.
+  #
+  # ci.yml listed 386 in its cross matrix regardless, so a platform that cannot
+  # compile was being asserted by a job that cannot pass. Restoring the lane
+  # needs the constant typed in simdjson and a release taken; until then the
+  # claim is that this is a 64-bit module.

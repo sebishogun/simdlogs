@@ -49,7 +49,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        goarch: [arm64, ppc64le, s390x, riscv64, 386]
+        # 386 is absent, and its absence is the accurate claim: this module
+        # depends on github.com/sebishogun/simdjson, whose marshal.go writes
+        # `math.MaxUint32` as an untyped constant, which overflows a 32-bit
+        # int. `GOARCH=386 go build ./...` has never been able to succeed here.
+        # It was listed anyway, so the matrix asserted a platform that could
+        # not compile.
+        goarch: [arm64, ppc64le, s390x, riscv64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

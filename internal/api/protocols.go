@@ -154,14 +154,35 @@ func (s *Server) ingestBody(w http.ResponseWriter, r *http.Request, status int,
 	opts := ingestOptions(r)
 	mark := tn.w.Mark()
 	res, perr := parse(tn.w, body, tn.fallbackTS(), &opts)
-	// Whatever was accepted before the failure is still counted: the rows are
-	// in the writer either way, and metrics that disagree with the store are
-	// worse than metrics that report a partial batch.
 	if perr != nil {
 		// A payload this parser could not read is a failed request. Every one
 		// of these used to return zero records and success, so a
 		// misconfigured agent looked healthy while nothing was stored.
-		s.writeErr(w, r, ndjsonSpec(), ingest.StatusFor(perr), perr.Error())
+		//
+		// A parse can fail PART WAY, and journald deliberately keeps the
+		// entries that came before a truncation rather than discarding data the
+		// client really sent. Those rows are in the shared writer buffer, so
+		// two things have to happen here that used to happen nowhere:
+		//
+		//   - They are FLUSHED under this request's mark. Skipping the flush
+		//     did not stop them being stored, it only moved the moment: the
+		//     next unrelated write on this tenant committed them. Measured --
+		//     a 400 for a truncated journald upload, then a single jsonline
+		//     write, and three rows in the store.
+		//   - The count is REPORTED. A client told nothing but "400" re-sends
+		//     the whole upload, duplicating exactly the part that landed.
+		//
+		// Counted after the flush, for the same reason the success path counts
+		// after it: a counter that leads the store turns a failure into an
+		// apparent restart for rate().
+		if res.Accepted > 0 {
+			if ferr := tn.w.FlushMark(mark); ferr != nil {
+				s.writeFlushErr(w, r, ndjsonSpec(), ferr)
+				return
+			}
+			s.countRows(res.Accepted, res.Rejected, len(body))
+		}
+		s.writeIngestErr(w, r, ndjsonSpec(), ingest.StatusFor(perr), perr.Error(), res)
 		return
 	}
 	// FlushMark, not Flush: the row buffer is shared by every request and

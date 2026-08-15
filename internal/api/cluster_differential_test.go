@@ -23,7 +23,7 @@ import (
 // mock returns.
 
 // realShard is a storage node with rows in it.
-func realShard(t *testing.T, rows []string) *httptest.Server {
+func realShard(t testing.TB, rows []string) *httptest.Server {
 	t.Helper()
 	srv, err := NewServer(t.TempDir())
 	if err != nil {

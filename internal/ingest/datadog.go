@@ -41,7 +41,7 @@ func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Opti
 		entries = []map[string]json.RawMessage{one}
 	}
 	fields := map[string]string{}
-	for _, e := range entries {
+	for ordinal, e := range entries {
 		for k := range fields {
 			delete(fields, k)
 		}
@@ -93,7 +93,14 @@ func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Opti
 		// one field and pass), and wrong again for one carrying only a
 		// timestamp (no fields, but a message is not what it is missing).
 		if len(fields) == 0 {
-			res.Rejected++
+			// The ordinal is the entry's position in the batch, which is what
+			// a client matches its own records against. It used to be recorded
+			// with no position at all, so there was nothing to match.
+			//
+			// The warning keeps offset 0: Warning.Offset is a BYTE offset, and
+			// this parser decoded JSON into a struct and no longer knows where
+			// in the body the entry was.
+			res.Reject(ordinal)
 			res.Warn(0, "entry carries no storable attribute")
 			continue
 		}

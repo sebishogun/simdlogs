@@ -16,6 +16,10 @@ func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 	var res Result
 	mapped := !opts.Empty()
 	fields := map[string]string{}
+	// ordinal counts RECORDS, not lines: a blank line is not a record a client
+	// sent, so counting it would shift every later position by one and a caller
+	// mapping a rejection back onto its own batch would name the wrong record.
+	ordinal := 0
 	for len(data) > 0 {
 		nl := indexByte(data, '\n')
 		var line []byte
@@ -43,7 +47,8 @@ func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 			fields[k] = v
 		})
 		if len(fields) == 0 {
-			res.Rejected++
+			res.Reject(ordinal)
+			ordinal++
 			continue
 		}
 		if !haveTS {
@@ -54,6 +59,7 @@ func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 		}
 		addWithStream(w, ts, fields, opts)
 		res.Accepted++
+		ordinal++
 	}
 	return res, nil
 }
