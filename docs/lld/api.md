@@ -326,6 +326,70 @@ Environment: `SIMDLOGS_STREAM_FIELDS` (stream-field default before the
 default tenant opens, so a deployment can synthesize `_stream` without a
 code change).
 
+## Observability: metrics, structured logs, audit
+
+**The metric contract.** A metric name is an API — a dashboard, an alert rule
+and a capacity model are all written against a name and a meaning, and changing
+either silently is worse than deleting the series: a deleted series makes a
+panel go blank, a redefined one makes it lie. This campaign did both. Refused
+syslog bytes were added to `vl_bytes_ingested_total` ("Bytes of log data
+ingested") for bytes never ingested, and three admission series were emitted
+only when admission was configured while two documents listed them
+unconditionally.
+
+`metrics_contract_test.go` pins every series: name, type, and a one-line
+meaning, asserted in **both directions** — every contracted series must be
+present on a *default* server with its contracted type, and nothing may be
+emitted that the contract does not name. Writing it immediately found five
+emitted series no document mentioned (`simdlogs_tenants_open`,
+`_tenants_evicted_total`, `_tenants_rejected_total`,
+`simdlogs_retention_tombstones`, `_retention_failures_total`) and one that
+disappeared when `statfs` was unavailable.
+
+No metric carries an unbounded label. A tenant key or field name in a label is
+one time series per value, and a log server sees unbounded numbers of both —
+which falls over on the *monitoring system* rather than here, so it has to be
+refused at the source. Every per-tenant number is an aggregate (how many
+tenants are degraded, over quota, refusing writes) for exactly that reason, and
+a test asserts the exposition is label-free.
+
+**Structured logs.** `internal/observability`. Every operational line was a
+formatted sentence — `tenant 7:3: flush on eviction failed: no space left on
+device` — which a human reads fine and a machine cannot: alerting on "eviction
+flush failures for tenant 7:3" needs a regex against wording that is not a
+contract and changed three times in this campaign. The *fields* are the
+contract: `tenant`, `route`, `request_id`, `shard`, `error_class`, `event`. A
+query is `event=tenant.evict.flush_failed AND tenant=7:3`, and rewording a
+message breaks nobody. `-log.format=json|text` (text by default, because that
+is what the process wrote before and a silent format change breaks whatever was
+parsing it) and `-log.level`.
+
+`error_class` is coarse and closed — `client`, `storage`, `budget`, `upstream`,
+`internal`, `cancelled`, `corruption` — because an operator alerts on "storage
+errors rose" and cannot alert on a sentence.
+
+**Audit.** A separate stream (`-audit.file`), because it answers to a different
+reader with a different retention: an operator greps the operational log while
+an incident is open and lets it roll; a security review reads the audit log
+months later and needs it complete. Mixing them means either the operational
+volume evicts the audit records or the audit retention pays for the operational
+volume. Audit records are **never** filtered by `-log.level` — "we stopped
+recording authentication failures because someone raised the log level" is not
+a thing an audit trail may do.
+
+A closed vocabulary: `auth.failed`, `auth.forbidden`, `admin.backup`,
+`admin.restore`, `admin.rule_changed`, `admin.corruption_acknowledged`,
+`admin.topology_reload`, `admin.retention`. Every record carries a subject; an
+unauthenticated action records `unauthenticated`, which is a countable fact
+rather than an absent field.
+
+`auth.failed` and `auth.forbidden` are distinct events — no credential at all
+versus a valid credential reaching for a role it does not hold — because the
+response to them is different. Both are recorded at the **tenant resolver** as
+well as in `requireAuth`: the resolver runs before the mux, so it is where most
+refusals actually happen, and a trail that recorded only `requireAuth` missed
+the common case entirely.
+
 ## Health: liveness and readiness
 
 `health.go`. They are used for **opposite actions**: liveness failing means

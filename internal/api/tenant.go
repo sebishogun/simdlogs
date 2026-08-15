@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"path"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/sebishogun/simdlogs/internal/config"
 	"github.com/sebishogun/simdlogs/internal/ingest"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
@@ -238,10 +238,18 @@ func (s *Server) evictIdleLocked() bool {
 	// must be shut before another OpenStore on the same directory: the
 	// directory lock allows one writer.
 	if err := victim.w.Close(); err != nil {
-		log.Printf("tenant %s: flush on eviction failed: %v", victim.key, err)
+		obs.L().Error("eviction flush failed",
+			obs.FieldEvent, "tenant.evict.flush_failed",
+			obs.FieldTenant, victim.key,
+			obs.FieldErrorClass, string(obs.ClassStorage),
+			"error", err)
 	}
 	if err := victim.store.Close(); err != nil {
-		log.Printf("tenant %s: close on eviction failed: %v", victim.key, err)
+		obs.L().Error("eviction close failed",
+			obs.FieldEvent, "tenant.evict.close_failed",
+			obs.FieldTenant, victim.key,
+			obs.FieldErrorClass, string(obs.ClassStorage),
+			"error", err)
 	}
 	tenantsEvicted.Add(1)
 	return true
@@ -311,8 +319,22 @@ func (s *Server) withTenant(h http.Handler) http.Handler {
 			// mux, so requireAuth -- the other place that sets it -- is never
 			// reached for these paths.
 			code := authStatus(err)
-			if code == http.StatusUnauthorized {
+			// Audited HERE as well as in requireAuth, because this is where
+			// most refusals actually happen: the tenant resolver runs before
+			// the mux, so an unauthenticated request to a privileged route is
+			// refused here and requireAuth's own branch is never reached. A
+			// trail that only recorded the second one would miss the common
+			// case entirely -- which is what it did.
+			switch code {
+			case http.StatusUnauthorized:
 				w.Header().Set("WWW-Authenticate", `Bearer realm="simdlogs"`)
+				obs.Audit(r.Context(), obs.EventAuthFailed, subjectOf(r), obs.OutcomeDenied,
+					obs.FieldRoute, r.URL.Path, obs.FieldMethod, r.Method,
+					"reason", err.Error())
+			case http.StatusForbidden:
+				obs.Audit(r.Context(), obs.EventAuthForbidden, subjectOf(r), obs.OutcomeDenied,
+					obs.FieldRoute, r.URL.Path, obs.FieldMethod, r.Method,
+					"reason", err.Error())
 			}
 			atomic.AddInt64(&s.nHTTPErrs, 1)
 			// A storage failure's message is the SERVER's -- "mkdir
@@ -325,7 +347,15 @@ func (s *Server) withTenant(h http.Handler) http.Handler {
 			// Only for the storage classes: an auth or parse failure's message
 			// is about the REQUEST and is what makes it fixable.
 			if k := storageErrKind(err); k != storageNotAnError {
-				log.Printf("tenant %s: store unavailable: %v", tenantKeyOf(r), err)
+				// The server's own message, with the data directory in it,
+				// goes HERE -- the client gets the class. See
+				// storageErrMessage.
+				obs.L().Error("tenant store unavailable",
+					obs.FieldEvent, "tenant.open_failed",
+					obs.FieldTenant, tenantKeyOf(r),
+					obs.FieldRoute, r.URL.Path,
+					obs.FieldErrorClass, string(obs.ClassStorage),
+					"error", err)
 				http.Error(w, storageErrMessage(k), code)
 				return
 			}

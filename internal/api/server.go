@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -27,6 +26,7 @@ import (
 
 	"github.com/sebishogun/simdlogs/internal/config"
 	"github.com/sebishogun/simdlogs/internal/ingest"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/query"
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
@@ -320,7 +320,9 @@ func (s *Server) drainInFlight(d time.Duration) bool {
 			return true
 		}
 		if time.Now().After(deadline) {
-			log.Printf("shutdown: %d requests still in flight after %s; closing anyway", busy, d)
+			obs.L().Warn("closing with requests still in flight",
+				obs.FieldEvent, "shutdown.drain_timeout",
+				"in_flight", busy, "waited", d.String())
 			return false
 		}
 		time.Sleep(2 * time.Millisecond)
@@ -726,7 +728,12 @@ func recoverPanic(h http.Handler) http.Handler {
 			if v == http.ErrAbortHandler {
 				panic(v) // net/http handles this one; it must reach conn.serve
 			}
-			log.Printf("simdlogs: panic serving %s: %v", r.URL.Path, v)
+			obs.L().Error("panic serving request",
+				obs.FieldEvent, "http.panic",
+				obs.FieldRoute, r.URL.Path,
+				obs.FieldMethod, r.Method,
+				obs.FieldErrorClass, string(obs.ClassInternal),
+				"panic", v)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 		}()
 		h.ServeHTTP(w, r)
@@ -2067,6 +2074,16 @@ func (s *Server) acknowledgeDegraded(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, err := s.AcknowledgeDegraded()
+	// Audited whichever way it went. Acknowledging corruption is a person
+	// deciding that data loss is accepted and the server may serve on -- the
+	// single most consequential administrative action here, and the one whose
+	// absence from a record would be least explicable afterwards.
+	outcome := obs.OutcomeOK
+	if err != nil {
+		outcome = obs.OutcomeFailed
+	}
+	obs.Audit(r.Context(), obs.EventCorruptionAck, subjectOf(r), outcome,
+		"tenants_acknowledged", n, "error", logErrText(err))
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)

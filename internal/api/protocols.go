@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/binary"
 	"encoding/json"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,6 +54,13 @@ func (s *Server) backup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tn.backupBusy.Store(false)
+
+	// Audited. A backup is a full copy of a tenant's data leaving the server,
+	// so "who took one, when" is the question a security review asks first --
+	// and the answer has to exist before the review, not be reconstructed from
+	// an access log that may have rolled.
+	obs.Audit(r.Context(), obs.EventBackupTaken, subjectOf(r), obs.OutcomeOK,
+		obs.FieldTenant, tn.key, obs.FieldRoute, r.URL.Path)
 
 	// Flush before the snapshot, so the archive holds what this tenant has
 	// been told is stored. Rows still in the writer's buffer are in no group

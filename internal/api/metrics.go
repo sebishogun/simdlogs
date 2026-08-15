@@ -135,10 +135,13 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 			over++
 		}
 	})
-	if capacity > 0 {
-		m("simdlogs_storage_capacity_bytes", "Total bytes of the storage filesystem.",
-			"gauge", capacity)
-	}
+	// Unconditional, 0 meaning "not measurable here". A series that appears
+	// only when statfs works makes a capacity panel silently blank on the
+	// platforms where it does not -- indistinguishable from a server with
+	// nothing to report.
+	m("simdlogs_storage_capacity_bytes",
+		"Total bytes of the storage filesystem; 0 where free space cannot be measured.",
+		"gauge", capacity)
 	m("simdlogs_storage_warn_tenants", "Tenants whose free space is below the warn reserve.",
 		"gauge", warn)
 	m("simdlogs_storage_reject_tenants", "Tenants whose free space is below the reject reserve.",

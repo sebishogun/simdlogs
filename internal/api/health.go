@@ -387,6 +387,17 @@ func (s *Server) writeHealthText(w http.ResponseWriter, rep HealthReport, ok boo
 	}
 }
 
+// logErrText renders an error for a log field without a nil check at every
+// call site. "" rather than "<nil>", so a query for `error != ""` means what
+// it looks like. (errText is already taken in this package by the response
+// error format.)
+func logErrText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 type healthKind uint8
 
 const (

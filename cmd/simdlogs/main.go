@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"io"
 	"log"
 	"net/http"
@@ -60,6 +61,18 @@ func main() {
 	queryQueueWait := flag.Duration("query-queue-wait", 0,
 		"how long a read may wait for an admission slot before 429; 0 refuses immediately, "+
 			"which is right for an interactive endpoint")
+	logFormat := flag.String("log.format", "text",
+		"`text` or `json`. JSON for a log pipeline; text is the default because it is "+
+			"what this process wrote before structured logging, and a silent format "+
+			"change breaks whatever was parsing it")
+	logLevel := flag.String("log.level", "info", "debug, info, warn or error")
+	auditFile := flag.String("audit.file", "",
+		"write audit records here instead of to stderr. Audit records answer to a "+
+			"different reader with a different retention than the operational log: an "+
+			"operator greps one while an incident is open, a security review reads the "+
+			"other months later and needs it complete. They are never filtered by "+
+			"-log.level -- \"we stopped recording authentication failures because someone "+
+			"raised the log level\" is not a thing an audit trail may do")
 	vectorFields := flag.String("vector-fields", "",
 		"comma-separated name:dim pairs declaring which record fields are embeddings, "+
 			"e.g. `embedding:768`. A JSON array is only read as a vector for a field named "+
@@ -189,6 +202,21 @@ func main() {
 	cfg.Limits.MaxQueriesPerTenant = *maxPerTenantQ
 	cfg.Limits.QueryQueueWait = *queryQueueWait
 	cfg.VectorFields = *vectorFields
+
+	var auditOut io.Writer
+	if *auditFile != "" {
+		f, err := os.OpenFile(*auditFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			log.Fatalf("simdlogs: -audit.file: %v", err)
+		}
+		defer f.Close()
+		auditOut = f
+	}
+	if err := obs.Init(obs.Config{
+		Format: *logFormat, Level: *logLevel, AuditOut: auditOut,
+	}); err != nil {
+		log.Fatalf("simdlogs: %v", err)
+	}
 	cfg.Limits.MaxVectorK = *maxVectorK
 	cfg.Limits.MaxVectorDim = *maxVectorDim
 	cfg.Limits.MaxVectorCandidates = *maxVectorCandidates

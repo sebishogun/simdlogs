@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
@@ -55,7 +56,11 @@ func (s *Server) syslogAdmits(n int) bool {
 	last := atomic.LoadInt64(&s.lastSyslogRefusal)
 	if now-last > int64(syslogRefusalLogInterval) &&
 		atomic.CompareAndSwapInt64(&s.lastSyslogRefusal, last, now) {
-		log.Printf("syslog: refusing messages, %d bytes dropped: %v", n, err)
+		obs.L().Warn("syslog messages refused by the storage budget",
+			obs.FieldEvent, "syslog.refused",
+			obs.FieldErrorClass, string(obs.ClassStorage),
+			obs.FieldBytes, n,
+			"error", err)
 	}
 	return false
 }

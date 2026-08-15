@@ -8,6 +8,7 @@ import (
 
 	"errors"
 	"github.com/sebishogun/simdlogs/internal/config"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/storage"
 	"syscall"
 )
@@ -183,11 +184,28 @@ func (s *Server) requireAuth(role config.Role, spec routeSpec, h http.HandlerFun
 		}
 		p := principalOf(r)
 		if p == nil {
+			// Audited. An unauthenticated request to a privileged route is the
+			// first line of any credential-stuffing or misconfiguration
+			// incident, and "we have no record" is the answer a security
+			// review must never get.
+			obs.Audit(r.Context(), obs.EventAuthFailed, "", obs.OutcomeDenied,
+				obs.FieldRoute, r.URL.Path,
+				obs.FieldMethod, r.Method,
+				"required_role", string(role))
 			w.Header().Set("WWW-Authenticate", `Bearer realm="simdlogs"`)
 			s.writeErr(w, r, spec, http.StatusUnauthorized, "authentication required")
 			return
 		}
 		if !p.Can(role) {
+			// A VALID credential reaching for a role it does not hold is a
+			// different event from no credential at all: one is a client that
+			// forgot to authenticate, the other is a principal doing something
+			// it was not given. They are counted separately because the
+			// response to them is different.
+			obs.Audit(r.Context(), obs.EventAuthForbidden, p.Subject, obs.OutcomeDenied,
+				obs.FieldRoute, r.URL.Path,
+				obs.FieldMethod, r.Method,
+				"required_role", string(role))
 			s.writeErr(w, r, spec, http.StatusForbidden,
 				"principal "+p.Subject+" does not hold the "+string(role)+" role")
 			return
@@ -332,6 +350,16 @@ func storageErrKind(err error) storageErrClass {
 // -- and the first version of this classified all three as retryable.
 var permanentStorageErrnos = []error{
 	syscall.EACCES, syscall.EPERM, syscall.EROFS, syscall.ENOTDIR,
+}
+
+// subjectOf is the authenticated principal's name, or "" when there is none.
+// Audit records carry it, and an audit record with no subject is a fact rather
+// than a gap: it says the action was taken unauthenticated.
+func subjectOf(r *http.Request) string {
+	if p := principalOf(r); p != nil {
+		return p.Subject
+	}
+	return ""
 }
 
 // storageErrMessage is what the CLIENT is told. The server's own message names
