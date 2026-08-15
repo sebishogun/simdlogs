@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/sebishogun/simdlogs/internal/storage"
 	"io"
 	"mime"
 	"net/http"
@@ -205,6 +206,71 @@ func (s *Server) routeWrites(next http.Handler) http.Handler {
 // relays its response -- so a burst of inserts spreads across the cluster.
 // It round-robins over shards and writes the record to every replica in the
 // chosen shard, so a replica loss never loses data.
+// ConsistencyLevel is how many replicas must acknowledge a write before the
+// client is told it succeeded.
+//
+// The old behaviour was none of these: forwardWrite replicated to every member
+// and relayed the LAST response's status. Replica A refusing on its own quota
+// and replica B accepting answered whichever finished last, so the same write
+// was reported as stored or refused depending on scheduling -- and a 507 in
+// the other order made a retry duplicate into the replica that had already
+// taken it.
+type ConsistencyLevel string
+
+const (
+	// ConsistencyOne succeeds when any replica commits. The write may exist on
+	// one machine only, so losing that machine loses the data.
+	ConsistencyOne ConsistencyLevel = "one"
+	// ConsistencyQuorum succeeds when more than half commit.
+	ConsistencyQuorum ConsistencyLevel = "quorum"
+	// ConsistencyAll succeeds only when every replica commits.
+	//
+	// The DEFAULT, and it stays the default until repair is proven. Quorum is
+	// the usual production choice because a repair process reconciles the
+	// replicas that missed a write -- and this has no repair process (task
+	// 8.7). Without one, "quorum" means a replica silently missing data
+	// forever, and a read that happens to land on it returns a short answer
+	// with nothing to say so. Defaulting to the strictest level is the honest
+	// position for a system that cannot yet heal.
+	ConsistencyAll ConsistencyLevel = "all"
+)
+
+// required is how many acknowledgements this level needs from n replicas.
+func (c ConsistencyLevel) required(n int) int {
+	switch c {
+	case ConsistencyOne:
+		return 1
+	case ConsistencyQuorum:
+		return n/2 + 1
+	default:
+		return n
+	}
+}
+
+// ParseConsistency validates a level.
+func ParseConsistency(s string) (ConsistencyLevel, error) {
+	switch ConsistencyLevel(s) {
+	case "":
+		return ConsistencyAll, nil
+	case ConsistencyOne:
+		return ConsistencyOne, nil
+	case ConsistencyQuorum:
+		return ConsistencyQuorum, nil
+	case ConsistencyAll:
+		return ConsistencyAll, nil
+	}
+	return "", fmt.Errorf("simdlogs: consistency must be one, quorum or all, not %q", s)
+}
+
+// replicaOutcome is one replica's answer to a write.
+type replicaOutcome struct {
+	URL       string `json:"replica"`
+	Status    int    `json:"status,omitempty"`
+	Duplicate bool   `json:"duplicate,omitempty"`
+	Class     string `json:"class,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
 func (s *Server) forwardWrite(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -219,41 +285,164 @@ func (s *Server) forwardWrite(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, r, ndjsonSpec(), http.StatusBadRequest, err.Error())
 		return
 	}
-	shards := s.shards()
-	shard := shards[int(atomic.AddInt64(&s.rr, 1)-1)%len(shards)]
-	var lastResp *http.Response
-	var okAny bool
-	for _, b := range shard { // replicate to every member of the shard
-		req, err := http.NewRequestWithContext(r.Context(), r.Method, b+r.URL.Path, bytes.NewReader(body))
-		if err != nil {
-			continue
-		}
-		req.Header = r.Header.Clone()
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			continue
-		}
-		if lastResp != nil {
-			lastResp.Body.Close()
-		}
-		lastResp, okAny = resp, true
-	}
-	if !okAny {
-		http.Error(w, "all replicas unreachable", 502)
+
+	level, err := ParseConsistency(r.Header.Get(HdrConsistency))
+	if err != nil {
+		s.writeErr(w, r, ndjsonSpec(), http.StatusBadRequest, err.Error())
 		return
 	}
-	defer lastResp.Body.Close()
-	// Relay the backend's Content-Type. Without it the router answered with
-	// whatever Go sniffed from the first bytes, so the SAME path returned a
-	// different media type depending on deployment mode -- and fixing the
-	// single-node handlers made two more paths diverge rather than fewer,
-	// because the router half never moved with them. A client must not have to
-	// know whether it is talking to a storage node or a router.
-	if ct := lastResp.Header.Get("Content-Type"); ct != "" {
-		w.Header().Set("Content-Type", ct)
+
+	// The write id: the client's if it sent one -- that is how a retry names
+	// the write it is repeating -- otherwise a fresh one. Validated because a
+	// client-supplied id ends up in the manifest.
+	wid := r.Header.Get(HdrWriteID)
+	if wid != "" && !storage.ValidWriteID(wid) {
+		s.writeErr(w, r, ndjsonSpec(), http.StatusBadRequest,
+			"simdlogs: "+HdrWriteID+" must be 8-64 hex characters")
+		return
 	}
-	w.WriteHeader(lastResp.StatusCode)
-	io.Copy(w, lastResp.Body)
+	if wid == "" {
+		id, err := storage.NewWriteID()
+		if err != nil {
+			s.writeErr(w, r, ndjsonSpec(), http.StatusInternalServerError, err.Error())
+			return
+		}
+		wid = string(id)
+	}
+
+	shards := s.shards()
+	shard := shards[int(atomic.AddInt64(&s.rr, 1)-1)%len(shards)]
+
+	// Every replica, in parallel, each carrying the SAME write id. A replica
+	// that already has it answers "duplicate", which counts as an
+	// acknowledgement: the data is there, which is the only thing the level is
+	// asking about.
+	outcomes := make([]replicaOutcome, len(shard))
+	var wg sync.WaitGroup
+	for i, b := range shard {
+		wg.Add(1)
+		go func(i int, b string) {
+			defer wg.Done()
+			outcomes[i] = s.replicateTo(r, b, body, wid)
+		}(i, b)
+	}
+	wg.Wait()
+
+	acked := 0
+	for _, o := range outcomes {
+		if o.Error == "" {
+			acked++
+		}
+	}
+	need := level.required(len(shard))
+	w.Header().Set(HdrWriteID, wid)
+	w.Header().Set(HdrConsistency, string(level))
+	w.Header().Set("Content-Type", "application/json")
+
+	if acked < need {
+		// Refused, and the client is told the write id. That is what makes the
+		// retry safe: the replicas that DID commit recognise the id and answer
+		// duplicate rather than storing the rows twice.
+		obs.L().Error("replicated write did not reach its consistency level",
+			obs.FieldEvent, "cluster.write_underreplicated",
+			"write_id", wid, "acked", acked, "required", need,
+			obs.FieldErrorClass, string(obs.ClassUpstream))
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": fmt.Sprintf(
+				"%d of %d replicas acknowledged, %s requires %d; retry with %s: %s "+
+					"-- replicas that already committed will not duplicate",
+				acked, len(shard), level, need, HdrWriteID, wid),
+			"write_id": wid,
+			"replicas": s.visibleOutcomes(r, outcomes),
+			"acked":    acked,
+			"required": need,
+		})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"write_id": wid,
+		"acked":    acked,
+		"replicas": s.visibleOutcomes(r, outcomes),
+	})
+}
+
+// visibleOutcomes redacts per-replica detail from unauthorized callers.
+//
+// Replica URLs and their individual failures are the cluster's internal
+// topology. An operator needs them to act; an ordinary ingest client needs to
+// know only that the write did or did not reach its level, and telling it
+// which machines exist and which are down is a map of the deployment.
+func (s *Server) visibleOutcomes(r *http.Request, outcomes []replicaOutcome) []replicaOutcome {
+	if s.healthDetailAllowed(r) {
+		return outcomes
+	}
+	out := make([]replicaOutcome, len(outcomes))
+	for i, o := range outcomes {
+		out[i] = replicaOutcome{Status: o.Status, Duplicate: o.Duplicate, Class: o.Class}
+	}
+	return out
+}
+
+// replicateTo sends the write to one replica and classifies the answer.
+func (s *Server) replicateTo(r *http.Request, url string, body []byte, wid string) replicaOutcome {
+	out := replicaOutcome{URL: url}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, url+r.URL.Path,
+		bytes.NewReader(body))
+	if err != nil {
+		out.Class, out.Error = string(PeerMalformed), err.Error()
+		return out
+	}
+	// Explicit headers, not r.Header.Clone().
+	//
+	// Cloning forwarded the client's Authorization and cookies to every
+	// storage node -- the router authenticates to peers as itself, and a
+	// client credential travelling past the node it was presented to is how
+	// one node's compromise becomes the cluster's.
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		req.Header.Set("Content-Type", ct)
+	}
+	if ce := r.Header.Get("Content-Encoding"); ce != "" {
+		req.Header.Set("Content-Encoding", ce)
+	}
+	for _, h := range forwardedHeaders {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+	req.Header.Set(HdrInternal, "1")
+	req.Header.Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+	req.Header.Set(HdrWriteID, wid)
+
+	resp, err := s.peers.http.Do(req)
+	if err != nil {
+		out.Class, out.Error = string(PeerUnavailable), err.Error()
+		return out
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	out.Status = resp.StatusCode
+	out.Duplicate = resp.Header.Get(HdrDuplicate) == "true"
+
+	switch {
+	case out.Duplicate:
+		// Already committed: an acknowledgement, not a failure. The data is
+		// there, which is the only thing the consistency level asks about.
+		return out
+	case resp.StatusCode/100 == 2:
+		return out
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		out.Class = string(PeerUnauthorized)
+	case resp.StatusCode == http.StatusInsufficientStorage:
+		out.Class = string(PeerDegraded)
+	case resp.StatusCode == http.StatusTooManyRequests:
+		out.Class = string(PeerOverloaded)
+	default:
+		out.Class = string(PeerUnavailable)
+	}
+	out.Error = fmt.Sprintf("replica answered HTTP %d", resp.StatusCode)
+	return out
 }
 
 // federatedSelect queries every backend concurrently, merges the NDJSON rows

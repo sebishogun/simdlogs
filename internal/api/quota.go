@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"net/http"
 
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
@@ -42,6 +44,43 @@ func (s *Server) checkStorage(spec routeSpec, h http.HandlerFunc) http.HandlerFu
 			h(w, r)
 			return
 		}
+		// A write this node has already taken is answered "duplicate" and NOT
+		// stored again.
+		//
+		// This is what makes a replicated write safe to retry: the router
+		// cannot tell "did not commit" from "committed and the answer was
+		// lost", so it retries -- and without this, every retry duplicates
+		// every row on the replicas that did commit. Silently, because a log
+		// store has no primary key and a duplicated line looks exactly like a
+		// line that happened twice.
+		//
+		// Checked before the body is read, so a duplicate costs nothing.
+		if wid := r.Header.Get(HdrWriteID); wid != "" && storage.ValidWriteID(wid) {
+			if tn.store.CommittedWrite(storage.WriteID(wid)) {
+				w.Header().Set(HdrDuplicate, "true")
+				w.Header().Set(HdrWriteID, wid)
+				s.writeErr(w, r, spec, http.StatusOK,
+					"simdlogs: this write id is already committed; nothing was stored")
+				return
+			}
+			// Carried to the writer through the request context: the ingest
+			// handlers take a body and a writer, not a header set, and
+			// threading it through every one of them is the change this
+			// avoids.
+			r = r.WithContext(withWriteID(r.Context(), storage.WriteID(wid)))
+			// The receipt is committed AFTER the handler, because it is only
+			// true once the rows are durable -- and the writer batches, so
+			// that means a flush. A replicated write pays a flush; an ordinary
+			// client write carries no id and pays nothing.
+			defer func() {
+				if err := tn.w.FlushWithReceipt(storage.WriteID(wid)); err != nil {
+					obs.L().Error("could not record a write receipt",
+						obs.FieldEvent, "cluster.receipt_failed",
+						"write_id", wid, obs.FieldTenant, tn.key,
+						obs.FieldErrorClass, string(obs.ClassStorage), "error", err)
+				}
+			}()
+		}
 		if err := tn.store.CheckWrite(); err != nil {
 			storage.NoteRejectedWrite(err)
 			s.writeErr(w, r, spec, http.StatusInsufficientStorage, err.Error())
@@ -49,4 +88,18 @@ func (s *Server) checkStorage(spec routeSpec, h http.HandlerFunc) http.HandlerFu
 		}
 		h(w, r)
 	}
+}
+
+// writeIDKey carries a replicated write's idempotency token from the
+// middleware to the writer.
+type writeIDKey struct{}
+
+func withWriteID(ctx context.Context, id storage.WriteID) context.Context {
+	return context.WithValue(ctx, writeIDKey{}, id)
+}
+
+// writeIDOf is the request's write id, or "" for a direct client write.
+func writeIDOf(r *http.Request) storage.WriteID {
+	id, _ := r.Context().Value(writeIDKey{}).(storage.WriteID)
+	return id
 }

@@ -64,6 +64,14 @@ const (
 	// A storage node answers internal requests with the envelope; a client
 	// request gets the public response unchanged.
 	HdrInternal = "X-Simdlogs-Internal"
+	// HdrWriteID is a replicated write's idempotency token. A retry carries
+	// the same one, which is what lets a replica that already committed answer
+	// duplicate instead of storing the rows twice.
+	HdrWriteID = "X-Simdlogs-Write-Id"
+	// HdrDuplicate marks a response to a write this node had already taken.
+	HdrDuplicate = "X-Simdlogs-Duplicate"
+	// HdrConsistency is the level a write must reach.
+	HdrConsistency = "X-Simdlogs-Consistency"
 )
 
 // PeerErrorClass is why a peer could not answer, in terms the router acts on.

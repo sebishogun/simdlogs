@@ -74,6 +74,68 @@ was refused" — and the merge treated all three as an empty contribution.
 `bodiesOf` keeps the old `[][]byte` shape for merges that have not yet learned
 to report completeness (task 8.3).
 
+## Replicated writes: idempotency and consistency
+
+`forwardWrite` replicated to every member of a shard and relayed the **last**
+response's status. Replica A refusing on its own quota and replica B accepting
+answered whichever finished last, so the same write was reported stored or
+refused by a coin flip — and in the other order, a retry duplicated into the
+replica that had already taken it.
+
+**Consistency is explicit.** `X-Simdlogs-Consistency: one | quorum | all`,
+default **all**. Quorum is the usual production choice *because a repair
+process reconciles the replicas that missed a write* — and this has none yet
+(task 8.7). Without one, "quorum" means a replica silently missing data forever
+and a read that lands on it returning a short answer with nothing to say so.
+Defaulting to the strictest level is the honest position for a system that
+cannot yet heal; the default moves when repair is proven, not before.
+
+**Every write carries an id.** The router mints one (or accepts the client's,
+so a retry can name the write it repeats) and sends the same id to every
+replica. A replica that already committed it answers `X-Simdlogs-Duplicate:
+true` and stores **nothing** — which counts as an acknowledgement, because the
+data is there and that is the only thing the level asks about.
+
+That is what makes a retry safe. The router cannot tell "did not commit" from
+"committed and the answer was lost" — the connection drops while the response
+comes back, the router times out, the process is killed between the fsync and
+the reply — and those need opposite responses. Without receipts, retrying
+duplicates every row on the replicas that did commit, *silently*, because a log
+store has no primary key and a duplicated line looks exactly like a line that
+happened twice; not retrying loses the rows on the ones that did not. A failed
+write therefore returns its id, so the retry is safe by construction.
+
+Ids are cryptographically random, not counters (which collide across routers —
+the multi-writer case this exists for) and not content hashes (which would fold
+two genuinely distinct identical batches into one, dropping data the client
+sent on purpose). A client-supplied id is validated to 8–64 hex characters
+before it reaches the manifest.
+
+**Where the receipt is committed, and the window that leaves.**
+`AppendGroupIdempotent` commits the id in the *same* manifest record as the
+group — one record is one transaction, so the rows and the receipt become
+durable together. The server's ingest path cannot use it: the writer batches
+rows from many requests, so no single group is "this request's rows". It uses
+`CommitReceipt` after the flush instead, which leaves a window — a crash
+between the group commit and the receipt commit keeps the rows and loses the
+receipt, so a retry stores them again. Given a choice between a duplicate and a
+loss that window takes the duplicate; recording the receipt first would lose
+the rows while claiming they were stored and refuse the retry that would have
+saved them.
+
+A replicated write therefore pays a **flush**. An ordinary client write carries
+no id and pays nothing.
+
+**Retention is bounded** at 65536 ids, and the bound is the honest limit: a
+retry arriving after that many further writes is not recognised and will
+duplicate. A count rather than a duration because the manifest has no clock —
+records carry a sequence, not a timestamp.
+
+**Per-replica detail is authorized.** Replica URLs and their individual
+failures are the cluster's topology; an ingest client is told `acked`,
+`required` and the write id, an operator is told which machine failed. On a
+server with no `-auth.config` everything is open, as it is everywhere else.
+
 ## Roles
 
 - **Storage node** — a default node: owns tenants' stores, serves ingest and

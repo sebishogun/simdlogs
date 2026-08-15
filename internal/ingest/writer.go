@@ -624,6 +624,31 @@ func buildStreamLabel(streamFields []string, fields map[string]string) string {
 // can call Flush after Close has already run.
 var ErrWriterClosed = errors.New("ingest: writer is closed")
 
+// FlushWithReceipt flushes and records a write id in the same commit.
+//
+// The id is recorded only after the rows are DURABLE. Recording it when the
+// rows were merely accepted into the buffer would be worse than not recording
+// it at all: a crash before the flush loses the rows while the receipt says
+// committed, so the retry that would have saved them is refused as a
+// duplicate. The whole point of the receipt is to make a retry safe, and that
+// version would make it unsafe in the one case where it matters.
+//
+// A flush per replicated write is a real cost, and it is the cost of the
+// guarantee: the writer batches rows from many requests, so "this request's
+// rows are stored" is not a question the batch can answer without one.
+// Ordinary client writes do not pay it -- they carry no write id.
+func (w *Writer) FlushWithReceipt(id storage.WriteID) error {
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if id == "" {
+		return nil
+	}
+	// After the flush: the rows this request contributed are in a committed
+	// group, so the receipt is now true.
+	return w.store.CommitReceipt(id)
+}
+
 func (w *Writer) Flush() error {
 	// defer, not a bare Unlock. flushLocked used to send on a channel that
 	// Close had already closed; the panic unwound past the Unlock, so the

@@ -130,6 +130,10 @@ type manifest struct {
 	// MANIFEST and let the legacy path adopt the directory -- because there
 	// was nothing left to adopt.
 	retired map[uint64]bool
+	// receipts is every write id the replayed records carried, in commit
+	// order. Bounded by the Store's set, not here: the manifest keeps what the
+	// file holds and the retention decision belongs where the bound is known.
+	receipts []string
 
 	// preexisted is whether the MANIFEST file was on disk when this manifest
 	// was opened. It is the bootstrap discriminator; see openManifest.
@@ -210,6 +214,11 @@ func (m *manifest) apply(rec manifestRecord) {
 	for _, id := range rec.Remove {
 		delete(m.visible, id)
 		m.retired[id] = true
+	}
+	if len(rec.Receipt) > 0 {
+		// Recorded on APPLY, so replay at open rebuilds the set in the same
+		// order a live commit built it.
+		m.receipts = append(m.receipts, string(rec.Receipt))
 	}
 	if rec.Seq > m.seq {
 		m.seq = rec.Seq
@@ -492,4 +501,16 @@ func joinRollback(commitErr, rollbackErr error) error {
 	// classified as an unrecognised failure and was answered "retry in a
 	// second" instead of "someone has to free space".
 	return fmt.Errorf("%w: %w (rollback: %w)", ErrRollbackFailed, commitErr, rollbackErr)
+}
+
+// receiptIDs is every write id the replayed records carried, in commit order.
+//
+// Bounded on the way out by the caller's set rather than here: the manifest
+// keeps whatever the file holds, and the retention decision belongs to the one
+// place that knows the bound. Compaction drops them with the records they were
+// on, which is the same trade the retired set makes -- a folded-away receipt
+// stops being recognised, so a retry older than a compaction duplicates.
+func (m *manifest) receiptIDs() []string {
+	out := make([]string, 0, len(m.receipts))
+	return append(out, m.receipts...)
 }

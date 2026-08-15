@@ -22,6 +22,9 @@ type Store struct {
 	openHook func(uint64)
 	lock     *dirLock
 	man      *manifest
+	// receipts is the bounded set of committed write ids, rebuilt from the
+	// manifest at open. It is what makes a replicated write safe to retry.
+	receipts *receiptSet
 	// tombstones are files whose group is committed as removed but whose
 	// unlink failed; retried on every later retention pass.
 	tombstones []string
@@ -98,7 +101,14 @@ func OpenStoreWith(dir string, opts OpenOptions) (*Store, error) {
 		lock.unlock()
 		return nil, err
 	}
-	s := &Store{dir: dir, lock: lock, man: man}
+	s := &Store{dir: dir, lock: lock, man: man, receipts: newReceiptSet()}
+	// Rebuilt from the manifest, in commit order, so a retry that arrives
+	// after a restart is still recognised. A receipt set that only lived in
+	// memory would make every restart a window in which every in-flight retry
+	// duplicates.
+	for _, id := range man.receiptIDs() {
+		s.receipts.add(WriteID(id))
+	}
 	s.health.policy = opts.Policy
 
 	files, _ := filepath.Glob(filepath.Join(dir, "group-*.bin"))
@@ -426,6 +436,18 @@ func (s *Store) AcknowledgeDegraded() error {
 // fsync, rename into place (atomic), then the index picks it up. A crash
 // between temp and rename leaves the temp file, which OpenStore ignores.
 func (s *Store) AppendGroup(g *Group) (uint64, error) {
+	return s.appendGroupWithReceipt(g, "")
+}
+
+// appendGroupWithReceipt is AppendGroup, optionally committing a write id in
+// the SAME manifest record as the group.
+//
+// One record is one transaction, so "the rows are visible" and "this id is
+// committed" become durable together. Committing the receipt separately would
+// leave a window where the rows are queryable and the id is not -- and a retry
+// landing in that window duplicates every row, which is the failure receipts
+// exist to prevent, made rarer and so harder to find.
+func (s *Store) appendGroupWithReceipt(g *Group, wid WriteID) (uint64, error) {
 	s.mu.Lock()
 	id := s.nextID
 	s.nextID++
@@ -465,11 +487,28 @@ func (s *Store) AppendGroup(g *Group) (uint64, error) {
 	// Commit before the group is visible. A crash between the rename and this
 	// point leaves an uncommitted file that the next open ignores, which is
 	// the difference between "not written" and "half written but queryable".
-	if err := s.man.commit([]uint64{id}, nil, nil); err != nil {
+	// The duplicate check is INSIDE the lock, with the commit. Checked outside
+	// it, two concurrent retries of one id both pass and both write: the
+	// window is small and the consequence is the duplicated rows the whole
+	// mechanism exists to prevent.
+	if wid != "" && s.receipts.has(wid) {
+		s.mu.Unlock()
+		unmap()
+		s.discardUncommitted(final, id, ErrDuplicateWrite)
+		return 0, ErrDuplicateWrite
+	}
+	var receipt []byte
+	if wid != "" {
+		receipt = []byte(wid)
+	}
+	if err := s.man.commit([]uint64{id}, nil, receipt); err != nil {
 		s.mu.Unlock()
 		unmap()
 		s.discardUncommitted(final, id, err)
 		return 0, err
+	}
+	if wid != "" {
+		s.receipts.add(wid)
 	}
 	s.groups = append(s.groups, &groupEntry{id: id, path: final, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax, unmap: unmap})
 	s.sortGroups()
