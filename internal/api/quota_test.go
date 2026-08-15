@@ -137,3 +137,41 @@ func TestAnInvalidBudgetRefusesToStart(t *testing.T) {
 		t.Fatal("a reject reserve above the warn reserve started")
 	}
 }
+
+// One tenant under pressure is ONE tenant, however many budgets it trips.
+//
+// storagePressure returns one string per finding and readiness prints
+// `len(pressure)` as "N tenant(s) under storage pressure". Splitting the
+// per-tenant switch into three independent ifs -- to fix a dead arm that could
+// never print -- made one tenant tripping the reject reserve, the warn reserve
+// and its quota report as three tenants. The count is the number an operator
+// is paged on.
+func TestReadinessCountsTenantsNotFindings(t *testing.T) {
+	defer storage.SetDiskUsageForTest(func(string) (storage.DiskUsage, error) {
+		return storage.DiskUsage{Total: 1 << 30, Free: 0}, nil
+	})()
+	ts := quotaServer(t, config.Storage{
+		ReserveWarnBytes: 1000, ReserveRejectBytes: 100, MaxTenantBytes: 1,
+	})
+	// A write to open the default tenant and put bytes in it.
+	postLine(t, ts, `{"_time":2,"_msg":"x"}`)
+
+	code, body := get(t, ts, "/-/ready")
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("/-/ready returned %d (%s), want 503", code, body)
+	}
+	if !strings.Contains(body, "1 tenant(s) under storage pressure") {
+		t.Fatalf("the tenant count is wrong:\n%s", body)
+	}
+	// The line names the budget that refused. Both causes on one line is
+	// covered below, where the samples can be expired the way time expires
+	// them -- rows are buffered in the writer until a flush, so the tenant's
+	// own size is legitimately 0 here and asserting the quota cause at this
+	// layer would be asserting the flush schedule rather than the reporting.
+	if !strings.Contains(body, "reject reserve") {
+		t.Errorf("the line does not name the budget:\n%s", body)
+	}
+	if n := strings.Count(body, "0:0:"); n != 1 {
+		t.Errorf("%d lines for one tenant:\n%s", n, body)
+	}
+}

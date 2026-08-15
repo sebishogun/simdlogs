@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
 // LockFileName is the advisory lock a writer holds for the whole life of an
@@ -63,9 +62,9 @@ func lockDir(dir string) (*dirLock, error) {
 			f.Close()
 			return nil, ferr
 		}
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if err := flockExclusive(f); err != nil {
 			f.Close()
-			if err == syscall.EWOULDBLOCK {
+			if err == errLockHeld {
 				return nil, fmt.Errorf("storage: %s is locked by another process: %w", dir, ErrLocked)
 			}
 			return nil, err
@@ -113,7 +112,7 @@ func (l *dirLock) unlock() error {
 	if l == nil || l.f == nil {
 		return nil
 	}
-	err := syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
+	err := flockRelease(l.f)
 	if cerr := l.f.Close(); err == nil {
 		err = cerr
 	}

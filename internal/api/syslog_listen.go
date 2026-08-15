@@ -32,12 +32,22 @@ func (s *Server) syslogAdmits(n int) bool {
 	if err == nil {
 		return true
 	}
+	// NoteRejectedWrite and nothing else.
+	//
+	// This used to also call countRows(0, 1, n) and bump nHTTPErrs, on the
+	// argument that a refused message is data that did not land and has to
+	// show up somewhere. It showed up in the wrong three places: countRows
+	// adds n to vl_bytes_ingested_total ("Bytes of log data ingested") for
+	// bytes that were never ingested, adds 1 to vl_rows_dropped_total ("Log
+	// entries rejected as malformed") for a well-formed message, and
+	// nHTTPErrs charges a UDP datagram to vl_http_errors_total ("HTTP
+	// requests answered with an error"). The HTTP path counts none of those
+	// for the identical event, so the two transports disagreed about it --
+	// the one-side-only shape, reintroduced by the fix for it.
+	//
+	// simdlogs_writes_rejected_disk_total and _quota_total are the counters
+	// for this, and they are what NoteRejectedWrite increments.
 	storage.NoteRejectedWrite(err)
-	atomic.AddInt64(&s.nHTTPErrs, 1)
-	// Counted as skipped rows, not as an unaccounted drop: a message refused
-	// by the budget is data that did not land, and an operator diffing bytes
-	// received against rows stored has to see it somewhere.
-	s.countRows(0, 1, n)
 	// Throttled. A firehose against a full disk would otherwise write one log
 	// line per datagram to the same filesystem that has no room -- the log
 	// becoming the thing that finishes the disk off.

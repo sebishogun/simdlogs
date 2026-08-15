@@ -261,10 +261,12 @@ The check runs in the middleware every insert route shares, before the body is
 read: rows that reach the writer are the writer's, and refusing a request whose
 rows are already buffered would either drop them silently or report a failure
 for rows that will be written anyway. The mux registers fourteen ingest routes
-reaching eight distinct handlers; a check written into each is a check that
-will be missing from the ninth. (This paragraph said "six entry points reaching
-four functions" — both numbers were wrong, which is what a count nothing
-gates does.)
+reaching **nine** distinct handlers — the eight that write, plus the inline 200
+on `/insert/datadog/api/v1/validate`, which resolves no tenant and has no
+budget to check. A check written into each is a check that will be missing from
+the tenth. (This paragraph has been wrong about its own numbers twice: "six
+entry points reaching four functions", then "eight distinct handlers". That is
+what a count nothing gates does.)
 
 The HTTP mux is not every write path. The native syslog listeners take bytes
 off a socket with no middleware anywhere near them; they call the budget
@@ -283,9 +285,15 @@ failure into a write outage is the protection causing the harm it exists to
 prevent. The per-tenant cap still applies there, because it is measured from
 the store's own groups and needs no filesystem call. That was false when first
 written: `QuotaState` returned at the `statfs` error before reaching the cap,
-so a platform without `statfs` enforced neither budget. `statfs` is
-implemented on linux, darwin and the BSDs; everywhere else — Windows,
-illumos, plan9 — only the tenant cap applies.
+so a platform without `statfs` enforced neither budget.
+
+`statfs` is used on **linux, darwin, freebsd and dragonfly**; everywhere else
+only the tenant cap applies. The first fix said "the BSDs" and copied
+`diskfree_unix.go`'s platform list, which was itself wrong — netbsd has no
+`syscall.Statfs` and openbsd spells the fields `F_bsize`/`F_blocks`/`F_bavail`,
+so neither compiled. Both files carry the corrected list now, and both
+platforms build for the first time. A copied build tag is a claim, and that one
+had never been compiled.
 
 Metrics: `simdlogs_storage_capacity_bytes` (only when free space can be
 measured, since it comes from the filesystem total),

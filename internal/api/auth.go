@@ -266,32 +266,86 @@ func authStatus(err error) int {
 	// and drops the batch it cannot re-send, so the one condition that is
 	// certain to be transient was reported as the one that is certain not to
 	// be.
-	if isStorageErr(err) {
+	switch storageErrKind(err) {
+	case storageTransient:
 		return http.StatusInsufficientStorage
+	case storagePermanent:
+		// 500, not 507 and not 400. The server cannot write where it was told
+		// to -- a read-only mount, a data directory it has no permission for
+		// -- and no retry and no change by the client fixes that. 507 would
+		// tell an agent to retry a permission bug until someone notices; 400
+		// would tell it the request was malformed and to drop the batch. This
+		// says the fault is the server's and is not going away by itself.
+		return http.StatusInternalServerError
 	}
 	return http.StatusBadRequest
 }
 
-// isStorageErr reports whether err is the filesystem refusing, as opposed to
-// the request being wrong.
+// storageErrClass says what kind of failure the filesystem reported.
+type storageErrClass uint8
+
+const (
+	storageNotAnError storageErrClass = iota
+	// storageTransient is a failure a retry could survive.
+	storageTransient
+	// storagePermanent is one it cannot: the server cannot write where it was
+	// told to, and nothing the client does changes that.
+	storagePermanent
+)
+
+// storageErrKind classifies a store-open failure.
 //
 // By errno rather than by string: the message is wrapped through OpenStore and
-// os.MkdirAll and its wording is not a contract, while ENOSPC, EDQUOT, EACCES,
-// EPERM, EROFS and EIO are.
-func isStorageErr(err error) bool {
+// os.MkdirAll and its wording is not a contract, while the errnos are. The
+// classification is what decides the status, and getting it backwards is worse
+// than not having it: 507 on a permanent failure is an infinite retry loop,
+// 400 on a transient one is a dropped batch.
+func storageErrKind(err error) storageErrClass {
 	if err == nil {
-		return false
+		return storageNotAnError
 	}
 	if errors.Is(err, storage.ErrDiskFull) || errors.Is(err, storage.ErrQuotaExceeded) {
-		return true
+		return storageTransient
 	}
-	for _, e := range []error{
-		syscall.ENOSPC, syscall.EDQUOT, syscall.EACCES,
-		syscall.EPERM, syscall.EROFS, syscall.EIO,
-	} {
+	for _, e := range transientStorageErrnos {
 		if errors.Is(err, e) {
-			return true
+			return storageTransient
 		}
 	}
-	return false
+	for _, e := range permanentStorageErrnos {
+		if errors.Is(err, e) {
+			return storagePermanent
+		}
+	}
+	return storageNotAnError
+}
+
+// permanentStorageErrnos are the failures no retry survives. A data directory
+// the process may never write to, or a read-only mount, is a deployment fault
+// -- and the first version of this classified all three as retryable.
+var permanentStorageErrnos = []error{
+	syscall.EACCES, syscall.EPERM, syscall.EROFS, syscall.ENOTDIR,
+}
+
+// transientStorageErrnos are the failures a retry could survive.
+//
+// The set is what 507 MEANS: come back and it may work. The first version got
+// both directions wrong. It listed EACCES, EPERM and EROFS -- a data directory
+// the process may never write to, or a read-only mount, are permanent, and
+// telling an agent to retry them forever trades "drops the batch" for "retries
+// a permission bug until someone notices". And it omitted every errno by which
+// a per-tenant store open actually fails under load: EMFILE and ENFILE (fd
+// exhaustion), ENOMEM (the mmap of a new group), EAGAIN (the store lock held
+// by another process -- lock_unix.go handles exactly this errno), EBUSY,
+// EINTR and ESTALE. Those answered 400, and an agent drops a batch on 400,
+// which is the defect the 507 mapping was added to close.
+//
+// A package-level slice rather than a literal in the function: the literal
+// boxed six syscall.Errno values to the heap on every call, on the error path
+// of a server already under storage pressure.
+var transientStorageErrnos = []error{
+	syscall.ENOSPC, syscall.EDQUOT,
+	syscall.EMFILE, syscall.ENFILE, syscall.ENOMEM,
+	syscall.EAGAIN, syscall.EBUSY, syscall.EINTR, syscall.ESTALE,
+	syscall.EIO,
 }

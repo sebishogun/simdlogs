@@ -47,6 +47,11 @@ var ErrDiskFull = errors.New("storage: disk space below the reserve")
 // ErrQuotaExceeded is a write refused because the tenant is at its byte quota.
 var ErrQuotaExceeded = errors.New("storage: tenant storage quota exceeded")
 
+// errUnmeasured is a cached statfs failure. It never reaches a caller: the
+// reserve check treats an unmeasurable filesystem as "do not refuse writes",
+// so this only tells cachedUsage's caller which branch to take.
+var errUnmeasured = errors.New("storage: free space could not be measured")
+
 // DiskUsage is what a filesystem reports. Bytes, because that is what the
 // syscall returns and what a reserve is expressed in.
 type DiskUsage struct {
@@ -98,11 +103,15 @@ func (q QuotaConfig) Normalize() error {
 
 // QuotaState is what the store currently thinks of its space.
 type QuotaState struct {
-	Usage      DiskUsage
-	StoreBytes int64 // this store's own bytes
-	Warn       bool  // free space at or below the warn reserve
-	Reject     bool  // free space at or below the reject reserve
-	OverQuota  bool  // this store is at or above MaxTenantBytes
+	Usage DiskUsage
+	// StoreBytes is this store's own bytes -- and is 0 when no budget is
+	// configured, because measuring it is a locked walk of every mapped group
+	// to answer a question no threshold would read. A caller that wants the
+	// size regardless calls DiskBytes.
+	StoreBytes int64
+	Warn       bool // free space at or below the warn reserve
+	Reject     bool // free space at or below the reject reserve
+	OverQuota  bool // this store is at or above MaxTenantBytes
 	// Err is nil when a write would be accepted, and the reason otherwise.
 	Err error
 }
@@ -218,9 +227,21 @@ func (s *Store) cachedUsage() (DiskUsage, error) {
 		if u := s.usage.Load(); u != nil {
 			return *u, nil
 		}
+		// A cached FAILURE: the sample is fresh and it is that the filesystem
+		// could not be measured. Reported as such rather than falling through
+		// to another syscall.
+		return DiskUsage{}, errUnmeasured
 	}
 	u, err := (*diskUsageFn.Load())(s.dir)
 	if err != nil {
+		// The FAILURE is cached too, and for the same reason the success is.
+		// Returning early without stamping meant a filesystem that cannot be
+		// measured -- ESTALE on a vanished NFS mount, a directory that went
+		// away -- was re-measured on every write rather than every two
+		// seconds, which is the syscall storm this cache exists to prevent,
+		// reached through the one condition that makes the syscall slow.
+		s.usage.Store(nil)
+		s.usageAt.Store(now)
 		return DiskUsage{}, err
 	}
 	s.usage.Store(&u)

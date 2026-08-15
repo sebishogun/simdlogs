@@ -1,4 +1,4 @@
-//go:build !(linux || darwin || freebsd || netbsd || openbsd || dragonfly)
+//go:build !(linux || darwin || freebsd || dragonfly)
 
 package storage
 
@@ -8,12 +8,15 @@ var errNoStatfs = errors.New("storage: free space is not measured on this platfo
 
 // statfsUsage has no implementation on this platform.
 //
-// The tag is the narrow one on purpose. It used to be `windows` against a
-// `!windows` unix file, which claimed every non-Windows platform has
-// syscall.Statfs_t -- illumos does not, and the build broke there. The unix
-// file now names the platforms the syscall exists on and this one takes
-// everything else, which is the shape internal/api/diskfree_unix.go already
-// used.
+// The tag names the platforms the syscall exists on, and this file takes
+// everything else. It used to be `windows` against a `!windows` unix file,
+// which claimed every non-Windows platform has syscall.Statfs_t -- illumos
+// does not, and the build broke there.
+//
+// The first fix copied internal/api/diskfree_unix.go's list, which was itself
+// wrong: netbsd has no syscall.Statfs at all, and openbsd's Statfs_t spells
+// the fields F_bsize/F_blocks/F_bavail. Both files carry the corrected list
+// now. A copied list is a claim, and this one had never been compiled.
 //
 // The reserve is not enforced here. The tenant byte quota IS: it is measured
 // from the store's own groups and needs no filesystem call, which is why

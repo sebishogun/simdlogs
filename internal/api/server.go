@@ -1914,23 +1914,34 @@ func (s *Server) storagePressure() []string {
 	var out []string
 	s.forEachTenantDetached(func(tn *tenant) {
 		st := tn.store.QuotaState()
-		// Not a switch. QuotaState sets Err whenever it sets OverQuota, so an
-		// `Err != nil` arm ahead of an `OverQuota` arm made the second one
-		// unreachable and "at its quota" could never print -- an operator
-		// paged on readiness saw only the refusal, never which of the two
-		// budgets produced it. Both are reported, and a store can be over its
-		// quota AND below the warn reserve at once.
-		if st.Err != nil {
-			out = append(out, fmt.Sprintf("%s: writes REJECTED: %v", tn.key, st.Err))
+		// ONE line per tenant, whatever combination of budgets it trips.
+		//
+		// The switch this replaced had a dead `OverQuota` arm -- QuotaState
+		// sets Err whenever it sets OverQuota, so the Err arm always won and
+		// a store over its quota AND below the warn reserve reported only the
+		// disk. Splitting it into three independent ifs fixed that and broke
+		// something worse: the caller prints `len(pressure)` as "N tenant(s)
+		// under storage pressure", so one tenant tripping all three became
+		// "3 tenant(s)". The count is what an operator is paged on.
+		var causes []string
+		if st.Reject {
+			causes = append(causes, fmt.Sprintf("%d bytes free, below the reject reserve",
+				st.Usage.Free))
+		} else if st.Warn {
+			causes = append(causes, fmt.Sprintf("%d bytes free, below the warn reserve",
+				st.Usage.Free))
 		}
 		if st.OverQuota {
-			out = append(out, fmt.Sprintf("%s: %d bytes used, at its quota",
-				tn.key, st.StoreBytes))
+			causes = append(causes, fmt.Sprintf("%d bytes used, at its quota", st.StoreBytes))
 		}
-		if st.Warn {
-			out = append(out, fmt.Sprintf("%s: %d bytes free, below the warn reserve",
-				tn.key, st.Usage.Free))
+		if len(causes) == 0 {
+			return
 		}
+		state := "degraded"
+		if st.Err != nil {
+			state = "writes REJECTED"
+		}
+		out = append(out, fmt.Sprintf("%s: %s: %s", tn.key, state, strings.Join(causes, "; ")))
 	})
 	return out
 }

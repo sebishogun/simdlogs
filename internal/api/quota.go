@@ -9,14 +9,17 @@ import (
 // checkStorage refuses a write when the tenant's storage budget says so.
 //
 // In the middleware every insert route shares, not in each handler. The mux
-// registers fourteen ingest routes reaching eight distinct handlers --
-// insertJSONLine, insertLogfmt, esBulk, insertLoki, insertDatadog,
-// insertSyslog, insertOTLPLogs and insertJournald -- and a check written into
-// each is a check that will be missing from the ninth. (This comment said
-// "six entry points reaching four functions"; both numbers were wrong, which
-// is what a count nothing gates does.) This repo has recorded the
-// one-side-only shape fifteen times; a budget enforced on seven of eight
-// paths is that shape with a storage bill attached.
+// registers fourteen ingest routes reaching NINE distinct handlers -- the
+// eight that write (insertJSONLine, insertLogfmt, esBulk, insertLoki,
+// insertDatadog, insertSyslog, insertOTLPLogs, insertJournald) plus the inline
+// 200 on /insert/datadog/api/v1/validate, which resolves no tenant and so has
+// no budget to check. A check written into each is a check that will be
+// missing from the tenth.
+//
+// This comment has now been wrong twice about its own numbers -- first "six
+// entry points reaching four functions", then "eight distinct handlers" --
+// which is what a count nothing gates does. Both were found by counting the
+// mux, which is the only way any of them was ever going to be found.
 //
 // The HTTP mux is not every write path. The native syslog listeners take
 // bytes off a socket with no middleware anywhere near them, so they check the budget themselves -- see syslogAdmits in syslog_listen.go.

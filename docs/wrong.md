@@ -3927,3 +3927,71 @@ the flags table, so twelve rows rendered as literal pipe text; the same
 paragraph said "six HTTP write entry points reaching four functions" where the
 mux registers fourteen routes reaching eight handlers. No docs gate covers that
 file, so nothing caught either.
+
+## The fix for a one-side-only shape reintroduced it, three times
+
+The previous entry's fixes were reviewed adversarially. Four of them were
+right; five created new defects, and each new defect is the SAME shape as the
+one it fixed.
+
+**Readiness counted findings, not tenants.** `storagePressure` had a `switch`
+whose `OverQuota` arm was unreachable, so a store over its quota AND below the
+reserve reported only the disk. Splitting it into three independent `if`s fixed
+that. Its only caller prints `len(pressure)` as "N tenant(s) under storage
+pressure", so one tenant tripping all three budgets became **"3 tenant(s)"** --
+the operator-facing number the change set out to improve, now wrong by 3x. One
+line per tenant, causes joined, is the answer; both halves of the original bug
+were invisible because nothing asserted either number.
+
+**The syslog refusal was counted in three wrong places.** `syslogAdmits` called
+`countRows(0, 1, n)` on the argument that a refused message is data that did
+not land and has to show up somewhere. It showed up as `vl_bytes_ingested_total
++n` for bytes never ingested, `vl_rows_dropped_total +1` ("rejected as
+malformed") for a well-formed message, and `vl_http_errors_total +1` for a UDP
+datagram. Measured, one refused TCP frame: `+68` bytes ingested, `+1` malformed.
+The HTTP path counts none of those for the identical event -- so the transport
+parity the fix existed to create was broken by the fix, in the metrics instead
+of the writes. `NoteRejectedWrite` was already on the line above and is the
+counter for this.
+
+**The status classification was backwards in both directions.** `isStorageErr`
+mapped `EACCES`, `EPERM` and `EROFS` to 507 -- a data directory the process may
+never write to, or a read-only mount, told to retry forever -- and left
+`EMFILE`, `ENFILE`, `ENOMEM`, `EAGAIN`, `EBUSY`, `EINTR` and `ESTALE` at 400,
+which is the set by which a per-tenant store open actually fails under load and
+the code on which an agent drops the batch. The defect being fixed was "a
+transient condition reported as permanent"; the fix reported permanent ones as
+transient and left the realistic transient ones alone. The new test enshrined
+it: `chmod 0555` is permanent, and it asserted 507.
+
+**A copied build tag is a claim that has never been compiled.**
+`quota_unix.go` moved from `!windows` to `internal/api/diskfree_unix.go`'s
+platform list, which was itself wrong: netbsd has no `syscall.Statfs` and
+openbsd spells the fields `F_bsize`/`F_blocks`/`F_bavail`. Two files then
+carried the broken list. Corrected to `linux || darwin || freebsd ||
+dragonfly`, both platforms build for the first time -- and `lock_unix.go`, the
+file with the same `!windows` shape two doors down, was split behind a
+`flock`-narrow tag, which is what solaris was failing on. Nothing gates any of
+this: CI's cross job is `GOOS=linux` with five GOARCHes.
+
+**A failing `statfs` was never cached.** `cachedUsage` returned at the error
+without stamping, so an unmeasurable filesystem was re-measured on every write
+rather than every two seconds -- the syscall storm the cache exists to prevent,
+reached through the one condition that makes the syscall slow.
+
+**Claims in the previous entry that do not hold.** "Twelve rows rendered as
+literal pipe text" is **fourteen**. "Three statements of a claim" is **two** --
+`QuotaState`'s comment never mentioned the tenant cap. "`-race` reported it
+three ways against the shipped tests" does not reproduce at the parent commit:
+`-race -count=2` and `-count=4` on `./internal/api/` report zero races, and the
+new race test only trips at `-count=50`, so it is a window rather than a guard
+at CI's `-count=1`. "1776 bytes stored" is 1053 on the same code. The
+`MaxTenantBytes` overshoot was measured again at **705,385,424 bytes accepted
+on the wire against a 64 KiB cap (10,763x)** in 10 s -- the 119-125 MB figure
+was the on-disk size, not what the server accepted.
+
+**The shape.** Every one of these is the same failure as the bug it replaced,
+committed while writing the fix for it: a count nobody counts, a claim nobody
+compiles, a parity fixed on one side, a classification asserted in the
+direction that was already believed. The review that found them is the only
+reason any of them is in this file rather than in production.

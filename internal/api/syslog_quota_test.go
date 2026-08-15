@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -139,14 +141,52 @@ func TestSyslogStillWritesWithRoomOnTheDisk(t *testing.T) {
 	}
 }
 
-// A filesystem that refuses the store open answers 507, not 400.
+// A store the server cannot open is classified by whether a retry could
+// survive it, and nothing else.
 //
-// withTenant opens the store before checkStorage can run, so this failure
-// never reached the budget middleware at all: authStatus's default fired and a
-// server-side storage condition was reported with a client-error code -- and
-// the server's absolute path in the body. An agent treats 400 as permanent and
-// drops a batch it could have re-sent.
-func TestAnUnwritableTenantDirectoryIs507(t *testing.T) {
+// The first version of this mapped every filesystem failure to 507, and the
+// test enshrined the wrong half: chmod 0555 is PERMANENT, and 507 tells an
+// agent to retry a permission bug forever. The other half was worse -- the
+// errnos by which a per-tenant store open actually fails under load (fd
+// exhaustion, ENOMEM, the store lock held by another process) all stayed at
+// 400, and an agent drops a batch on 400. That is exactly the defect the
+// mapping was added to close, reached through a different errno.
+func TestStorageFailuresAreClassifiedByWhetherARetryHelps(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"disk full", syscall.ENOSPC, http.StatusInsufficientStorage},
+		{"over quota", syscall.EDQUOT, http.StatusInsufficientStorage},
+		{"fd exhaustion", syscall.EMFILE, http.StatusInsufficientStorage},
+		{"system fd exhaustion", syscall.ENFILE, http.StatusInsufficientStorage},
+		{"out of memory", syscall.ENOMEM, http.StatusInsufficientStorage},
+		{"lock held by another process", syscall.EAGAIN, http.StatusInsufficientStorage},
+		{"io error", syscall.EIO, http.StatusInsufficientStorage},
+		{"the store's own disk-full error", storage.ErrDiskFull, http.StatusInsufficientStorage},
+		{"the store's own quota error", storage.ErrQuotaExceeded, http.StatusInsufficientStorage},
+
+		{"no permission", syscall.EACCES, http.StatusInternalServerError},
+		{"not permitted", syscall.EPERM, http.StatusInternalServerError},
+		{"read-only filesystem", syscall.EROFS, http.StatusInternalServerError},
+
+		{"a bad request is still a bad request", errors.New("unparseable AccountID"),
+			http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Wrapped, because that is how it arrives: through OpenStore and
+			// os.MkdirAll, whose message wording is not a contract.
+			got := authStatus(fmt.Errorf("open store: %w", tc.err))
+			if got != tc.want {
+				t.Fatalf("%v -> %d, want %d", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// End to end: an unwritable data directory is a server fault, reported as one.
+func TestAnUnwritableTenantDirectoryIsAServerFault(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores the permission bits this test sets")
 	}
@@ -160,10 +200,10 @@ func TestAnUnwritableTenantDirectoryIs507(t *testing.T) {
 	defer ts.Close()
 
 	// Read-only AFTER construction, so the server starts and the failure is a
-	// NEW tenant's directory that cannot be created -- which is the case that
-	// reaches the resolver at request time. Chmod before construction only
-	// tests that the process refuses to start, which is a different thing and
-	// the right behaviour for it.
+	// NEW tenant's directory that cannot be created -- the case that reaches
+	// the resolver at request time. Chmod before construction only tests that
+	// the process refuses to start, which is a different thing and the right
+	// behaviour for it.
 	if err := os.Chmod(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -180,8 +220,8 @@ func TestAnUnwritableTenantDirectoryIs507(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusInsufficientStorage {
-		t.Fatalf("an unwritable tenant directory returned %d (%s), want 507",
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("an unwritable tenant directory returned %d (%s), want 500",
 			resp.StatusCode, b)
 	}
 }
