@@ -207,8 +207,28 @@ holds an exclusive `flock` on `LOCK` for the life of the store. Two processes
 on one directory each allocate group ids from their own `nextID`, so both
 write `group-7.bin` and one destroys the other's data with nothing to detect
 it. flock is advisory but process-scoped and released by the kernel on exit,
-so a crashed writer does not leave the directory permanently locked. On
-Windows the held handle is the lock (Go opens without share-delete) and a
+so a crashed writer does not leave the directory permanently locked.
+
+**The flocked inode is checked against the path afterwards, and that check is
+load-bearing.** `open` and `flock` are two syscalls and a staged restore
+replaces the whole directory in one, so a descriptor taken just before a swap
+names an inode that has left the path -- unlinked with the directory it lived
+in, contended by nobody, and therefore always flockable. The caller gets a lock
+that excludes no one and writes group files BY PATH into the store that
+replaced it, beside a second process holding the real lock. Traced under 24
+concurrent writers: a store opened on lock inode 113001480 six directory
+generations after that inode was released and deleted, appending `group-0.bin`
+into the live directory whose lock was 113001501; 13 committed groups lost and
+27 of a restored archive's groups overwritten. With the check, two runs at zero
+and zero. A mismatch is retried rather than returned -- the caller is not wrong
+to want the lock, it is holding the wrong file -- and retries are bounded at 8,
+because a destination being replaced in a loop has no lock to give and an
+unbounded wait there is a hang rather than an answer. The check is not itself a
+race: replacing the directory requires holding this lock, so once a caller
+holds the inode that IS at the path, no swap can start until it lets go.
+Entry 87.
+
+On Windows the held handle is the lock (Go opens without share-delete) and a
 crash does leave a stale `LOCK` needing manual removal -- stated here rather
 than papered over, since deleting a lock file whose owner may be alive is the
 failure the lock exists to prevent.
@@ -423,8 +443,216 @@ error.
 
 A pre-format-1 archive has nothing to validate against. It is restored and
 `ErrBackupUnverified` is returned, so a caller requiring a verified restore
-fails rather than being told success with a note. This is still the unstaged
-restore; the staged, atomic one is Task 5.2.
+fails rather than being told success with a note.
+
+### Staged restore (`restore.go`)
+
+`Restore` is the supported one, and `RestoreTar` stays for the callers that
+already use it. Two things separate them: where the bytes land while they are
+being read, and whether anything stops a second writer.
+
+**Stage, then rename.** `RestoreTar` writes each group into the destination as
+it reads it, so a failure halfway leaves a destination holding half a store —
+and a directory of valid group files opens as a store and answers queries with
+a silent subset, no error anywhere. `Restore` writes into `<dst>.restoring`, a
+sibling, and moves the whole thing into place with one `os.Rename`. The sibling
+is not a detail: a rename across filesystems fails with `EXDEV` rather than
+doing anything, so staging on another device turns every restore into an error
+after all the work. A failed restore removes the staging directory, so a retry
+is not blocked by the last attempt — but a *crash* does not, and the leftover
+`<dst>.restoring` is how an operator can see where a killed restore got to. A
+`<dst>.restoring.marker` file sits BESIDE it, written before the directory it
+marks and removed after the rename: without a marker, "a directory of group
+files at that path" cannot be told from a pre-MANIFEST store, and clearing on
+that rule destroyed one. Beside rather than inside, and first rather than
+second, so no process kill can leave a staging directory a later restore
+refuses. Process kill, not power loss: the marker is written with no fsync of
+either the file or its parent, so a power cut can lose it while the directory
+it vouches for survives. Not measured -- this repository has no power-loss
+harness. A
+crashed restore also leaves `dst/LOCK`, which the destination check ignores
+precisely so the retry is not blocked by it.
+
+`os.Rename` is not raw `rename(2)`: it `Lstat`s the destination and returns
+`EEXIST` for any existing directory, empty or not. So the destination is taken
+out of the way first, and that line is load-bearing on Linux rather than a
+portability nicety. A destination that is a mount point fails there, at the
+rename that displaces it with `EBUSY`, rather than at the rename that refills
+it.
+
+**The lock, and why the emptiness check alone was worthless.** The check that
+the destination is empty ran once, at the start; the removal ran at the end, an
+archive-read later. A server that opened a store at that path in between had
+its `LOCK`, its manifest and every group deleted, the archive renamed over the
+top, and the call returned nil — while the still-running writer allocated group
+ids from its own counter and overwrote the archive's files. The result opened
+clean and answered queries with a silent mixture of two stores. Two concurrent
+restores were the same defect in a different dress: both derive the same
+staging path, the second's `RemoveAll` deletes the first's staged files
+mid-stream, and both write into it; measured, that put two groups from each of
+two archives into one destination with one call reporting success.
+
+`Restore` takes the store's own exclusive lock on the destination and holds it
+from before the archive is read until the syscall that ends that directory --
+NOT until the rename that refills it, and the difference is measured. Releasing
+it early leaves `dst/LOCK` present and unheld (the file is never unlinked), so a
+server flocks what is already there, opens the store, and the rename then
+SUCCEEDS because that server never had to create the directory: a restore
+returning nil with the archive's groups overwritten. On unix a rename moves a
+directory whose lock file is held without complaint, so holding costs nothing;
+on Windows it cannot, which is why the early release exists there and only
+there. A second restore cannot start while it is held -- in the gap between
+the two renames one can, and the outcome is one of three, not one: `ENOENT`,
+`EEXIST`, or, with both parked in their own gaps, a first call returning nil
+over the other's destination. Both abort branches delete this call's staging
+directory, since both restores derive their paths from `dst`. The three-way
+answer and its reachability are below, under the staging lock. The emptiness
+**re-check
+immediately before the swap** is what makes the swap safe -- placed at the top
+of the call it would only say the directory was empty an archive-read ago, and
+a lock does not stop a process dropping a file in.
+
+**The old destination is renamed away, not removed in place.** The safe-abort
+argument needs the destination to go from "exists, holding a lock this call
+holds" to "does not exist" with nothing in between, and `os.RemoveAll` is not
+that: it unlinks `dst/LOCK`, then re-reads the directory until it reads empty,
+then `rmdir`s, so in the middle of its own loop the destination is present and
+lockless. A server opening it there creates a second `LOCK` inode, writes a
+manifest and a group, and the loop's next pass deletes them before the rename
+goes on to succeed. The re-check guarantees the destination holds nothing but
+this call's lock file, so the walk is one unlink, one readdir and one rmdir --
+a window nothing reaches at production speed, which is why measuring the shipped
+walk finds no losses. Keep the shape and widen only the gap to 200us and it
+opens: 56,434 foreign entries appeared inside an emptied destination in 25
+seconds, 692 archive groups overwritten, 519 committed groups lost, 85 restores
+landing incomplete; against 0, 0, 0 and 0 for the rename. One syscall takes the
+directory and its lock inode away together, and the sibling it lands in is
+removed afterwards off a path no opener can reach. Entry 87.
+
+**The lock has to survive the swap, and it does so by being the one the rename
+installs.** The staging directory is locked too, just before the swap, and that
+lock file is the one the rename puts at `dst/LOCK`. After the rename this
+process holds the restored store's own lock; between the two renames the
+destination does not exist, so a server has to create it and the second rename
+then fails with `EEXIST` — a safe abort. `os.Rename`'s own Lstat-then-rename is
+not a hole in that: for the raw rename to replace a directory a server created,
+that directory must still be empty, which means the server has not made
+`dst/LOCK` yet -- and the lock it then opens is the staging lock this call
+holds, so it gets `ErrLocked`. The other ordering leaves `dst` non-empty and the
+rename fails. Those, plus holding the destination's own lock right up to the
+first rename, leave no ordering in which a SERVER writes into the result.
+
+Two restores are a different question and the answer is weaker. Both parked in
+their own gap between the two renames, the first returns nil with a manifest
+naming its own groups over a destination holding the other's -- measured with
+two ordinary `Restore` calls and this package's own `restore-removed` fault
+point. Zero occurrences at production speed (20,000 barrier rounds of six
+workers with six archives; 11.6 million overlapping attempts, 104,479
+successful restores), and reachable only when something outside a restore
+widens the window. Recorded rather than closed: closing it needs a lock that
+outlives the swap on a path neither restore owns. Do not run two restores at
+one destination.
+
+The lock file is never unlinked, on either side of the swap. Both orderings
+have a gap -- unlink-then-unlock lets a competitor that already opened the fd
+flock the dead inode after the unlock, unlock-then-unlink is the mirror -- and
+measured under contention both produced 211 to 268 double-holds per thirty
+seconds where not unlinking produced zero. A lock file whose inode can change
+cannot be handed over by ordering. So `release` is `unlock`, exactly as
+`Store.Close` has always been, and a restored store carries a `LOCK` like any
+other.
+
+Releasing the destination's own lock before the swap is a **Windows-only** step
+(`releaseBeforeRemoval`, a no-op on unix). There the lock IS an open handle
+without `FILE_SHARE_DELETE`, so a directory containing it cannot be moved or
+removed. On unix that same release is what let a server flock the file that is
+still there, open the store, and have the rename succeed over it -- measured at
+4,364 overwritten archive groups in ten seconds, ending in a SIGBUS inside a
+reader's mmap. The paragraph above says "there and only there"; this one used
+to say the opposite, in the same document.
+
+That release leaves Windows a window this design does not close, narrower than
+the removal walk it replaces and in the same class: a server that flocks
+`dst/LOCK` inside it opens a store which the displacement then moves aside and
+the restore's cleanup removes. Stated rather than measured -- no Windows
+machine runs these tests, and a claim of closure there would be one nobody
+checked.
+
+**The destination must be empty or absent, and must be a plain directory.** A
+restore never merges — the result would be a store whose group set is neither
+the archive's nor the destination's. The three refusals are checked up front,
+before the archive is read, and each of the failures they prevent arrives at a
+different place now that the destination is renamed aside rather than removed:
+`.` fails the emptiness re-check (its own staging and marker siblings are
+inside it) after the whole archive has been staged; `..` the same, a level up;
+and a symbolic link SUCCEEDS with the check bypassed -- `os.Rename` replaces
+the link with a real directory and leaves the target holding nothing but a
+`LOCK`, which is a store written to the link's parent with success reported.
+Measured with each refusal removed in turn. An earlier version of this
+paragraph gave `os.RemoveAll`'s treatment of each as the reason; that is the
+call this design replaced, and the refusals now stand on what actually
+happens. A `LOCK` in the destination is never
+counted and never named: `lockDir` is what decides whether a process has the
+store open, and it runs next. On unix the file outlives the process that made
+it -- `unlock` releases the flock and closes the descriptor without unlinking
+-- so a cleanly stopped store and a SIGKILLed restore both leave one, and
+counting it made a killed restore unrecoverable by the tool that produced it.
+On WINDOWS the lock IS the open handle and `unlock` does remove the file, so a
+stale `LOCK` there means a crash and `lockDir` refuses it with `O_EXCL`
+whatever this listing does.
+
+**Tenant.** `RequireTenant` refuses an archive whose manifest names a different
+tenant, and refuses it the moment the manifest is decoded — and refuses any
+group that PRECEDES the manifest, because `readBackup` enforces manifest-first
+retroactively: a group arriving earlier is read, parsed and emitted, and the
+ordering error is raised only when the manifest turns up. Measured, all four
+groups of a manifest-last archive landed in staging before anything looked at
+the tenant. The manifest is the archive's first entry and `readBackup`
+enforces that, so there is no reason to fill a volume with the wrong tenant's
+logs before refusing them. Nothing inside a group file records where it came
+from, so the manifest is the only place that fact exists, and restoring one
+tenant's groups into another's directory produces a store that answers that
+tenant's queries with someone else's logs — with no error, at any layer, ever.
+The flag wants the tenant KEY the manifest carries (`0:0`), not the directory
+name (`tenant-0-0`); `-dry-run` prints it.
+
+**Dry run.** `DryRun` runs the full `VerifyBackup` validation — declared size,
+manifest size, CRC32C and a `ReadGroup` parse per group, plus the tenant check
+— under every limit below, and writes nothing. It touches no destination at
+all, so a scheduled backup check needs no directory and a dry run against the
+store you intend to overwrite is not refused for being occupied. The first
+version called `VerifyBackup` directly, which is `readBackup` with no callback,
+and every limit lived in that callback: the one mode an operator is told to
+point at an untrusted archive was the one mode that checked nothing.
+
+**Limits.** `MaxFiles`, `MaxBytes` and `MaxFileBytes` bound what an archive can
+make the process do; the defaults (100k entries, 1 TiB, 1 GiB per entry) are
+sized for a real store and are all overridable. `MaxManifestBytes` is separate
+because the manifest is decoded *before* any of the others can apply — it is
+what sizes everything after it, and a 24 MiB manifest decodes into roughly
+340 MiB of live heap. `MaxFiles` also bounds the group count the manifest
+declares, which is where a verified archive is refused.
+
+**Unverified archives.** A pre-format-1 archive carries no manifest and cannot
+be checked against one. `AllowUnverified` keeps what landed and still returns
+`ErrBackupUnverified`, so a caller requiring a verified restore fails; without
+it the restore is discarded, which left an operator holding an old backup with
+no supported path. `RequireTenant` with such an archive is always refused: it
+names no tenant, and accepting it would place another tenant's logs under a
+flag whose whole purpose is to stop that.
+
+**A failed sync after the rename is not a failed restore.**
+`ErrRestoredButUnsynced` says the store is in place and the final directory
+sync failed, so the caller must not report plain failure and must not retry
+into what is now an occupied destination — what is missing is the guarantee
+that the rename survives a power loss.
+
+The command is `simdlogs restore -src FILE -dst DIR`, with `-dry-run`,
+`-tenant`, `-allow-unverified` and the four limits as flags; `-src -` reads
+stdin. It is a subcommand rather than a flag on the server binary because it is
+not the server, and a `-restore` flag on a process whose other flags all
+configure a long-running listener invites pointing it at a live storage
+directory.
 
 ## Disk
 

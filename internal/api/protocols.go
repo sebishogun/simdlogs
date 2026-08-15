@@ -22,7 +22,8 @@ import (
 const backupFlushTimeout = 10 * time.Second
 
 // backup streams a tar of the tenant's group files: a consistent point-in-time
-// snapshot for offline restore via storage.RestoreTar.
+// snapshot for offline restore via storage.Restore (the `simdlogs restore`
+// command); storage.RestoreTar is the older unstaged path.
 //
 // A backup that fails partway CANNOT be reported with a status code, because
 // the 200 and the first bytes are already on the wire. It used to call

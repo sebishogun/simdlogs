@@ -48,13 +48,21 @@ func newFailWriter(t *testing.T) (*Writer, *storage.Store) {
 func TestEveryWriteFaultReachesTheCaller(t *testing.T) {
 	injected := errors.New("injected")
 
+	nonWrite := map[string]bool{}
+	for _, name := range storage.NonWriteFaultPointNames() {
+		nonWrite[name] = true
+	}
 	for _, name := range storage.FaultPointNames() {
-		switch name {
-		case "buffering", "post-ack":
-			// Not steps of the write: they exist so the crash matrix can stop
-			// with rows buffered and after an acknowledgement. Nothing calls
-			// them on this path.
+		if nonWrite[name] {
+			// Points that are not steps of the write at all -- the crash
+			// matrix's buffering and post-acknowledgement stops, and the
+			// staged restore's post-rename hook. The list lives in the
+			// storage package, next to the points themselves, so a new WRITE
+			// step is covered here the day it exists rather than falling out
+			// of a list kept in this file.
 			continue
+		}
+		switch name {
 		case "manifest-sync":
 			// Handled by its own test below rather than skipped in silence.
 			// It is the one point where a reported failure does NOT mean the

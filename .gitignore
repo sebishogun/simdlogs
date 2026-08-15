@@ -2,3 +2,9 @@ docs/bench/
 docs/figures/
 *.test
 internal/bench/victoria-logs
+
+# The server binary. `go build ./cmd/simdlogs` drops it at the repo root, and
+# a 3.9 MB copy of it went in with the first commit and stayed tracked for the
+# whole build-out. Removing it from HEAD does not shrink the history, which
+# still holds the blob; rewriting that is a separate decision.
+/simdlogs

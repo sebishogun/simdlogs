@@ -133,9 +133,26 @@ committed assembly; every kernel has a portable fallback) and
   parked on a stalled writer. Both exceptions exist so a stalled writer cannot
   turn "take a backup" into "wait forever"; the consequence is an archive that
   stops at the last durable group rather than the last acknowledged row.
-  `storage.RestoreTar` unpacks it, validating each group against the manifest's
-  size, checksum and a full parse, with entry names flattened so an archive
-  cannot escape the directory. Immutability is why a group's BYTES are stable,
+  `storage.Restore`, behind the `simdlogs restore` command, unpacks it,
+  validating each group against the manifest's size, checksum and a full parse,
+  with entry names flattened so an archive cannot escape the directory. It
+  stages into a sibling and moves the result into place with one rename while
+  holding a lock on the destination and arranging for the lock file the rename
+  installs to be one it already holds, so the destination is the whole store or
+  holds no groups at all -- a failed restore into a path that did not exist
+  leaves an empty directory carrying a lock nobody holds, which the next
+  restore accepts. A server that opens the directory in the one gap that
+  exists --
+  between the rename that takes the old store away and the one that puts the
+  new store in place -- has to create it,
+  which makes the second rename fail with `EEXIST` and the restore abort
+  without touching that server's store. That is one of two orderings: Go's
+  `os.Rename` `Lstat`s first and returns `EEXIST` for an existing directory,
+  and a directory created between that `Lstat` and the raw `rename(2)` is
+  empty, so the rename replaces it -- safe too, because the server then flocks
+  the staging lock this call still holds and gets `ErrLocked`.
+  `storage.RestoreTar` is the older unstaged path and leaves a partial
+  destination on failure. Immutability is why a group's BYTES are stable,
   not why the archive is complete: the previous version copied paths out and
   silently skipped any that had gone. See `docs/lld/storage.md`.
 

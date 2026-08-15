@@ -2881,3 +2881,862 @@ leaves both backup tests green — `TestBackupReleasesItsAdmission` asserts the
 posted row is in the archive, and the ingest request's own `FlushMark` put it
 there. Two sentences claiming coverage that a one-line deletion disproves, in a
 file whose subject is claims of coverage.
+
+## The restore that deleted the store it was restoring into
+
+Task 5.2 shipped a staged restore whose whole claim was that the destination
+ends up holding the archive's store or holding nothing. Review found the claim
+false in three ways, two of them destructive, and found that not one of the
+nine tests carrying "staged" or "atomic" in its name tested staging at all.
+
+**The emptiness check and the removal are an archive-read apart.** The check
+ran at the top of `Restore`; `os.RemoveAll(dst)` ran at the bottom, after every
+group had been read. A server that opened a store at that path in between had
+its `LOCK`, its manifest and every group deleted, the archive renamed over the
+top, and the call returned nil. The measured aftermath is the part worth
+keeping:
+
+```
+live AppendGroup after the swap SUCCEEDED
+dst now holds: [group-0.bin group-1.bin]
+re-open of the restored dir: err=<nil>
+the reopened store reports 2 groups / 7 rows
+```
+
+The live writer's id counter is independent of the archive's, so its next group
+**overwrote the archive's `group-1.bin`**. The result opened clean and answered
+with 7 rows where the archive held 8 — a silent mixture of two stores, from the
+tool whose entire reason to exist is that the moment it runs is the moment
+there is nothing to compare against.
+
+**Two concurrent restores were the same defect in a different dress.** Both
+derive `<dst>.restoring`, so the second one's `os.RemoveAll(staging)` deleted
+the first one's staged files mid-stream and both wrote into the same directory.
+Measured with two archives from two tenants:
+
+```
+A err=<nil>  B err=open .../store.restoring/group-2.bin.tmp: no such file
+dst holds 4 entries: [group-0.bin group-1.bin group-2.bin group-3.bin]
+WRONG BYTES group-0.bin: 436 bytes, the manifest says 379
+```
+
+Two groups from each archive, one call reporting success, cross-tenant
+contamination produced by the function `RequireTenant` exists to prevent.
+
+Both are closed by one mechanism: take the store's own exclusive lock on the
+destination before reading the archive and hold it through the rename, then
+re-check emptiness **under the lock**. A server cannot open the directory while
+it is held, a second restore cannot start, and the re-check is what makes the
+removal safe — it proves the directory holds nothing but the lock this process
+created.
+
+**Every restore test passed against a build with no staging at all.** With
+`staging := dst` and the rename pair deleted — i.e. exactly `RestoreTar` plus a
+cleanup defer, the design the task exists to replace — all nine tests stayed
+green. `TestRestoreIsAtomic` truncates an archive and finds the destination
+absent, which the error-path `defer` produces just as well as staging does. The
+difference between the two designs only shows on a **crash**, where no defer
+runs, or **mid-stream**, where the destination can be looked at while the
+archive is still being read. The replacement asserts mid-stream, through a
+reader that runs a hook halfway:
+
+```go
+r := &pausingReader{r: bytes.NewReader(archive), at: int64(len(archive)/2),
+    hook: func() { midDst = dirNames(dst); midStaging = dirNames(dst+".restoring") }}
+```
+
+and the lock's test opens a store at the destination from that same hook and
+requires `ErrLocked`.
+
+### The same mistake, made again, in the fix
+
+The first replacement test for the lock was
+`TestRestoreRefusesALiveStoreAndLeavesItIntact`: open a store at `dst`, restore
+into it, assert the refusal and the store's survival. It passes with the lock
+deleted **and** the under-lock re-check deleted, because the start-of-call
+emptiness check refuses an already-occupied directory on its own. It was a test
+of the check that was never the problem, written to guard the lock, and it took
+a revert probe to see it — the same probe discipline that found the original
+defect, applied to its fix, catching the fix's test one round later.
+
+The lesson is not "write better tests". It is that a test for a
+time-of-check-to-time-of-use defect **cannot** be written as a before-and-after
+assertion, because the whole defect lives in the middle. It has to make its
+assertion during the window or it is testing something else.
+
+### The rest of the round
+
+- **`DryRun` applied none of the three limits.** It called `VerifyBackup`,
+  which is `readBackup` with no callback, and every limit lived in that
+  callback. `-max-files 1 -max-bytes 1 -dry-run` accepted a four-group archive.
+  The one mode an operator is told to point at an untrusted archive was the one
+  mode that checked nothing.
+- **The manifest is decoded before any limit can apply**, and it is what sizes
+  everything after it: a 24 MiB manifest cost 339.6 MiB of live heap from an
+  archive declaring `MaxFiles: 1, MaxBytes: 1`. Bounding it needed a limit
+  inside `readBackup`, not in the callback — hence `backupReadLimits`.
+- **The tenant check ran after every group was on disk.** The manifest is the
+  archive's first entry and `readBackup` enforces that, so nothing forced it to
+  be last; a 1 TiB wrong-tenant archive filled the volume before the refusal,
+  and a SIGKILL in that window left the wrong tenant's groups in a
+  `<dst>.restoring` sibling of the victim's directory.
+- **`-dry-run` without `-dst`** cleaned `""` to `"."` and read the current
+  directory, so a scheduled backup check succeeded or failed depending on where
+  it was run from. A dry run now touches no destination at all.
+- **`dst` as a symlink**: `os.ReadDir` follows it, `os.RemoveAll` unlinks the
+  link itself, so the store landed in the link's parent and the target kept
+  what it had — with success reported. `dst` as `"."`: `os.RemoveAll` rejects
+  any path ending in one, so the restore failed *after* writing the whole
+  archive. Both are refused up front now.
+- **A post-rename `syncDirNamed` failure returned a plain error** with the
+  store fully in place, sending an operator to retry into a destination that is
+  now occupied. `ErrRestoredButUnsynced` says which it is.
+- **The escape test proved nothing.** Its four crafted names are all rejected
+  by `groupIDFromName` before the flattening matters, so deleting
+  `filepath.Base` left the whole suite green while `../group-9.bin` landed in
+  the destination's parent. The flattening is only reachable for an entry that
+  gets as far as being written, which needs a manifest-less archive.
+- **The `total bytes` limit subtest was a second per-entry test**: `MaxBytes:
+  64` against 379-byte groups trips on the first entry, so `total +=` could be
+  `total =` and it still passed. The accumulation is the only thing that
+  distinguishes `MaxBytes` from `MaxFileBytes`.
+- **A comment on the most dangerous line in the file was wrong about Go and
+  argued the line was unnecessary.** It said `os.RemoveAll(dst)` was redundant
+  on Linux because a rename onto an empty directory succeeds. Raw `rename(2)`
+  does; `os.Rename` `Lstat`s the destination and returns `EEXIST` for any
+  existing directory. The line is load-bearing on the platform CI runs, and it
+  is also the line that turned the missing lock from a safe abort into
+  destruction.
+- **`cmd/simdlogs` had no tests at all**, which is how a usage message
+  claiming "the destination is the whole store or is untouched" shipped over an
+  implementation where it was not. The command now returns an exit code instead
+  of calling `os.Exit`, and has seven.
+
+Eight of the nine new guards were revert-probed; the ninth (the lock) needed
+its test rewritten first, which is the entry above.
+
+### Round two: that claim did not survive either
+
+Reviewer B deleted the guards one at a time and found three of them left the
+whole suite green:
+
+- **the tenant-timing hook** -- `TestRestoreRefusesTheWrongTenant`'s
+  `os.Stat(dst)` assertion passes whether the check runs before the first
+  write or after the last, because the cleanup removes the destination either
+  way. It tests the deferred cleanup, not the timing.
+- **the under-lock re-check** -- deleting it changed nothing, and the reason
+  turned out to be worse than a missing test: the re-check ran *before* the
+  archive read, so it could not protect the `os.RemoveAll(dst)` that runs
+  after it. A file appearing in the destination during the read -- which the
+  lock does not prevent, since a lock stops a process opening a STORE, not one
+  dropping a file in -- was deleted with no error. The check now sits against
+  the removal it guards, and the test writes the file from inside a
+  `pausingReader` hook.
+- **the dry-run "writes nothing" sentinel** -- `staging == ""`, and
+  `filepath.Join("", name)` is `name`. Deleting the guard left every package
+  green while the dry runs wrote eight stray `group-*.bin` files into
+  `internal/storage/`, `cmd/simdlogs/` and `internal/api/`. No test looked at
+  the working directory. The signal is a nil function now, which has no such
+  failure mode.
+
+And seven more defects, of which two matter:
+
+- **A SIGKILLed restore made the destination unrestorable.** `lockDir` creates
+  `dst/LOCK` and nothing unlinks it when the process dies, so the next attempt
+  counted it as an occupant and refused. A disaster-recovery tool that cannot
+  recover from its own crash without a manual `rm` is the wrong end of that
+  trade; `unlock` closes the descriptor and never removes the file, so a
+  cleanly stopped store leaves one too. The listing no longer counts it, and
+  `lockDir` -- the only thing that can tell a running process from a file it
+  left behind -- decides.
+- **`os.RemoveAll(dst)` unlinks the lock two syscalls before the rename.**
+  From that instant another process can create the destination and take a
+  fresh lock on a new inode; the rename then fails with EEXIST, and the
+  deferred cleanup removed `dst/LOCK` -- *that* process's lock. Two writers
+  with independent id counters, reached through the cleanup of the mechanism
+  that exists to prevent them. The cleanup now skips the lock removal once the
+  removal has run.
+
+The rest: the README's own restore command failed on a fresh machine
+(`os.Mkdir`, not `MkdirAll`, and the parent is created by the *server*);
+`ErrBackupUnverified` was swallowed when the sync also failed, so an operator
+was told the store landed and not that nothing had checked it (`errors.Join`);
+`MaxManifestBytes` could only be lowered, so an operator whose own manifest
+exceeded the built-in 64 MiB could not restore their own backup; a pre-created
+destination's mode was replaced; the library read a negative limit as "give me
+the default" where the CLI refused it; `os.RemoveAll(staging)` destroyed a
+same-named directory that had nothing to do with a restore; and
+`simdlogs restore -h` exited 2.
+
+**And the worst of the round was mine and was not code at all.** The script
+that added the "Staged restore" section to `docs/lld/storage.md` ended with
+`s = s[:start] + new` -- it truncated the file. `## Disk` and the entire
+`## Corruption policy and storage health` section, ~186 lines documenting a
+subsystem shipped two commits earlier, were deleted: quarantine ordering, the
+recovery gate, the record format, `quarantine/ACKNOWLEDGED` persistence, four
+metrics, `DirRereadInterval`, the disk-footprint baselines. `go test ./...`
+was green, `gofmt` was clean, `go vet` was clean, and this repository has no
+link or count gate over the LLDs. Nothing but reading the diff would have
+caught it, and I did not read the diff -- I read the section I had added.
+
+The rule that follows is narrow and absolute: **a scripted edit to a document
+is reviewed by its diffstat.** `+102 -2` is an insertion; `+89 -170` is not,
+whatever the section you were looking at says. `git diff --stat` takes one
+second and is the only thing that sees what a truncating splice did.
+
+### Round three: the window was narrowed, not closed
+
+Reviewer C reproduced the original catastrophe against the FIXED code.
+`os.RemoveAll(dst)` unlinks the lock file the call has been holding, two
+syscalls before `os.Rename` re-establishes anything. Hammering `OpenStore` +
+`AppendGroup` against a loop of restores for fifteen seconds, four runs:
+
+```
+restores ok=63552 failed=179697  short-destinations=6  partial-visible=1065
+restores ok=70483 failed=202267  short-destinations=9  partial-visible= 940
+restores ok=82525 failed=265367  short-destinations=4  partial-visible= 582
+restores ok=75717 failed=238429  short-destinations=6  partial-visible= 511
+a successful restore left [group-1.bin group-2.bin group-3.bin];
+  stat: group-0.bin=no such file or directory
+```
+
+`Restore` returned nil with a group missing, and `partial-visible` counts opens
+that saw one to three group files -- a partial store visible mid-restore, which
+staging exists to make impossible. Isolated deterministically, the mechanism is
+plain:
+
+```
+AppendGroup err=<nil>
+the restored group-0.bin was OVERWRITTEN by the live writer: 379 bytes -> 348
+```
+
+A writer that gets in allocates ids from its own counter, and
+`discardUncommitted` unlinks `dst/group-<id>.bin` **by path** on a failed
+commit -- after the rename, that path is the archive's file.
+
+The window went from "the whole archive read" to "two syscalls", which is a
+real improvement and is not what four documents asserted. The fix is to make
+the lock survive the swap rather than to shrink the gap further: the STAGING
+directory is locked too, just before the swap, and that lock file is the one
+the rename installs as `dst/LOCK`. After the rename this process holds the
+restored store's own lock; before it, a server that creates `dst` makes the
+rename fail with `EEXIST`, which is a safe abort. There is no ordering left in
+which someone else writes into the result.
+
+Testing it needed a seam. The assertion is about the instant between the rename
+and the return, so `restore-renamed` joins the fault points -- used as a
+notification rather than an injection, with the test opening the destination
+from the hook and requiring `ErrLocked`.
+
+**And the fix for the lock introduced a lock defect of its own.** The deferred
+cleanup ran `lock.unlock()` and then `os.Remove(dst/LOCK)`. Between them the
+inode is linked and unheld; a process that flocks it in that gap has its lock
+file unlinked out from under it, and a third process then creates a new inode
+and also succeeds. Two holders of a lock whose entire purpose is that there is
+one:
+
+```
+restores=4 competing lock acquisitions=5 DOUBLE-HELD=1
+restores=2 competing lock acquisitions=3 DOUBLE-HELD=1
+restores=5 competing lock acquisitions=8 DOUBLE-HELD=2
+restores=3 competing lock acquisitions=4 DOUBLE-HELD=2
+restores=2 LOCK-UNLINKED-UNDER-A-HOLDER=2
+```
+
+The unlink goes first, while the flock is still held. That ordering has no gap
+to inject into, so it is recorded here rather than guarded by a test -- the
+same placement as simdparquet's int64 wrap.
+
+### The rest of round three
+
+- **The tenant-timing guard was still untested**, and round two's own entry had
+  named it as one of three that left the suite green. The other two got tests;
+  this one did not. It has one now, and it counts `temp-create` faults rather
+  than looking at what survives -- 0 writes for the wrong tenant, 4 for the
+  right one, so the counter is measuring something.
+- **"Before the first group is written" was false for a manifest-last
+  archive.** `readBackup` enforces manifest-first *retroactively*: groups
+  arriving first are read, parsed and emitted, and the ordering error is raised
+  when the manifest turns up. All four groups landed on the destination's own
+  volume from an archive whose manifest had been moved to the end, bounded only
+  by `MaxBytes` -- a terabyte by default. A restore that names a tenant now
+  refuses any group that precedes the manifest.
+- **A fresh destination came out wider than the server would make it.** The fix
+  for "a pre-created destination's mode was replaced" chmodded unconditionally
+  to the hard-coded 0755, so under umask 077 a restore produced 0755 where
+  `OpenStore` gives 0700: log data made world-readable by the fix for the
+  opposite defect. The mode is applied only to a destination that already
+  existed, and the test now runs at umask 077 -- 022, where it used to run, is
+  the one umask at which the two branches agree and nothing shows.
+- **`clearStaging` destroyed a legacy store at the staging path.** Keying on
+  "does it hold only group files" cannot tell crashed staging from a
+  pre-MANIFEST store, and `-dst /srv/logs` derives `/srv/logs.restoring`. A
+  `.simdlogs-restoring` marker, written first and removed before the rename, is
+  present in exactly one situation.
+- **Two CLI branches had no test**: the `ErrRestoredButUnsynced` message, which
+  is the entire operator-facing reason that error exists, and the usage
+  refusal for a missing `-dst`.
+- **Three stray `group-*.bin` files** were sitting in `internal/storage/`,
+  residue of round two's dry-run-sentinel probe, one `git add -A` from being
+  committed.
+- Two stated rationales were wrong. "unlock closes the descriptor and never
+  removes the file" is unix-only -- on Windows the lock IS the open handle and
+  `unlock` removes it, so a stale LOCK there means a crash and `lockDir`
+  refuses it with `O_EXCL` whatever the destination listing does. And
+  `os.RemoveAll` rejects a path ending in `.`, not `..`; the kernel refuses
+  that one, with a different errno arriving just as late.
+
+Adding `restore-renamed` broke `TestEveryWriteFaultReachesTheCaller`, which
+sweeps `FaultPointNames()` and requires each to fail a write. That test is
+right and the fix is not a skip: the exclusion list moved into the storage
+package as `NonWriteFaultPointNames`, inverted so that a new WRITE step is
+covered the day it exists. A write-path list would have silently missed the
+next one, which is the failure the sweep exists to prevent.
+
+### Round five: the round that fixed it re-opened it
+
+Round two closed a defect by skipping the lock-file unlink "once the removal
+has run". Round four, rewriting the same function, moved that flag from
+*before `os.RemoveAll(dst)`* to *after `os.Rename`*:
+
+```go
+if err := os.RemoveAll(dst); err != nil { return man, err }   // this call's dst/LOCK is gone
+if err := os.Rename(staging, dst); err != nil { return man, err }  // lock still non-nil here
+lock = nil                                                     // guard moved to here
+```
+
+On the rename-failure path the lock is still considered ours, and the deferred
+cleanup unlinks `dst/LOCK`. But the ONLY way `os.Rename` returns `EEXIST` is
+that another process created `dst` -- so on that path the lock file is theirs.
+The failure condition and the ownership are the same event, not a race.
+
+Measured with generation-counter attribution, 30-second runs under contention:
+
+| build | LOCK-STOLEN | DOUBLE-HELD |
+|---|---|---|
+| as shipped | 38, 47 | 31, 37 |
+| flag before the removal | 0, 0 | 0, 0 |
+
+Identical EEXIST pressure in both. The failure it produces is two writers with
+independent `nextID` counters in one directory -- the thing `lockDir` exists to
+prevent, reached through the cleanup of the mechanism that prevents it. The
+flag is back before the removal, where round two put it, and
+`TestALostRenameDoesNotTakeTheWinnersLock` now creates the winning process from
+a new `restore-removed` fault point and requires its lock to survive.
+
+**On Windows every successful restore produced a store nobody could open.**
+`dirLock` captures its path at lock time, and the rename moves the file from
+the staging directory to `dst/LOCK`. The release then did `os.Remove(dst/LOCK)`
+-- which on Windows *must* fail, since the lock IS the open handle and this
+repo's own comment says an open file cannot be deleted -- and then `unlock`,
+which removes the path captured earlier: `staging/LOCK`, long gone. Net:
+`dst/LOCK` survives, and `lockDir`'s `O_EXCL` refuses that directory forever.
+The unlink-before-unlock invariant this file recorded as universal one round
+earlier is unix-only for exactly that reason. `dirLock` grew `movedTo` and a
+per-platform `release`: unix unlinks while holding, Windows unlocks and lets
+`unlock` do the removal.
+
+**The dry-run guard was unguarded, and the test written to close it could not
+fire.** Reverting the nil-function signal to the empty-path sentinel left
+`go test ./...` at exit 0 while writing the same eight stray `group-*.bin`
+files into the same three directories that round two's entry records --
+reproduced against the fix for it. The test compared the working directory
+before and after its own dry run, and any earlier dry run in the package put
+the strays into the "before" snapshot: it failed alone and passed in the suite.
+It runs in its own `t.Chdir(t.TempDir())` now. That is round one's recorded
+lesson -- *a defect that lives in the middle cannot be tested by a
+before-and-after assertion* -- made again on a different property.
+
+**A kill in the marker-less window made the destination unrestorable.** The
+marker was written inside the staging directory, so it had to be removed before
+the rename or it would land in the restored store -- and between those two
+points sit an fsync of the whole staged store, a lock, a readdir and the
+removal of the old store. Seconds on a real store. A kill there left a
+complete, marker-less staging directory that every later restore refused, and
+if it landed after the removal the old store was gone too. The marker is a
+sibling now, `<dst>.restoring.marker`, removed after the rename: it can never
+reach a store and there is no window.
+
+Also: the staging directory was created 0755 while the destination was 0700,
+leaving group names and sizes world-listable for the length of the restore;
+four documents and comments asserted properties the code did not have (the
+"safe abort", "no server can open that directory", "a LOCK is named in the
+error", and the manifest-first reasoning that round three had already corrected
+360 lines below in the same file -- the eighth one-side-only claim, re-added in
+the round that wrote the lesson down); and the umask helper justified itself
+with "none calls t.Parallel" in a package with nine such call sites.
+
+**What this round is really about.** Every defect above was introduced by the
+fix for the defect before it, and two of them are the earlier defect returning
+in the same function. Rewriting a function that a previous round hardened
+re-opens what that round closed unless every guard it added is carried across
+deliberately -- and a guard whose reason lives only in a comment, or only in a
+`docs/wrong.md` entry, is one nobody carries. The three that survived five
+rounds are the ones with a test that dies when they are deleted.
+
+### Round six: a lock file cannot be handed over by unlinking it
+
+Round five ordered the unlink before the unlock and recorded that ordering as
+having "no gap to inject into". Review measured the gap on the other side: a
+competitor whose `open(2)` precedes the unlink acquires the flock on the
+now-unlinked inode after the unlock, while the next competitor creates a fresh
+inode at the path and flocks that. One lock, two holders. Thirty-second hammer,
+`OpenStore`+`AppendGroup` against a restore loop:
+
+| build | restores | LOCK-STOLEN | DOUBLE-HELD |
+|---|---|---|---|
+| unlink-then-unlock (round five) | 321257 | 24 | 268 |
+| same, second run | 315989 | 44 | 211 |
+| `dstRemoved` late (round four control) | 305638 | 197 | 276 |
+| **no unlink at all** | 315639 | **0** | **0** |
+
+Both orderings have a gap; the mistake was thinking one of them did not. **A
+lock file whose inode can change cannot be handed over safely by ordering.** So
+the file is never unlinked -- which is what `unlock` and `Store.Close` have
+always done, and what the destination check was already written to tolerate.
+`release` is now `unlock` on unix, and a restored store carries a `LOCK` exactly
+as a store the server created does.
+
+That has a visible consequence and it is the right one: a failed restore into a
+path that did not exist leaves an empty directory holding a lock nobody holds.
+The next restore accepts it. Six tests that asserted "the destination does not
+exist" as a proxy for "nothing landed" now assert the property itself -- no
+group files -- which is what they were always about.
+
+**Windows could never have completed a restore.** `lockDir(dst)` keeps
+`dst/LOCK` open, and `os.RemoveAll(dst)` must then fail with a sharing
+violation: Go opens without `FILE_SHARE_DELETE`, and `removeall_at.go`'s
+`Deleteat` needs `DELETE` access. That is the premise `lock_windows.go` and the
+LLD both state -- "a file opened without FILE_SHARE_DELETE cannot be deleted
+while open… holding the handle is itself the lock" -- so the design was
+internally inconsistent: either the rule holds and the removal cannot succeed,
+or it does not and the Windows lock is not a lock. Every restore would have
+failed after staging, validating and fsyncing the whole archive, leaving a
+`LOCK` that `O_EXCL` refused forever. The destination's lock is released
+explicitly before the removal now, which is what makes the removal possible
+there at all. REASONED, not measured: there is no Windows host here, and
+`GOOS=windows go vet ./...` does not even compile the test files (a pre-existing
+`syscall.Kill` in a helper).
+
+**The conditional release skipped the close, not just the unlink.** Round two's
+rule was "do not remove the lock file once the removal has run"; round three
+merged remove and unlock into one function, so the guard began skipping the
+unlock too -- 75 leaked descriptors per 200 restores, and on an `os.RemoveAll`
+failure a held lock that made the destination unopenable for the life of the
+process. The release is unconditional now, and it has nothing left to guard
+against.
+
+**The marker-less window was moved, not closed.** The marker was written after
+`os.Mkdir(staging)`, so a kill between them left an empty marker-less staging
+directory that `clearStaging` refused forever -- the same non-retryable
+destination, two syscalls wide instead of an fsync-and-readdir wide, in a round
+whose entry said "there is no window". The marker goes down first now. Like the
+two lock orderings, that is reasoning and not a test: the orderings differ only
+on a kill, where no defer runs.
+
+Three claims in three documents were also wrong: the LLD still described round
+three's marker (wrong name, wrong location, wrong timing) in the document round
+five rewrote; `docs/architecture.md` said "no server can open it mid-restore",
+which is false and measured -- a server DID open the destination in the
+removal-to-rename gap, appended a group, and the restore aborted with `EEXIST`,
+which is safe but is not what the sentence says, and the accurate version is in
+two other files; and the LLD restated the `..`/`os.RemoveAll` error that round
+three had already corrected in the code beside it.
+
+### Round seven: the Windows fix cost the unix platform its data
+
+Round six released the destination's lock immediately before
+`os.RemoveAll(dst)`, because Windows cannot remove a directory holding an open
+handle. On unix that release is not merely unnecessary, it is the original
+catastrophe again -- and it is round six's OTHER change that makes it so.
+
+Since the lock file is never unlinked, after an early release `dst/LOCK` is
+still there and is UNHELD. A server flocks the file that already exists, opens
+the store, and then: `os.RemoveAll(dst)` deletes that live store, and
+`os.Rename` **succeeds** -- because the winner never had to create the
+directory, so there is no `EEXIST` to abort on. Instrumented, one run:
+
+```
+Restore returned nil; the manifest names 4 groups
+a store OPENED at the destination inside the release-to-removal window
+the ghost's AppendGroup SUCCEEDED, taking id 0
+THE ARCHIVE'S group-0.bin WAS OVERWRITTEN: 353 bytes, want 379
+the reopened store answers with 4 groups / 13 rows; the archive held 16
+```
+
+Round one's paragraph, word for word, six rounds later, on the fix for it.
+Hammered, thirty seconds:
+
+| build | restores ok | displaced holders | over a restored store | archive group overwritten |
+|---|---|---|---|---|
+| as shipped | 560 | 3739 | 7 | **1** |
+| again, 60 s | 1055 | 7096 | 5 | **1** |
+| pre-removal release deleted | 544 | 192 | **0** | **0** |
+
+The control's 192 are `RemoveAll` racing a competitor that recreates `dst`;
+none reached a restored store, because the rename fails `EEXIST`. That is the
+safe abort the documents describe, and it is the argument the early release
+destroys: **the abort depends on the winner having to CREATE the directory.**
+Leave the directory there for them to open and the argument is gone.
+
+The repair is `releaseBeforeRemoval`, per-platform: `release()` on Windows,
+nothing on unix. Round six put a Windows-only requirement in shared code and
+the shared platform is the one that lost data.
+
+Round six's own table -- "no unlink at all: 0 steals, 0 double-holds" -- is
+true of what it measured, two holders of the same INODE, and says nothing
+about two holders of the same DIRECTORY. A metric that answers a narrower
+question than the prose around it is how a round certifies its own regression.
+
+### Three more, and one guard that turned out to be two
+
+- **Nothing tested that the marker is written at all.** Two rounds hardened its
+  timing and its location; deleting the `os.WriteFile` left the suite green,
+  and `clearStaging` then refuses EVERY leftover staging directory -- the
+  non-retryable destination both of those rounds wrote an entry about. Both
+  crash tests wrote the marker by hand, and the fault-injected ones take the
+  error path where the deferred cleanup makes it irrelevant. It is asserted
+  mid-restore now, from a reader hook.
+- **The per-entry `MaxFiles` counter was unguarded.** The subtest named "group
+  count" trips the MANIFEST bound; the per-entry counter is the only
+  entry-count bound an unverified archive can get, and nothing exercised it.
+  Same shape as round one's "the total-bytes subtest was a second per-entry
+  test", two rounds after that was recorded.
+- **`RequireTenant` on an unverified archive is guarded by two rules, and the
+  test only reached one.** An archive WITH groups is refused by the
+  groups-before-manifest rule on its first entry, so the refusal at the end of
+  `readRestore` never runs -- which is why deleting it changed nothing. It is
+  reachable for an archive with no entries at all, and without it an empty
+  manifest-less archive restores under a tenant it does not name. Both rules
+  now have a case, and deleting either fails one.
+
+And the ninth one-side-only claim, this time in the text an operator reads:
+round six corrected "no server can open it mid-restore" in
+`docs/architecture.md` while `simdlogs restore -h` went on printing "the
+store's own lock is held for the whole run, so no server can open the
+destination while it is in progress" -- false twice over. Six more sites said
+"for the whole run"; the lock is held until the removal, and that is the
+sentence that has to be everywhere, because the safe-abort argument depends on
+it.
+
+### Round eight: the protocol holds, and three residues
+
+The swap was hammered with `OpenStore`+`AppendGroup` ghosts and with concurrent
+restorers, and the harness proved sensitive by reproducing the round-seven
+defect on demand:
+
+| build | restores | ghost opens | displaced | archive group overwritten |
+|---|---|---|---|---|
+| as shipped, 30 s, 4 ghosts | 30636 | 173578 | 0 | **0** |
+| as shipped, 30 s, 12 ghosts | 3825 | 132006 | 0 | **0** |
+| control (unix `releaseBeforeRemoval` = `release()`), 10 s | 12314 | 89636 | 203 | **4364** |
+
+The control's thirty-second run did not finish: `fatal error: fault / SIGBUS`
+inside `binary.littleEndian.Uint32`, a reader's mmapped group replaced under
+it. Restore-against-restore, 163k and 139k rounds at four and eight
+concurrent restorers, destination verified byte for byte against the winning
+archive: zero two-winner outcomes, zero mixtures, zero wrong bytes.
+
+**The per-entry limits bounded the write, not the allocation.** `readBackup`
+reads a whole entry with `io.ReadAll` sized from the manifest's declared size,
+and every per-entry limit lived in the emit callback that runs after it:
+measured, an archive declaring one 128 MiB group cost 268.5 MiB of live heap
+with `MaxFileBytes` set to 1 -- in a DRY RUN, the mode the documents point an
+operator at for an untrusted archive. That is the argument this file already
+makes three times about the manifest, one entry type over, with the mechanism
+to fix it (`backupReadLimits`) already in place. The ceiling is pushed down
+now, and the test asserts the ERROR MESSAGE rather than the allocation: a
+truncated tar is bounded by the bytes it carries, so a buffer sized from the
+declaration and one sized from the stream look identical on that fixture, and
+only the wording says the refusal came before any read.
+
+**The descriptor-leak test's own rationale went false when round seven made
+the release per-platform.** Its comment says "the success path releases the
+lock explicitly before the removal, so only a failure exercises the deferred
+release" -- true on Windows and false on unix since `releaseBeforeRemoval`
+became a no-op there, where the deferred release is now the ONLY one. The test
+drove twenty failing restores and no successful ones, so with the conditional
+release restored, twenty successful restores leak twenty descriptors and the
+suite stays green. Round six's own recorded number, uncovered again by the
+round that fixed something else.
+
+**And the eleventh one-side-only claim.** Round seven corrected "the lock is
+held for the whole run" in eight places including the CLI help, and left
+paragraph five of `docs/lld/storage.md` stating the round-six design outright:
+"the destination's own lock is released explicitly before the removal". That is
+the sentence whose wrongness produced the round-seven catastrophe, sitting
+twenty-eight lines below the paragraph that says the early release exists "there
+and only there". A reader who goes to the lock-protocol paragraph reads the
+design that lost the data.
+
+Two smaller ones. "A second restore cannot start" is false in the
+removal-to-rename gap: one can, and it deletes this call's staging directory on
+its way out, because both derive their paths from `dst`. Contained -- the
+winner's next write fails `ENOENT` and it reports an error, zero mixtures in
+302k rounds -- and the sentence now says so. And `FaultPointNamed`'s doc
+enumerated eleven names, three behind, directly above the paragraph explaining
+why `FaultPointNames()` exists so that a hand-written list cannot go stale.
+
+## The lock that excluded nobody, and the fix that was aimed at the wrong window
+
+Round nine came in as a data-loss finding against the uncommitted restore:
+`os.RemoveAll(dst)` unlinks `dst/LOCK`, then re-reads the directory until it
+reads empty, then `rmdir`s -- so in the middle of its own loop the destination
+is present and lockless, a server opening it there creates a second `LOCK`
+inode, and the loop's next pass deletes what that server wrote before the
+rename goes on to succeed. Measured against twelve writers over thirty
+seconds: 24 of the archive's groups overwritten in one run and 3 in another,
+against 0 for the same harness with `Restore` never called.
+
+The finding was right that data was being lost. It was wrong about which
+window was losing it, and the fix aimed at the named window did nothing.
+
+Replacing the removal walk with `os.Rename(dst, dst+".restoring.old")` -- one
+syscall, so the directory and the lock inode inside it leave together, with
+the sibling removed afterwards off a path no opener can reach -- and running
+the same harness:
+
+| build | ghost groups lost | archive groups overwritten |
+|---|---|---|
+| removal walk (as found) | 13 | 27 |
+| one-syscall rename | 7 | 17 |
+
+Within noise of each other. Both fail.
+
+**What was actually firing** came out of a syscall trace rather than an
+argument. `lockDir` opens the lock file and then flocks it, which is two
+syscalls, and a staged restore replaces the whole directory in one. The
+descriptor then names an inode that has left the path -- unlinked with the
+directory it lived in, contended by nobody, so the flock ALWAYS succeeds:
+
+```
+077219 R renameIn ok dstDirIno=113001475 stagedLockIno=113001480
+077220 R stagedRelease lockIno=113001480
+077230 R rmDisplaced ino=113001475            <- inode 480's directory destroyed
+...
+077252 R lockDst ok  lockIno=113001501 dirIno=113001496
+077256 G open        lockIno=113001480 dirIno=113001496   <- locked the corpse
+077261 G append id=0 err=<nil>                <- writes into 496 BY PATH
+```
+
+Six directory generations after inode 113001480 was released and deleted, a
+store opened on it and appended `group-0.bin` into the live directory whose
+lock was 113001501. Two processes, one path, one of them holding a dead file.
+That is not a restore defect at all -- every `OpenStore` in the product has it,
+and the restore is merely the thing that swaps directories fast enough to
+expose it.
+
+Checking the flocked inode against the path afterwards, and retrying a bounded
+number of times, closes it. Interleaved in one session:
+
+| build | ghost groups lost | archive groups overwritten | |
+|---|---|---|---|
+| as found | 13 | 27 | FAIL |
+| inode check + rename, 60s / 24 ghosts | 0 | 0 | PASS |
+| inode check + rename, 45s / 16 ghosts | 0 | 0 | PASS |
+
+**Then the rename had to justify itself, because the check alone might have
+been enough.** Reverting to the removal walk with the inode check kept, 45
+seconds and 16 ghosts: 0 lost, 0 overwritten, PASS. By that measurement the
+rename is dead weight.
+
+It is not, and the reason is that the walk's window is real but a great deal
+narrower than the finding implied. `checkRestoreDestinationLocked` guarantees
+the destination holds nothing but this call's own lock file, so the walk is
+always exactly one unlink, one readdir, one rmdir -- a window no competitor
+reaches at production speed. Widen only the width, keeping the shape and the
+inode check, and it opens:
+
+| build | foreign entries in the gap | archive groups overwritten | ghost groups lost | restores landing incomplete |
+|---|---|---|---|---|
+| removal walk, gap widened to 200us | **56,434** | 692 | 519 | 85 |
+| one-syscall rename | 0 | 0 | 0 | 0 |
+
+56,434 times in twenty-five seconds a file belonging to another process
+appeared inside a destination the removal had already emptied. So both changes
+ship: the inode check closes what fires at production speed, the rename closes
+what only amplification reaches.
+
+**The lesson is about the amplification.** The finding's evidence -- 2,432
+foreign `LOCK` files and 508 foreign manifests and groups unlinked -- came from
+an instrumented removal that was deliberately slower per entry. That
+measurement proved a hole existed. It did not prove which hole was firing, and
+the diagnosis attached to it named the window the instrument had widened rather
+than the one the product was losing through. Slowing a suspect down finds holes
+near the suspect; it cannot rank them against holes somewhere else. The trace
+could, because it recorded what the losing writer actually held.
+
+Recorded because none of it was reasoning: three rounds of argument about
+rename orderings and `EEXIST` were all consistent with the code and all beside
+the point, and the sixty-second trace answered it in one read.
+
+## Four things the round-nine sign-off found, and the one measurement that was more useful than the argument
+
+The sign-off reviewer could not lose data against the shipped build — 60 s,
+24 ghosts, both windows widened to 200 µs, zero double-holds and zero groups
+lost or changed. Four other things did not survive.
+
+**The rename was independently load-bearing after all.** The round's own probe
+B (removal walk restored, inode check kept) lost nothing at production speed,
+which made the rename look like dead weight justified only by amplification.
+Deleting the inode check while KEEPING the rename — the probe nobody ran —
+produces 8 double-holds in 30 seconds at production speed. Both changes carry
+their own weight; the earlier entry's framing of the rename as
+"amplification-only" was an artefact of testing one direction.
+
+**The marker died before the staging directory it vouches for.** Deferred
+calls run in reverse, and the marker's removal was inside the cleanup
+registered last, so it ran before the staging cleanup. Sampled from another
+goroutine during the unwind after an abort between the renames:
+
+| archive | samples | saw (marker gone, staging present) |
+|---|---|---|
+| 4 groups | 212 | 13 |
+| 40 groups | 967 | 58 |
+| 400 groups | 9,323 | 690 |
+
+Six to seven per cent of every unwind, on an invariant `restore.go` and
+`docs/lld/storage.md` both state in words — *"a kill between them would leave a
+staging directory a later restore refuses"*. A kill in that window produces
+exactly that, refused forever.
+
+The end state is identical whichever order they go in, which is why nothing
+caught it and why the fix needed a fault point rather than an assertion: the
+marker's removal is registered with its WRITE now, so reverse order puts it
+last, and `faultRestoreCleanup` lets a test stand inside the cleanup and check
+that both directories are already gone.
+
+**The `os.Remove(dst)` on the failure path could only ever remove somebody
+else's directory.** Its own residue it cannot touch: `lockDir` has put a LOCK
+in the directory, the file is never unlinked, and rmdir refuses a non-empty
+directory — measured after a truncated restore into a path that did not exist,
+`dst` holds `[LOCK]` and the rmdir fails every time. A competitor's it can: a
+server creating the destination in the gap between the two renames has an empty
+directory for as long as it takes to open its lock file, and the rmdir takes it.
+Deleted. It was also the last thing making *"aborts without touching
+anything"* false.
+
+**Four guards were unguarded** — deletable with the whole suite green: the
+rename itself, the marker ordering, `clearStaging`'s displaced arm, and that
+rmdir. Now five test functions and six cases -- the marker ordering needs two,
+one per path -- each verified to fail against its own reversion.
+
+**And four doc claims did not match the code.** *"Two restores cannot
+interleave"* in README.md and verification.md, which round eight had already
+recorded as false and corrected in the LLD and in `restore.go` — the same
+sentence left standing in the two documents an operator actually reads. The
+`EEXIST` claim in architecture.md and verification.md, which is one of two
+orderings: Go's `os.Rename` `Lstat`s and returns EEXIST for an existing
+directory, but a directory created between that `Lstat` and the raw
+`rename(2)` is empty and gets replaced — safe by the staging lock, not by
+EEXIST. `lockedFileIsAtPath` claimed `os.SameFile` was stronger than comparing
+device and inode; on unix it *is* that comparison, and what makes the check
+sound is the held descriptor pinning the inode. And `movedTo`'s comment on the
+unix file described the Windows consequence as if it were unix's, where
+`release` never reads the path at all.
+
+Five of these are the one-side-only shape this file has now recorded twelve
+times. The new one is the third: **a correction that lands in the reference
+document and not in the README.** The LLD was fixed in round eight, the entry
+was written in round eight, and the false sentence survived in the two files
+with the widest audience — because the round's diff touched the LLD and the
+grep that would have found the others was never run.
+
+## Two restores in each other's gap, and the sentence that said it could not happen
+
+The round-ten sign-off could not lose data on any path a deployment reaches:
+61,425 committed groups under four concurrent restore loops with none vanished
+or changed, 20,000 barrier rounds of six workers with six distinct archives and
+exactly one winner each, 11.6 million overlapping attempts with 104,479
+successful restores and no foreign group in any of them. A ghost `OpenStore`
+at every one of the five fault points loses nothing either.
+
+It did find an ordering the code said did not exist. Two restores, each parked
+in its own gap between `os.Rename(dst, displaced)` and `os.Rename(staging,
+dst)`: the first returns **nil**, with a manifest naming its own three groups,
+over a destination holding the other's six. Two ordinary `Restore` calls, no
+hand-made filesystem state, parked with this package's own `restore-removed`
+point. `simdlogs restore` would exit 0 and print the archive it read.
+
+Reachability is the reason this is recorded rather than fixed:
+
+| harness | occurrences |
+|---|---|
+| 20,000 barrier rounds, 6 workers, 6 archives | **0** |
+| 11.6M overlapping attempts, 104,479 successful restores | **0** |
+| same, re-run: 6.8M attempts, 95,600 restores | **0** |
+| with a concurrent `os.RemoveAll(dst)` from outside any restore | 267 of 85,686 in-lock samples |
+
+It needs something that is not a restore to widen the window. Closing it needs
+a lock that outlives the swap on a path neither restore owns, which is a
+different design; the documented answer is that two restores must not target
+one destination, and the four places that said otherwise now say this.
+
+**The claim is the finding.** `restore.go` said *"There is no ordering left in
+which someone else writes into the result"*, and the LLD said *"leave no
+ordering in which someone else writes into the result"*. Both were reasoned
+from the server case, which is genuinely closed, and stated over all cases.
+That is the thirteenth instance of the one-side-only shape this file has now
+recorded twelve times — and the first where the untrue half is a claim of
+completeness rather than a claim about a platform or a branch. "No ordering
+left" is a quantifier, and a quantifier is exactly the kind of sentence that
+cannot be true of the case you had in mind and false nowhere else.
+
+Four smaller things from the same review, all text: a garbled sentence shipped
+in `docs/verification.md` (a splice that duplicated half a clause and lost the
+other half — the diffstat was insertion-shaped and the sentence was still
+broken, so a numstat check does not catch this class); the pre-fix comment left
+standing on the very cleanup this round rewrote, four lines above the line that
+contradicts it; *"no crash can leave a staging directory a later restore
+refuses"*, which holds for a process kill and is not established for a power
+loss, because the marker is written with no fsync of the file or its parent;
+and the refusal of `.`, `..` and symlinks justified by what `os.RemoveAll(dst)`
+does, which is the call this round deleted.
+
+And `TestTheMarkerOutlivesTheDirectoriesItVouchesFor` asserted on the success
+path, where the staging directory has already been renamed away — so its
+staging check could never fire, on a fix whose defect was on the abort path.
+It is two subtests now, and the abort one fails against the pre-fix ordering.
+A test that cannot fail is the shape entry 33 records; this one could fail, on
+the half of the invariant that was never broken.
+
+## A retraction that landed in one paragraph and left the claim standing twice in the same file
+
+The previous entry retracted "there is no ordering left in which someone else
+writes into the result" and rewrote the four places that stated it. The
+verification round found the claim still standing in two more —
+`docs/lld/storage.md` and `restore.go` — each of them **forty lines above the
+paragraph retracting it**, so both files asserted the claim and its correction
+at once. A third site, a test's own comment, had never been on the list.
+
+The reason is worth more than the fix. The retracted sentence was reworded
+where it appeared as a *conclusion*, and left where it appeared as a *passing
+mention* inside a paragraph about something else — the lock's release timing in
+one case, the emptiness re-check in the other. A grep for the sentence would
+have found all six; the round searched for the paragraph instead, because that
+is what it had just rewritten. Correcting a claim means finding every place it
+is asserted, not every place it is argued.
+
+Four smaller things from the same round, all text: `entry 44` cited for the
+value-count bomb where the ordinal is 45; the `.`/`..`/symlink refusals still
+justified by what `os.RemoveAll(dst)` does, which is the call this design
+replaced — measured with each refusal removed, `.` now fails the emptiness
+re-check and a symlinked destination SUCCEEDS, replacing the link with a real
+directory and leaving the target holding a `LOCK`; "four guards in five tests"
+against a file holding five functions and six cases; and a paragraph whose
+"Asserted mid-stream, not after the fact" had drifted twenty lines from the
+claim it qualifies.
+
+And one the round introduced while fixing the first: **"reachable only when
+something outside a restore widens the window"**. Four harnesses observed it
+zero times without such a widener, which bounds how often it happens and does
+not establish that nothing else reaches it. That is a universal negative
+inferred from bounded runs — the same shape as the quantifier the previous
+entry was written to retract, reappearing in the sentence retracting it. It now
+says what was measured.
+
+Also settled, because it is what makes one branch of the three-outcome answer
+reachable: Go's `os.Rename` returns `EEXIST` for an existing directory, but
+having found one it `Lstat`s OLDNAME and reports THAT error first — so a
+staging directory another restore already deleted yields `ENOENT` even though
+the destination exists.

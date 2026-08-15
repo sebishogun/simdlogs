@@ -177,11 +177,43 @@ claims are amd64/AVX-512 only.
   by the index.
 - Graceful shutdown (SIGINT/SIGTERM): stop accepting, drain in-flight (15 s),
   flush writers, unmap stores — no buffered rows lost, no mmap leaks.
-- Restore: `storage.RestoreTar` unpacks a `/admin/backup` tar into a fresh
-  directory with entry names flattened so an archive cannot escape, and only
-  entries named as group files are written -- an archive can place group files
-  and nothing else. A `MANIFEST` entry would otherwise be honoured by the
-  legacy-directory gate and make every restored group invisible.
+- Restore: `storage.Restore`, behind the `simdlogs restore` command, unpacks a
+  `/admin/backup` tar into a staging sibling and moves it into place with one
+  rename, holding a lock on the destination until the syscall that takes that
+  directory away, and arranging for the lock file the rename installs to be one
+  it already holds -- so a server that opens the destination in the one gap
+  where it exists (between the rename that takes the old store away and the one
+  that puts the new store in place) has to CREATE it, which makes that second
+  rename fail with EEXIST and the restore abort without touching that server's
+  store. (One of two orderings: Go's os.Rename Lstats the destination and
+  returns EEXIST for an existing directory, but a directory created between
+  that Lstat and the raw rename(2) is empty and the rename replaces it. Safe
+  either way -- the server then flocks the staging lock this call still holds
+  and gets ErrLocked.) A server that arrives after the rename gets ErrLocked
+  until the restore returns. A second RESTORE cannot start while the lock is
+  held; in the gap between the two renames one can, and the outcome is one of
+  three, not one: this call aborts ENOENT, or aborts EEXIST, or -- both parked
+  in their own gaps -- returns nil over the other's destination. Measured at
+  zero occurrences in 20,000 barrier rounds and 11.6 million overlapping
+  attempts; every run that observed it had something outside a restore
+  widening the window, which bounds the rate rather than proving the bound.
+  `docs/wrong.md`, the entry on two restores parked in each other's gap.
+
+  **The staging claim is asserted mid-stream, not after the fact:** a test
+  that truncates an archive and finds the destination absent passes just as
+  well against a build with no staging at all, because the error-path defer
+  removes what it wrote.
+  Entry names are flattened so an archive cannot escape, and only entries named
+  as group files are written -- an archive can place group files and nothing
+  else. A `MANIFEST` entry would otherwise be honoured by the legacy-directory
+  gate and make every restored group invisible. `-dry-run` validates the
+  archive against its own manifest under every limit and touches no
+  destination; `-tenant` refuses an archive taken from a different tenant, the
+  moment the manifest is decoded rather than after the groups are on disk.
+  `.`, `..` and a symlinked destination are refused. `ErrRestoredButUnsynced`
+  distinguishes a store that landed from a restore that failed.
+  `storage.RestoreTar` is the older unstaged path and leaves a partial
+  destination on failure.
 
 ### The process-kill matrix
 

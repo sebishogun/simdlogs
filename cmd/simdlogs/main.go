@@ -22,6 +22,13 @@ import (
 )
 
 func main() {
+	// Subcommands before flags: `simdlogs restore ...` takes a different set
+	// of arguments and exits when it is done, so it does not belong behind a
+	// flag on a binary whose other flags all describe a long-running server.
+	if len(os.Args) > 1 && os.Args[1] == "restore" {
+		os.Exit(runRestore(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	addr := flag.String("addr", ":9428", "listen address (VL's default port)")
 	dir := flag.String("storage", "./simdlogs-data", "storage directory")
 	retention := flag.Duration("retention", 0, "drop data older than this (e.g. 720h); 0 disables")

@@ -29,9 +29,10 @@ import (
 type FaultPoint = faultPoint
 
 // FaultPointNamed resolves a fault point by the name the crash matrix uses on
-// its command line: "temp-create", "partial-write", "file-sync", "file-close",
-// "rename", "dir-open", "dir-sync", "manifest-append", "manifest-sync",
-// "buffering", "post-ack".
+// its command line. FaultPointNames() is the list; this comment deliberately
+// does not repeat it, because the paragraph below explains that a hand-written
+// list is what goes stale -- and the one that used to be here had already
+// fallen three names behind.
 func FaultPointNamed(name string) (FaultPoint, bool) {
 	for p, n := range faultPointName {
 		if n == name {
@@ -51,6 +52,35 @@ func FaultPointNames() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// NonWriteFaultPointNames lists the fault points that are NOT steps of the
+// durable write, so a sweep over FaultPointNames can exclude them without
+// hardcoding a list of its own.
+//
+// Inverted deliberately. A sweep that enumerated a WRITE-path list would
+// silently miss the next write step someone forgets to add to it, which is the
+// exact failure the sweep exists to prevent. Excluding a small closed set that
+// only grows when a non-write point is deliberately added keeps every new
+// write step covered the day it exists.
+func NonWriteFaultPointNames() []string {
+	return []string{
+		// Not steps of the write: they exist so the crash matrix can stop
+		// with rows buffered and after an acknowledgement.
+		faultPointName[faultBuffered],
+		faultPointName[faultPostAck],
+		// A restore is not an ingest. This one fires after a staged restore
+		// has renamed its staging directory into place.
+		faultPointName[faultRestoreRenamed],
+		faultPointName[faultRestoreRemoved],
+		faultPointName[faultRestoreReleasing],
+		// Not a step of the write either: it is a step of taking the lock,
+		// and a sweep that failed it would be testing that lockDir propagates
+		// an error rather than anything about durability.
+		faultPointName[faultLockOpened],
+		// Not a step of the write either: it is a step of a restore's cleanup.
+		faultPointName[faultRestoreCleanup],
+	}
 }
 
 // SetFaultHookForTest installs a fault injector into the durable write path

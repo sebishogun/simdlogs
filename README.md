@@ -117,8 +117,32 @@ materialize only fields needed by their predicates and transforms.
 - `/select/vector` performs cosine k-nearest-neighbor search over an embedding
   field supplied by the ingested logs.
 - `/metrics`, `/alerts`, `/admin/backup`, and `/vmui` provide operational
-  endpoints. The backup endpoint streams immutable group files as a tar; the
-  Go storage API restores that tar into a new store.
+  endpoints. The backup endpoint streams immutable group files as a
+  self-describing tar; `simdlogs restore` unpacks one into a new store:
+
+  ```
+  simdlogs restore -src backup.tar -dry-run
+  simdlogs restore -src backup.tar -dst ./simdlogs-data/tenant-0-0
+  ```
+
+  The restore stages into a sibling directory and moves it into place with one
+  rename, holding a lock on the destination until the syscall that takes that
+  directory away, and arranging for the lock file the rename installs to be one
+  it already holds -- so a server starting on that directory either finds it
+  locked, or wins the one race there is and makes the restore abort without
+  touching that server's store. A second RESTORE cannot start while the lock is
+  held; in the gap between the two renames one can, and the outcome is one of
+  three: this call aborts `ENOENT`, or aborts `EEXIST`, or -- with both parked
+  in their own gaps -- returns success over the other's destination. Measured
+  at zero occurrences in 20,000 barrier rounds and in 11.6 million overlapping
+  attempts; every run that did observe it had something outside a restore
+  widening the window. Zero observations bound how often it happens, not
+  whether it can, so: do not run two restores at one `-dst`.
+
+  `-dry-run` checks every group against the
+  archive's own manifest, needs no destination at all, and writes nothing;
+  `-tenant` refuses an archive taken from a different tenant. The destination
+  and its parents are created if absent.
 
 This is not full Elasticsearch compatibility. In particular, `_msearch`, the
 complete Query DSL, and Elasticsearch aggregation response compatibility are

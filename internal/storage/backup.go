@@ -155,7 +155,7 @@ var ErrBackupUnverified = errors.New("storage: the backup archive carries no man
 // as a failure rather than as a pass with a note, which is why it is an error
 // and not a boolean.
 func VerifyBackup(r io.Reader) (*BackupManifest, error) {
-	man, _, err := readBackup(r, nil)
+	man, _, err := readBackup(r, backupReadLimits{}, nil, nil)
 	return man, err
 }
 
@@ -165,7 +165,50 @@ func VerifyBackup(r io.Reader) (*BackupManifest, error) {
 // Validation is streaming rather than collect-then-check: a 200 GiB archive
 // must not be buffered to be verified, and an entry that fails is reported
 // before anything after it has been written anywhere.
-func readBackup(r io.Reader, emit func(name string, data []byte) error) (*BackupManifest, []string, error) {
+// backupReadLimits bounds what an archive can make readBackup spend BEFORE any
+// entry reaches emit. The manifest is decoded first and sizes everything after
+// it, so a limit applied only in emit is a limit applied after the expensive
+// part: a 24 MiB manifest decodes into roughly 340 MiB of live heap, and the
+// callback that would have refused it has not been called yet.
+//
+// The zero value is the built-in ceiling for the manifest and no group-count
+// bound, which is what VerifyBackup and RestoreTar have always had.
+type backupReadLimits struct {
+	maxManifestBytes int64 // 0 means maxBackupManifestBytes
+	maxGroups        int   // 0 means unbounded
+	// maxEntryBytes bounds one entry BEFORE io.ReadAll sizes a buffer from
+	// the manifest's declared size. A limit applied in emit is applied after
+	// the allocation it was meant to prevent: an archive declaring one 128 MiB
+	// group cost 268.5 MiB of live heap with MaxFileBytes set to 1, in a dry
+	// run, which is the mode an operator is told to point at an untrusted
+	// archive. The same argument this file already makes about the manifest,
+	// one entry type over. 0 means the built-in ceiling.
+	maxEntryBytes int64
+}
+
+func (l backupReadLimits) entryBytes() int64 {
+	if l.maxEntryBytes > 0 && l.maxEntryBytes < maxUnverifiedGroupBytes {
+		return l.maxEntryBytes
+	}
+	return maxUnverifiedGroupBytes
+}
+
+// manifestBytes resolves the ceiling. A caller may RAISE it as well as lower
+// it: the built-in is a default for an untrusted archive, not a statement that
+// no legitimate manifest is bigger, and an operator whose own backup carries a
+// larger one would otherwise have no way to restore it.
+func (l backupReadLimits) manifestBytes() int64 {
+	if l.maxManifestBytes > 0 {
+		return l.maxManifestBytes
+	}
+	return maxBackupManifestBytes
+}
+
+// readBackup walks an archive with limits, calling onManifest once the
+// manifest is decoded -- before any group is emitted, which is the only place
+// a check that must precede the first write can go -- and emit per group.
+// Both may be nil.
+func readBackup(r io.Reader, lim backupReadLimits, onManifest func(*BackupManifest) error, emit func(name string, data []byte) error) (*BackupManifest, []string, error) {
 	tr := tar.NewReader(r)
 	var man *BackupManifest
 	var restored []string
@@ -205,15 +248,16 @@ func readBackup(r io.Reader, emit func(name string, data []byte) error) (*Backup
 			if man != nil {
 				return man, restored, fmt.Errorf("storage: the archive carries two manifests")
 			}
-			if hdr.Size > maxBackupManifestBytes {
-				return nil, restored, fmt.Errorf("storage: the backup manifest declares %d bytes", hdr.Size)
+			if hdr.Size > lim.manifestBytes() {
+				return nil, restored, fmt.Errorf("storage: the backup manifest declares %d bytes, over the %d ceiling",
+					hdr.Size, lim.manifestBytes())
 			}
-			b, err := io.ReadAll(io.LimitReader(tr, maxBackupManifestBytes+1))
+			b, err := io.ReadAll(io.LimitReader(tr, lim.manifestBytes()+1))
 			if err != nil {
 				return nil, restored, err
 			}
-			if int64(len(b)) > maxBackupManifestBytes {
-				return nil, restored, fmt.Errorf("storage: the backup manifest exceeds %d bytes", maxBackupManifestBytes)
+			if int64(len(b)) > lim.manifestBytes() {
+				return nil, restored, fmt.Errorf("storage: the backup manifest exceeds %d bytes", lim.manifestBytes())
 			}
 			if groupsBeforeManifest {
 				return nil, restored, fmt.Errorf(
@@ -224,8 +268,17 @@ func readBackup(r io.Reader, emit func(name string, data []byte) error) (*Backup
 			if err != nil {
 				return nil, restored, err
 			}
+			if lim.maxGroups > 0 && len(man.Groups) > lim.maxGroups {
+				return man, restored, fmt.Errorf("storage: the manifest names %d groups, over the %d limit",
+					len(man.Groups), lim.maxGroups)
+			}
 			for _, g := range man.Groups {
 				byName[g.Name] = g
+			}
+			if onManifest != nil {
+				if err := onManifest(man); err != nil {
+					return man, restored, err
+				}
 			}
 			continue
 		case backupCompleteName:
@@ -278,12 +331,12 @@ func readBackup(r io.Reader, emit func(name string, data []byte) error) (*Backup
 			// allocation an untrusted archive chooses. This is the same
 			// ceiling the manifest entry itself has, one entry type over.
 			groupsBeforeManifest = true
-			if hdr.Size > maxUnverifiedGroupBytes {
+			if hdr.Size > lim.entryBytes() {
 				return man, restored, fmt.Errorf(
 					"storage: unverified entry %s declares %d bytes, over the %d ceiling",
-					name, hdr.Size, maxUnverifiedGroupBytes)
+					name, hdr.Size, lim.entryBytes())
 			}
-			data, err = io.ReadAll(io.LimitReader(tr, maxUnverifiedGroupBytes+1))
+			data, err = io.ReadAll(io.LimitReader(tr, lim.entryBytes()+1))
 			if err != nil {
 				return man, restored, err
 			}
@@ -320,10 +373,10 @@ func readBackup(r io.Reader, emit func(name string, data []byte) error) (*Backup
 			// allocation a hostile archive chooses" was a bound present in one
 			// of two places, which this repository has now recorded three
 			// times as reading like a bound present in both.
-			if g.Bytes > maxUnverifiedGroupBytes {
+			if g.Bytes > lim.entryBytes() {
 				return man, restored, fmt.Errorf(
 					"storage: %s declares %d bytes, over the %d ceiling",
-					name, g.Bytes, maxUnverifiedGroupBytes)
+					name, g.Bytes, lim.entryBytes())
 			}
 			data, err = io.ReadAll(io.LimitReader(tr, g.Bytes+1))
 			if err != nil {
@@ -383,7 +436,7 @@ func RestoreTar(r io.Reader, dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	_, _, err := readBackup(r, func(name string, data []byte) error {
+	_, _, err := readBackup(r, backupReadLimits{}, nil, func(name string, data []byte) error {
 		return writeFileAtomic(filepath.Join(dir, name), data, DataFileMode)
 	})
 	return err
