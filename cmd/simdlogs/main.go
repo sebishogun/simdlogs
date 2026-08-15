@@ -7,12 +7,14 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +25,19 @@ import (
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
+// version and commit are stamped at build time:
+//
+//	go build -ldflags "-X main.version=v1.0.0 -X main.commit=$(git rev-parse --short HEAD)"
+//
+// Defaults say "dev" and "unknown" rather than a plausible-looking version. A
+// binary that claims to be a release it is not is worse than one that admits
+// it was built from a working tree -- an operator reading a support ticket
+// needs the difference.
+var (
+	version = "dev"
+	commit  = "unknown"
+)
+
 func main() {
 	// Subcommands before flags: `simdlogs restore ...` takes a different set
 	// of arguments and exits when it is done, so it does not belong behind a
@@ -31,6 +46,7 @@ func main() {
 		os.Exit(runRestore(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	}
 
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	addr := flag.String("addr", ":9428", "listen address (VL's default port)")
 	dir := flag.String("storage", "./simdlogs-data", "storage directory")
 	retention := flag.Duration("retention", 0, "drop data older than this (e.g. 720h); 0 disables")
@@ -151,6 +167,11 @@ func main() {
 	syslogTLS := flag.Bool("syslog.tls", false,
 		"serve RFC 5425 syslog-over-TLS on the syslog TCP listener, using -tls.certFile/-tls.keyFile (UDP stays plaintext)")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("simdlogs %s (%s) %s %s/%s\n",
+			version, commit, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		return
+	}
 
 	// Validate the listener configuration before anything is acquired. It
 	// depends only on flags, and log.Fatal calls os.Exit, so a failure after

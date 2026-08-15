@@ -243,7 +243,11 @@ func bounds() []growthBound {
 			return s.ManifestBytes / int64(s.GroupFiles)
 		}, 3.0, 512,
 			"a manifest that never compacts makes every startup slower and is " +
-				"invisible in total disk use, because the groups dwarf it"},
+				"invisible in total disk use, because the groups dwarf it. This is " +
+				"the bound most likely to fire on a long run: retention writes a " +
+				"record per removal, so the manifest grows with ACTIVITY while the " +
+				"group count it is divided by does not -- measured at 36 bytes per " +
+				"group after a minute and 77 after retention had run for half of it"},
 	}
 }
 

@@ -77,19 +77,26 @@ func TestSoak(t *testing.T) {
 	c := config.Default()
 	c.Dir = dir
 	c.Limits = config.TestLimits()
-	// Retention is not configurable through config.Config in this build, so the
-	// soak exercises it on whatever schedule the server runs it. That is worth
-	// stating rather than implying: the overlap this most wants -- retention
-	// unmapping groups while a query holds a snapshot of them -- happens only
-	// if a retention pass fires inside the run, which for a short developer
-	// soak it may not. The one-hour and 24-hour modes are where it does.
 
 	srv, err := api.NewServerConfig(c)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv.Handler())
+
+	// Retention, running INSIDE the soak.
+	//
+	// This is the overlap the soak most wants: a retention pass unmapping and
+	// removing groups while queries hold snapshots of them and backups hold
+	// snapshots of everything. Without it the run exercises growth and never
+	// exercises removal -- and removal is where a mapping outlives its group.
+	//
+	// A short window and a fast interval, because a soak's clock is the run
+	// and not the deployment: with the default hour-scale retention no pass
+	// would fire inside a developer soak at all.
+	stopRetention := srv.StartRetention(30*time.Second, 5*time.Second)
 	defer func() {
+		stopRetention()
 		ts.Close()
 		srv.Close()
 	}()
