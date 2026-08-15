@@ -443,6 +443,90 @@ exercises the router with real fan-out, and the zero-copy federated merge
 hot path for big results. None of that measures answer correctness — the
 envelope defects above are exactly what such a benchmark cannot see.
 
+## Repair, and what makes it safe
+
+A write goes to every replica of its shard. Any of them can miss one, and
+nothing brought it back into line: the replica stayed short forever, and a read
+that landed on it returned fewer rows with nothing to say so. That is why
+`ConsistencyAll` is the default write level — without repair, "quorum" means a
+replica permanently missing data.
+
+Groups are immutable once sealed, so this is set reconciliation, not conflict
+resolution. Each replica reports the digests of the groups it holds; the union
+is what the shard should hold; each replica is sent what it lacks.
+
+**Reconciliation is by content, never by manifest id.** An id is assigned by the
+store that wrote it — `nextID++` — so two replicas agree only by coincidence of
+ordering, and they stop agreeing precisely when one misses a write:
+
+| | replica A | replica B (missed W2) |
+|---|---|---|
+| id 1 | W1 | W1 |
+| id 2 | W2 | **W3** |
+| id 3 | W3 | — |
+
+B is not missing id 2; B has id 2, holding different rows. Repair by id would
+copy A's id 3 into B and leave B holding W3 twice — turning a missing write into
+a duplicated one, which is worse, because a gap shows up as a short answer and a
+duplicate shows up as a plausible larger number.
+
+Three properties do the safety work:
+
+- **Repair only adds.** Nothing deletes, so no pass can remove the last good
+  copy of anything, and a replica holding data the others lack hands it over
+  rather than losing it. Verified both directions, not just leader-to-follower.
+- **The receiver validates.** Bytes are hashed against the digest that was asked
+  for and parsed as a group before anything is committed, so a peer that is
+  compromised or on another format version cannot write into the store.
+- **Bounded per pass** — 64 groups, 1 GiB — and the report says what it left, so
+  "still diverging" is visible rather than inferred. An unreachable replica is
+  never read as an empty one: its silence would otherwise make the union wrong
+  in both directions at once.
+
+A repaired group is committed under a fresh local id and consumes no write
+receipt. It is not a client write, and taking an idempotency token a real retry
+would need is a cost with no benefit.
+
+## Coordinated backup
+
+Backing up every node and keeping the archives in a directory is not a cluster
+backup: nothing records the topology, replicas of one shard are not
+interchangeable, and the archives are taken at different moments.
+
+`/admin/cluster/backup` writes one tar holding a manifest and one archive per
+shard, taken from a replica that holds the **whole** shard. Completeness is
+checked, not assumed — the replicas are asked for their inventories first, and
+if no replica of some shard is complete the backup **fails with a 503 naming
+repair**. A cluster backup that silently captured the shortest replica is worse
+than no backup, because it looks like one.
+
+The manifest is the first tar entry, so a reader validates before streaming
+gigabytes. `ValidateClusterBackup` refuses a newer format, another protocol
+version, a shard count that does not match the target topology, a shard
+appearing twice, and a shard naming no archive. The shard-count check is the one
+a directory of per-node archives cannot even express: restoring an N-shard
+backup into an M-shard cluster puts rows where no query looks for them.
+
+Per-shard high watermarks are recorded and `Spread()` reports the distance
+between the earliest and latest. Reported, not enforced — no bound is right for
+every deployment, and a threshold invented here would either refuse good backups
+or bless bad ones.
+
+## Chaos
+
+Seven scenarios, one rule: an exact answer or an explicit failure, never a
+smaller number with HTTP 200.
+
+| Scenario | Required behaviour |
+|---|---|
+| Replica kill | exact; the surviving replica holds the shard |
+| Whole shard down | 503, never one shard's rows as the cluster's |
+| Stalled peer | bounded by the router (10 s header timeout), not by the caller |
+| Stale replica | repair converges both replicas, then the answer no longer depends on which is read |
+| Corrupt group | never served as data; the store refuses to open over damaged groups |
+| Rolling restart | exact throughout, replica by replica |
+| Disk full | 507 with the budget named, and the refusal reaches the client through the router |
+
 ## What this is not
 
 No consensus, no leader election, no transactions, no automatic membership
@@ -456,7 +540,9 @@ state on the wire. That is correct and slower than it could be. Pushing one
 down means putting a partial state on the wire, and a partial state that is
 subtly wrong is a number nobody can spot.
 
-There is still no merge for avg/quantile/distinct stats — those are refused
-with the reason — and plain `stats_query` without `by=` decodes a `count` field
-the backend does not emit. No federation at all for the endpoints listed above.
-Those are roadmap items with measurable exits, not current behavior.
+There is still no merge for avg/quantile/distinct stats — those are refused with
+the reason. Repair reconciles replicas of a shard and does not move data between
+shards, so it cannot help a rebalance. A restore of a cluster backup is validated
+here but performed by the operator per shard; there is no single restore command
+that unpacks a cluster archive. Those are roadmap items with measurable exits,
+not current behavior.

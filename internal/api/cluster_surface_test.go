@@ -154,6 +154,21 @@ func surfaceRoutes() []surfaceRoute {
 		{path: "/select/vmui", method: "GET", kind: routerLocal, why: "static assets"},
 		{path: "/", method: "GET", kind: routerLocal, why: "the index page"},
 
+		// Anti-entropy. State and group are what a PEER calls on a storage
+		// node; on a router they describe the router's own empty store, which
+		// is true and useless, so they are router-local rather than federated.
+		{path: pathReplicaState, method: "GET", kind: routerLocal,
+			why: "one replica's own inventory; the router's cluster-wide view is " +
+				"/admin/cluster/repair"},
+		{path: pathReplicaGroup, method: "GET", query: "digest=deadbeef", kind: routerLocal,
+			why: "one replica's own group bytes, addressed by content"},
+		{path: "/admin/cluster/backup", method: "POST", kind: routerLocal,
+			why: "the router's own coordinated capture of every shard; it is the " +
+				"cluster-wide form and has nothing further to federate to"},
+		{path: "/admin/cluster/repair", method: "POST", kind: routerLocal,
+			why: "the router's own cluster-wide repair pass; it has no meaning to " +
+				"federate further"},
+
 		// Admin: coordinated cluster forms are task 8.7. Until then a router
 		// must refuse, because the local answer is about an empty store.
 		{path: "/admin/backup", method: "POST", kind: refused,
@@ -465,4 +480,51 @@ func routerServer(t *testing.T, urls ...string) (*Server, *httptest.Server) {
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return srv, ts
+}
+
+// No classified route answers with a server error in router mode.
+//
+// The router-local routes had no coverage at all: the read comparison skips
+// them by definition and the refusal test only looks at refused ones. So a
+// route could panic on every request and the surface tests would stay green --
+// which is what happened when the two anti-entropy endpoints were added without
+// being named in the tenant allowlist. They 500'd with a panic, and the only
+// thing that noticed was a test written for something else.
+//
+// A 4xx is fine here: a request with no digest, or one this fixture is not
+// authorized for, is the endpoint working. A 5xx is the endpoint failing.
+func TestNoRouteAnswersWithAServerErrorInRouterMode(t *testing.T) {
+	shard := realShard(t, corpus(1)[0])
+	cluster := router(t, shard.URL)
+
+	for _, rt := range surfaceRoutes() {
+		if rt.write {
+			continue // covered, with real payloads, by the write test
+		}
+		t.Run(rt.path, func(t *testing.T) {
+			code, body := surfaceCall(t, cluster, rt)
+			if code >= 500 && code != http.StatusNotImplemented {
+				t.Fatalf("%s answered %d in router mode: %.300s", rt.path, code, body)
+			}
+		})
+	}
+}
+
+// And the same on a storage node, where the tenant allowlist is what decides
+// whether a handler has a store to talk to.
+func TestNoRouteAnswersWithAServerErrorOnAStorageNode(t *testing.T) {
+	node := realShard(t, corpus(1)[0])
+	for _, rt := range surfaceRoutes() {
+		if rt.write {
+			continue
+		}
+		t.Run(rt.path, func(t *testing.T) {
+			code, body := surfaceCall(t, node, rt)
+			// 501 is a deliberate refusal, not a failure: /admin/cluster/repair
+			// reconciles replicas and a storage node has none to reconcile.
+			if code >= 500 && code != http.StatusNotImplemented {
+				t.Fatalf("%s answered %d on a storage node: %.300s", rt.path, code, body)
+			}
+		})
+	}
 }

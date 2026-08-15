@@ -4169,3 +4169,65 @@ executed". This is the audit-level version: a metric that counts the wrong
 population. If the question is "what did we forget", no count of what we
 remembered can answer it — only a comparison against something that knows the
 right answer.
+
+## 40. A peer's 4xx was success, and a quota that measured a store's size from before the writes
+
+Task 8.7 built anti-entropy between replicas. Three defects turned up, none of
+them in the anti-entropy design; all three were found by a test failing rather
+than by reading the code.
+
+**A peer's 4xx was merged as an answer.** `clusterClient.do` classified 401/403
+(unauthorized), 429/503 (overloaded) and 5xx (unavailable), and let every other
+4xx fall through as success — so the peer's error body became part of the merged
+result. The repair pass made it visible: the adopt POST was arriving without its
+`?digest=`, the destination refused it with 400, and the router reported the
+group as **copied**. Two rounds of "copied 2, still 1 row" before the cause was
+the classification rather than the copy.
+
+The missing query string was its own bug: `do` appended `r.URL.RawQuery` only
+for GET, which is fine for a read fan-out and wrong for anything that addresses
+a resource in the query and sends it in the body.
+
+**The tenant quota measured every write against a size from before them.**
+`DiskBytes()` caches for ten seconds so the check stays cheap on the write path.
+Cached alone, it made the check wrong there. Measured directly:
+
+| MaxTenantBytes | write 1 | write 2 | write 3 | write 4 |
+|---|---|---|---|---|
+| 1 (before) | 200 | 200 | 200 | 200 |
+| 1 (after) | 200 | **507** | **507** | **507** |
+
+The first 200 is correct — the store really was empty when it was checked, and a
+bound smaller than one group cannot be enforced before the group exists. The
+next three were the cache. The fix updates the cached size at the append, which
+knows exactly how many bytes it committed, so the check stays cheap and becomes
+correct for growth; shrink is left to the interval refresh, because a size
+briefly too high refuses writes for a moment and a size briefly too low accepts
+writes that should have been refused.
+
+This is entry 37's "two-second reserve hole" again, five times longer and on the
+other threshold.
+
+**The LIFO cleanup deadlock, a second time.** A stalled-peer test registered
+`close(block)` before `httptest.Close`. Cleanups run last-registered-first, and
+Close waits for in-flight handlers — so Close ran first and waited forever on a
+handler nothing would release. The package ran to its 450-second `-timeout` and
+reported nothing about the code. The unblock must be registered LAST so it runs
+FIRST, and the comment above it now says why, since the correct order reads
+backwards.
+
+The same run showed the stalled-peer bound is real: with a client patient enough
+to outlast it, the router answers in **10.01 s**, which is
+`ResponseHeaderTimeout`. The first version of the test used an 8-second client
+and concluded the router never answered — measuring its own impatience.
+
+**Two gates caught what nothing else would have.** The route-contract test and
+the surface-classification test both failed on each newly added route until it
+was classified and given a contract. That is the pair working exactly as
+written: three anti-entropy routes and a cluster-backup route could not be
+merged while invisible to either.
+
+**The shape.** The peer-4xx one is the sharpest: a classification that handles
+the interesting cases and lets the rest fall through to the success path. Every
+status nobody thought about became "fine", and the failure only surfaced when
+something downstream depended on the operation having actually happened.

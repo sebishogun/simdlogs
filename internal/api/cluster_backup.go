@@ -1,0 +1,304 @@
+package api
+
+import (
+	"archive/tar"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sort"
+	"time"
+
+	obs "github.com/sebishogun/simdlogs/internal/observability"
+)
+
+// A backup of a cluster, rather than a backup of each machine.
+//
+// # Why per-node backups do not compose
+//
+// Backing up every storage node and keeping the archives in a directory looks
+// like a cluster backup and is not one:
+//
+//   - Nothing records the TOPOLOGY. Restoring three archives into a two-shard
+//     cluster silently drops a third of the data, or duplicates it, depending
+//     on how the operator maps them -- and no file in the set says which shard
+//     an archive came from.
+//   - Replicas of one shard are not interchangeable. Take the archive from a
+//     replica that had missed writes and the restored cluster is missing them,
+//     with nothing anywhere to say so.
+//   - The archives are taken at different moments, so the restored cluster is
+//     a state the cluster was never in. For an append-only log store that is
+//     survivable, and it still has to be RECORDED: a per-shard high watermark
+//     is what lets an operator see how far apart the pieces are.
+//
+// # What this writes
+//
+// One tar holding a cluster manifest and one archive per shard, taken from a
+// replica that holds the whole shard.
+//
+// "Complete" is checked, not assumed: the replicas of a shard are asked for
+// their inventories first, and the chosen one must hold every group any of them
+// holds. If no replica is complete, the backup FAILS. A cluster backup that
+// silently captured the shortest replica is worse than no backup, because it
+// looks like one.
+
+// ClusterBackupFormat is the archive layout version. Bumped when the layout or
+// the manifest's meaning changes, so a restore refuses what it cannot read
+// rather than reading it wrongly.
+const ClusterBackupFormat = 1
+
+// clusterManifestName is the manifest's path inside the archive. First entry,
+// so a reader can validate before streaming gigabytes of shard data.
+const clusterManifestName = "cluster.json"
+
+// ClusterManifest describes a cluster backup.
+type ClusterManifest struct {
+	Format      int   `json:"format"`
+	CreatedUnix int64 `json:"createdUnix"`
+	// Protocol is the internal protocol version of the router that took it,
+	// which is what the shard archives' shapes are tied to.
+	Protocol int `json:"protocol"`
+	// Shards is one entry per shard, in shard order.
+	Shards []ShardBackup `json:"shards"`
+}
+
+// ShardBackup is one shard's part of a cluster backup.
+type ShardBackup struct {
+	Shard int `json:"shard"`
+	// Archive is the entry name inside the tar.
+	Archive string `json:"archive"`
+	// SourceURL is the replica the archive came from, recorded so a restore can
+	// be traced back and an operator can tell two backups apart.
+	SourceURL string `json:"sourceURL"`
+	// Replicas is how many replicas this shard had when the backup was taken.
+	// A restore into a different topology is refused on this.
+	Replicas int `json:"replicas"`
+	// HighWatermark is the newest timestamp this shard's data covered.
+	// Recorded per shard because the archives are taken at different moments,
+	// and the spread between them is the thing an operator needs to see.
+	HighWatermark int64 `json:"highWatermark"`
+	// Groups and Rows are what the source held, so a restore can check that
+	// what it unpacked is what was captured.
+	Groups int `json:"groups"`
+	Rows   int `json:"rows"`
+	// Receipts is the source's write-id count at capture.
+	Receipts int `json:"receipts"`
+}
+
+// clusterBackup streams a coordinated backup of every shard.
+func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) == 0 {
+		s.writeErr(w, r, adminSpec(), http.StatusNotImplemented,
+			"simdlogs: a cluster backup captures every shard, and this node has no "+
+				"backends configured, so it is not a router. /admin/backup takes this "+
+				"node's own store")
+		return
+	}
+	shards := s.shards()
+
+	// Choose the sources BEFORE writing a byte. A backup that streamed the
+	// first shard and then discovered the second had no complete replica would
+	// have to fail mid-tar, leaving a truncated archive that looks like a
+	// finished one to anything that does not read the manifest.
+	man := ClusterManifest{
+		Format:      ClusterBackupFormat,
+		CreatedUnix: time.Now().Unix(),
+		Protocol:    ProtocolVersion,
+	}
+	sources := make([]string, len(shards))
+	for i, replicas := range shards {
+		states := make([]ReplicaState, 0, len(replicas))
+		for j, u := range replicas {
+			states = append(states, s.askReplicaState(r, i, j, u))
+		}
+		src, why := completeReplica(states)
+		if src < 0 {
+			s.writeErr(w, r, adminSpec(), http.StatusServiceUnavailable, fmt.Sprintf(
+				"simdlogs: shard %d has no replica holding the whole shard, so a "+
+					"backup taken now would be short without saying so: %s. Run "+
+					"/admin/cluster/repair and try again", i, why))
+			return
+		}
+		st := states[src]
+		sources[i] = st.URL
+		man.Shards = append(man.Shards, ShardBackup{
+			Shard:         i,
+			Archive:       fmt.Sprintf("shard-%d.tar", i),
+			SourceURL:     st.URL,
+			Replicas:      len(replicas),
+			HighWatermark: st.HighWatermark,
+			Groups:        len(st.Groups),
+			Rows:          st.rows(),
+			Receipts:      st.Receipts,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.Header().Set("Content-Disposition", `attachment; filename="simdlogs-cluster-backup.tar"`)
+	tw := tar.NewWriter(w)
+	defer tw.Close()
+
+	blob, err := json.MarshalIndent(man, "", "  ")
+	if err != nil {
+		s.writeErr(w, r, adminSpec(), http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := writeTarFile(tw, clusterManifestName, blob); err != nil {
+		obs.L().Error("cluster backup failed writing its manifest",
+			obs.FieldEvent, "cluster.backup_failed", "err", err)
+		return
+	}
+
+	for i, sb := range man.Shards {
+		// One replica per shard, the one chosen above. Its own /admin/backup is
+		// snapshot-consistent and self-validating already (task 5.1); this
+		// wraps those archives with the topology they were missing.
+		resp := s.peers.do(r, i, 0, sources[i], http.MethodGet, "/admin/backup", nil)
+		if !resp.OK() {
+			// Mid-stream failure. The tar is abandoned WITHOUT its closing
+			// blocks, so a reader hits an unexpected EOF rather than a
+			// well-formed archive missing a shard. A truncated archive that
+			// parses is the failure mode worth avoiding here.
+			obs.L().Error("cluster backup failed mid-stream",
+				obs.FieldEvent, "cluster.backup_failed", "shard", i,
+				"source", sources[i], "class", string(resp.Class), "err", resp.Err)
+			return
+		}
+		if err := writeTarFile(tw, sb.Archive, resp.Body); err != nil {
+			obs.L().Error("cluster backup failed writing a shard",
+				obs.FieldEvent, "cluster.backup_failed", "shard", i, "err", err)
+			return
+		}
+	}
+	obs.L().Info("cluster backup complete",
+		obs.FieldEvent, "cluster.backup", "shards", len(man.Shards))
+}
+
+// completeReplica picks a replica holding every group the shard's reachable
+// replicas hold, and explains a refusal.
+//
+// Ties break on the lowest index, so two runs against an in-step shard choose
+// the same source and produce comparable archives.
+func completeReplica(states []ReplicaState) (int, string) {
+	union := map[string]bool{}
+	reachable := 0
+	for _, st := range states {
+		if st.Err != "" {
+			continue
+		}
+		reachable++
+		for _, g := range st.Groups {
+			union[g.Digest] = true
+		}
+	}
+	if reachable == 0 {
+		return -1, "no replica answered"
+	}
+	best, bestHave := -1, -1
+	for i, st := range states {
+		if st.Err != "" {
+			continue
+		}
+		have := map[string]bool{}
+		for _, g := range st.Groups {
+			have[g.Digest] = true
+		}
+		missing := 0
+		for d := range union {
+			if !have[d] {
+				missing++
+			}
+		}
+		if missing == 0 {
+			return i, ""
+		}
+		if n := len(union) - missing; n > bestHave {
+			best, bestHave = i, n
+		}
+	}
+	return -1, fmt.Sprintf(
+		"the shard's replicas hold %d groups between them and the best single "+
+			"replica (index %d) holds %d", len(union), best, bestHave)
+}
+
+// writeTarFile writes one entry.
+func writeTarFile(tw *tar.Writer, name string, body []byte) error {
+	if err := tw.WriteHeader(&tar.Header{
+		Name: name, Mode: 0o600, Size: int64(len(body)),
+		// A fixed time, not time.Now(): two backups of identical data should
+		// differ only where the data differs, and per-entry timestamps make
+		// every archive unique for no reason. The capture time is in the
+		// manifest, where a reader can see it.
+		ModTime: time.Unix(0, 0), Format: tar.FormatPAX,
+	}); err != nil {
+		return err
+	}
+	_, err := tw.Write(body)
+	return err
+}
+
+// ValidateClusterBackup reads an archive's manifest and checks it against the
+// topology it is about to be restored into.
+//
+// Called BEFORE anything is unpacked. A restore that discovers the mismatch
+// halfway has already written some of it.
+func ValidateClusterBackup(man ClusterManifest, intoShards int) error {
+	if man.Format != ClusterBackupFormat {
+		return fmt.Errorf(
+			"simdlogs: this archive is cluster backup format %d and this build reads %d",
+			man.Format, ClusterBackupFormat)
+	}
+	if man.Protocol != ProtocolVersion {
+		return fmt.Errorf(
+			"simdlogs: this archive was taken by a router speaking protocol %d and "+
+				"this build speaks %d", man.Protocol, ProtocolVersion)
+	}
+	if len(man.Shards) == 0 {
+		return fmt.Errorf("simdlogs: this archive records no shards")
+	}
+	if intoShards > 0 && len(man.Shards) != intoShards {
+		// The failure a per-node backup set cannot even detect: the data is
+		// sharded by a function of the shard COUNT, so restoring an N-shard
+		// backup into an M-shard cluster puts rows where no query looks for
+		// them.
+		return fmt.Errorf(
+			"simdlogs: this archive holds %d shards and the target cluster has %d. "+
+				"Restoring it would place rows where no query looks for them",
+			len(man.Shards), intoShards)
+	}
+	seen := map[int]bool{}
+	for _, sb := range man.Shards {
+		if sb.Shard < 0 || sb.Shard >= len(man.Shards) {
+			return fmt.Errorf("simdlogs: shard index %d is outside the archive's %d shards",
+				sb.Shard, len(man.Shards))
+		}
+		if seen[sb.Shard] {
+			// Two archives claiming the same shard: restoring both would double
+			// that shard's rows and leave another shard with none.
+			return fmt.Errorf("simdlogs: shard %d appears twice in this archive", sb.Shard)
+		}
+		seen[sb.Shard] = true
+		if sb.Archive == "" {
+			return fmt.Errorf("simdlogs: shard %d names no archive", sb.Shard)
+		}
+	}
+	return nil
+}
+
+// ClusterBackupSpread is how far apart the shard archives were taken, in
+// nanoseconds between the earliest and latest high watermark.
+//
+// Reported rather than enforced. There is no bound that is right for every
+// deployment, and a threshold this code invented would either refuse good
+// backups or bless bad ones. An operator comparing it against their own ingest
+// rate can tell whether the spread matters.
+func (m ClusterManifest) Spread() int64 {
+	if len(m.Shards) == 0 {
+		return 0
+	}
+	hw := make([]int64, 0, len(m.Shards))
+	for _, sb := range m.Shards {
+		hw = append(hw, sb.HighWatermark)
+	}
+	sort.Slice(hw, func(i, j int) bool { return hw[i] < hw[j] })
+	return hw[len(hw)-1] - hw[0]
+}

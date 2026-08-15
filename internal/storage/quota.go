@@ -285,6 +285,34 @@ func (s *Store) DiskBytes() int64 {
 	return total
 }
 
+// noteGrowth adds a freshly committed group's bytes to the cached size.
+//
+// The cache is what makes the quota check cheap on the write path, and on its
+// own it is what made the quota check WRONG on the write path: a store's size
+// was sampled once and then believed for ten seconds, so every write in that
+// window was measured against a size from before any of them. A store created
+// with a 1-byte budget accepted four writes in a row -- the first because it
+// really was empty, the next three because the answer was cached.
+//
+// Growth is exact and free to track: the append knows how many bytes it just
+// committed. So the cache is UPDATED here rather than invalidated, which keeps
+// the check cheap and makes it correct for the direction that matters. Shrink
+// -- retention, compaction, cold demotion -- is left to the interval refresh,
+// because a size that is briefly too high refuses writes for a moment and a
+// size that is briefly too low accepts writes that should have been refused.
+func (s *Store) noteGrowth(n int64) {
+	if n <= 0 {
+		return
+	}
+	// Only when a sample exists. Before the first DiskBytes call there is no
+	// baseline to add to, and adding to zero would claim the store holds only
+	// what has been appended since it opened.
+	if s.sizeAt.Load() == 0 {
+		return
+	}
+	s.sizeBytes.Add(n)
+}
+
 // quotaCounters are process-wide, for /metrics.
 var (
 	writesRejectedDisk  atomic.Int64

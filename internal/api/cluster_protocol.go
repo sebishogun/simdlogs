@@ -99,6 +99,16 @@ const (
 	PeerMalformed PeerErrorClass = "malformed"
 	// PeerOverloaded is a peer that refused for a budget reason.
 	PeerOverloaded PeerErrorClass = "overloaded"
+	// PeerRejected is a peer that refused the REQUEST -- a 4xx that is not an
+	// auth or load problem. The router sent something this peer would not
+	// accept, so every replica will refuse it identically.
+	//
+	// Before this class existed, do() classified 401/403, 429/503 and 5xx and
+	// let every other 4xx fall through as success: the peer's error body became
+	// the merged answer. A 400 from one shard was merged as though it were that
+	// shard's data, and an anti-entropy copy that the destination REFUSED was
+	// reported as copied.
+	PeerRejected PeerErrorClass = "rejected"
 )
 
 // retryAnotherReplica reports whether a different replica of the same shard is

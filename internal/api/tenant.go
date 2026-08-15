@@ -296,6 +296,11 @@ var tenantPaths = map[string]bool{
 	"/_search":                           true,
 	"/_count":                            true,
 	"/admin/backup":                      true,
+	// Anti-entropy reads and writes one tenant's store, like every other data
+	// path. /admin/cluster/repair is deliberately absent: it runs on a router,
+	// touches no local store, and only talks to peers.
+	"/internal/replica/state": true,
+	"/internal/replica/group": true,
 }
 
 func (s *Server) withTenant(h http.Handler) http.Handler {

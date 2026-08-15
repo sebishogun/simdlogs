@@ -448,12 +448,28 @@ func (s *Store) AppendGroup(g *Group) (uint64, error) {
 // landing in that window duplicates every row, which is the failure receipts
 // exist to prevent, made rarer and so harder to find.
 func (s *Store) appendGroupWithReceipt(g *Group, wid WriteID) (uint64, error) {
+	return s.appendBlob(g.Marshal(), wid)
+}
+
+// appendRawGroup commits an already-marshaled group.
+//
+// The bytes come from a peer, through AdoptGroup, which has validated them:
+// hashed against the digest that was asked for and parsed as a group. This does
+// the same commit every write does -- fresh id, atomic file, manifest record --
+// with no receipt, because a repaired group is not a client write and must not
+// consume an idempotency token that a real retry would need.
+func (s *Store) appendRawGroup(blob []byte) error {
+	_, err := s.appendBlob(blob, "")
+	return err
+}
+
+// appendBlob is the commit shared by a marshaled group and an adopted one.
+func (s *Store) appendBlob(blob []byte, wid WriteID) (uint64, error) {
 	s.mu.Lock()
 	id := s.nextID
 	s.nextID++
 	s.mu.Unlock()
 
-	blob := g.Marshal()
 	final := filepath.Join(s.dir, fmt.Sprintf("group-%d.bin", id))
 	if err := writeFileAtomic(final, blob, DataFileMode); err != nil {
 		// The last two steps of writeFileAtomic -- opening the directory and
@@ -513,6 +529,10 @@ func (s *Store) appendGroupWithReceipt(g *Group, wid WriteID) (uint64, error) {
 	s.groups = append(s.groups, &groupEntry{id: id, path: final, reader: r, timeMin: r.TimeMin, timeMax: r.TimeMax, unmap: unmap})
 	s.sortGroups()
 	s.mu.Unlock()
+	// The size cache is told what just landed. Without this the tenant quota
+	// measured every write in a ten-second window against the size from before
+	// the first of them -- see noteGrowth.
+	s.noteGrowth(int64(len(blob)))
 	return id, nil
 }
 

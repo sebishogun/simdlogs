@@ -157,6 +157,19 @@ func routeContracts() []contract {
 		{method: "GET", path: "/select/sql?query=" + url.QueryEscape("SELECT level FROM logs LIMIT 2"),
 			token: tokQuery, wantStatus: 200, wantCT: ctNDJSON, check: ndjson(1)},
 
+		// --- anti-entropy: the internal replica surface ---
+		{method: "GET", path: pathReplicaState, token: tokAdmin,
+			wantStatus: 200, wantCT: ctJSON, check: jsonObject("groups")},
+		// A digest no store holds: the contract is that it 404s with a reason,
+		// not that it serves something. Serving a group by content means a
+		// digest that names nothing has no answer.
+		{method: "GET", path: pathReplicaGroup + "?digest=" + strings.Repeat("0", 64),
+			token: tokAdmin, wantStatus: 404},
+		{method: "POST", path: "/admin/cluster/repair", token: tokAdmin,
+			wantStatus: 501}, // not a router in this fixture
+		{method: "POST", path: "/admin/cluster/backup", token: tokAdmin,
+			wantStatus: 501}, // likewise; /admin/backup is the single-node form
+
 		// --- select: JSON documents ---
 		{method: "GET", path: "/select/logsql/hits?query=" + q + "&step=1h", token: tokQuery,
 			wantStatus: 200, wantCT: ctJSON, check: jsonObject("hits")},

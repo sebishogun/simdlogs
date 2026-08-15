@@ -125,7 +125,14 @@ func (c *clusterClient) do(
 		rdr = bytes.NewReader(body)
 	}
 	target := url + path
-	if method == http.MethodGet && r.URL.RawQuery != "" {
+	// The query string travels with EVERY method, not only GET.
+	//
+	// It used to be GET-only, which is fine for the read fan-out and wrong for
+	// anything that addresses a resource in the query and sends it in the body:
+	// the anti-entropy adopt is a POST whose ?digest= names what the body must
+	// hash to, and dropping it meant the destination refused every copy -- while
+	// the router reported them as copied, because a peer 4xx was success.
+	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
 	req, err := http.NewRequestWithContext(r.Context(), method, target, rdr)
@@ -201,6 +208,17 @@ func (c *clusterClient) do(
 	case resp.StatusCode >= 500:
 		out.Class = PeerUnavailable
 		out.Err = fmt.Errorf("peer returned HTTP %d", resp.StatusCode)
+		return out
+	case resp.StatusCode >= 400:
+		// Every remaining 4xx. This used to fall through as success, so the
+		// peer's error body became part of the merged answer -- and an
+		// operation the peer REFUSED was reported as having happened. A bounded
+		// prefix of the body comes along because a 4xx from a peer is a bug in
+		// what this router sent, and the peer already said what was wrong.
+		out.Class = PeerRejected
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		out.Err = fmt.Errorf("peer refused the request (HTTP %d): %s",
+			resp.StatusCode, bytes.TrimSpace(msg))
 		return out
 	}
 

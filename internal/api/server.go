@@ -666,6 +666,14 @@ func (s *Server) Handler() http.Handler {
 		in(specForPath("/insert/datadog/api/v1/validate"), func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	handle("/insert/opentelemetry/v1/logs", in(specForPath("/insert/opentelemetry/v1/logs"), s.insertOTLPLogs))
 	handle("/admin/backup", adm(s.backup)) // tar snapshot for offline restore
+	// Anti-entropy. The state and group endpoints are what a peer calls; the
+	// repair endpoint is what an operator calls on a router. All three are
+	// admin-authorized: the group endpoint WRITES into the store, and the state
+	// endpoint discloses the shape of the data.
+	handle(pathReplicaState, adm(s.serveReplicaState))
+	handle(pathReplicaGroup, adm(s.serveReplicaGroup))
+	handle("/admin/cluster/repair", adm(s.repairCluster))
+	handle("/admin/cluster/backup", adm(s.clusterBackup))
 	// Exempt from the query budget, for opsSpec's own argument with one word
 	// changed: a scraper that gets 429 under load loses the telemetry that
 	// explains the load, and an operator who gets 429 under load loses the
