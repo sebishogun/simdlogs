@@ -203,6 +203,15 @@ made for another architecture.
 | hits | 2.3ms | 2.8ms | 1.2x |
 
 Values above 1 mean `simdlogs` is faster; all 20 rows are above 1 in both runs.
+
+> **Provenance.** These figures were taken under the discipline stated above,
+> but before that discipline was *enforced*. `requireQuiet` now refuses to
+> produce a number above load average 1 and stamps every result with the
+> machine, CPU model, core count, Go version, commit and load it ran under —
+> and this table carries none of that, because it predates the gate. The
+> numbers have not been re-measured since. What is known about them is exactly
+> what the paragraph above says; what is not known is which machine and which
+> commit produced them.
 [`internal/bench/perops_test.go`](internal/bench/perops_test.go) fails the build
 if any row falls below 1. On the 3M-row harness ingest ran at 3.17M rec/s here
 and 0.49M rec/s in VictoriaLogs, and the selective window took 7.0 ms versus
