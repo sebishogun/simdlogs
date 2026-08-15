@@ -14,6 +14,12 @@ import (
 // racy, so a group is written whole and never mutated), with an index
 // listing them in time order. Readers are safe for concurrent queries.
 type Store struct {
+	// digestByID caches each sealed group's content hash. A group file never
+	// changes once written, so this is exact rather than a cache that can go
+	// stale; see groupDigestCached.
+	digestMu   sync.Mutex
+	digestByID map[uint64]string
+
 	dir      string
 	mu       sync.RWMutex
 	groups   []*groupEntry

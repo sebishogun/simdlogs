@@ -136,13 +136,18 @@ type Server struct {
 	syslogListeners []io.Closer
 	syslogClosing   bool
 	syslogWG        sync.WaitGroup
-	routeMu         sync.Mutex
-	routes          []string
-	bgCtx           context.Context
-	bgCancel        context.CancelFunc
-	bg              sync.WaitGroup
-	bgMu            sync.Mutex // orders the stopping check against bg.Add
-	stopping        atomic.Bool
+	// retentionMaxAge is this node's retention horizon in nanoseconds, 0 when
+	// retention is off. Read by the adopt path, which must not accept a group
+	// the next sweep would delete -- see StartRetention.
+	retentionMaxAge atomic.Int64
+
+	routeMu  sync.Mutex
+	routes   []string
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	bg       sync.WaitGroup
+	bgMu     sync.Mutex // orders the stopping check against bg.Add
+	stopping atomic.Bool
 }
 
 // goBackground runs fn on an interval until the server shuts down. It is the
@@ -671,7 +676,10 @@ func (s *Server) Handler() http.Handler {
 	// admin-authorized: the group endpoint WRITES into the store, and the state
 	// endpoint discloses the shape of the data.
 	handle(pathReplicaState, adm(s.serveReplicaState))
-	handle(pathReplicaGroup, adm(s.serveReplicaGroup))
+	handle(pathReplicaGroup, func() http.HandlerFunc {
+		sp := replicaGroupSpec()
+		return s.requireAuth(config.RoleAdmin, sp, s.guard(sp, s.serveReplicaGroup))
+	}())
 	handle("/admin/cluster/repair", adm(s.repairCluster))
 	handle("/admin/cluster/backup", adm(s.clusterBackup))
 	// Exempt from the query budget, for opsSpec's own argument with one word

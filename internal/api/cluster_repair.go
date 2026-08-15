@@ -162,6 +162,27 @@ func (s *Server) serveReplicaGroup(w http.ResponseWriter, r *http.Request) {
 				fmt.Sprintf("simdlogs: a repaired group may not exceed %d bytes", maxRepairBytes))
 			return
 		}
+		// Refused if this node's retention would delete it on the next sweep.
+		//
+		// Absent is absent: anti-entropy cannot tell a group that was never
+		// received from one that was deliberately dropped, so a peer holding
+		// data past this node's horizon offers it back on every pass. The
+		// horizon belongs to this node, so this node is the only one that can
+		// say no.
+		if maxAge := s.retentionMaxAge.Load(); maxAge > 0 {
+			if g, gerr := storage.ReadGroup(b); gerr == nil {
+				cutoff := time.Now().Add(-time.Duration(maxAge)).UnixNano()
+				if g.TimeMax < cutoff {
+					s.writeErr(w, r, adminSpec(), http.StatusConflict, fmt.Sprintf(
+						"simdlogs: refusing a group whose newest row (%d) is older "+
+							"than this node's retention horizon (%d). It was deleted "+
+							"here deliberately, and adopting it would resurrect rows "+
+							"retention removed",
+						g.TimeMax, cutoff))
+					return
+				}
+			}
+		}
 		adopted, err := tn.store.AdoptGroup(digest, b)
 		if err != nil {
 			// A refusal here is the validation doing its job: bytes that do not
@@ -186,6 +207,12 @@ type RepairReport struct {
 	Copied    int           `json:"copied"`
 	Bytes     int64         `json:"bytes"`
 	Remaining int           `json:"remaining"`
+	// Blocked is groups repair REFUSED to copy because the destination may
+	// already hold their rows under different bytes -- a compacted or retained
+	// range. Separate from Remaining, which is work the bounds cut short and a
+	// later pass finishes: a blocked group is work no pass will ever do, and it
+	// needs an operator.
+	Blocked int `json:"blocked"`
 	// Complete is false when any replica could not be reached, or when the
 	// bounds cut the pass short. A caller that treats an incomplete pass as
 	// convergence has re-created the problem repair exists to solve.
@@ -199,6 +226,7 @@ type ShardRepair struct {
 	Replicas  []ReplicaState `json:"replicas"`
 	Copied    int            `json:"copied"`
 	Remaining int            `json:"remaining"`
+	Blocked   int            `json:"blocked"`
 	// Divergent is how many groups were not held by every reachable replica
 	// when the pass started. Zero means the shard was already in step.
 	Divergent int `json:"divergent"`
@@ -206,12 +234,17 @@ type ShardRepair struct {
 
 // repairCluster runs one bounded anti-entropy pass over every shard.
 func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
+	if !s.clusterTenant(w, r) {
+		return
+	}
 	if len(s.backends) == 0 {
 		s.writeErr(w, r, adminSpec(), http.StatusNotImplemented,
 			"simdlogs: repair reconciles the replicas of a shard, and this node has "+
 				"no backends configured, so it is not a router")
 		return
 	}
+	obs.Audit(r.Context(), obs.EventClusterRepair, subjectOf(r), obs.OutcomeOK,
+		obs.FieldTenant, tenantKeyOf(r), obs.FieldRoute, r.URL.Path)
 	rep := RepairReport{Complete: true}
 	budget := int64(maxRepairBytes)
 	copied := 0
@@ -264,7 +297,56 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 				if have[digest] {
 					continue
 				}
-				if copied >= maxRepairGroups || budget-g.Bytes < 0 {
+				// The destination must not already hold these ROWS under
+				// different bytes.
+				//
+				// Reconciling by content assumes two replicas differ only by
+				// writes one of them missed. Two local operations break that
+				// without either replica being wrong:
+				//
+				//   compaction  {g1,g2} -> G. Same rows, new bytes, new digest.
+				//               The union then holds g1, g2 AND G, each replica
+				//               is "missing" the other's spelling, and repair
+				//               copies both ways. Measured: 4 rows written
+				//               became 8 rows on both replicas.
+				//   retention   a group dropped on one replica is still in the
+				//               union while another holds it, and the next pass
+				//               copies the deleted rows back.
+				//
+				// Both are per-node timers, so replicas never do them in
+				// lockstep. A group's time span is contiguous and groups within
+				// one store do not overlap, so an OVERLAP is exactly the
+				// signal: a genuinely missed write occupies a span the
+				// destination has nothing in; a compacted or retained range
+				// does not.
+				//
+				// Overlapping means REFUSE. Repair's promise is that it never
+				// makes a replica worse, and duplicating or resurrecting rows
+				// is worse than leaving a divergence an operator can see.
+				if blocked := overlapping(st.Groups, g); blocked != "" {
+					sr.Blocked++
+					rep.Blocked++
+					rep.Complete = false
+					rep.Errors = append(rep.Errors, fmt.Sprintf(
+						"shard %d replica %d: not copying %s [%d,%d]: its rows may "+
+							"already be here as %s -- compaction or retention has "+
+							"diverged these replicas, and copying would duplicate "+
+							"or resurrect rows",
+						shardIdx, st.Replica, shortDigest(digest), g.TimeMin, g.TimeMax,
+						shortDigest(blocked)))
+					continue
+				}
+				// The peer's SELF-REPORTED size decides only whether to try.
+				// It cannot be trusted to decide what was spent: a peer
+				// reporting 0 left the budget untouched and one reporting a
+				// negative made it GROW, so a pass moved megabytes while
+				// reporting a negative total and complete: true. Clamped, and
+				// the budget is charged what actually crossed the wire.
+				claimed := g.Bytes
+				if claimed < 0 {
+					claimed = 0
+				}
+				if copied >= maxRepairGroups || budget-claimed < 0 {
 					sr.Remaining++
 					rep.Remaining++
 					rep.Complete = false
@@ -274,16 +356,17 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 				if src == "" {
 					continue
 				}
-				if err := s.copyGroup(r, src, st.URL, digest); err != nil {
+				moved, err := s.copyGroup(r, src, st.URL, digest)
+				if err != nil {
 					rep.Complete = false
 					rep.Errors = append(rep.Errors, fmt.Sprintf(
-						"copying %s to %s: %v", digest[:12], st.URL, err))
+						"copying %s to %s: %v", shortDigest(digest), st.URL, err))
 					continue
 				}
 				copied++
 				sr.Copied++
-				budget -= g.Bytes
-				rep.Bytes += g.Bytes
+				budget -= moved
+				rep.Bytes += moved
 			}
 		}
 		rep.Shards = append(rep.Shards, sr)
@@ -336,7 +419,7 @@ func (s *Server) askReplicaState(r *http.Request, shard, replica int, u string) 
 // receiver hashes what it is given against the digest the router asked for, so
 // a source that returns the wrong group is caught by the destination rather
 // than trusted by it.
-func (s *Server) copyGroup(r *http.Request, src, dst, digest string) error {
+func (s *Server) copyGroup(r *http.Request, src, dst, digest string) (int64, error) {
 	// Bounded: a peer that accepts the connection and then stalls would hold
 	// the whole repair pass open for as long as it cared to.
 	ctx, cancel := context.WithTimeout(r.Context(), repairFetchTimeout)
@@ -346,11 +429,90 @@ func (s *Server) copyGroup(r *http.Request, src, dst, digest string) error {
 
 	got := s.peers.do(fetch, 0, 0, src, http.MethodGet, pathReplicaGroup, nil)
 	if !got.OK() {
-		return fmt.Errorf("fetching from %s: %s: %v", src, got.Class, got.Err)
+		return 0, fmt.Errorf("fetching from %s: %s: %v", src, got.Class, got.Err)
 	}
 	put := s.peers.do(fetch, 0, 0, dst, http.MethodPost, pathReplicaGroup, got.Body)
 	if !put.OK() {
-		return fmt.Errorf("adopting at %s: %s: %v", dst, put.Class, put.Err)
+		return 0, fmt.Errorf("adopting at %s: %s: %v", dst, put.Class, put.Err)
 	}
-	return nil
+	// What CROSSED THE WIRE, which is the only number this router observed
+	// itself. Everything else here is the peer's word.
+	return int64(len(got.Body)), nil
+}
+
+// clusterTenant authorizes the tenant a cluster-scope admin request names, and
+// stamps the RESOLVED tenant back onto the request.
+//
+// # Why this exists separately from withTenant
+//
+// /admin/cluster/backup and /admin/cluster/repair are deliberately absent from
+// tenantPaths: they touch no local store, and putting them there would make a
+// router open a tenant directory it will never write to. The consequence was
+// that `withTenant` never ran for them, so `tenantFor` never ran, so
+// `CanTenant` never ran -- and the client's RAW AccountID was then forwarded to
+// every shard by forwardedHeaders. Shards normally carry no auth config of
+// their own, so they honour it.
+//
+// A principal holding only tenant 7:0 could therefore send `AccountID: 0` to
+// /admin/cluster/backup and receive tenant 0's entire archive, on the same
+// server where the same claim on /select/logsql/query answers 403. The repair
+// endpoint leaked the same tenant's whole group inventory.
+//
+// The second half matters as much: STAMPING the resolved key. A principal that
+// sends no header forwards no header, and each shard then falls back to ITS
+// default -- so a repair pass reported success having reconciled a tenant the
+// caller never named and may not hold.
+func (s *Server) clusterTenant(w http.ResponseWriter, r *http.Request) bool {
+	key, err := s.tenantFor(r)
+	if err != nil {
+		code := authStatus(err)
+		if code == http.StatusUnauthorized {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="simdlogs"`)
+		}
+		obs.Audit(r.Context(), obs.EventAuthFailed, subjectOf(r), obs.OutcomeDenied,
+			obs.FieldRoute, r.URL.Path, "err", err.Error())
+		s.writeErr(w, r, adminSpec(), code, err.Error())
+		return false
+	}
+	// The resolved key, not the caller's text. Everything downstream --
+	// forwardedHeaders, the audit record, the shards -- sees the tenant this
+	// principal is actually authorized for.
+	r.Header.Set("AccountID", key.Account)
+	r.Header.Set("ProjectID", key.Project)
+	return true
+}
+
+// shortDigest is a digest truncated for a message, safely.
+//
+// `digest[:12]` panicked on any peer whose state JSON carried a short or absent
+// digest -- a missing field is version skew, not necessarily malice, and it
+// took the whole repair pass down mid-loop with no report of what it had
+// already copied.
+func shortDigest(d string) string {
+	if len(d) > 12 {
+		return d[:12]
+	}
+	if d == "" {
+		return "(empty)"
+	}
+	return d
+}
+
+// overlapping reports the digest of a group the destination already holds whose
+// time span intersects g's, or "" when there is none.
+//
+// Groups within a store cover contiguous, non-overlapping spans -- each is one
+// flush's rows in time order -- so an intersection means the destination
+// already has rows from that range. It may hold them as the groups g was
+// compacted from, or it may have dropped them to retention. Either way the
+// digests differ for a reason other than a missed write, and copying is unsafe.
+func overlapping(have []storage.GroupDigest, g storage.GroupDigest) string {
+	for _, h := range have {
+		// Closed intervals: a group whose max equals another's min shares a
+		// timestamp, and a duplicate row at the boundary is still a duplicate.
+		if g.TimeMin <= h.TimeMax && h.TimeMin <= g.TimeMax {
+			return h.Digest
+		}
+	}
+	return ""
 }

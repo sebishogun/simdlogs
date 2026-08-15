@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"time"
@@ -86,6 +87,9 @@ type ShardBackup struct {
 
 // clusterBackup streams a coordinated backup of every shard.
 func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
+	if !s.clusterTenant(w, r) {
+		return
+	}
 	if len(s.backends) == 0 {
 		s.writeErr(w, r, adminSpec(), http.StatusNotImplemented,
 			"simdlogs: a cluster backup captures every shard, and this node has no "+
@@ -94,6 +98,9 @@ func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	shards := s.shards()
+	obs.Audit(r.Context(), obs.EventClusterBackup, subjectOf(r), obs.OutcomeOK,
+		obs.FieldTenant, tenantKeyOf(r), obs.FieldRoute, r.URL.Path,
+		"shards", len(shards))
 
 	// Choose the sources BEFORE writing a byte. A backup that streamed the
 	// first shard and then discovered the second had no complete replica would
@@ -134,8 +141,19 @@ func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.Header().Set("Content-Disposition", `attachment; filename="simdlogs-cluster-backup.tar"`)
+	// NOT `defer tw.Close()`.
+	//
+	// tar.Writer.Close writes the archive's two zero blocks -- its footer. A
+	// deferred Close therefore runs on the mid-stream failure path below and
+	// finishes the archive, so a client that lost half its shards receives a
+	// WELL-FORMED tar containing the rest, with HTTP 200 and a clean `curl
+	// -fsS`. The comment on that path used to claim the opposite ("abandoned
+	// WITHOUT its closing blocks"), which is a guarantee the code did not make.
+	//
+	// Close is called explicitly on the success path only; every failure after
+	// the first byte aborts the connection instead, which is what the
+	// single-node handler already does.
 	tw := tar.NewWriter(w)
-	defer tw.Close()
 
 	blob, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -145,29 +163,49 @@ func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
 	if err := writeTarFile(tw, clusterManifestName, blob); err != nil {
 		obs.L().Error("cluster backup failed writing its manifest",
 			obs.FieldEvent, "cluster.backup_failed", "err", err)
-		return
+		// Bytes may already be out; abort rather than finish the archive.
+		panic(http.ErrAbortHandler)
 	}
 
 	for i, sb := range man.Shards {
 		// One replica per shard, the one chosen above. Its own /admin/backup is
 		// snapshot-consistent and self-validating already (task 5.1); this
 		// wraps those archives with the topology they were missing.
-		resp := s.peers.do(r, i, 0, sources[i], http.MethodGet, "/admin/backup", nil)
+		// Spooled to a temp file, not buffered.
+		//
+		// A shard's backup is as large as the shard, so `do`'s 256 MiB
+		// in-memory ceiling discarded every real one as malformed -- and the
+		// cluster backup then captured no shard data at all. The file also
+		// gives the tar header the size it needs before the body is written.
+		f, size, resp, cleanup := s.peers.spool(r, i, 0, sources[i], "/admin/backup")
 		if !resp.OK() {
-			// Mid-stream failure. The tar is abandoned WITHOUT its closing
-			// blocks, so a reader hits an unexpected EOF rather than a
-			// well-formed archive missing a shard. A truncated archive that
-			// parses is the failure mode worth avoiding here.
+			cleanup()
+			// Mid-stream failure, and the manifest is already on the wire.
+			//
+			// The connection is ABORTED, so the client sees a truncated
+			// transfer. Returning here let the deferred Close write the tar
+			// footer, and the caller got a well-formed archive missing a shard
+			// with HTTP 200 -- an operator's `curl -fsS` exits 0 and the gap is
+			// found at restore time, or later.
 			obs.L().Error("cluster backup failed mid-stream",
 				obs.FieldEvent, "cluster.backup_failed", "shard", i,
 				"source", sources[i], "class", string(resp.Class), "err", resp.Err)
-			return
+			panic(http.ErrAbortHandler)
 		}
-		if err := writeTarFile(tw, sb.Archive, resp.Body); err != nil {
+		err := streamTarFile(tw, sb.Archive, f, size)
+		cleanup()
+		if err != nil {
 			obs.L().Error("cluster backup failed writing a shard",
 				obs.FieldEvent, "cluster.backup_failed", "shard", i, "err", err)
-			return
+			panic(http.ErrAbortHandler)
 		}
+	}
+	// The footer, on the success path only. Its absence is what makes a failed
+	// backup unreadable rather than plausibly complete.
+	if err := tw.Close(); err != nil {
+		obs.L().Error("cluster backup failed closing the archive",
+			obs.FieldEvent, "cluster.backup_failed", "err", err)
+		panic(http.ErrAbortHandler)
 	}
 	obs.L().Info("cluster backup complete",
 		obs.FieldEvent, "cluster.backup", "shards", len(man.Shards))
@@ -218,6 +256,33 @@ func completeReplica(states []ReplicaState) (int, string) {
 	return -1, fmt.Sprintf(
 		"the shard's replicas hold %d groups between them and the best single "+
 			"replica (index %d) holds %d", len(union), best, bestHave)
+}
+
+// streamTarFile writes one entry from a reader of known length.
+//
+// The length is why the source is spooled rather than piped: a tar entry
+// declares its size in the header, before any of its bytes, so a body of
+// unknown length cannot be written into one without buffering it somewhere.
+// A file is that somewhere, and it bounds memory at one copy buffer whatever
+// the shard's size.
+func streamTarFile(tw *tar.Writer, name string, src io.Reader, size int64) error {
+	if err := tw.WriteHeader(&tar.Header{
+		Name: name, Mode: 0o600, Size: size,
+		ModTime: time.Unix(0, 0), Format: tar.FormatPAX,
+	}); err != nil {
+		return err
+	}
+	n, err := io.Copy(tw, src)
+	if err != nil {
+		return err
+	}
+	if n != size {
+		// A short copy would leave the tar declaring more than it carries,
+		// which is an archive that parses and is wrong.
+		return fmt.Errorf("shard archive %s: copied %d bytes of a declared %d",
+			name, n, size)
+	}
+	return nil
 }
 
 // writeTarFile writes one entry.

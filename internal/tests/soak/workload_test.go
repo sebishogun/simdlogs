@@ -2,6 +2,7 @@ package soak
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -38,6 +39,24 @@ import (
 // They run CONCURRENTLY on purpose. Each in isolation is already covered by an
 // ordinary test; what a soak adds is that they overlap, which is where a
 // snapshot outlives the retention pass that was waiting for it.
+
+// errThrottled is backpressure, not failure and not success.
+//
+// It has to be a distinct value because it is neither: a soak that treated a
+// 429 as failure would refuse to run at the rates it exists to sustain, and one
+// that treated it as success counted throttled requests as writes -- which is
+// how a run in which every request was refused reported thousands of them
+// against an empty store.
+var errThrottled = errors.New("throttled")
+
+// errRestarting is a request that raced this soak's own listener swap.
+//
+// The restart generator closes the listener and opens a new one, so a request
+// already in flight to the old address gets "connection refused". That is the
+// soak restarting, not the server failing -- and it must be told apart from a
+// connection refused to the CURRENT address, which is the server having died
+// and is exactly what a soak is for.
+var errRestarting = errors.New("raced a listener restart")
 
 // tenantsInPlay is the steady set of tenants under continuous load.
 const tenantsInPlay = 8
@@ -82,7 +101,30 @@ func TestSoak(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), total)
+	defer cancel()
+	// The listener is swappable, because the restart generator cycles it and
+	// every other generator has to follow it to the new address.
+	var listenerMu sync.Mutex
 	ts := httptest.NewServer(srv.Handler())
+	baseURL := func() string {
+		listenerMu.Lock()
+		defer listenerMu.Unlock()
+		return ts.URL
+	}
+	swapListener := func() string {
+		listenerMu.Lock()
+		defer listenerMu.Unlock()
+		if ctx.Err() != nil {
+			return ""
+		}
+		prev := ts.URL
+		// Close DRAINS: it waits for every in-flight handler before returning.
+		// That wait is the property this generator exists to exercise.
+		ts.Close()
+		ts = httptest.NewServer(srv.Handler())
+		return prev
+	}
 
 	// Retention, running INSIDE the soak.
 	//
@@ -97,16 +139,15 @@ func TestSoak(t *testing.T) {
 	stopRetention := srv.StartRetention(30*time.Second, 5*time.Second)
 	defer func() {
 		stopRetention()
+		listenerMu.Lock()
 		ts.Close()
+		listenerMu.Unlock()
 		srv.Close()
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), total)
-	defer cancel()
-
 	var (
 		writes, reads, churns, backups, restarts atomic.Int64
-		failures                                 atomic.Int64
+		throttled, failures                      atomic.Int64
 	)
 	fail := func(what string, err error) {
 		failures.Add(1)
@@ -142,7 +183,14 @@ func TestSoak(t *testing.T) {
 			// investigated.
 			rnd := rand.New(rand.NewSource(int64(len(name))))
 			for ctx.Err() == nil {
-				if err := fn(rnd); err != nil && ctx.Err() == nil {
+				err := fn(rnd)
+				if errors.Is(err, errThrottled) || errors.Is(err, errRestarting) {
+					// Backpressure, already counted; or this soak's own restart.
+					// Neither is the server failing, and a connection refused to
+					// the CURRENT address still falls through to fail() below.
+					continue
+				}
+				if err != nil && ctx.Err() == nil {
 					fail(name, err)
 					return
 				}
@@ -150,8 +198,13 @@ func TestSoak(t *testing.T) {
 		}()
 	}
 
+	// raced reports whether a transport error was this soak's own listener
+	// swap: the address the request went to is no longer the current one.
+	raced := func(used string) bool { return used != baseURL() }
+
 	post := func(path, ctype, body, tenant string) error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+path,
+		used := baseURL()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, used+path,
 			strings.NewReader(body))
 		if err != nil {
 			return err
@@ -162,6 +215,9 @@ func TestSoak(t *testing.T) {
 		}
 		resp, err := client.Do(req)
 		if err != nil {
+			if raced(used) {
+				return errRestarting
+			}
 			return err
 		}
 		defer resp.Body.Close()
@@ -175,13 +231,20 @@ func TestSoak(t *testing.T) {
 		// bounds it feeds pass vacuously.
 		// 429 is the concurrency limiter doing its job under load, not a
 		// defect -- a soak that treated backpressure as failure would refuse to
-		// run at the very rates it exists to sustain. Everything else non-2xx
-		// is a failure: counting only 5xx meant a soak whose every write was
-		// refused 400 still reported 172,037 "writes" and a flat resource
-		// profile, because nothing was happening.
+		// run at the very rates it exists to sustain.
+		//
+		// But it is NOT a write either, and returning nil here made it one:
+		// the caller increments `writes` before calling, so a run in which
+		// every request was throttled reported thousands of writes against an
+		// empty store. Probed: with admission refusing everything 429, the soak
+		// passed with writes=1682, groups=0, disk=0 and three of four bounds
+		// skipped. That is entry 42's defect exactly, one status code over.
+		//
+		// So it is counted separately and the caller learns nothing landed.
 		if resp.StatusCode == http.StatusTooManyRequests {
+			throttled.Add(1)
 			time.Sleep(50 * time.Millisecond)
-			return nil
+			return errThrottled
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return fmt.Errorf("%s: HTTP %d: %.200s", path, resp.StatusCode, b)
@@ -190,7 +253,8 @@ func TestSoak(t *testing.T) {
 	}
 
 	get := func(path, tenant string) error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+path, nil)
+		used := baseURL()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, used+path, nil)
 		if err != nil {
 			return err
 		}
@@ -199,6 +263,9 @@ func TestSoak(t *testing.T) {
 		}
 		resp, err := client.Do(req)
 		if err != nil {
+			if raced(used) {
+				return errRestarting
+			}
 			return err
 		}
 		defer resp.Body.Close()
@@ -207,8 +274,9 @@ func TestSoak(t *testing.T) {
 		// looking for and be the test's own fault.
 		io.Copy(io.Discard, resp.Body)
 		if resp.StatusCode == http.StatusTooManyRequests {
+			throttled.Add(1)
 			time.Sleep(50 * time.Millisecond)
-			return nil
+			return errThrottled
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return fmt.Errorf("%s: HTTP %d", path, resp.StatusCode)
@@ -226,8 +294,14 @@ func TestSoak(t *testing.T) {
 				fmt.Fprintf(&b, `{"_msg":"soak line %d","level":"%s","host":"h%d","n":"%d"}`+"\n",
 					k, []string{"error", "warn", "info"}[rnd.Intn(3)], rnd.Intn(16), rnd.Int63())
 			}
+			// Counted AFTER acceptance. Incrementing first counts requests
+			// offered, which is not the same number and is the one that stays
+			// high when nothing is landing.
+			if err := post("/insert/jsonline", "application/x-ndjson", b.String(), tenant); err != nil {
+				return err
+			}
 			writes.Add(1)
-			return post("/insert/jsonline", "application/x-ndjson", b.String(), tenant)
+			return nil
 		})
 	}
 
@@ -236,7 +310,6 @@ func TestSoak(t *testing.T) {
 		spawn(fmt.Sprintf("query-%d", i), func(rnd *rand.Rand) error {
 			defer time.Sleep(ingestPace)
 			tenant := strconv.Itoa(rnd.Intn(tenantsInPlay))
-			reads.Add(1)
 			for _, q := range []string{
 				"/select/logsql/query?query=%2A&limit=100",
 				"/select/logsql/query?query=level%3A%3Derror%20%7C%20stats%20count%28%29%20n",
@@ -247,6 +320,7 @@ func TestSoak(t *testing.T) {
 				if err := get(q, tenant); err != nil {
 					return err
 				}
+				reads.Add(1)
 			}
 			return nil
 		})
@@ -255,7 +329,6 @@ func TestSoak(t *testing.T) {
 	// Tenant churn: new tenants arriving and old ones going idle.
 	spawn("tenant-churn", func(rnd *rand.Rand) error {
 		defer time.Sleep(churnPace)
-		churns.Add(1)
 		// A bounded ring, above the steady set so the two do not collide. The
 		// ring is walked rather than sampled, so every tenant in it goes idle
 		// for a full lap -- which is what makes eviction and reopen happen.
@@ -264,7 +337,11 @@ func TestSoak(t *testing.T) {
 			`{"_msg":"churn"}`+"\n", tenant); err != nil {
 			return err
 		}
-		return get("/select/logsql/query?query=%2A&limit=1", tenant)
+		if err := get("/select/logsql/query?query=%2A&limit=1", tenant); err != nil {
+			return err
+		}
+		churns.Add(1)
+		return nil
 	})
 
 	// Backups: each holds a snapshot for its whole stream, pinning every group
@@ -287,12 +364,25 @@ func TestSoak(t *testing.T) {
 	})
 
 	// Graceful restarts of the HTTP front, which drains in-flight requests.
+	//
+	// This generator's body used to be `get("/-/ready")` -- it restarted
+	// nothing, while its name, its counter and its comment all said it did, and
+	// the run printed `restarts=6` for six readiness probes. The drain is named
+	// in this package's header as one of the six things a soak adds and was
+	// exercised nowhere.
+	//
+	// A real listener cycle: Close() waits for in-flight handlers, which is the
+	// drain, and a new listener takes the same store. The URL changes, so the
+	// generators read it through a mutex rather than closing over it.
 	spawn("restart", func(rnd *rand.Rand) error {
 		defer time.Sleep(10 * time.Second)
+		old := swapListener()
+		if old == "" {
+			return nil // shutting down
+		}
 		restarts.Add(1)
-		// The store stays; the listener cycles. Restarting the store as well
-		// would need the whole fixture rebuilt mid-flight, and what this is
-		// exercising is the drain.
+		// The new listener must actually serve, or a "restart" that left the
+		// server dead would look like a successful one to everything above.
 		return get("/-/ready", "")
 	})
 
@@ -302,7 +392,7 @@ func TestSoak(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("the soak ended during warm-up; the duration is too short to measure anything")
 	}
-	base := takeSample(t, dir, ts.URL, client)
+	base := takeSample(t, dir, baseURL(), client)
 	t.Logf("baseline  %s", base)
 
 	// Sample periodically so a run that fails late still leaves a trace of how
@@ -313,7 +403,7 @@ func TestSoak(t *testing.T) {
 	for done := false; !done; {
 		select {
 		case <-ticker.C:
-			last = takeSample(t, dir, ts.URL, client)
+			last = takeSample(t, dir, baseURL(), client)
 			t.Logf("t+%-8s %s", time.Since(base.At).Truncate(time.Second), last)
 		case <-ctx.Done():
 			done = true
@@ -322,7 +412,7 @@ func TestSoak(t *testing.T) {
 	cancel()
 	wg.Wait()
 
-	final := takeSample(t, dir, ts.URL, client)
+	final := takeSample(t, dir, baseURL(), client)
 	t.Logf("final     %s", final)
 	if os.Getenv("SIMDLOGS_SOAK_DEBUG") != "" {
 		filepath.Walk(dir, func(p string, fi os.FileInfo, err error) error {
@@ -332,12 +422,33 @@ func TestSoak(t *testing.T) {
 			return nil
 		})
 	}
-	t.Logf("writes=%d reads=%d churns=%d backups=%d restarts=%d failures=%d",
+	t.Logf("writes=%d reads=%d churns=%d backups=%d restarts=%d throttled=%d failures=%d",
 		writes.Load(), reads.Load(), churns.Load(), backups.Load(),
-		restarts.Load(), failures.Load())
+		restarts.Load(), throttled.Load(), failures.Load())
 
-	if writes.Load() == 0 || reads.Load() == 0 {
-		t.Fatal("no load was generated; the bounds below would pass vacuously")
+	// The load must have REACHED THE STORE, not merely been offered.
+	//
+	// Counting requests is what let a run in which every one was refused report
+	// six figures of them, and counting only accepted requests is still not
+	// enough: a write can be accepted and buffered and never flushed. The
+	// bounds below are ratios over group files and stored bytes, so those are
+	// what has to be non-zero for any of them to mean anything.
+	switch {
+	case writes.Load() == 0 || reads.Load() == 0:
+		t.Fatalf("no load was accepted (writes=%d reads=%d throttled=%d); every "+
+			"bound below would pass vacuously",
+			writes.Load(), reads.Load(), throttled.Load())
+	case final.GroupFiles == 0:
+		t.Fatalf("%d writes were accepted and the store holds no group files; "+
+			"nothing reached disk and three of the four bounds are ratios over "+
+			"group count", writes.Load())
+	case final.DiskKB == 0:
+		t.Fatalf("%d writes were accepted and the store occupies no measurable "+
+			"disk", writes.Load())
+	case final.GroupFiles <= base.GroupFiles:
+		t.Fatalf("the store went from %d group files to %d: the run stored "+
+			"nothing after the baseline, so the bounds compare a sample against "+
+			"itself", base.GroupFiles, final.GroupFiles)
 	}
 	// Every bound reports, including the ones that did not run. A bound
 	// skipped in silence reads as a bound that passed -- and two of these were

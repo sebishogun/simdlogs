@@ -471,6 +471,24 @@ func adminSpec() routeSpec {
 	return routeSpec{methods: []string{http.MethodGet, http.MethodPost}, format: errText}
 }
 
+// replicaGroupSpec is adminSpec with the ANTI-ENTROPY body limit.
+//
+// The adopt POST carries one whole group, and a group is bounded by the
+// compactor, not by any client's request: compaction merges up to 128Ki rows
+// into one, so a group routinely exceeds Limits.MaxBodyBytes (64 MiB by
+// default) without a single client write coming close. Behind the general
+// guard, MaxBytesReader cut those bodies long before the handler's own 1 GiB
+// ceiling could apply -- so a shard holding a large group could never converge,
+// permanently, and no bound anybody configured said so.
+//
+// The handler's own ceiling still applies; this only stops a limit meant for
+// client uploads from deciding what one node may hand another.
+func replicaGroupSpec() routeSpec {
+	sp := adminSpec()
+	sp.limit = func() int64 { return maxRepairBytes }
+	return sp
+}
+
 // writeIngestErr answers a failed ingest that stored part of its batch.
 //
 // The plain writeErr says only what went wrong. For a parse that failed part

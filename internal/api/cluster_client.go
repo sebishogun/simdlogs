@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 )
@@ -252,4 +253,92 @@ func (c *clusterClient) do(
 		out.TraceID = id
 	}
 	return out
+}
+
+// spool fetches a peer response to a TEMPORARY FILE and returns it, its size,
+// and a cleanup.
+//
+// # Why a file and not a buffer
+//
+// `do` reads a peer's whole response into memory under a 256 MiB ceiling, and
+// discards anything larger as malformed. That is right for a query answer,
+// whose size a router controls through limits it set.
+//
+// It is wrong for a shard's BACKUP. A backup is as large as the shard, and a
+// shard is as large as the operator's data -- so every real deployment exceeds
+// the ceiling, and the cluster backup could not capture a single shard. With
+// the abandon path finishing the tar, the operator received a well-formed
+// archive containing only the manifest; with it aborting, they receive nothing.
+// Neither is a backup.
+//
+// A temp file bounds the memory at one copy buffer regardless of shard size,
+// and gives the SIZE the tar header needs before the body is written -- which
+// is the reason the buffered version existed at all: a tar entry declares its
+// length up front, and a streamed body of unknown length cannot fill it in.
+func (c *clusterClient) spool(
+	r *http.Request, shard, replica int, url, path string,
+) (f *os.File, size int64, resp PeerResponse, cleanup func()) {
+	cleanup = func() {}
+	out := PeerResponse{Shard: shard, Replica: replica, URL: url}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url+path, nil)
+	if err != nil {
+		out.Class, out.Err = PeerMalformed, err
+		return nil, 0, out, cleanup
+	}
+	for _, h := range forwardedHeaders {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+	req.Header.Set(HdrInternal, "1")
+	req.Header.Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+
+	hr, err := c.http.Do(req)
+	if err != nil {
+		out.Class, out.Err = PeerUnavailable, err
+		return nil, 0, out, cleanup
+	}
+	defer hr.Body.Close()
+	out.Status = hr.StatusCode
+
+	if v := hr.Header.Get(HdrProtocolVersion); v == "" {
+		out.Class = PeerVersionMismatch
+		out.Err = errors.New("peer sent no protocol version")
+		return nil, 0, out, cleanup
+	} else if n, cerr := strconv.Atoi(v); cerr != nil || n != ProtocolVersion {
+		out.Class = PeerVersionMismatch
+		out.Err = fmt.Errorf("peer speaks protocol %q, this node speaks %d", v, ProtocolVersion)
+		return nil, 0, out, cleanup
+	}
+	if hr.StatusCode < 200 || hr.StatusCode >= 300 {
+		out.Class = PeerRejected
+		out.Err = fmt.Errorf("peer refused the request (HTTP %d)", hr.StatusCode)
+		return nil, 0, out, cleanup
+	}
+
+	tmp, err := os.CreateTemp("", "simdlogs-shard-*.tar")
+	if err != nil {
+		out.Class, out.Err = PeerUnavailable, err
+		return nil, 0, out, cleanup
+	}
+	// Unlinked immediately: the file stays readable through the handle and
+	// vanishes when it is closed, so a crash mid-backup leaves nothing behind
+	// and a caller that forgets the cleanup leaks nothing durable.
+	os.Remove(tmp.Name())
+	cleanup = func() { tmp.Close() }
+
+	n, err := io.Copy(tmp, hr.Body)
+	if err != nil {
+		out.Class, out.Err = PeerUnavailable, err
+		cleanup()
+		return nil, 0, out, func() {}
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		out.Class, out.Err = PeerUnavailable, err
+		cleanup()
+		return nil, 0, out, func() {}
+	}
+	out.Complete = hr.Header.Get(HdrComplete) == "true"
+	return tmp, n, out, cleanup
 }

@@ -191,9 +191,18 @@ func Audit(ctx context.Context, event, subject, outcome string, args ...any) {
 // are free text cannot be queried for "every authentication failure" -- and
 // every one of these is an action a person or a person's credential took.
 const (
-	EventAuthFailed     = "auth.failed"
-	EventAuthForbidden  = "auth.forbidden"
-	EventBackupTaken    = "admin.backup"
+	EventAuthFailed    = "auth.failed"
+	EventAuthForbidden = "auth.forbidden"
+	EventBackupTaken   = "admin.backup"
+	// EventClusterBackup and EventClusterRepair are the CLUSTER-scope versions.
+	// Distinct events because the scope differs in a way a reviewer cares
+	// about: a cluster backup copies a tenant's data out of every shard at
+	// once, and a repair moves a tenant's data between machines. Neither was
+	// audited at all -- the single-node backup was, on the argument that "who
+	// took one, when" is the first question a security review asks, and the
+	// whole-cluster version of the same operation left no record anywhere.
+	EventClusterBackup  = "admin.cluster_backup"
+	EventClusterRepair  = "admin.cluster_repair"
 	EventRestoreRun     = "admin.restore"
 	EventRuleChanged    = "admin.rule_changed"
 	EventCorruptionAck  = "admin.corruption_acknowledged"
