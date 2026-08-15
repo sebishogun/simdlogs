@@ -769,33 +769,111 @@ func (s *Server) federatedStatsQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 // federatedHits sums per-bucket histogram counts across storage nodes.
+// clusterHitSeries is the shape a storage node returns: one entry per label
+// set, with parallel timestamp and value arrays.
+type clusterHitSeries struct {
+	Fields     map[string]string `json:"fields"`
+	Timestamps []string          `json:"timestamps"`
+	Values     []int             `json:"values"`
+	Total      int               `json:"total"`
+}
+
+// federatedHits merges dense hit series by label set and timestamp.
+//
+// It decoded `{"_time": ..., "hits": ...}` -- a bag of {time, count} objects
+// that no backend has ever sent. /select/logsql/hits returns the reference's
+// DENSE shape, so every field the merge read was absent: the router answered
+// one bogus series, `[{"_time":"","hits":0}]`, on every cluster histogram.
+//
+// The same stale shape was in the embedded UI (task 7.4). Two independent
+// readers of one endpoint had both been written against a remembered
+// envelope, which is what a fixture test is for and why there is one now.
 func (s *Server) federatedHits(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	type hit struct {
-		Time  string `json:"_time"`
-		Count int    `json:"hits"`
-	}
-	merged := map[string]int{}
 	hitBodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/hits", nil)
 	if !ok {
 		return
 	}
+	// Merged by LABEL SET first: a shard contributes its own series per label
+	// set, and two shards' `{level=error}` are the same series, not two.
+	type acc struct {
+		fields  map[string]string
+		buckets map[string]int
+		total   int
+	}
+	byLabels := map[string]*acc{}
+	var order []string
 	for _, b := range hitBodies {
 		var v struct {
-			Hits []hit `json:"hits"`
+			Hits []clusterHitSeries `json:"hits"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			for _, h := range v.Hits {
-				merged[h.Time] += h.Count
+		if json.Unmarshal(b, &v) != nil {
+			continue
+		}
+		for _, se := range v.Hits {
+			key := labelKey(se.Fields)
+			a := byLabels[key]
+			if a == nil {
+				a = &acc{fields: se.Fields, buckets: map[string]int{}}
+				if a.fields == nil {
+					a.fields = map[string]string{}
+				}
+				byLabels[key] = a
+				order = append(order, key)
 			}
+			// Buckets summed per timestamp: shards cover the same window, so
+			// the same bucket appears on each and the cluster's count for it
+			// is the sum.
+			for i := range se.Timestamps {
+				if i < len(se.Values) {
+					a.buckets[se.Timestamps[i]] += se.Values[i]
+				}
+			}
+			a.total += se.Total
 		}
 	}
-	out := make([]hit, 0, len(merged))
-	for tm, c := range merged {
-		out = append(out, hit{tm, c})
+
+	sort.Strings(order)
+	out := make([]clusterHitSeries, 0, len(order))
+	for _, key := range order {
+		a := byLabels[key]
+		stamps := make([]string, 0, len(a.buckets))
+		for t := range a.buckets {
+			stamps = append(stamps, t)
+		}
+		// Ascending and gap-free is what the dense shape means: a client
+		// indexes the two arrays together.
+		sort.Strings(stamps)
+		vals := make([]int, 0, len(stamps))
+		for _, t := range stamps {
+			vals = append(vals, a.buckets[t])
+		}
+		out = append(out, clusterHitSeries{
+			Fields: a.fields, Timestamps: stamps, Values: vals, Total: a.total,
+		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Time < out[j].Time })
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"hits": out})
+}
+
+// labelKey is a canonical key for a label set, so two shards' identical label
+// sets merge whatever order their fields decoded in.
+func labelKey(fields map[string]string) string {
+	if len(fields) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte(0)
+		b.WriteString(fields[k])
+		b.WriteByte(0)
+	}
+	return b.String()
 }
 
 // rowLineTime extracts and parses the "_time":"..." value from a result line
