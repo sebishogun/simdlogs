@@ -78,6 +78,19 @@ var (
 	// query at all. Task 6.2 sets it; the executor carries it so the HTTP
 	// mapping has one place to live.
 	ErrRejected = errors.New("query: rejected")
+
+	// ErrTooManyGroupKeys is an aggregate with more distinct keys than the
+	// caller allowed. Distinct from ErrTooManyGroups, which counts ROW GROUPS
+	// on disk: one is how much of the store a query reads, the other is how
+	// big the answer's key space grows, and a `stats by (request_id)` over a
+	// billion requests trips the second while touching few of the first.
+	ErrTooManyGroupKeys = errors.New("query: too many aggregate groups")
+
+	// ErrPipeRowLimit is a pipe producing more rows than the caller allowed.
+	// A join is the reason it exists: a left join whose key is not unique on
+	// the right multiplies, so an outer result the row budget allowed becomes
+	// an output it never bounded.
+	ErrPipeRowLimit = errors.New("query: pipe produced too many rows")
 )
 
 // Limits is one query's budget. The zero value is unbounded, which is what an
@@ -105,6 +118,18 @@ type Limits struct {
 	// MaxBytes, which is cumulative: a query that streams a terabyte through a
 	// small buffer is fine by this one and not by that one.
 	MaxMemory int64
+
+	// MaxGroupKeys bounds an aggregate's distinct keys -- stats/uniq/top's
+	// `by` cardinality. The map they build is proportional to it and to
+	// nothing the other limits measure: MaxRows counts the scan's rows, of
+	// which a high-cardinality aggregate may read few, and MaxBytes counts
+	// materialized row bytes, which an aggregate does not accumulate.
+	MaxGroupKeys int
+
+	// MaxPipeRows bounds the rows one pipe may produce. Joins are why: a left
+	// join on a key that is not unique on the right multiplies, so an outer
+	// result inside every other budget becomes an output no budget covered.
+	MaxPipeRows int
 }
 
 // Sink receives matching rows in batches.
@@ -223,7 +248,8 @@ func HTTPStatus(err error) int {
 	case errors.Is(err, ErrDeadlineExceeded):
 		return http.StatusGatewayTimeout
 	case errors.Is(err, ErrRowLimit), errors.Is(err, ErrByteLimit),
-		errors.Is(err, ErrTooManyGroups):
+		errors.Is(err, ErrTooManyGroups), errors.Is(err, ErrTooManyGroupKeys),
+		errors.Is(err, ErrPipeRowLimit):
 		// The request is well-formed and asks for more than the server will
 		// give: 413 says which side has to change and that retrying the same
 		// request will not help.

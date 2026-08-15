@@ -60,6 +60,15 @@ func main() {
 	queryQueueWait := flag.Duration("query-queue-wait", 0,
 		"how long a read may wait for an admission slot before 429; 0 refuses immediately, "+
 			"which is right for an interactive endpoint")
+	maxGroupKeys := flag.Int("search.maxGroupKeys", 0,
+		"cap on an aggregate's distinct `by` keys (stats/uniq/top); 0 = unbounded. "+
+			"Nothing else bounds it: -search.maxRows counts scanned rows, of which a "+
+			"high-cardinality aggregate may read few, and -search.maxQueryBytes counts "+
+			"materialized row bytes, which an aggregate does not accumulate")
+	maxPipeRows := flag.Int("search.maxPipeRows", 0,
+		"cap on the rows one pipe may produce; 0 = unbounded. A join whose key is not "+
+			"unique on the right multiplies, so two results each inside -search.maxRows "+
+			"become an output no other budget covers. Over it the query errors 413")
 	maxScanWorkers := flag.Int("max-scan-workers", 0,
 		"total scan goroutines shared by all concurrent queries; 0 means GOMAXPROCS. "+
 			"Each query used to take GOMAXPROCS of its own, so ten concurrent queries on a "+
@@ -167,6 +176,8 @@ func main() {
 	cfg.Limits.MaxOpenTenants = *maxTenants
 	cfg.Limits.MaxQueriesPerTenant = *maxPerTenantQ
 	cfg.Limits.QueryQueueWait = *queryQueueWait
+	cfg.Limits.MaxGroupKeys = *maxGroupKeys
+	cfg.Limits.MaxPipeRows = *maxPipeRows
 	cfg.Limits.MaxScanWorkers = *maxScanWorkers
 	cfg.Storage.ReserveWarnBytes = *reserveWarn
 	cfg.Storage.ReserveRejectBytes = *reserveReject

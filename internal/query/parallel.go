@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,8 @@ func runParallel(groups []*storage.Reader, q *Query) []Row {
 				// exceeds MaxRows, so the caller errors either way -- this just
 				// stops the remaining groups from materializing.
 				if q.MaxRows > 0 && produced.Load() > int64(q.MaxRows) {
+					q.stop(fmt.Errorf("%w: more than %d rows matched",
+						ErrRowLimit, q.MaxRows))
 					continue
 				}
 				// The deadline and the byte budget, checked between groups.

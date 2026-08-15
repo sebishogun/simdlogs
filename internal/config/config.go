@@ -56,6 +56,20 @@ type Limits struct {
 	// a queue deeper than the client's patience does work nobody collects.
 	QueryQueueWait time.Duration
 
+	// MaxGroupKeys bounds an aggregate's distinct `by` keys. Nothing else
+	// measures it: MaxQueryRows counts the scan's rows, of which a
+	// high-cardinality aggregate may read few, and MaxQueryBytes counts
+	// materialized row bytes, which an aggregate does not accumulate. The map
+	// it builds is proportional to the key space and to nothing else. 0 is
+	// unbounded.
+	MaxGroupKeys int
+
+	// MaxPipeRows bounds the rows one pipe may produce. Joins are why: a left
+	// join on a key that is not unique on the right multiplies, so two results
+	// each inside MaxQueryRows become an output no budget covered. 0 is
+	// unbounded.
+	MaxPipeRows int
+
 	// MaxScanWorkers bounds the goroutines every concurrent scan draws from,
 	// in total rather than each. 0 means GOMAXPROCS, which is the right number
 	// for the machine and was previously the number taken by each query.

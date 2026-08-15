@@ -165,6 +165,66 @@ the answer. `MaxMemory` shares the byte accounting, which is gated on
 zero and the ceiling could never be reached, which is a limit that is
 configuration nothing reads.
 
+## Limits are semantics-preserving
+
+A budget may **refuse** a query. It may not answer a different one.
+
+That was broken in exactly the way it is easy to miss. `selectQuery` set
+`MaxRows` for every non-projecting pipe chain — `PipesProject` is false for
+`sort`, `offset`, `limit`, and every row rewriter (`delete`/`rename`/`copy`/
+`format`/`math`/`extract`/`unpack_*`/`filter`/`replace`) — and reported the
+overflow for exactly one shape, a bare select. So `* | sort by (x)` over an
+oversized result had its input cut by the scan, sorted the prefix, and returned
+**200 OK**. A sort of the first N rows is not the first N of the sort; a
+`| offset` skipped into a truncated set; a `| join` joined against one. Nothing
+in the response said so.
+
+The cap is now recorded where it trips, not left to the caller to notice:
+`Run` and `runParallel` call `q.stop(ErrRowLimit)`, `stopErr()` carries it, and
+the HTTP layer reports 413 for **every** shape. An explicit LogsQL `| limit N`
+as the first pipe is pushed into the scan, which then stops at N by
+construction — bounded semantics, so it is answered rather than refused.
+
+`-search.maxRows` overflow answers **413**, not the 400 it used to. The request
+is well-formed and asks for more than the server will give, which is what 413
+says; it is also the code every other row, byte and group ceiling already used,
+so a client could not previously tell this refusal from a malformed query.
+
+### The ceilings nothing else measured
+
+| limit | bounds | why the others do not cover it |
+| --- | --- | --- |
+| `-search.maxGroupKeys` | distinct `by` keys in `stats`/`uniq`/`top` | `maxRows` counts scanned rows, of which a high-cardinality aggregate may read few; `maxQueryBytes` counts materialized row bytes, which an aggregate does not accumulate. The map is proportional to the key space alone. |
+| `-search.maxPipeRows` | rows one pipe may produce | a left join on a key that is not unique on the right multiplies: two results each inside `maxRows` become an output no budget covered. Union appends for the same reason. |
+
+Both are checked as the state is BUILT, not on the finished result — noticing
+after the map exists is noticing after the cost. The three aggregate fast paths
+(`runCountFast`, `runTopFast`, `runUniqFast`, and the leading
+`stats by (f) count()` shortcut) read the footer's posting counts and never
+build the accumulator map, so they carry the same ceiling: a bound written only
+on the map would have covered the path that is *not* taken for the common
+single-field shape.
+
+`stream_context` capped its context scan with a `Limit` and computed context
+over the first two million rows of the window. A neighbour that exists was
+dropped because rows elsewhere in the window spent the budget — a wrong answer
+the caller could not see. It is a `MaxRows` now, and the pipe errors. Its
+overflow is translated to `ErrPipeRowLimit` rather than reported as
+`ErrRowLimit`: the caller's row budget is not the knob, the window is.
+
+`applyBudget` now shares the parent's context and stop-reason pointer with
+subqueries, so the first stop anywhere in the query tree is the one reported.
+Before, a subquery recorded its reason on a `Query` the caller threw away and
+every cause surfaced as the generic "time or byte budget" — including a
+cancelled client, which is not a budget at all.
+
+`runSub` also materializes whole records unless the subquery's own chain
+projects, by the same rule the top-level select uses. It did not, so sub rows
+carried `_time` and nothing else and `join by (f) (<sub>)` computed its key
+from an absent field: every key was the empty one, nothing matched, and the
+join returned the outer rows unchanged. A left join that never joins looks
+exactly like a left join with no matches, which is how it survived.
+
 ## Streaming a bare select (`iterator.go`)
 
 `Run` returns `[]Row`: every matching row is in memory before the first byte
@@ -243,6 +303,9 @@ query.
 
 | Outcome | Error | Status |
 | --- | --- | --- |
+| row cap exceeded | `ErrRowLimit` | 413 |
+| aggregate cardinality | `ErrTooManyGroupKeys` | 413 |
+| a pipe produced too many rows | `ErrPipeRowLimit` | 413 |
 | tenant at its limit | `ErrRejected` | 429 |
 | queue wait elapsed | `ErrQueueTimeout` (wraps `ErrRejected`) | 429 |
 | execution deadline | `ErrDeadlineExceeded` | 504 |

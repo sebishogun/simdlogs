@@ -135,8 +135,8 @@ func TestAnUncappedSelectStreamsMoreRowsThanTheDefaultCap(t *testing.T) {
 func TestTheRowCapStillRefusesWhenStreamingIsAvailable(t *testing.T) {
 	ts := streamServer(t, 20, 5)
 	code, body := bodyOf(t, ts.URL+"/select/logsql/query?query=*")
-	if code != 400 {
-		t.Fatalf("an over-cap bare select returned %d (%s), want 400", code, body)
+	if code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("an over-cap bare select returned %d (%s), want 413", code, body)
 	}
 	if !strings.Contains(body, "maxRows") {
 		t.Errorf("the refusal does not name the flag: %q", body)
@@ -210,5 +210,34 @@ func TestTheStreamingPathIsActuallyTaken(t *testing.T) {
 	code, body := bodyOf(t, ts.URL+"/metrics")
 	if code != 200 || !strings.Contains(body, "simdlogs_query_streamed_total 1") {
 		t.Errorf("/metrics does not report the streamed count:\n%s", body)
+	}
+}
+
+// A piped query whose input exceeds -search.maxRows errors instead of
+// answering from a truncated input.
+//
+// This is the defect task 6.4 fixed at the HTTP layer: the cap was SET for
+// every non-projecting pipe chain and REPORTED for exactly one of them, so a
+// `| sort` over an oversized result returned 200 and a sort of the first N
+// rows -- which is not the first N of the sort.
+func TestAPipedQueryOverTheRowCapErrorsRatherThanTruncating(t *testing.T) {
+	ts := streamServer(t, 200, 20)
+	for _, q := range []string{
+		"*%20%7C%20sort%20by%20(seq)", // * | sort by (seq)
+		"*%20%7C%20offset%205",        // * | offset 5
+		"*%20%7C%20delete%20app",      // * | delete app
+	} {
+		code, body := bodyOf(t, ts.URL+"/select/logsql/query?query="+q)
+		if code != http.StatusRequestEntityTooLarge {
+			t.Errorf("query %q returned %d, want 413\n%.300s", q, code, body)
+		}
+	}
+	// And one that IS bounded by its own LogsQL limit still answers.
+	code, body := bodyOf(t, ts.URL+"/select/logsql/query?query=*%20%7C%20limit%205")
+	if code != 200 {
+		t.Fatalf("`| limit 5` returned %d: %s", code, body)
+	}
+	if n := strings.Count(strings.TrimSpace(body), "\n") + 1; n != 5 {
+		t.Fatalf("`| limit 5` returned %d rows", n)
 	}
 }

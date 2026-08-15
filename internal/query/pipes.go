@@ -59,6 +59,11 @@ type StatsPipe struct {
 	By       []string
 	Aggs     []Agg
 	rangeSec float64 // query-window seconds, stamped at run for rate()/rate_sum()
+	// q is the running query, stamped at run so the aggregate can refuse a key
+	// space bigger than its ceiling. Not a plain int: the refusal has to be
+	// RECORDED, and a pipe that returned a truncated map would be the silent
+	// answer-change this exists to stop.
+	q *Query
 }
 
 // apply aggregates a materialized row stream -- stats used mid-pipe (e.g. after
@@ -83,6 +88,9 @@ func (p *StatsPipe) apply(rows []Row) []Row {
 			e = newStatEntry(by, p.Aggs)
 			acc[string(key)] = e
 			order = append(order, string(key))
+			if tooManyKeys(p.q, len(order), "stats by") {
+				return nil
+			}
 		}
 		accSample(e, p.Aggs,
 			func(j int) string { return rowField(r, p.Aggs[j].Field) },
@@ -240,12 +248,14 @@ type FieldsPipe struct{ Keep []string }
 type UniqPipe struct {
 	By    []string
 	Limit int
+	q     *Query // stamped at run; see StatsPipe.q
 }
 
 // TopPipe is `top N (fields)` -- the N most frequent field-tuples with counts.
 type TopPipe struct {
 	By []string
 	N  int
+	q  *Query // stamped at run; see StatsPipe.q
 }
 
 // TailPipe is `tail N` -- the last N rows.
@@ -302,15 +312,40 @@ type statEntry struct {
 	rows  int64 // count()
 }
 
+// tooManyKeys reports whether an aggregate has outgrown its key ceiling, and
+// records why if it has.
+//
+// Checked as keys are ADDED rather than on the finished map: the map is the
+// memory the ceiling exists to bound, so noticing after it is built is
+// noticing after the cost. A nil query means an internal caller with no
+// budget, which is unbounded on purpose.
+func tooManyKeys(q *Query, have int, what string) bool {
+	if q == nil || q.maxGroupKeys <= 0 || have <= q.maxGroupKeys {
+		return false
+	}
+	q.stop(fmt.Errorf("%w: %s produced more than %d distinct groups",
+		ErrTooManyGroupKeys, what, q.maxGroupKeys))
+	return true
+}
+
 // RunPipeline runs q's filter and pipes. A leading stats pipe aggregates
 // during the scan; otherwise the filter's rows feed the pipe chain.
 func RunPipeline(s Store, q *Query) []Row {
 	resolveTimePreds(q)     // relative _time -> absolute before stats or Run see the window
 	resolveSubqueries(s, q) // in(<subquery>) -> value set, before the filter evaluates
 	rangeSec := float64(q.To-q.From) / 1e9
-	for _, p := range q.Pipes { // stamp the window on stats pipes for rate()/rate_sum()
-		if sp, ok := p.(*StatsPipe); ok {
-			sp.rangeSec = rangeSec
+	for _, p := range q.Pipes {
+		// The window, for rate()/rate_sum(); and the running query, so a pipe
+		// that builds state proportional to CARDINALITY can stop when it
+		// blows its ceiling instead of returning a map it silently truncated.
+		switch pp := p.(type) {
+		case *StatsPipe:
+			pp.rangeSec = rangeSec
+			pp.q = q
+		case *UniqPipe:
+			pp.q = q
+		case *TopPipe:
+			pp.q = q
 		}
 	}
 	var rows []Row
@@ -383,6 +418,22 @@ func RunPipeline(s Store, q *Query) []Row {
 			rows = pp.run(s, q, rows)
 		default:
 			rows = p.apply(rows)
+		}
+		// After every pipe, because a pipe can GROW its input. A join whose
+		// key is not unique on the right multiplies and a union appends, so a
+		// result inside MaxRows on the way in is outside every budget on the
+		// way out -- and MaxRows is checked in the scan, which has already
+		// finished by here.
+		if q.maxPipeRows > 0 && len(rows) > q.maxPipeRows {
+			q.stop(fmt.Errorf("%w: %T produced %d rows, ceiling is %d",
+				ErrPipeRowLimit, p, len(rows), q.maxPipeRows))
+			return nil
+		}
+		// And the stop a pipe recorded itself -- cardinality, or a subquery
+		// that blew its own budget. Returning the partial rows would be the
+		// silent truncation this whole change is about.
+		if q.stopErr() != nil {
+			return nil
 		}
 	}
 	return rows
@@ -507,6 +558,10 @@ func templateFields(tpl string) []string {
 // runStats aggregates matched rows by the group-by fields during the scan,
 // accumulating each aggregation without building the matched rows.
 func runStats(s Store, q *Query, sp *StatsPipe) []Row {
+	// The ceiling applies to the scan-time path as much as to the mid-pipe
+	// one. A leading `| stats by (...)` never reaches StatsPipe.apply, so a
+	// bound written only there would cover the rarer of the two.
+	sp.q = q
 	// Fast path: `by (field) count()` is the footer posting counts --
 	// StatsByField reads them from the offset table without a per-row scan
 	// for whole-in-window groups (the 1078x trick). This is the common
@@ -517,6 +572,9 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 	if len(sp.By) == 1 && len(sp.Aggs) == 1 && sp.Aggs[0].Kind == AggCount && sp.Aggs[0].If == nil {
 		alias := sp.Aggs[0].Alias
 		vcs := StatsByField(s, q, sp.By[0])
+		if tooManyKeys(q, len(vcs), "stats by") {
+			return nil
+		}
 		out := make([]Row, 0, len(vcs))
 		for _, vc := range vcs {
 			out = append(out, Row{NoTime: true, Fields: []Field{{sp.By[0], vc.Value}, {alias, strconv.Itoa(vc.Count)}}})
@@ -531,6 +589,7 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 			filterFields(sp.Aggs[i].If, ifFields)
 		}
 	}
+	var overKeys bool // set by the cardinality ceiling inside sel.ForEach
 	acc := map[string]*statEntry{}
 	var key []byte
 	sn1 := snapshotOf(s, q.From, q.To)
@@ -574,6 +633,11 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 			}
 		}
 		sel.ForEach(func(i int) {
+			// ForEach takes a func with no return, so the ceiling sets a flag
+			// the group loop reads rather than returning from inside it.
+			if overKeys {
+				return
+			}
 			key = key[:0]
 			for j := range sp.By {
 				if byCol[j] != nil {
@@ -591,6 +655,10 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 				}
 				e = newStatEntry(by, sp.Aggs)
 				acc[string(key)] = e
+				if tooManyKeys(q, len(acc), "stats by") {
+					overKeys = true
+					return
+				}
 			}
 			accSample(e, sp.Aggs, func(j int) string {
 				if aggCol[j] != nil {
@@ -609,6 +677,9 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 				return ""
 			})
 		})
+		if overKeys {
+			return nil
+		}
 	}
 	out := make([]Row, 0, len(acc))
 	for _, e := range acc {
@@ -872,6 +943,9 @@ func (p *UniqPipe) apply(rows []Row) []Row {
 			continue
 		}
 		seen[k] = true
+		if tooManyKeys(p.q, len(seen), "uniq by") {
+			return nil
+		}
 		if len(p.By) == 0 {
 			out = append(out, r)
 			continue
@@ -901,6 +975,9 @@ func (p *TopPipe) apply(rows []Row) []Row {
 				v[i] = rowField(r, f)
 			}
 			vals[k] = v
+			if tooManyKeys(p.q, len(vals), "top by") {
+				return nil
+			}
 		}
 		cnt[k]++
 	}

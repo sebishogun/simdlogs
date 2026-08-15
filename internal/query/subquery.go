@@ -1,8 +1,11 @@
 package query
 
 import (
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // StreamContextPipe is `stream_context before N after N` -- around each matched
@@ -12,6 +15,12 @@ import (
 type StreamContextPipe struct{ Before, After int }
 
 // streamContextCap bounds the context scan's materialized rows.
+//
+// It used to be a Limit, so a window with more rows than this silently
+// returned context computed over the first two million and nothing said so:
+// a neighbour that exists gets dropped because a row far away in the window
+// used up the budget, and the answer is wrong in a way the caller cannot see.
+// It is a MaxRows now -- the query errors instead.
 const streamContextCap = 2_000_000
 
 func (p *StreamContextPipe) apply(rows []Row) []Row { return rows }
@@ -21,13 +30,41 @@ func (p *StreamContextPipe) run(s Store, parent *Query, matches []Row) []Row {
 		return matches
 	}
 	// The N neighbors sit next to each match in time, so the context scan needs
-	// the window's rows in time order. Cap the materialize at streamContextCap
-	// rows so a huge window degrades (context over the first cap rows) instead
-	// of OOMing; real stream-context use is over a bounded slice.
+	// the window's rows in time order. MaxRows, not Limit: a Limit truncates
+	// and the pipe then computes context over a prefix of the window, which
+	// drops neighbours that exist because rows elsewhere in the window spent
+	// the budget. A window too big to hold is a query to refuse, not one to
+	// answer differently.
+	cap := streamContextCap
+	if parent.maxPipeRows > 0 && parent.maxPipeRows < cap {
+		cap = parent.maxPipeRows
+	}
 	ctxQ := &Query{From: parent.From, To: parent.To, Now: parent.Now,
-		Filter: &Expr{Op: OpAnd}, MatAll: true, Limit: streamContextCap}
+		Filter: &Expr{Op: OpAnd}, MatAll: true, MaxRows: cap}
 	applyBudget(ctxQ, parent)
+	// Its OWN stop reason, then translated. applyBudget shares the parent's so
+	// the first stop anywhere in the query tree is the one reported -- right
+	// everywhere else, and wrong here: this scan's row cap is not the caller's
+	// row budget, it is "the window does not fit in memory", and reporting
+	// ErrRowLimit would send the caller to raise -search.maxRows, which is not
+	// the knob.
+	ctxQ.stopReason = new(atomic.Pointer[error])
 	all := Run(s, ctxQ)
+	overflowed := len(all) > cap
+	if err := ctxQ.stopErr(); err != nil {
+		if errors.Is(err, ErrRowLimit) {
+			overflowed = true
+		} else {
+			parent.stop(err) // cancellation, deadline, bytes: the caller's, unchanged
+			return nil
+		}
+	}
+	if overflowed {
+		parent.stop(fmt.Errorf(
+			"%w: stream_context needs the whole window in time order and it holds more "+
+				"than %d rows; narrow the window", ErrPipeRowLimit, cap))
+		return nil
+	}
 	sort.SliceStable(all, func(i, j int) bool { return all[i].Time < all[j].Time })
 	matchTime := map[int64]bool{}
 	for _, m := range matches {
@@ -84,6 +121,17 @@ func (p *JoinPipe) run(s Store, parent *Query, rows []Row) []Row {
 			out = append(out, r)
 			continue
 		}
+		// The fanout, bounded as it is produced. A left join whose key is not
+		// unique on the right multiplies -- 10k outer rows against a right
+		// side averaging 100 matches is a million-row answer built from two
+		// results that each passed every other budget. Checked inside the
+		// loop, because by the time the slice is returned the memory is
+		// already spent.
+		if parent.maxPipeRows > 0 && len(out)+len(matches) > parent.maxPipeRows {
+			parent.stop(fmt.Errorf("%w: join fanout passed %d rows, ceiling is %d",
+				ErrPipeRowLimit, parent.maxPipeRows, parent.maxPipeRows))
+			return nil
+		}
 		for _, m := range matches {
 			nr := cloneRow(r)
 			for _, f := range m.Fields {
@@ -107,7 +155,13 @@ type UnionPipe struct{ Sub *Query }
 func (p *UnionPipe) apply(rows []Row) []Row { return rows }
 
 func (p *UnionPipe) run(s Store, parent *Query, rows []Row) []Row {
-	return append(rows, runSub(s, parent, p.Sub)...)
+	sub := runSub(s, parent, p.Sub)
+	if parent.maxPipeRows > 0 && len(rows)+len(sub) > parent.maxPipeRows {
+		parent.stop(fmt.Errorf("%w: union would produce %d rows, ceiling is %d",
+			ErrPipeRowLimit, len(rows)+len(sub), parent.maxPipeRows))
+		return nil
+	}
+	return append(rows, sub...)
 }
 
 // runSub executes a subquery over the parent's time window and under the
@@ -120,6 +174,20 @@ func (p *UnionPipe) run(s Store, parent *Query, rows []Row) []Row {
 func runSub(s Store, parent *Query, sub *Query) []Row {
 	q := *sub // copy so the parsed template is not mutated by run
 	q.From, q.To, q.Now = parent.From, parent.To, parent.Now
+	// Whole records, by the same rule the top-level select uses: a chain that
+	// does not PROJECT still emits whole rows, so the scan has to materialize
+	// every column for it.
+	//
+	// It was not applied here, and a subquery is where it matters most. The
+	// sub rows came back carrying _time and nothing else, so `join by (f)
+	// (<sub>)` computed its key from an absent field: every key was the empty
+	// one, nothing ever matched, and the join returned the outer rows
+	// unchanged. A left join that never joins looks exactly like a left join
+	// with no matches, which is why it survived -- the answer is a valid
+	// answer to a different question.
+	if !PipesProject(q.Pipes) {
+		q.MatAll = true
+	}
 	applyBudget(&q, parent)
 	return RunPipeline(s, &q)
 }

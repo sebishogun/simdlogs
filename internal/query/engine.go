@@ -76,6 +76,12 @@ type Query struct {
 	maxGroups int
 	// maxMemory bounds the working set; 0 is unbounded.
 	maxMemory int64
+	// maxGroupKeys bounds an aggregate's distinct `by` keys; 0 is unbounded.
+	// Separate from maxGroups, which counts row groups on disk: a
+	// `stats by (request_id)` reads few of those and explodes this one.
+	maxGroupKeys int
+	// maxPipeRows bounds the rows one pipe may produce; 0 is unbounded.
+	maxPipeRows int
 	// stopReason is why the scan stopped, recorded once by the FIRST stop.
 	// A cancelled context and an exhausted budget can both become true while
 	// the scan unwinds, and reporting the second tells the caller to fix the
@@ -108,6 +114,8 @@ func (q *Query) bindContext(ctx context.Context, lim Limits) {
 	q.ctx = ctx
 	q.maxGroups = lim.MaxGroups
 	q.maxMemory = lim.MaxMemory
+	q.maxGroupKeys = lim.MaxGroupKeys
+	q.maxPipeRows = lim.MaxPipeRows
 	q.stopReason = new(atomic.Pointer[error])
 	if lim.MaxRows > 0 && (q.MaxRows == 0 || lim.MaxRows < q.MaxRows) {
 		q.MaxRows = lim.MaxRows
@@ -132,10 +140,10 @@ func (q *Query) countsBytes() bool { return q.MaxBytes > 0 || q.maxMemory > 0 }
 
 // stopErr reports why the scan stopped, or nil.
 //
-// It also reports a row-limit overflow, which the scan signals by producing
-// more rows than MaxRows rather than by setting a reason: that check lives in
-// the scan loops and predates this, and turning a detected overflow into a
-// silent truncation is exactly the failure the executor exists to prevent.
+// A row-limit overflow is one of the reasons. It used to be signalled only by
+// the scan producing more rows than MaxRows, which made enforcement the
+// caller's job -- and exactly one caller did it, so every piped query answered
+// from a silently truncated input.
 func (q *Query) stopErr() error {
 	if q.stopReason == nil {
 		return nil
@@ -443,7 +451,15 @@ func Run(s Store, q *Query) []Row {
 			return out[:q.Limit]
 		}
 		if q.MaxRows > 0 && len(out) > q.MaxRows {
-			return out // over the cap: stop scanning, the caller errors
+			// Recorded, not merely returned. The caller used to be trusted to
+			// compare len(out) against MaxRows, and only ONE caller did: a
+			// bare select. Every other shape -- `| sort`, `| offset`,
+			// `| rename`, `| join`, `| union` -- got the cap set by the HTTP
+			// layer, had its input silently cut here, and then answered from
+			// the truncated set. A sort of the first N rows is not the first
+			// N of the sort, and nothing said so.
+			q.stop(fmt.Errorf("%w: more than %d rows matched", ErrRowLimit, q.MaxRows))
+			return out
 		}
 		// The budget check that costs something: after a group has been
 		// materialized, not only before the first one.

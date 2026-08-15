@@ -414,7 +414,10 @@ func (s *Server) applyQueryBudget(r *http.Request, q *query.Query) *atomic.Bool 
 	// under load that is the difference between shedding work and doing it
 	// twice. The Deadline above is kept as well: it is what -search.maxDuration
 	// sets, and a caller with no context deadline still gets it.
-	q.Bind(r.Context(), query.Limits{})
+	q.Bind(r.Context(), query.Limits{
+		MaxGroupKeys: s.limits.MaxGroupKeys,
+		MaxPipeRows:  s.limits.MaxPipeRows,
+	})
 	return stopped
 }
 
@@ -918,8 +921,22 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
-	if bareSelect && s.maxRows > 0 && len(rows) > s.maxRows {
-		http.Error(w, fmt.Sprintf("simdlogs: result exceeds -search.maxRows=%d; add a `| limit N`, a stats pipe, or narrow the query", s.maxRows), 400)
+	if s.maxRows > 0 && len(rows) > s.maxRows {
+		// The belt to the scan's braces. The scan now records ErrRowLimit when
+		// it trips the cap, and queryStoppedErr above reports it -- but a pipe
+		// chain can also GROW its input past the cap without the scan ever
+		// tripping (a join that multiplies, a union that appends), and that
+		// result is as unbounded as the one the cap exists to refuse.
+		//
+		// Not `bareSelect &&` any more. That was the defect: the HTTP layer
+		// set MaxRows for every non-projecting chain and reported the overflow
+		// for exactly one of them, so `| sort`, `| offset`, `| rename`,
+		// `| format`, `| join` and `| union` each answered from an input the
+		// scan had silently cut. A sort of the first N rows is not the first N
+		// of the sort.
+		s.writeErr(w, r, readSpec(), http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("simdlogs: result exceeds -search.maxRows=%d; add a `| limit N`, "+
+				"a stats pipe, or narrow the query", s.maxRows))
 		return
 	}
 	// NDJSON, so say so: this is what the reference sends, and a client that

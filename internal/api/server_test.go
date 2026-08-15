@@ -97,15 +97,23 @@ func TestMaxRowsCap(t *testing.T) {
 	if post != nil {
 		post.Body.Close()
 	}
-	// a bare select of all 20 exceeds the cap of 5 -> 400, not a truncated 200
+	// A bare select of all 20 exceeds the cap of 5 -> an error, not a
+	// truncated 200.
+	//
+	// 413, not the 400 this asserted before task 6.4. The request is
+	// well-formed and asks for more than the server will give, which is what
+	// 413 says and what 400 does not -- and it is the code every other row,
+	// byte and group ceiling already used, so a client could not previously
+	// tell this refusal from a malformed query. The message names the flag
+	// either way.
 	resp, err := http.Get(ts.URL + `/select/logsql/query?query=` + url.QueryEscape("*"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 400 {
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		b, _ := io.ReadAll(resp.Body)
-		t.Fatalf("over-cap bare select = %d (want 400): %s", resp.StatusCode, b)
+		t.Fatalf("over-cap bare select = %d (want 413): %s", resp.StatusCode, b)
 	}
 	// an explicit limit within the cap succeeds
 	r2, err := http.Get(ts.URL + `/select/logsql/query?query=` + url.QueryEscape("* | limit 3"))

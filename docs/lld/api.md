@@ -193,7 +193,9 @@ recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
 | `-syslog` | also listen for syslog on UDP/TCP |
 | `-select-backends` | peer node URLs; sets select-router mode (vmselect role) |
 | `-replicas` | replication factor for the backends |
-| `-search.maxRows` | cap on a bare select's rows; 0 = built-in default, -1 = unlimited |
+| `-search.maxRows` | cap on rows a select may return; 0 = built-in default, -1 = unlimited. Over it the query errors 413 — for EVERY pipe shape, not only a bare select |
+| `-search.maxGroupKeys` | cap on an aggregate's distinct `by` keys (stats/uniq/top); 0 = unbounded |
+| `-search.maxPipeRows` | cap on the rows one pipe may produce (join fanout, union, stream_context); 0 = unbounded |
 | `-search.maxDuration` | wall-time cap for one query request (not the live tail); 0 = default, -1ns = unlimited |
 | `-search.maxQueryBytes` | cap on the bytes one query may materialize; 0 = default (256 MiB), -1 = unlimited. Over it the query errors 504 rather than returning a short answer. |
 | `-http.maxBodyBytes` | maximum request body; 0 = default, -1 = unlimited |

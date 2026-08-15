@@ -42,6 +42,14 @@ func runTopFast(s Store, q *Query, p *TopPipe) ([]Row, bool) {
 		return nil, false
 	}
 	vcs := StatsByField(s, q, p.By[0])
+	// The ceiling applies here as much as on the generic path. These fast
+	// paths read the footer's posting counts, so they build the key space
+	// without ever building the accumulator map -- cheaper, and exactly as
+	// unbounded. A ceiling written only on the map would have covered the
+	// path that is NOT taken for the common single-field shape.
+	if tooManyKeys(q, len(vcs), "top by") {
+		return nil, true
+	}
 	// StatsByField sorts by count only; top's tie-break is the grouped value
 	// ascending, which VictoriaLogs applies and the generic path reproduces.
 	sort.SliceStable(vcs, func(a, b int) bool {
@@ -74,6 +82,9 @@ func runUniqFast(s Store, q *Query, p *UniqPipe) ([]Row, bool) {
 		return nil, false
 	}
 	vcs := StatsByField(s, q, p.By[0])
+	if tooManyKeys(q, len(vcs), "uniq by") {
+		return nil, true
+	}
 	sort.Slice(vcs, func(a, b int) bool { return vcs[a].Value < vcs[b].Value })
 	if p.Limit > 0 && len(vcs) > p.Limit {
 		vcs = vcs[:p.Limit]

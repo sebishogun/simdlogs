@@ -159,4 +159,14 @@ func applyBudget(q, budget *Query) {
 		return
 	}
 	q.Deadline, q.MaxBytes, q.Stopped = budget.Deadline, budget.MaxBytes, budget.Stopped
+	// The context and the reason, not only the flag. A subquery that stopped
+	// used to set the shared bool and record its reason on a Query the caller
+	// throws away, so the outer query reported the generic "time or byte
+	// budget" for every cause -- including a cancelled client, which is not a
+	// budget at all. Sharing the pointer means the first stop anywhere in the
+	// tree is the one reported.
+	q.ctx = budget.ctx
+	q.stopReason = budget.stopReason
+	q.maxGroups, q.maxMemory = budget.maxGroups, budget.maxMemory
+	q.maxGroupKeys, q.maxPipeRows = budget.maxGroupKeys, budget.maxPipeRows
 }
