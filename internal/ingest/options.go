@@ -120,6 +120,24 @@ type RecordLimits struct {
 	MaxValueBytes int
 }
 
+// addWithStreamVec is addWithStream for a record carrying embeddings.
+func addWithStreamVec(w *Writer, ts int64, fields map[string]string, o *Options,
+	vecs map[string][]float32,
+) {
+	if len(vecs) == 0 {
+		addWithStream(w, ts, fields, o)
+		return
+	}
+	if o != nil && len(o.StreamFields) > 0 {
+		if sv := buildStreamLabel(o.StreamFields, fields); sv != "" {
+			fields["_stream"] = sv
+		} else {
+			delete(fields, "_stream")
+		}
+	}
+	w.AddVectors(ts, fields, vecs)
+}
+
 func addWithStream(w *Writer, ts int64, fields map[string]string, o *Options) {
 	// The override is a property of the request, not of the row. A row whose
 	// label comes out empty still belongs to the overriding request and must

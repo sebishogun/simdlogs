@@ -54,6 +54,9 @@ type Server struct {
 	// The zero value is storage.CorruptionFail, so a server configured with
 	// nothing refuses to open a damaged tenant rather than serving it short.
 	corruptionPolicy storage.CorruptionPolicy
+	// vecFlds is which record fields are embeddings, stamped on every tenant
+	// writer as it opens.
+	vecFlds ingest.VectorFields
 
 	// quota is the storage budget every tenant store opens under. Validated
 	// once at construction, so a tenant opening later cannot fail for a
@@ -193,9 +196,17 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Parsed once, at startup: a typo in -vector-fields is a startup failure
+	// rather than a field silently stored as text and invisible to the one
+	// search it exists for.
+	vecFlds, err := ingest.ParseVectorFields(c.VectorFields)
+	if err != nil {
+		return nil, err
+	}
 	srv := &Server{dir: dir, tenants: map[string]*tenant{},
 		degraded: map[string]storage.Health{}, dirRereadEvery: DefaultDirRereadEvery,
 		started: time.Now()}
+	srv.vecFlds = vecFlds
 	if c.DirRereadInterval != 0 {
 		srv.dirRereadEvery = c.DirRereadInterval
 		if c.DirRereadInterval < 0 {
@@ -1292,16 +1303,26 @@ func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
 		body.Field = "emb"
 	}
 	from, to := timeWindow(r)
+	vq := &query.Query{From: from, To: to}
+	vStopped := s.applyQueryBudget(r, vq)
+	rows := query.VectorSearch(s.tn(r).store, from, to, body.Field, body.Vector, body.K,
+		vq, query.VectorLimits{
+			MaxK:           s.limits.MaxVectorK,
+			MaxDim:         s.limits.MaxVectorDim,
+			MaxCandidates:  s.limits.MaxVectorCandidates,
+			MaxResultBytes: s.limits.MaxQueryBytes,
+		})
+	// Before the header and the first byte: a refusal has to be reportable,
+	// and this handler used to set Content-Type and take a bufio.Writer
+	// BEFORE the search ran, so a budget stop wrote its status into a response
+	// already committed to NDJSON.
+	if s.queryStoppedErr(w, r, vStopped, vq) {
+		return
+	}
 	w.Header().Set("Content-Type", ndjsonContentType)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	var buf []byte
-	vq := &query.Query{From: from, To: to}
-	vStopped := s.applyQueryBudget(r, vq)
-	rows := query.VectorSearch(s.tn(r).store, from, to, body.Field, body.Vector, body.K, vq)
-	if s.queryStopped(w, r, vStopped) {
-		return
-	}
 	for _, row := range rows {
 		buf = appendRowJSON(buf[:0], row, false)
 		bw.Write(buf)

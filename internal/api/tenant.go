@@ -182,6 +182,11 @@ func (s *Server) tenant(acc, proj string) (*tenant, error) {
 		delete(s.degraded, key)
 	}
 	tn := &tenant{key: key, store: st, w: ingest.NewWriter(st)}
+	// Before the writer takes any rows: changing the vector configuration with
+	// rows buffered would put two dimensions in one column.
+	if len(s.vecFlds) > 0 {
+		tn.w.SetVectorFields(s.vecFlds)
+	}
 	tn.touch()
 	tn.inFlight.Add(1) // handed out busy, released by the caller
 	if len(s.strmFlds) > 0 {

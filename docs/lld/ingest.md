@@ -396,6 +396,48 @@ fallback, cfg ParallelConfig, opts) (ingested, skipped int, err error)`:
 `ingest.MinParallelBytes` also gates `/_bulk` (after the in-place action-line
 strip), so a large ES bulk gets the same sharded path.
 
+## Vector fields
+
+`value.go`. `-vector-fields` declares which record fields are embeddings and at
+what dimension, as `name:dim` pairs (`embedding:768,title_vec:384`). Nothing is
+guessed: `[1,2,3]` might be a retry-delay schedule or a status sequence, and a
+store that inferred the column type would decide it from whichever record
+arrived first — so the same payload would land as a vector on an empty store
+and as text on a populated one. An array in an unconfigured field is ignored.
+
+The dimension is configuration rather than learned from the first record,
+because a learned one is re-learned after a restart: the first post-restart
+record would define the column afresh and split the corpus in two, each half
+invisible to the other's queries. A malformed `-vector-fields` is a startup
+failure. There is a hard 16384-dimension ceiling on top of the configured one —
+larger than any published text embedding by a wide margin, and small enough
+that a record claiming the maximum is 64 KiB rather than a memory event.
+
+Every rule is a refusal, not a repair, and the record is rejected with its
+ordinal rather than stored with the field dropped — a log line stored without
+its embedding is invisible to the one search it was ingested for:
+
+| rejected | why |
+| --- | --- |
+| wrong dimension | cosine over vectors of different lengths is undefined, and the search's `dim != len(q)` skip would silently drop the whole group |
+| NaN | `NaN > x` is false for every x, so a NaN row sorts wherever the comparison lands it and every score against it is NaN — one bad record makes a result set meaningless without failing anything |
+| ±Inf | infinite norm, NaN cosine, same route |
+| non-numeric element | not an embedding |
+
+Floats reach the writer already parsed, through `AddVectors`. A vector
+round-tripped through a string would be 768 floats formatted and re-parsed per
+record on the hot path, for a value that was already in the right form when it
+was read — and stored as text it would make every row a distinct dictionary
+entry, the worst case for a structure whose whole value is repetition, while
+staying invisible to a search that reads float32s. The ingest loop reuses one
+scratch slice, so a 768-dimension embedding is not 3 KiB of garbage per line.
+
+A record that carries no embedding for a configured field still occupies its
+slot in the flat column: the search reads row *i* of the vector buffer as row
+*i* of the group, so a gap would put every later score on the wrong line — a
+wrong answer rather than a missing one. Columns are padded to the full row
+count at flush.
+
 ## Failure behavior
 
 - Malformed input: skipped and counted (`skipped` in the response body,

@@ -60,6 +60,18 @@ func main() {
 	queryQueueWait := flag.Duration("query-queue-wait", 0,
 		"how long a read may wait for an admission slot before 429; 0 refuses immediately, "+
 			"which is right for an interactive endpoint")
+	vectorFields := flag.String("vector-fields", "",
+		"comma-separated name:dim pairs declaring which record fields are embeddings, "+
+			"e.g. `embedding:768`. A JSON array is only read as a vector for a field named "+
+			"here: [1,2,3] is not self-evidently an embedding, and a store that guessed "+
+			"would type the column from whichever record arrived first")
+	maxVectorK := flag.Int("search.maxVectorK", 0,
+		"cap on k for /select/vector; 0 = unbounded")
+	maxVectorDim := flag.Int("search.maxVectorDim", 0,
+		"cap on the query vector's dimension, and so on the cost of one comparison; 0 = unbounded")
+	maxVectorCandidates := flag.Int("search.maxVectorCandidates", 0,
+		"cap on stored vectors scored by one search; 0 = unbounded. Distinct from "+
+			"-search.maxVectorK: the top 10 of a billion still reads a billion")
 	maxGroupKeys := flag.Int("search.maxGroupKeys", 0,
 		"cap on an aggregate's distinct `by` keys (stats/uniq/top); 0 = unbounded. "+
 			"Nothing else bounds it: -search.maxRows counts scanned rows, of which a "+
@@ -176,6 +188,10 @@ func main() {
 	cfg.Limits.MaxOpenTenants = *maxTenants
 	cfg.Limits.MaxQueriesPerTenant = *maxPerTenantQ
 	cfg.Limits.QueryQueueWait = *queryQueueWait
+	cfg.VectorFields = *vectorFields
+	cfg.Limits.MaxVectorK = *maxVectorK
+	cfg.Limits.MaxVectorDim = *maxVectorDim
+	cfg.Limits.MaxVectorCandidates = *maxVectorCandidates
 	cfg.Limits.MaxGroupKeys = *maxGroupKeys
 	cfg.Limits.MaxPipeRows = *maxPipeRows
 	cfg.Limits.MaxScanWorkers = *maxScanWorkers

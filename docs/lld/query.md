@@ -381,6 +381,31 @@ subset is a clear error, never a silent wrong answer.
 column, `k` default 10, results carry `_score`. An ANN index is a future
 optimization, not a claim.
 
+The candidates go through a **bounded min-heap of exactly k**, not a
+collect-everything-and-sort. The sort was never the problem; the slice was. A
+window holding ten million embeddings built a ten-million-entry candidate list
+to return ten rows, so memory was proportional to the corpus and not to the
+answer, and `k` — the one thing a caller controls — had no effect on it. The
+heap's root is the WEAKEST kept candidate, so a new score is decided in one
+comparison and nearly every row on a large corpus touches nothing. Rows are
+materialized for the k survivors only.
+
+Four ceilings, because they bound four quantities and a limit only limits the
+quantity it is expressed in:
+
+| flag | bounds |
+| --- | --- |
+| `-search.maxVectorK` | the answer's size |
+| `-search.maxVectorDim` | the cost of one comparison (the query vector is client-supplied) |
+| `-search.maxVectorCandidates` | how many stored vectors are scored — the top 10 of a billion is a small answer and a billion comparisons |
+| `-search.maxQueryBytes` | the materialized result: ten rows carrying megabyte payloads is small by every other measure |
+
+A refusal is recorded on the query's stop reason as `ErrVectorSearch`, which
+wraps `ErrRowLimit` so the existing 413 mapping covers it. The handler reports
+it **before** setting `Content-Type` and taking a writer — it used to commit
+the response to NDJSON before the search ran, so a budget stop wrote its status
+into a response already on the wire.
+
 ## Parallelism summary
 
 - Ingest: sharded parse (`NumCPU/3` writers) + flush pool (`min(4, NumCPU)`).

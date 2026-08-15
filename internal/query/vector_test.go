@@ -24,7 +24,7 @@ func TestVectorSearch(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	rows := VectorSearch(s, 0, int64(1)<<62, "emb", []float32{0, 1}, 2, nil)
+	rows := VectorSearch(s, 0, int64(1)<<62, "emb", []float32{0, 1}, 2, nil, VectorLimits{})
 	if len(rows) != 2 {
 		t.Fatalf("knn returned %d rows, want 2", len(rows))
 	}

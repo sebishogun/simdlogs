@@ -13,6 +13,7 @@ package ingest
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
 	"sort"
 	"strings"
@@ -41,11 +42,19 @@ var flushWorkers = min(4, runtime.NumCPU())
 // Writer accumulates rows and flushes groups to a store. Add is for one
 // goroutine; the flush pool runs concurrently behind it.
 type Writer struct {
-	store     *storage.Store
-	ts        []int64
-	cols      map[string]*colBuf
-	colOrder  []string
-	strmFlds  []string // fields that identify a log stream; synthesize _stream from them
+	store    *storage.Store
+	ts       []int64
+	cols     map[string]*colBuf
+	colOrder []string
+	strmFlds []string // fields that identify a log stream; synthesize _stream from them
+	// vecFlds is which fields are embeddings and at what dimension; vecs
+	// holds their flat row-major data for the batch being built. Separate
+	// from cols because a vector is not a string and round-tripping it
+	// through the dictionary would store the TEXT of 768 floats per row and
+	// make every one of them a distinct dictionary entry -- the worst case
+	// for a structure whose whole value is repetition.
+	vecFlds   VectorFields
+	vecs      map[string][]float32
 	limits    RecordLimits
 	maxLine   int
 	maxDecomp int
@@ -139,6 +148,8 @@ type flushJob struct {
 	ts       []int64
 	colOrder []string
 	vals     map[string][]string
+	vecs     map[string][]float32
+	vecFlds  VectorFields
 	compact  bool
 	batch    *flushBatch // the Flush waiting for this job, never nil
 }
@@ -156,6 +167,7 @@ func NewWriterWorkers(s *storage.Store, workers int) *Writer {
 	w := &Writer{
 		store:    s,
 		cols:     map[string]*colBuf{},
+		vecs:     map[string][]float32{},
 		lastFlsh: nowFn(),
 		jobs:     make(chan flushJob, workers),
 		batch:    &flushBatch{},
@@ -180,6 +192,31 @@ func (w *Writer) worker() {
 		for _, k := range j.colOrder {
 			d := storage.BuildDict(j.vals[k])
 			cols = append(cols, storage.Column{Name: k, Type: storage.ColDict, Dict: &d})
+		}
+		// Vector columns after the dictionaries, in configured-name order via
+		// the job's own map -- their content is fixed-width and needs no
+		// dictionary build.
+		for name, dim := range j.vecFlds {
+			data := j.vecs[name]
+			if len(data) == 0 {
+				continue
+			}
+			// A row that carried no vector was zero-filled at add time, so the
+			// flat buffer is exactly Rows*Dim. A short buffer here would be a
+			// bug in that backfill, and appending a column whose length does
+			// not match the row count would build a group whose vector rows
+			// are offset from its other columns -- every score attached to the
+			// wrong line.
+			if len(data) != len(j.ts)*dim {
+				e := fmt.Errorf("ingest: vector column %q has %d floats for %d rows of %d dimensions",
+					name, len(data), len(j.ts), dim)
+				j.batch.err.CompareAndSwap(nil, &e)
+				j.batch.failed.Add(1)
+				continue
+			}
+			cols = append(cols, storage.Column{
+				Name: name, Type: storage.ColVector, Vec: data, Dim: dim,
+			})
 		}
 		g := &storage.Group{Rows: len(j.ts), Columns: cols, Compact: j.compact}
 		if _, err := w.store.AppendGroup(g); err != nil {
@@ -219,6 +256,44 @@ func (w *Writer) Add(ts int64, fields map[string]string) {
 // its own retention bucket.
 func (w *Writer) AddStreamOverridden(ts int64, fields map[string]string) {
 	w.add(ts, fields, true)
+}
+
+// SetVectorFields declares which record fields are embeddings, and at what
+// dimension. Safe to call before the writer takes any rows; changing it with
+// rows buffered would put two dimensions in one column.
+//
+// The dimension is configuration rather than something learned from the first
+// record, because a learned one is re-learned after a restart: a deployment
+// whose first post-restart record carried 768 floats would silently define the
+// column afresh and split its corpus in two, each half invisible to the
+// other's queries.
+func (w *Writer) SetVectorFields(v VectorFields) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.vecFlds = v
+}
+
+// VectorFields reports the configured embedding fields.
+func (w *Writer) VectorFields() VectorFields {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.vecFlds
+}
+
+// ValidateVector reports whether a record's value for a configured vector
+// field is storable, without storing it.
+//
+// Exported so the PARSE path refuses the record -- with a reason, counted in
+// Result.Rejected -- rather than the writer silently zero-filling it. A log
+// line stored with its embedding dropped is a line invisible to the search it
+// was ingested for, which is worse than a rejection the client can see.
+func (w *Writer) ValidateVector(field, text string) error {
+	dim, ok := w.VectorFields().Dim(field)
+	if !ok {
+		return nil
+	}
+	_, err := ParseVector(make([]float32, 0, dim), field, text, dim)
+	return err
 }
 
 // SetMaxDecompressedBytes bounds what one compressed body may expand to.
@@ -351,7 +426,27 @@ func (w *Writer) isStreamField(k string) bool {
 	return false
 }
 
+// AddVectors is Add for a record carrying embeddings.
+//
+// The floats arrive already parsed, from the ingest path that read them out of
+// the payload -- not as text this re-parses. A vector round-tripped through a
+// string is 768 floats formatted and re-parsed per record on the hot path, for
+// a value that was already in the right form when it was read.
+//
+// vecs is borrowed for the call: the writer copies into its own column buffer,
+// so an ingest loop reuses one scratch slice per record rather than allocating
+// 3 KiB of garbage per log line.
+func (w *Writer) AddVectors(ts int64, fields map[string]string, vecs map[string][]float32) {
+	w.addVec(ts, fields, false, vecs)
+}
+
 func (w *Writer) add(ts int64, fields map[string]string, streamOverridden bool) {
+	w.addVec(ts, fields, streamOverridden, nil)
+}
+
+func (w *Writer) addVec(ts int64, fields map[string]string, streamOverridden bool,
+	vecs map[string][]float32,
+) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed.Load() {
@@ -380,6 +475,15 @@ func (w *Writer) add(ts int64, fields map[string]string, streamOverridden bool) 
 		if k == "_stream" && dropPayloadStream {
 			continue
 		}
+		if _, isVec := w.vecFlds.Dim(k); isVec {
+			// A configured vector field arriving as an ordinary string is
+			// dropped, not stored as text. Storing the TEXT of 768 floats
+			// would make every row a distinct dictionary entry -- the worst
+			// case for a structure whose whole value is repetition -- and the
+			// search reads float32s, so it would be invisible to the one
+			// query the field exists for. The float path is AddVectors.
+			continue
+		}
 		cb := w.cols[k]
 		if cb == nil {
 			cb = &colBuf{name: k, vals: make([]string, row)} // backfill prior rows
@@ -393,6 +497,39 @@ func (w *Writer) add(ts int64, fields map[string]string, streamOverridden bool) 
 		cb.vals = append(cb.vals, v)
 		w.bytes += len(k) + len(v)
 	}
+	// The embeddings, into the flat per-column buffer.
+	//
+	// Backfilled to this row's offset first: a record that carried no vector
+	// for a configured field still occupies its slot, because the search reads
+	// row i of the flat buffer as row i of the group. A gap would move every
+	// later row's score onto the wrong line -- a wrong answer rather than a
+	// missing one.
+	for name, dim := range w.vecFlds {
+		v := vecs[name]
+		if len(v) != dim {
+			if _, seen := w.vecs[name]; !seen && len(v) == 0 {
+				// Nothing has ever supplied this field: no column, no
+				// backfill. A column of zeros for a field nobody sends is
+				// Rows*Dim*4 bytes of nothing.
+				continue
+			}
+			v = nil
+		}
+		buf := w.vecs[name]
+		for len(buf) < row*dim {
+			buf = append(buf, 0)
+		}
+		if v == nil {
+			for i := 0; i < dim; i++ {
+				buf = append(buf, 0)
+			}
+		} else {
+			buf = append(buf, v...)
+		}
+		w.vecs[name] = buf
+		w.bytes += len(name) + dim*4
+	}
+
 	// Synthesize the _stream label from the configured stream fields, so
 	// `stats by (_stream)` and stream-scoped retention have a value to group
 	// on. The selector `_stream:{...}` queries the underlying label fields
@@ -615,11 +752,25 @@ func (w *Writer) flushLocked() {
 	w.batch.wg.Add(1)
 	w.batch.jobs.Add(1)
 	w.batch.outstanding.Add(1)
-	w.jobs <- flushJob{ts: w.ts, colOrder: w.colOrder, vals: vals, compact: w.compact, batch: w.batch}
+	// Every vector column is padded to the full row count before handoff. A
+	// row that carried no embedding still occupies its slot: a vector column
+	// shorter than the group's rows would put every score on the wrong line,
+	// because the search reads row i of the flat buffer as row i of the group.
+	for name, dim := range w.vecFlds {
+		if len(w.vecs[name]) == 0 {
+			continue
+		}
+		for len(w.vecs[name]) < len(w.ts)*dim {
+			w.vecs[name] = append(w.vecs[name], 0)
+		}
+	}
+	w.jobs <- flushJob{ts: w.ts, colOrder: w.colOrder, vals: vals, vecs: w.vecs,
+		vecFlds: w.vecFlds, compact: w.compact, batch: w.batch}
 
 	// Fresh buffers; the job owns the handed-off ones.
 	w.ts = make([]int64, 0, FlushRows)
 	w.cols = map[string]*colBuf{}
+	w.vecs = map[string][]float32{}
 	w.colOrder = nil
 	w.bytes = 0
 	w.lastFlsh = nowFn()

@@ -70,6 +70,15 @@ type Limits struct {
 	// unbounded.
 	MaxPipeRows int
 
+	// MaxVectorK, MaxVectorDim and MaxVectorCandidates bound a vector search.
+	// Three numbers because they bound three quantities: how big the answer
+	// is, how expensive one comparison is, and how many comparisons run. The
+	// top 10 of a billion vectors is a small answer and a billion
+	// comparisons, so MaxVectorK says nothing about the cost. 0 is unbounded.
+	MaxVectorK          int
+	MaxVectorDim        int
+	MaxVectorCandidates int
+
 	// MaxScanWorkers bounds the goroutines every concurrent scan draws from,
 	// in total rather than each. 0 means GOMAXPROCS, which is the right number
 	// for the machine and was previously the number taken by each query.
@@ -216,6 +225,17 @@ type Config struct {
 	// server parses it once at startup, so a typo is a startup failure and not
 	// a silent fall back to the default.
 	CorruptionPolicy string
+
+	// VectorFields declares which record fields are embeddings, as `name:dim`
+	// pairs. Empty means the deployment stores no vectors, and a JSON array in
+	// a payload is ignored rather than guessed at.
+	//
+	// A string rather than the ingest package's type, for the same reason
+	// CorruptionPolicy is a string: config must not depend on ingest -- the
+	// dependency runs the other way -- and this value comes from a flag or a
+	// file, where it is a string anyway. The server parses it once at startup,
+	// so a typo is a startup failure and not a field silently stored as text.
+	VectorFields string
 
 	// DirRereadInterval is how often the readiness probe re-reads the store
 	// directories of degraded tenants that are not open, to notice that an

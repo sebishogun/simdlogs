@@ -2,6 +2,8 @@ package ingest
 
 import (
 	"errors"
+	"fmt"
+	"math"
 	"runtime"
 	"strconv"
 	"sync"
@@ -293,6 +295,12 @@ func IngestJSONLinesOpts(w *Writer, data []byte, fallback func() int64, opts *Op
 	var res Result
 	mapped := !opts.Empty()
 	fields := map[string]string{}
+	// Hoisted out of the loop: the configured set is asked for once per body
+	// rather than once per record (it takes the writer's mutex), and the
+	// scratch buffer is reused so a 768-float embedding is not 3 KiB of
+	// garbage per log line.
+	vecFlds := w.VectorFields()
+	var vecScratch []float32
 	for len(data) > 0 {
 		// Split one line; lenient ingest parses each independently so a
 		// malformed line is counted and skipped, never aborting the batch
@@ -333,6 +341,8 @@ func IngestJSONLinesOpts(w *Writer, data []byte, fallback func() int64, opts *Op
 		}
 		var ts int64
 		haveTS := false
+		var rowVecs map[string][]float32
+		var vecErr error
 		v.ForEachKey(func(key string, val simdjson.Value) bool {
 			switch val.Kind() {
 			case simdjson.String:
@@ -363,16 +373,69 @@ func IngestJSONLinesOpts(w *Writer, data []byte, fallback func() int64, opts *Op
 				} else {
 					fields[key] = "false"
 				}
+			case simdjson.Array:
+				// An array is only read when the field is CONFIGURED as an
+				// embedding. `[1,2,3]` is not self-evidently a vector -- it
+				// might be a retry schedule or a status sequence -- and a
+				// store that guessed would decide the column type from
+				// whichever record arrived first, so the same payload would
+				// land as a vector on an empty store and as text on a
+				// populated one.
+				dim, isVec := vecFlds.Dim(key)
+				if !isVec {
+					return true
+				}
+				buf := vecScratch[:0]
+				n := 0
+				bad := false
+				val.ForEach(func(e simdjson.Value) bool {
+					if e.Kind() != simdjson.Number || n == dim {
+						bad = true
+						return false
+					}
+					f := e.Float()
+					// NaN and Inf are refused, not clamped: a NaN component
+					// makes every score computed against the vector NaN, and
+					// NaN compares false against everything, so one bad record
+					// does not fail -- it quietly makes a whole result set
+					// meaningless.
+					if math.IsNaN(f) || math.IsInf(f, 0) {
+						bad = true
+						return false
+					}
+					buf = append(buf, float32(f))
+					n++
+					return true
+				})
+				vecScratch = buf[:0]
+				if bad || n != dim {
+					vecErr = fmt.Errorf("%w: %s has an unusable value for a %d-dimension field",
+						ErrVector, key, dim)
+					return false
+				}
+				if rowVecs == nil {
+					rowVecs = map[string][]float32{}
+				}
+				rowVecs[key] = buf
 			}
 			return true
 		})
 		if !haveTS {
 			ts = fallback()
 		}
+		if vecErr != nil {
+			// Rejected as a RECORD, at its ordinal, rather than stored with
+			// the embedding dropped. A log line stored without its vector is
+			// a line invisible to the one search it was ingested for, which
+			// is worse than a rejection the client can see and fix.
+			res.Reject(ordinal)
+			res.Warn(int64(ordinal), "%v", vecErr)
+			continue
+		}
 		if mapped {
 			opts.apply(fields)
 		}
-		addWithStream(w, ts, fields, opts)
+		addWithStreamVec(w, ts, fields, opts, rowVecs)
 		res.Accepted++
 	}
 	return res, nil
