@@ -104,8 +104,11 @@ type Server struct {
 	// retention pass in flight when the stores close would unmap under
 	// itself, and the alert and rule tickers had no stop at all and ran for
 	// the life of the process.
-	auth     *authState
-	querySem chan struct{} // MaxConcurrentQuery
+	auth *authState
+	// readyOnce records that readiness has answered at least once, so the
+	// startup grace stops applying to a server that has already reported.
+	readyOnce atomic.Bool
+	querySem  chan struct{} // MaxConcurrentQuery
 	// admission bounds reads per tenant, which the class semaphores cannot:
 	// they are process-wide, so one tenant can hold every slot.
 	admission *query.Admission
@@ -658,9 +661,15 @@ func (s *Server) Handler() http.Handler {
 	}()) // accept a degraded store
 	handle("/metrics", s.requireAuth(config.RoleMetrics, opsSpec(), s.guard(opsSpec(), s.metrics))) // Prometheus text exposition
 	handle("/alerts", rd(s.alertsHandler))                                                          // alerting rule state
-	handle("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
-	handle("/-/healthy", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
-	handle("/-/ready", s.readiness)
+	// /health and /-/healthy are LIVENESS: the process. They answered a
+	// literal "OK" whatever the server was doing, including while draining --
+	// so an orchestrator kept routing to a process that was going to exit.
+	// Every store, disk and peer condition belongs to readiness: a full disk
+	// that failed liveness would kill the process, which would restart onto
+	// the same full disk and lose the rows a graceful drain flushes.
+	handle("/health", s.healthHandler(healthLive))
+	handle("/-/healthy", s.healthHandler(healthLive))
+	handle("/-/ready", s.healthHandler(healthReady))
 	handle("/flags", adm(s.flagsHandler)) // flag dump: administrative
 	handle("/vmui", rd(s.ui))             // web UI (vmui equivalent); same gate as /select/vmui
 	handle("/select/vmui", rd(s.ui))
@@ -1931,39 +1940,18 @@ func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
 // Detached, like the compaction walk: it samples every open store, and holding
 // the lock every request needs while doing that would make a readiness probe a
 // source of latency.
+// storagePressure is the typed conditions rendered as one line per tenant.
+//
+// One function, not two. It and storagePressureConditions had drifted into
+// different wordings of the same facts -- which is how the dead OverQuota arm
+// survived, and how the "3 tenant(s)" count bug got in: two renderings of one
+// state, each tested against itself.
 func (s *Server) storagePressure() []string {
-	var out []string
-	s.forEachTenantDetached(func(tn *tenant) {
-		st := tn.store.QuotaState()
-		// ONE line per tenant, whatever combination of budgets it trips.
-		//
-		// The switch this replaced had a dead `OverQuota` arm -- QuotaState
-		// sets Err whenever it sets OverQuota, so the Err arm always won and
-		// a store over its quota AND below the warn reserve reported only the
-		// disk. Splitting it into three independent ifs fixed that and broke
-		// something worse: the caller prints `len(pressure)` as "N tenant(s)
-		// under storage pressure", so one tenant tripping all three became
-		// "3 tenant(s)". The count is what an operator is paged on.
-		var causes []string
-		if st.Reject {
-			causes = append(causes, fmt.Sprintf("%d bytes free, below the reject reserve",
-				st.Usage.Free))
-		} else if st.Warn {
-			causes = append(causes, fmt.Sprintf("%d bytes free, below the warn reserve",
-				st.Usage.Free))
-		}
-		if st.OverQuota {
-			causes = append(causes, fmt.Sprintf("%d bytes used, at its quota", st.StoreBytes))
-		}
-		if len(causes) == 0 {
-			return
-		}
-		state := "degraded"
-		if st.Err != nil {
-			state = "writes REJECTED"
-		}
-		out = append(out, fmt.Sprintf("%s: %s: %s", tn.key, state, strings.Join(causes, "; ")))
-	})
+	conds := s.storagePressureConditions()
+	out := make([]string, 0, len(conds))
+	for _, c := range conds {
+		out = append(out, c.Detail)
+	}
 	return out
 }
 

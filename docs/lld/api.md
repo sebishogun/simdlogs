@@ -315,6 +315,59 @@ Environment: `SIMDLOGS_STREAM_FIELDS` (stream-field default before the
 default tenant opens, so a deployment can synthesize `_stream` without a
 code change).
 
+## Health: liveness and readiness
+
+`health.go`. They are used for **opposite actions**: liveness failing means
+kill the process, readiness failing means stop sending it traffic. Conflating
+them turns a full disk into a crash loop — probe red, process killed, restarts
+onto the same full disk, and the restart destroys the rows a graceful drain
+would have flushed. So liveness is the **process and nothing else**, and every
+store, disk and peer condition is readiness's.
+
+`/health` and `/-/healthy` are liveness; `/-/ready` is readiness. The liveness
+routes used to return a literal `OK` whatever the server was doing, draining
+included — so an orchestrator kept routing to a process that was about to exit.
+
+| state | ready | live | clears by itself |
+| --- | --- | --- | --- |
+| `ready` | ✅ | ✅ | — |
+| `disk_low` | ❌ | ✅ | yes |
+| `cluster_incomplete` | ❌ | ✅ | yes |
+| `storage_degraded` | ❌ | ✅ | no |
+| `disk_full` | ❌ | ✅ | yes |
+| `shutting_down` | ❌ | ❌ | no |
+
+`disk_low` is red on purpose. Writes still succeed through it, which is exactly
+why: the warn reserve exists so readiness goes red BEFORE the first write
+fails, and a probe that only went red once writes failed would report the
+outage rather than prevent it.
+
+There is deliberately **no `starting` state**. It was in the first draft and it
+is not reachable: `NewServerConfig` opens the default tenant's store and runs
+`scanDegradedTenants` before it returns, and the mux does not exist until it
+has. A state that cannot occur is the dead readiness arm this campaign has
+already removed twice.
+
+Severities are distinct and ordered by what an operator does about them, so the
+reported summary state is the most actionable one while the `conditions` list
+keeps all of them — an operator fixing a full disk still needs to know two
+peers are missing.
+
+`?format=json` returns the machine-readable report. It names tenants, peer URLs
+and byte counts, so it is gated on the **metrics or admin** role — the same
+class of information as `/metrics`, which that role already scrapes. An
+unauthenticated caller gets `state`/`ready`/`live` and nothing else, and the
+probe itself never answers 401: a 401 on a readiness probe takes the server out
+of rotation for having authentication configured. The plain-text body keeps the
+shape it had, because it is what an existing probe parses and a health endpoint
+whose body changes shape breaks the monitoring at the one moment you least want
+it broken.
+
+A select-router probes its peers in parallel with a 500 ms timeout. Sequential
+probes at one second each would make a five-peer readiness check a five-second
+probe, and an orchestrator whose probe times out kills the process — the
+crash-loop failure again, reached through the probe rather than the disk.
+
 ## Elasticsearch and SQL contracts
 
 Both surfaces had the same defect: **a clause the server did not implement was
