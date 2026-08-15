@@ -714,8 +714,6 @@ func (s *Server) fanOutPeers(r *http.Request, path string, body []byte) []PeerRe
 	return out
 }
 
-// bodiesOf keeps the [][]byte shape the existing merges consume. Each merge
-// moves to the PeerResponse form as it learns to report completeness (8.3).
 // mergeDecode unmarshals one shard's answer into v, refusing rather than
 // skipping when it will not parse.
 //
@@ -723,8 +721,15 @@ func (s *Server) fanOutPeers(r *http.Request, path string, body []byte) []PeerRe
 // contributed its rows. Skipping it produces a short answer that looks
 // complete -- which is exactly what the completeness rule in fanOutChecked
 // exists to prevent, one layer down and invisible to it, because as far as the
-// fan-out is concerned that shard answered fine. Six merges used to `continue`
-// here.
+// fan-out is concerned that shard answered fine.
+//
+// EIGHT handlers decode a shard body: _count, _search, valueCounts, matrix,
+// statsQuery, hits, facets and vector. Four of them reached this point with a
+// bare `continue` (matrix, hits, facets, vector) and four with an
+// `if json.Unmarshal(...) == nil` guard around the whole body (the rest); both
+// shapes drop the shard. An earlier version of this comment said "six", and
+// the commit that wrote it said "eight merges continued", and neither was the
+// count of either thing.
 func (s *Server) mergeDecode(w http.ResponseWriter, r *http.Request, a shardAnswer, v any) bool {
 	shard := a.shard
 	if err := json.Unmarshal(a.body, v); err != nil {

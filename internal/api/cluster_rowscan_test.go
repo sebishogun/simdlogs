@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sebishogun/simdlogs/internal/query"
 )
@@ -200,12 +203,12 @@ func checkRowScanner(t *testing.T, line []byte) {
 	t.Helper()
 	got := jsonLineToRow(line)
 	if json.Valid(line) && startsWithBrace(line) {
-		if hasNested(line) {
-			return // covered by TestANestedValueIsItsRawText
+		if !utf8.Valid(line) {
+			return // covered by TestInvalidUTF8IsPreservedNotCoerced
 		}
-		want := decoderRow(line)
+		want := rawMessageRow(line)
 		if !rowsEqual(want, got) {
-			t.Errorf("input %q is a valid JSON object\n  decoder: %s\n  scanner: %s",
+			t.Errorf("input %q is a valid JSON object\n  reference: %s\n    scanner: %s",
 				line, showRow(want), showRow(got))
 		}
 		return
@@ -282,27 +285,88 @@ func FuzzJSONLineToRow(f *testing.F) {
 	})
 }
 
-// hasNested reports whether a line contains a composite value, which is the
-// one shape the two implementations answer differently.
-func hasNested(line []byte) bool {
-	depth, inStr := 0, false
-	for i := 0; i < len(line); i++ {
-		switch {
-		case inStr && line[i] == '\\':
-			i++
-		case line[i] == '"':
-			inStr = !inStr
-		case inStr:
-		case line[i] == '{' || line[i] == '[':
-			depth++
-			if depth > 1 {
-				return true
-			}
-		case line[i] == '}' || line[i] == ']':
-			depth--
-		}
+// rawMessageRow is the reference the scanner is checked against.
+//
+// decoderRow is encoding/json's TOKEN stream, which flattens a nested value
+// into fields that never existed -- so checkRowScanner used to skip any line
+// containing a composite, and that exemption covered a large share of the
+// input space: `{"a":[1],"k":"\ud800\ud800"}` got no assertion at all from
+// the whole suite, sibling field and everything.
+//
+// This reads each VALUE as a json.RawMessage instead, which keeps nesting
+// intact and still comes entirely from the standard library. It is slower than
+// either implementation and does not care.
+func rawMessageRow(line []byte) query.Row {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.UseNumber()
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return rawRow(line)
 	}
-	return false
+	row := query.Row{NoTime: true}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return rawRow(line)
+		}
+		key, isString := kt.(string)
+		if !isString {
+			return rawRow(line)
+		}
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return rawRow(line)
+		}
+		val, ok := rawValueText(raw)
+		if !ok {
+			return rawRow(line)
+		}
+		if key == "_time" && row.NoTime {
+			if t, terr := time.Parse(time.RFC3339Nano, val); terr == nil {
+				row.Time, row.NoTime = t.UnixNano(), false
+				continue
+			}
+		}
+		row.Fields = append(row.Fields, query.Field{Key: key, Value: val})
+	}
+	// The scanner refuses trailing bytes after the object; encoding/json
+	// ignores them. Reproduced here so the two agree on which lines are rows.
+	if _, err := dec.Token(); err != nil {
+		return rawRow(line)
+	}
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return rawRow(line)
+	}
+	return row
+}
+
+// rawValueText is the text the scanner produces for one JSON value.
+func rawValueText(raw json.RawMessage) (string, bool) {
+	t := strings.TrimSpace(string(raw))
+	if t == "" {
+		return "", false
+	}
+	switch t[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return "", false
+		}
+		return s, true
+	case 'n':
+		return "", t == "null"
+	case 't', 'f':
+		return t, t == "true" || t == "false"
+	case '{', '[':
+		// The scanner keeps the value's own bytes verbatim.
+		return t, true
+	}
+	var n json.Number
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return "", false
+	}
+	return n.String(), true
 }
 
 // Two allocations per row, and a gate so it stays that way.
@@ -312,6 +376,9 @@ func hasNested(line []byte) bool {
 // per token, per row, on the merge path of every clustered query with a
 // coordinator half. The two that remain are the byte buffer every key and value
 // aliases and the exactly-sized Field slice.
+// It is an upper bound for THIS row, not a guarantee for every row: see the
+// aliasing note in cluster_rowscan.go. A row whose decoded content exceeds the
+// line length would grow the buffer once more, safely.
 func TestRowScannerAllocatesTwicePerRow(t *testing.T) {
 	got := testing.AllocsPerRun(200, func() {
 		row := jsonLineToRow(benchLine)
@@ -347,5 +414,41 @@ func TestTheFieldSliceIsSizedFromTheLine(t *testing.T) {
 			// +1 because a lifted _time is counted and then removed.
 			t.Errorf("%s: %d fields in a slice of capacity %d", tc.line, tc.want, c)
 		}
+	}
+}
+
+// Invalid UTF-8 comes back as the shard sent it.
+//
+// encoding/json coerces it to U+FFFD; this scanner does not, because the line
+// was encoded by appendJSONString, which passes every byte >= 0x80 through
+// unchanged, and /insert/logfmt stores a raw 0x80 without rejecting it.
+// Matching encoding/json made the same query answer different BYTES from a
+// cluster than from a node, at HTTP 200, with nothing to say so.
+func TestInvalidUTF8IsPreservedNotCoerced(t *testing.T) {
+	for _, tc := range []struct{ name, line, key, want string }{
+		{"lone 0x80", "{\"_msg\":\"bad-\x80-byte\"}", "_msg", "bad-\x80-byte"},
+		{"two invalid", "{\"k\":\"\x80\x81\"}", "k", "\x80\x81"},
+		{"invalid in a key", "{\"k\x80\":\"v\"}", "k\x80", "v"},
+		{"after an escape", "{\"k\":\"a\\tb\x80\"}", "k", "a\tb\x80"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := jsonLineToRow([]byte(tc.line))
+			if len(row.Fields) != 1 {
+				t.Fatalf("%q decoded to %s, want one field", tc.line, showRow(row))
+			}
+			if row.Fields[0].Key != tc.key || row.Fields[0].Value != tc.want {
+				t.Errorf("%q decoded to %q=%q, want %q=%q", tc.line,
+					row.Fields[0].Key, row.Fields[0].Value, tc.key, tc.want)
+			}
+			// And the decoder really does differ, so the exemption in
+			// checkRowScanner is covering a real difference rather than
+			// hiding a bug that no longer exists.
+			if old := decoderRow([]byte(tc.line)); len(old.Fields) == 1 &&
+				old.Fields[0].Key == tc.key && old.Fields[0].Value == tc.want {
+				t.Errorf("%q: encoding/json preserved the bytes too, so this test "+
+					"and the exemption beside it are asserting a difference that "+
+					"does not exist", tc.line)
+			}
+		})
 	}
 }

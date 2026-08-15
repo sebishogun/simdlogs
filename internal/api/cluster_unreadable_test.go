@@ -2,8 +2,12 @@ package api
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	gotoken "go/token"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -31,16 +35,94 @@ func garbageShard(t *testing.T) *httptest.Server {
 	return ts
 }
 
-// mergeDecodeEndpoints are the reads whose merge decodes a shard body. Each
-// federated handler that unmarshals appears at least once.
-var mergeDecodeEndpoints = []struct{ name, path, method, body string }{
-	{"hits", "/select/logsql/hits?query=*&step=1m&start=1&end=2", "GET", ""},
-	{"stats_query", "/select/logsql/stats_query?query=*+%7C+stats+count%28%29+n", "GET", ""},
-	{"stats_query_range", "/select/logsql/stats_query_range?query=*+%7C+stats+count%28%29+n&step=1m", "GET", ""},
-	{"field_values", "/select/logsql/field_values?query=*&field=level", "GET", ""},
-	{"facets", "/select/logsql/facets?query=*", "GET", ""},
-	{"es_count", "/_count", "POST", `{"query":{"match_all":{}}}`},
-	{"es_search", "/_search", "POST", `{"query":{"match_all":{}}}`},
+// mergeDecodeEndpoints are the reads whose merge decodes a shard body, one per
+// HANDLER that calls mergeDecode.
+//
+// `handler` is the function each entry actually reaches, and
+// TestEveryMergeDecodeCallerIsCovered checks that set against the mergeDecode
+// call sites in the source. The list is hand-kept and the gate is not: the
+// first version had seven entries for eight handlers, because
+// `stats_query` without `by=` delegates to federatedVector, so
+// federatedStatsQuery's own loop was never entered. That is the same drift as
+// federatedEndpoints, in the commit that fixed federatedEndpoints.
+var mergeDecodeEndpoints = []struct {
+	name, path, method, body string
+	handler                  string
+}{
+	{"hits", "/select/logsql/hits?query=*&step=1m&start=1&end=2", "GET", "", "federatedHits"},
+	{"stats_query", "/select/logsql/stats_query?query=*+%7C+stats+count%28%29+n", "GET", "", "federatedVector"},
+	{"stats_query_by", "/select/logsql/stats_query?query=*&by=level", "GET", "", "federatedStatsQuery"},
+	{"stats_query_range", "/select/logsql/stats_query_range?query=*+%7C+stats+count%28%29+n&step=1m", "GET", "", "federatedMatrix"},
+	{"field_values", "/select/logsql/field_values?query=*&field=level", "GET", "", "federatedValueCounts"},
+	{"facets", "/select/logsql/facets?query=*", "GET", "", "federatedFacets"},
+	{"es_count", "/_count", "POST", `{"query":{"match_all":{}}}`, "federatedESCount"},
+	{"es_search", "/_search", "POST", `{"query":{"match_all":{}}}`, "federatedESSearch"},
+}
+
+// Every function that calls mergeDecode is exercised by the table above.
+//
+// Taken from the source rather than listed twice: a merge added later with a
+// `continue` restored in it would otherwise pass this file unchallenged.
+func TestEveryMergeDecodeCallerIsCovered(t *testing.T) {
+	covered := map[string]bool{}
+	for _, e := range mergeDecodeEndpoints {
+		covered[e.handler] = true
+	}
+	callers := mergeDecodeCallers(t)
+	if len(callers) == 0 {
+		t.Fatal("no mergeDecode call sites were found, so this gate measures nothing")
+	}
+	for fn := range callers {
+		if !covered[fn] {
+			t.Errorf("%s calls mergeDecode and no entry in mergeDecodeEndpoints "+
+				"reaches it, so nothing says what it does with an unreadable shard "+
+				"answer", fn)
+		}
+	}
+	for fn := range covered {
+		if !callers[fn] {
+			t.Errorf("mergeDecodeEndpoints names %s, which does not call mergeDecode", fn)
+		}
+	}
+	t.Logf("%d functions call mergeDecode; %d named in the table", len(callers), len(covered))
+}
+
+// mergeDecodeCallers is the set of functions in this package containing a call
+// to s.mergeDecode.
+func mergeDecodeCallers(t *testing.T) map[string]bool {
+	t.Helper()
+	fset := gotoken.NewFileSet()
+	names, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]bool{}
+	for _, n := range names {
+		if strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", n, err)
+		}
+		for _, d := range f.Decls {
+			fn, isFunc := d.(*ast.FuncDecl)
+			if !isFunc || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				if sel, isSel := call.Fun.(*ast.SelectorExpr); isSel && sel.Sel.Name == "mergeDecode" {
+					out[fn.Name.Name] = true
+				}
+				return true
+			})
+		}
+	}
+	return out
 }
 
 func TestAShardAnsweringUnreadableIsRefusedNotSkipped(t *testing.T) {
@@ -50,7 +132,9 @@ func TestAShardAnsweringUnreadableIsRefusedNotSkipped(t *testing.T) {
 
 	for _, e := range mergeDecodeEndpoints {
 		t.Run(e.name, func(t *testing.T) {
-			resp, body := callEndpoint(t, ts, e)
+			resp, body := callEndpoint(t, ts, struct{ name, path, method, body string }{
+				e.name, e.path, e.method, e.body,
+			})
 			if resp.StatusCode/100 == 2 {
 				t.Fatalf("answered %d with %q: one shard's body was unreadable and its "+
 					"rows are missing from this answer, which the caller has no way to see",
@@ -73,7 +157,10 @@ func TestAnUnreadableAnswerNamesTheShard(t *testing.T) {
 	// bad is shard 1: SetBackends order is shard order at one replica each.
 	ts := router(t, good.URL, bad.URL)
 
-	resp, body := callEndpoint(t, ts, mergeDecodeEndpoints[5]) // _count
+	e := mergeDecodeEndpoints[6] // _count
+	resp, body := callEndpoint(t, ts, struct{ name, path, method, body string }{
+		e.name, e.path, e.method, e.body,
+	})
 	if resp.StatusCode/100 == 2 {
 		t.Fatalf("answered %d, want a refusal", resp.StatusCode)
 	}

@@ -290,8 +290,13 @@ tests (`cluster_failure_test.go`). The list used to be hand-kept and had
 drifted to nine while this page said "all nine"; the set is now derived from
 `surfaceRoutes()` by `TestEveryFederatedReadIsInTheCompletenessSuite`, which
 fails in both directions -- a federated read missing from the suite, and an
-entry in the suite that does not federate: select, hits, stats_query, stats_query_range, field_names, field_values,
-streams, `_count` and `_search`.
+entry in the suite that does not federate.
+
+The nine names that used to end this paragraph were the old sentence's list,
+left attached to a new clause after the colon -- so they read as examples of
+routes that do NOT federate, which is the opposite of what they are, and they
+contradicted "fourteen" four lines above. The set is derived now, so there is
+no list here to go stale.
 
 ## Replicated writes: idempotency and consistency
 

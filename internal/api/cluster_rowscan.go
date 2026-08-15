@@ -24,13 +24,31 @@ import (
 // buffer, and an `any` box plus a string per token, per row, on the merge path
 // of every clustered query with a coordinator half.
 //
-// The scanner below allocates one byte slice sized at len(line) -- unescaping
-// only ever shrinks a JSON string, and every key and value appears in the line
-// inside quotes, so the content can never exceed it -- and one Field slice.
-// Keys and values are strings aliasing that one buffer via unsafe.String. That
-// is sound here because the buffer is created per row, is never written after
-// the string over it is formed, and is never handed to a caller as a slice; the
-// line itself is NOT aliased, because it comes from a reused read buffer.
+// The scanner below allocates one byte slice sized at len(line) and one Field
+// slice. Keys and values are strings aliasing that one buffer via
+// unsafe.String.
+//
+// # Why the aliasing is sound, which is NOT because the buffer cannot grow
+//
+// It can. An earlier version of this comment said the buffer "never
+// reallocates" because unescaping only shrinks, and that was false in one
+// direction: a `\uXXXX` escape can encode up to three bytes from six, so it
+// shrinks, but the buffer is a fixed cap and a caller could still exceed it in
+// a shape nobody has constructed. Resting on "it never grows" is the licence
+// somebody needs to hoist an unsafe.String above its appends or reuse the
+// buffer across rows, and both of those ARE unsafe.
+//
+// What actually makes it sound, and stays true whether or not the buffer
+// grows: every string is formed by bufStr AFTER its own appends are finished,
+// so the bytes behind it never change; append COPIES on growth, so a string
+// over the old array keeps its own bytes and the GC keeps that array alive
+// through the interior pointer; and the buffer is per row and never handed to a
+// caller as a slice. The line itself is NOT aliased, because it comes from a
+// reused read buffer.
+//
+// So the two-allocation figure is the common case, not a guarantee. It is what
+// TestRowScannerAllocatesTwicePerRow measures for a ten-field row, and a row
+// whose content exceeds len(line) would pay one more.
 //
 // # Field order is preserved, not sorted
 //
@@ -72,6 +90,20 @@ import (
 //     a field `a` with value "{" followed by a field `b` -- a row that exists
 //     nowhere. A nested value is now the raw JSON text of that value, which is
 //     the one case here that is not simply rawRow.
+//
+// # Bytes are preserved, which is where this deliberately differs from encoding/json
+//
+// encoding/json COERCES invalid UTF-8 in a string to U+FFFD. This does not,
+// because the line did not come from encoding/json: the storage node encodes a
+// row with appendJSONString, which passes every byte >= 0x80 through
+// unchanged, and /insert/logfmt stores a raw 0x80 without rejecting it. An
+// earlier version of this scanner matched encoding/json here, and the result
+// was that the same query answered `bad-\x80-byte` from a node and
+// `bad-\xef\xbf\xbd-byte` from a cluster -- different bytes, HTTP 200, no
+// marker, and anything doing an exact-match or a checksum against the ingested
+// payload got a different answer from a cluster than from a node.
+//
+// The round trip is the contract: what a shard encoded is what comes back.
 func jsonLineToRow(line []byte) query.Row {
 	i := skipWS(line, 0)
 	if i >= len(line) || line[i] != '{' {
@@ -79,10 +111,11 @@ func jsonLineToRow(line []byte) query.Row {
 	}
 	i++
 
-	// One buffer for every key and value byte in the row. Sized so it never
-	// grows: a string that needed reallocation would leave earlier fields
-	// aliasing the old array -- still valid and still correct, but the fixed
-	// size makes that unreachable rather than merely benign.
+	// One buffer for every key and value byte in the row, sized so the common
+	// case never grows. Growth is SAFE if it happens -- append copies, and a
+	// string already formed over the old array keeps its bytes and keeps that
+	// array alive -- so this is a sizing hint and not an invariant anything
+	// depends on.
 	buf := make([]byte, 0, len(line))
 	row := query.Row{NoTime: true}
 
@@ -208,13 +241,9 @@ func scanJSONString(b []byte, i int, buf *[]byte) (string, int, bool) {
 	start := i
 	// Fast path: no escape and no byte that needs coercing, so the value is
 	// one copy of a contiguous span.
-	high := false
 	for i < len(b) {
 		c := b[i]
 		if c == '"' {
-			if high {
-				return appendCoerced(buf, b[start:i]), i + 1, true
-			}
 			return appendStr(buf, b[start:i]), i + 1, true
 		}
 		if c == '\\' {
@@ -222,9 +251,6 @@ func scanJSONString(b []byte, i int, buf *[]byte) (string, int, bool) {
 		}
 		if c < 0x20 {
 			return "", i, false // control byte, unescaped
-		}
-		if c >= utf8.RuneSelf {
-			high = true
 		}
 		i++
 	}
@@ -234,11 +260,7 @@ func scanJSONString(b []byte, i int, buf *[]byte) (string, int, bool) {
 
 	// Escaped path: copy what is already scanned, then decode the rest.
 	off := len(*buf)
-	if high {
-		appendCoerced(buf, b[start:i])
-	} else {
-		*buf = append(*buf, b[start:i]...)
-	}
+	*buf = append(*buf, b[start:i]...)
 	for i < len(b) {
 		c := b[i]
 		switch {
@@ -246,12 +268,6 @@ func scanJSONString(b []byte, i int, buf *[]byte) (string, int, bool) {
 			return bufStr(buf, off), i + 1, true
 		case c < 0x20:
 			return "", i, false
-		case c >= utf8.RuneSelf:
-			// Same coercion as the fast path, one rune at a time.
-			r, size := utf8.DecodeRune(b[i:])
-			*buf = utf8.AppendRune(*buf, r)
-			i += size
-			continue
 		case c != '\\':
 			*buf = append(*buf, c)
 			i++
@@ -478,35 +494,6 @@ func skipStringRaw(b []byte, i int) (int, bool) {
 	return i, false
 }
 
-// appendCoerced copies s into *buf replacing every byte that is not part of a
-// valid UTF-8 sequence with U+FFFD, and returns a string over the copy.
-//
-// This is what encoding/json's unquoteBytes does, and matching it byte for byte
-// is the point: the fuzz differential found `{"":"\x80"}`, where the decoder
-// produced the replacement rune and this scanner produced the raw byte -- a row
-// whose field value was not valid UTF-8 and would have been re-encoded as
-// something else again.
-//
-// Coercion can GROW the text: one 0x80 byte becomes three. The buffer is sized
-// at len(line), and a lone invalid byte in the line costs two bytes of quoting
-// there, so the copy still fits -- but the growth is why appendCoerced returns
-// through bufStr rather than assuming a span length.
-func appendCoerced(buf *[]byte, s []byte) string {
-	off := len(*buf)
-	for i := 0; i < len(s); {
-		c := s[i]
-		if c < utf8.RuneSelf {
-			*buf = append(*buf, c)
-			i++
-			continue
-		}
-		r, size := utf8.DecodeRune(s[i:])
-		*buf = utf8.AppendRune(*buf, r)
-		i += size
-	}
-	return bufStr(buf, off)
-}
-
 // appendStr copies s into *buf and returns a string over the copy.
 func appendStr(buf *[]byte, s []byte) string {
 	off := len(*buf)
@@ -515,8 +502,13 @@ func appendStr(buf *[]byte, s []byte) string {
 }
 
 // bufStr returns the bytes appended to *buf since off as a string aliasing the
-// buffer. Nothing writes over those bytes afterwards: append only ever extends
-// past len, and the buffer is sized so it never reallocates.
+// buffer.
+//
+// Call it AFTER the appends that make up the string, never before: the
+// soundness rests on the bytes behind the returned string being final, not on
+// the buffer never reallocating. If it does reallocate, this string points at
+// the old array, which still holds the right bytes and is kept alive by this
+// very pointer.
 func bufStr(buf *[]byte, off int) string {
 	if len(*buf) == off {
 		return ""

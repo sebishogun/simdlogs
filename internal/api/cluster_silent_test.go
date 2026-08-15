@@ -1,6 +1,7 @@
 package api
 
 import (
+	"github.com/sebishogun/simdlogs/internal/query"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -254,5 +255,45 @@ func TestABackupIsRefusedWhenAReplicaIsUnreachable(t *testing.T) {
 	if !strings.Contains(string(body), "unreachable") {
 		t.Errorf("the refusal does not say a replica was unreachable: %q",
 			truncate(string(body), 300))
+	}
+}
+
+// A row carrying a field named _stream_id does not come back with the key
+// twice.
+//
+// _stream_id is synthesized from stream membership and is not a reserved
+// ingest name, so a client can send one. appendRowJSON skipped a row's own
+// _time (which it emits canonically) and had no equivalent guard for
+// _stream_id, so the object carried the key twice: Go's json.Unmarshal takes
+// the last, a first-wins parser takes the other, and a single node gave a
+// third answer -- three results for one query, all 200.
+func TestARowWithItsOwnStreamIDDoesNotDuplicateTheKey(t *testing.T) {
+	row := queryRowWithStreamID()
+	line := appendRowJSON(nil, row, true)
+
+	if n := strings.Count(string(line), `"_stream_id"`); n != 1 {
+		t.Fatalf("the encoded row carries _stream_id %d times: %s", n, line)
+	}
+	// And the synthesized value is the one that survives, which is what the
+	// name means to a client grouping by stream.
+	if strings.Contains(string(line), "CLIENT-SUPPLIED") {
+		t.Errorf("the client's value won over the synthesized one: %s", line)
+	}
+	// Without withStream nothing is synthesized, so the row's own field is
+	// the answer and is emitted unchanged.
+	plain := appendRowJSON(nil, row, false)
+	if !strings.Contains(string(plain), "CLIENT-SUPPLIED") {
+		t.Errorf("without the synthesized pair the row's own field vanished: %s", plain)
+	}
+}
+
+// queryRowWithStreamID is a row carrying a client-supplied _stream_id.
+func queryRowWithStreamID() query.Row {
+	return query.Row{
+		Time: 1767225600000000000,
+		Fields: []query.Field{
+			{Key: "_msg", Value: "a"},
+			{Key: "_stream_id", Value: "CLIENT-SUPPLIED"},
+		},
 	}
 }

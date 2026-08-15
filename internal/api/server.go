@@ -1118,6 +1118,19 @@ func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 		if f.Key == "_time" {
 			continue
 		}
+		// The same skip _time gets, for the same reason: _stream_id is
+		// SYNTHESIZED below from stream membership, so a row carrying a field
+		// of that name -- it is not a reserved ingest name, so a client can
+		// send one -- produced an object with the key twice. Go's
+		// json.Unmarshal then takes the last, a first-wins parser takes the
+		// other, and a single node gave a third answer, all at HTTP 200.
+		//
+		// The synthesized value wins because that is what the name means to a
+		// client grouping by stream. The ingested value is still in the store
+		// and still reachable under any other name.
+		if withStream && f.Key == "_stream_id" {
+			continue
+		}
 		if f.Key == "_stream" {
 			stream = f.Value
 		}
