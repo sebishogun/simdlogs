@@ -112,6 +112,44 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	if free := freeDiskBytes(s.dir); free >= 0 {
 		m("vl_free_disk_space_bytes", "Free bytes on the storage filesystem.", "gauge", free)
 	}
+	// The storage budget: what it is, where it is, and what it has refused.
+	//
+	// Capacity and free space are gauges an operator alerts on before writes
+	// fail; the two counters are how they tell "the machine is full" from
+	// "this tenant is over its share" after the fact, which are different
+	// incidents with different fixes.
+	var warn, reject, over int64
+	var capacity int64
+	s.forEachTenantDetached(func(tn *tenant) {
+		st := tn.store.QuotaState()
+		if st.Usage.Total > capacity {
+			capacity = st.Usage.Total
+		}
+		if st.Warn {
+			warn++
+		}
+		if st.Reject {
+			reject++
+		}
+		if st.OverQuota {
+			over++
+		}
+	})
+	if capacity > 0 {
+		m("simdlogs_storage_capacity_bytes", "Total bytes of the storage filesystem.",
+			"gauge", capacity)
+	}
+	m("simdlogs_storage_warn_tenants", "Tenants whose free space is below the warn reserve.",
+		"gauge", warn)
+	m("simdlogs_storage_reject_tenants", "Tenants whose free space is below the reject reserve.",
+		"gauge", reject)
+	m("simdlogs_storage_over_quota_tenants", "Tenants at or above their byte quota.",
+		"gauge", over)
+	rejDisk, rejQuota := storage.RejectedWrites()
+	m("simdlogs_writes_rejected_disk_total", "Writes refused because free space is below the reserve.",
+		"counter", rejDisk)
+	m("simdlogs_writes_rejected_quota_total", "Writes refused because the tenant is at its quota.",
+		"counter", rejQuota)
 	// Retention health. A removal is committed to the manifest before the
 	// unlink, so a failing unlink costs disk rather than correctness -- but it
 	// costs disk silently unless it is counted.

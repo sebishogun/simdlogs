@@ -160,6 +160,16 @@ func (s *Server) tenant(acc, proj string) (*tenant, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The budget is applied at open, so a tenant that appears an hour after
+	// startup is under the same limits as the one opened with the server.
+	// SetQuota validates, and the server's copy was validated at construction,
+	// so this cannot fail for a reason the operator has not already been told
+	// about; the error is checked rather than dropped because a quota that
+	// silently did not apply is worse than one that refuses to start.
+	if err := st.SetQuota(s.quota); err != nil {
+		st.Close()
+		return nil, err
+	}
 	// Whether this tenant is degraded is recorded on the SERVER, not only on
 	// the store, and it survives eviction. forEachTenant iterates open tenants
 	// only, so readiness read "no degraded tenant among those currently open"
@@ -372,6 +382,21 @@ func (r *tenantRef) release() {
 
 func tenantRefOf(r *http.Request) *tenantRef {
 	return r.Context().Value(tenantKey{}).(*tenantRef)
+}
+
+// tenantOf is tenantRefOf without the panic, for a handler that runs on routes
+// which may not have resolved a tenant at all.
+//
+// `/insert/datadog/api/v1/validate` is one: it carries the ingest role and the
+// ingest middleware, and it writes nothing and never resolves a tenant. A
+// middleware that assumed every ingest route had one turned that endpoint into
+// a 500.
+func tenantOf(r *http.Request) *tenant {
+	ref, ok := r.Context().Value(tenantKey{}).(*tenantRef)
+	if !ok || ref == nil {
+		return nil
+	}
+	return ref.tn
 }
 
 // forEachTenant calls fn under the lock for every open tenant -- the basis for

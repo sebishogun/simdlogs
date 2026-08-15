@@ -33,6 +33,15 @@ type Store struct {
 
 	// health carries the corruption policy and what it has seen.
 	health healthState
+
+	// The storage budget and its cached samples. Atomics rather than fields
+	// under s.mu: CheckWrite is on the write path and must not queue behind a
+	// structural operation holding the lock.
+	quota     atomic.Pointer[QuotaConfig]
+	usage     atomic.Pointer[DiskUsage]
+	usageAt   atomic.Int64
+	sizeBytes atomic.Int64
+	sizeAt    atomic.Int64
 }
 
 type groupEntry struct {

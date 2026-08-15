@@ -44,6 +44,24 @@ type Limits struct {
 	MaxOpenTenants    int
 }
 
+// Storage is the disk budget. The zero value enforces nothing, which is the
+// behaviour a deployment had before these fields existed.
+//
+// Bytes to keep free rather than a percentage used: a percentage is the wrong
+// unit for what is being protected. 5% of a 40 TB array is 2 TB of slack
+// nobody needs; 5% of a 20 GB volume is less than one large group plus the
+// manifest rewrite that follows it. What matters is that the RECOVERY -- a
+// retention pass, which has to write a manifest record before it can unlink
+// anything -- still has room.
+type Storage struct {
+	// ReserveWarnBytes degrades readiness while still accepting writes.
+	ReserveWarnBytes int64
+	// ReserveRejectBytes refuses new writes. Must be below the warn level.
+	ReserveRejectBytes int64
+	// MaxTenantBytes bounds one tenant's own bytes on disk.
+	MaxTenantBytes int64
+}
+
 // Unlimited is the explicit opt-out for a numeric bound. It is negative so it
 // cannot be reached by accident: a forgotten field is zero, which means
 // "default", and an overflowing computation is positive.
@@ -152,6 +170,7 @@ func (l Limits) BodyLimit() int64 { return l.MaxBodyBytes }
 type Config struct {
 	Dir          string
 	Limits       Limits
+	Storage      Storage
 	StreamFields []string
 	Compact      bool
 

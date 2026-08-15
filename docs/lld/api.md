@@ -185,6 +185,45 @@ recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
 | `-compact-max-outputs` | bound one pass to this many output groups per tenant |
 | `-compact-max-input-bytes` | refuse to rewrite more than this per pass, per tenant; 0 = no bound |
 | `-compact-max-group-bytes` | leave input groups larger than this alone; 0 = no bound |
+| `-storage-reserve-warn-bytes` | free space at which readiness degrades, writes still accepted; 0 disables |
+| `-storage-reserve-reject-bytes` | free space at which writes get 507; must be below the warn level |
+| `-storage-max-tenant-bytes` | refuse writes once one tenant's groups reach this many bytes |
+
+**Storage budget.** Two thresholds and a per-tenant cap. WARN degrades
+`/-/ready` while the store still accepts everything, so an operator sees it
+before a single write fails; REJECT refuses new writes with **507 Insufficient
+Storage** — not 503, because the condition is about storage rather than the
+server being down, and an agent that retries a 503 forever against a full disk
+is a busy loop. Queries, `/metrics`, retention and the admin surface keep
+working past both: the answer to a full disk is to read what is there and
+delete some of it, and a store that refuses reads has taken away the only tool
+the operator has.
+
+Bytes, not a percentage. 5% of a 40 TB array is 2 TB of slack nobody needs; 5%
+of a 20 GB volume is less than one large group plus the manifest rewrite that
+follows it. What has to be protected is room for the RECOVERY — a retention
+pass writes a manifest record before it can unlink anything.
+
+The check runs in the middleware every insert route shares, before the body is
+read: rows that reach the writer are the writer's, and refusing a request whose
+rows are already buffered would either drop them silently or report a failure
+for rows that will be written anyway. There are six HTTP write entry points
+reaching four functions; a check written into each is a check that will be
+missing from the seventh.
+
+The free-space sample is cached for about two seconds, so a burst of small
+writes is not a burst of `statfs` calls. That staleness is why the threshold is
+a RESERVE: there is room to be wrong by one interval's worth of writes. A
+filesystem that cannot be measured does NOT refuse writes — turning a `statfs`
+failure into a write outage is the protection causing the harm it exists to
+prevent — and on Windows free space is not measured at all, so only the
+per-tenant cap applies there.
+
+Metrics: `simdlogs_storage_capacity_bytes`, `simdlogs_storage_warn_tenants`,
+`simdlogs_storage_reject_tenants`, `simdlogs_storage_over_quota_tenants`,
+`simdlogs_writes_rejected_disk_total`, `simdlogs_writes_rejected_quota_total`.
+The last two are separate counters because "the machine is full" and "this
+tenant is over its share" are different incidents with different fixes.
 | `-compact` | compact mode: flate dicts, ~15% smaller groups, 2–10x slower value reads — cold archival only |
 | `-stream-fields` | comma-separated fields identifying a log stream |
 | `-syslog` | also listen for syslog on UDP/TCP |

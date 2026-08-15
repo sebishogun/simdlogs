@@ -45,6 +45,11 @@ type Server struct {
 	// The zero value is storage.CorruptionFail, so a server configured with
 	// nothing refuses to open a damaged tenant rather than serving it short.
 	corruptionPolicy storage.CorruptionPolicy
+
+	// quota is the storage budget every tenant store opens under. Validated
+	// once at construction, so a tenant opening later cannot fail for a
+	// configuration problem the operator was never told about.
+	quota storage.QuotaConfig
 	// degraded is every tenant key whose store reported degraded when it was
 	// opened, and what it reported. Guarded by mu. It outlives the tenant so
 	// eviction cannot turn readiness green.
@@ -184,6 +189,16 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	}
 	srv.corruptionPolicy = pol
 	srv.limits = c.Limits
+	// Validated here rather than at each store open, so a bad budget refuses
+	// to start the server instead of failing the first tenant to arrive.
+	srv.quota = storage.QuotaConfig{
+		ReserveWarnBytes:   c.Storage.ReserveWarnBytes,
+		ReserveRejectBytes: c.Storage.ReserveRejectBytes,
+		MaxTenantBytes:     c.Storage.MaxTenantBytes,
+	}
+	if err := srv.quota.Normalize(); err != nil {
+		return nil, err
+	}
 	// Concurrency budgets. A nil channel means unbounded.
 	if n := c.Limits.MaxConcurrentQuery; n > 0 {
 		srv.querySem = make(chan struct{}, n)
@@ -490,7 +505,7 @@ func (s *Server) Handler() http.Handler {
 	// outside, a wrong Content-Type answered 415 first, which tells an
 	// anonymous caller which media types a route accepts.
 	in := func(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
-		return s.requireAuth(config.RoleIngest, spec, s.guard(spec, h))
+		return s.requireAuth(config.RoleIngest, spec, s.guard(spec, s.checkStorage(spec, h)))
 	}
 	rd := func(h http.HandlerFunc) http.HandlerFunc {
 		sp := readSpec()
@@ -1574,16 +1589,53 @@ func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
 			bad = append(bad, t)
 		}
 	}
-	if len(bad) == 0 {
+	// Storage pressure degrades readiness BEFORE any write fails, which is the
+	// whole point of having a warn threshold as well as a reject one: an
+	// operator watching /-/ready gets the warning while the store is still
+	// accepting everything. A probe that only went red once writes started
+	// failing would report the outage rather than prevent it.
+	pressure := s.storagePressure()
+	if len(bad) == 0 && len(pressure) == 0 {
 		w.Write([]byte("OK"))
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusServiceUnavailable)
-	fmt.Fprintf(w, "NOT READY: %d degraded tenant(s)\n", len(bad))
-	for _, d := range bad {
-		fmt.Fprintf(w, "%s: %s\n", d.key, d.health)
+	if len(bad) > 0 {
+		fmt.Fprintf(w, "NOT READY: %d degraded tenant(s)\n", len(bad))
+		for _, d := range bad {
+			fmt.Fprintf(w, "%s: %s\n", d.key, d.health)
+		}
 	}
+	if len(pressure) > 0 {
+		fmt.Fprintf(w, "NOT READY: %d tenant(s) under storage pressure\n", len(pressure))
+		for _, p := range pressure {
+			fmt.Fprintf(w, "%s\n", p)
+		}
+	}
+}
+
+// storagePressure describes every tenant at or past a storage threshold.
+//
+// Detached, like the compaction walk: it samples every open store, and holding
+// the lock every request needs while doing that would make a readiness probe a
+// source of latency.
+func (s *Server) storagePressure() []string {
+	var out []string
+	s.forEachTenantDetached(func(tn *tenant) {
+		st := tn.store.QuotaState()
+		switch {
+		case st.Err != nil:
+			out = append(out, fmt.Sprintf("%s: writes REJECTED: %v", tn.key, st.Err))
+		case st.Warn:
+			out = append(out, fmt.Sprintf("%s: %d bytes free, below the warn reserve",
+				tn.key, st.Usage.Free))
+		case st.OverQuota:
+			out = append(out, fmt.Sprintf("%s: %d bytes used, at its quota",
+				tn.key, st.StoreBytes))
+		}
+	})
+	return out
 }
 
 // The corruption policy is set through config.Config and nowhere else.

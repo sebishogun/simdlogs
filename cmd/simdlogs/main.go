@@ -53,6 +53,17 @@ func main() {
 	compactMaxIn := flag.Int64("compact-max-input-bytes", 0,
 		"refuse to read and rewrite more than this many bytes in one pass, per tenant; "+
 			"0 means no bound")
+	reserveWarn := flag.Int64("storage-reserve-warn-bytes", 0,
+		"free space at which readiness degrades while writes are still accepted; 0 disables. "+
+			"Bytes rather than a percentage: what has to be protected is room for the "+
+			"RECOVERY, and a retention pass has to write a manifest record before it can "+
+			"unlink anything")
+	reserveReject := flag.Int64("storage-reserve-reject-bytes", 0,
+		"free space at which new writes are refused with 507; 0 disables. Must be below "+
+			"-storage-reserve-warn-bytes, or writes would stop before anything reported "+
+			"degraded. Queries, /metrics and retention keep working past it")
+	tenantBytes := flag.Int64("storage-max-tenant-bytes", 0,
+		"refuse writes once one tenant's own groups reach this many bytes; 0 is unbounded")
 	compactMaxGroup := flag.Int64("compact-max-group-bytes", 0,
 		"leave any input group larger than this alone -- merging one that is already big "+
 			"copies its bytes for no change in the group count; 0 means no bound")
@@ -142,6 +153,9 @@ func main() {
 	cfg.Limits.MaxQueryDuration = *maxQueryDur
 	cfg.Limits.MaxQueryBytes = *maxQueryBytes
 	cfg.Limits.MaxOpenTenants = *maxTenants
+	cfg.Storage.ReserveWarnBytes = *reserveWarn
+	cfg.Storage.ReserveRejectBytes = *reserveReject
+	cfg.Storage.MaxTenantBytes = *tenantBytes
 
 	srv, err2 := api.NewServerConfig(cfg)
 	if err2 != nil {
