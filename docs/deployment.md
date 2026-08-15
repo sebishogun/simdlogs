@@ -50,12 +50,12 @@ logs on upgrade is worse than one that refuses to start.
 | | Driven by |
 |---|---|
 | memory | the working set of a query, not the store size — groups are mapped and paged in |
-| disk | ingest rate × retention, plus roughly 6% for the manifest and index |
+| disk | ingest rate × retention, plus the index: 16-18% for the per-column index and 25-27% for postings, measured (`docs/wrong.md`). 6% is the bloom section alone |
 | CPU | query concurrency; ingest is cheap per row and parallel across shards |
 
 Address space matters more than resident memory: every group in the store is
-mapped. A 64-bit build is required, and `docs/compatibility.md` says why 32-bit
-is not offered.
+mapped. A 64-bit build is required; `docs/verification.md` says why 32-bit is not
+offered.
 
 ## Cluster
 
@@ -63,7 +63,11 @@ A select-router holds no data. Give it the backend list and no storage of
 consequence:
 
     simdlogs -addr :9428 -storage /var/lib/simdlogs-router \
-      -backends node1:9428,node2:9428,node3:9428 -replicas 1
+      -select-backends http://node1:9428,http://node2:9428,http://node3:9428 \
+      -replicas 1
+
+The flag is `-select-backends`, and the URLs carry their scheme. Written
+`-backends node1:9428` the server exits with `flag provided but not defined`.
 
 Storage nodes are ordinary single-node deployments. Shard membership is
 **position in the backend list**, so the list must be identical on every router

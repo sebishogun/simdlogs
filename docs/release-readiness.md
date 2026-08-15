@@ -3,7 +3,7 @@
 Where the production plan's exit criteria stand. Written as an assessment, not
 as an announcement: the point of the list is the rows that are not green.
 
-## Gates, run at `cf9bd3b`
+## Gates
 
 | Gate | Result |
 |---|---|
@@ -29,9 +29,14 @@ produced them. Plan step 10.3.3 requires confirming that current claims come
 only from the corrected harness, and that cannot be confirmed without
 re-measuring.
 
-The gate is in place and refuses above load 1; what remains is to run the
-harnesses on a quiet machine and replace the table with numbers that carry
-their own provenance.
+The gate is in place and now covers `perops_test.go` too -- the harness that
+produces the README table was the one it did NOT cover, while this document
+said otherwise. What remains is to run the harnesses on a quiet machine and
+replace the table with numbers that carry their own provenance.
+
+The gate SKIPS rather than fails above load 1, and `SIMDLOGS_BENCH_NOISY=1`
+overrides it (stamping the result unquotable). A platform without
+`/proc/loadavg` only logs that the gate could not run.
 
 ## Not blockers, but stated
 

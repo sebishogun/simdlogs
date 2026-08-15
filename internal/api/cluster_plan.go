@@ -44,10 +44,16 @@ import (
 // planQuery splits the request's query and returns the string to send to the
 // shards plus the pipes to apply here.
 //
-// The shard query is rebuilt from the FILTER plus the row-local prefix. It is
-// not the caller's string with pipes trimmed textually: a text edit of a query
-// language is how a subtly different query gets sent, and the parse is already
-// done.
+// The shard query IS the caller's text, cut at a pipe boundary -- the head plus
+// as many segments as the planner kept.
+//
+// This comment used to claim the opposite ("not the caller's string with pipes
+// trimmed textually"), which is the stronger and wrong version: rebuilding from
+// the parse would need a printer for every pipe in the language, kept exactly
+// in step with the parser, and that printer does not exist. What the code does
+// is cut text and then CHECK the cut against the parse -- one segment per pipe
+// plus the head -- refusing when they disagree. That is a weaker guarantee than
+// the comment promised and it is the one the code makes.
 func (s *Server) planQuery(w http.ResponseWriter, r *http.Request) (shardQuery string, coord []query.Pipe, ok bool) {
 	raw := r.FormValue("query")
 	if strings.TrimSpace(raw) == "" {

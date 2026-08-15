@@ -6,10 +6,19 @@ Every cluster read is either complete or explicitly not. A router that cannot
 reach a shard answers **503**, not a smaller result set. If reads are
 succeeding, the answer is whole.
 
-    curl -fsS http://router:9428/-/ready
+    curl -sS -o /dev/null -w '%{http_code}\n' http://router:9428/-/ready
+    curl -sS http://router:9428/-/ready
 
-Readiness is the router's own: its store is empty and stays that way, so red
-readiness on a router is about the router process, not about the data.
+**A router's readiness DOES go red when it cannot reach its peers.** It answers
+`503 NOT READY: 1 of 2 peers unreachable: [http://...]`, naming them --
+health.go sets `cluster_incomplete` from the unreachable set. This runbook
+previously said the opposite ("red readiness on a router is about the router
+process, not about the data"), which was wrong in exactly the situation the
+runbook exists for.
+
+Note the absent `-f`. With `curl -fsS` the command exits non-zero and prints
+NOTHING on a 503 -- so the documented invocation was silent precisely when it
+had something to say.
 
 ## Diagnose
 

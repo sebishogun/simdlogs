@@ -18,6 +18,17 @@ func TestPerOperation(t *testing.T) {
 	if os.Getenv("SIMDLOGS_OPS") == "" {
 		t.Skip("set SIMDLOGS_OPS=1 to run the per-operation head-to-head")
 	}
+	// The quiet-machine gate, on the harness that produces the README table.
+	//
+	// It was wired to the realistic, scale and cluster harnesses and NOT to
+	// this one -- so the twenty rows README publishes were the only numbers the
+	// gate did not cover, while three documents said it now refuses to produce
+	// a number above load average 1. Re-running here on a quiet machine also
+	// stamps the result with the machine, commit and load it ran under, which
+	// the published table does not carry.
+	facts := requireQuiet(t)
+	defer func() { t.Logf("measured at: %s", facts) }()
+
 	const nRows = 200_000
 	body := clusterCorpus(nRows, "NEEDLEops")
 	esBody := toESBulk(body)

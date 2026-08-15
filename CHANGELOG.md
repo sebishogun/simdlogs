@@ -55,28 +55,39 @@ No version has been tagged. This section is what a first release would carry.
 - Merge dense hit series by label set and timestamp (`5ae5ccf`)
 - Merge stats-range series with identical labels (`e4e1dd5`)
 - Apply ES from/size to the merged cluster hits (`87e9bcf`)
+- Land the adversarial security review of the cluster work (`ea0b4f2`)
+- The distributed query path returned wrong answers seven ways (`94e2c3a`)
+- Close the rest of the cluster review — silent drops, order-dependent refusals, and guards nothing tested (`825b61c`)
 
 ### Not included
 
-Documentation, chores and refactors are in the git history and not here: a
-changelog is what changed for a user of the software, and 132 chore commits
-would bury the 39 that did.
+180 of the 222 commits are documentation, refactors and internal work.
+They are in the git history and not here: a changelog is what changed for a
+user of the software.
 
-**Known limitations at this point**, stated because a changelog that lists only
-what works is an advertisement:
+(An earlier version of this line said "132 chore commits". That number matched
+nothing — one commit is prefixed `chore:`. The counts above are computed from
+the history each time this file is regenerated.)
+
+**Known limitations**, stated because a changelog that lists only what works is
+an advertisement:
 
 - No incremental backup; RPO is bounded by how often a full capture is
   affordable (`docs/runbooks/backup-restore.md`).
-- Repair is an operator action, not automatic, and moves data only between
-  replicas of one shard — it cannot help a rebalance.
+- Repair is an operator action, not automatic, and it moves data only between
+  replicas of one shard. It REFUSES rather than resolves a divergence caused by
+  compaction or retention: there is no lineage to tell a group that was never
+  received from one that was deliberately deleted or superseded.
 - Non-mergeable aggregates (`quantile`, `avg`, `uniq`, `count_uniq`,
-  `histogram`, `rate`) are refused across shards rather than answered, until a
-  mergeable sketch exists and is tested against the exact single-node answer.
+  `histogram`, `rate`) are refused across shards rather than answered, on every
+  stats surface.
+- A query whose text does not split the way it parses -- a filter containing an
+  apostrophe or an unbalanced bracket -- is refused by the router rather than
+  planned.
 - `/select/logsql/tail` and `/select/vector` are not federated; they answer 501
   on a router.
-- No single command restores a cluster archive; the archive is validated and
-  the unpacking is per shard.
+- No single command restores a cluster archive, and `ValidateClusterBackup` has
+  no caller: the checks it encodes are performed by the operator by hand.
 - linux/386 is not supported: a dependency does not compile for a 32-bit int.
-- The published scale and head-to-head numbers have not been re-measured on a
-  quiet machine since the harness was corrected. The quiet-machine gate now
-  refuses to produce a number above load average 1.
+- The published scale and head-to-head numbers have not been re-measured since
+  the quiet-machine gate was added and wired to every publishing harness.

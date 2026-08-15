@@ -72,12 +72,14 @@ Exits:
 
 ## Stage 3 — Cluster protocol
 
-The current router surface is experimental and not production-safe: the
-`streams`, `stream_ids`, plain `stats_query`, and `hits` merges decode stale
-envelopes and answer empty/bogus results, and `facets`, `tail`, `/select/sql`,
-`/select/vector`, `/admin/backup`, `/metrics`, and `/alerts` are not
-federated (router-local). The exact envelope mismatches are recorded in
-[`lld/cluster.md`](lld/cluster.md); this stage fixes them tests-first.
+The envelope mismatches this stage was written for are fixed and tested
+(8.4), every route is classified and gated (8.6), and the distributed query
+path has been through an adversarial review whose findings are landed. What
+remains for the cluster is listed in
+[`release-readiness.md`](release-readiness.md): repair refuses rather than
+resolves a compaction or retention divergence because there is no lineage to
+tell a missed write from a deliberate delete, and there is no single command
+that restores a cluster archive.
 
 Exits:
 

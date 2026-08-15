@@ -25,8 +25,8 @@ and none is claimed.
 | Property | Test |
 |---|---|
 | A rejected credential is answered identically however close the guess | `TestDrillARejectedCredentialRevealsNothing` |
-| No credential and a wrong credential differ (the caller already knows which it sent) | same |
-| A valid token lacking a role gets 403 naming the role, not 401 | same |
+| No credential answers 401 | same — it asserts the STATUS; it does not compare the body against a rejected guess, and both hold in code |
+| A valid token lacking a role gets 403, distinguishable from a bad token | same — it asserts the status and that the two answers differ; nothing inspects the body for the role name, though `auth.go` does emit it |
 | A role cannot reach another role's routes, including the internal ones | `TestDrillARoleCannotReachAnotherRolesRoutes` |
 
 Surrounding whitespace in `Authorization: Bearer <token>` is trimmed, for
@@ -47,6 +47,14 @@ further than the node it was presented to is how one node's compromise becomes
 the cluster's. The forwarded set is an explicit list, not a copy of the header
 set.
 
+**The router presents no credential of its own to peers.** It forwards the
+resolved tenant headers and the protocol headers, and nothing else; there is no
+`Authorization` and no client certificate (`newClusterClient(nil)`). So
+`PeerUnauthorized`'s message names a credential that is never sent, and a
+deployment that needs authenticated peer traffic has to provide it at the
+network layer. That is a gap, stated rather than implied by the absence of a
+row in this table.
+
 ## The internal cluster protocol
 
 `X-Simdlogs-Internal` selects the envelope response shape. It grants nothing:
@@ -66,15 +74,18 @@ what that cost before it was true).
 |---|---|
 | Request body size | `TestGuardRejectsOversizedBody` |
 | Decompression ratio | `TestGuardRejectsDecompressionBomb` |
-| Syslog frame and datagram size | `TestSyslogOversizedFrameIsRejected`, `TestSyslogUDPOversizedDatagramIsDropped` |
-| Peer response size | `clusterClient.maxBody`, discarded rather than truncated |
+| Syslog frame size | `TestSyslogOversizedFrameIsRejected` |
+| Syslog datagram size | `TestSyslogUDPOversizedDatagramIsDropped` asserts the KERNEL refuses one over 65507 and that one at the ceiling is stored. The server-side drop branch is unreachable by construction and is untested |
+| Peer response size | `TestAnOversizedPeerResponseIsDiscarded` — discarded, not truncated. A shard BACKUP bypasses this ceiling deliberately by spooling to a temp file, since a backup is as large as the shard |
 | Concurrent queries, per tenant | `TestPerTenantAdmissionRefusesOnlyTheTenantAtItsLimit` |
 | Tenant count | `TestTenantCountIsBounded` |
-| Repair transfer, per pass | 64 groups / 1 GiB, reported when it stops short |
+| Repair transfer, per pass | 64 groups / 1 GiB, cluster-wide per pass, reported when it stops short. **No test covers the bound itself** — `complete` is only asserted on the unreachable-replica path |
 
-Every ingest envelope is fuzzed for panics, determinism, and the property that
+Nine ingest envelopes are fuzzed for panics, determinism, and the property that
 the reported accepted count equals the rows that landed
-(`.github/workflows/fuzz.yml`, 22 targets).
+(`.github/workflows/fuzz.yml`, 22 targets across four packages). `_bulk` --
+reached from `/​_bulk` and `/insert/elasticsearch/_bulk` -- has no fuzz target;
+`FuzzESSearchBody` covers `_search`, which is a different parser.
 
 ## What this does not defend against
 

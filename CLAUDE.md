@@ -186,11 +186,9 @@ number behind it does not go in a doc.
 - **Boundary and status:** docs/architecture.md — what ships (and what does
   not: no metrics ingestion, no consensus, no tagged release).
 - **Current low-level design:** docs/lld/storage.md, ingest.md, query.md,
-  api.md, cluster.md — one per layer, exact current source. cluster.md also
-  records the known router-merge defects (streams/stream_ids/plain
-  stats_query/hits are stale and answer empty/bogus; facets/tail/alerts and
-  other endpoints are router-local — representative, not complete): the
-  cluster surface is experimental, not production-safe.
+  api.md, cluster.md — one per layer, exact current source. cluster.md
+  carries the per-endpoint status table, which a test checks against the mux,
+  and the outstanding items are in docs/release-readiness.md.
 - **Planned direction (not shipped):** docs/roadmap.md and
   docs/plans/2026-08-13-simdlogs-production-design.md (status: approved) /
   2026-08-13-simdlogs-production.md.
@@ -244,13 +242,11 @@ release: the storage format and HTTP surface are not under a stable-version
 promise, so pin a commit when deploying. It ingests logs only — there is no
 metrics ingestion; `/metrics` and `/alerts` are export surfaces. The cluster
 layer is application-level sharding/replication with no consensus, no leader
-election, no transactions, no automatic membership — and it is experimental,
-not production-safe: the `streams`, `stream_ids`, plain `stats_query`, and
-`hits` router merges are stale and answer empty/bogus results, and `facets`,
-`tail`, `/alerts` and other endpoints are router-local, not federated. The
-enumeration is representative, not complete — the per-endpoint status lives
-in `docs/lld/cluster.md`; do not read an endpoint's absence from this list
-as federation. Planned direction lives in
+election, no transactions, no automatic membership. Every route is classified
+federated / router-local / refused and the classification is checked against
+the mux, so the per-endpoint status in `docs/lld/cluster.md` is derived rather
+than remembered — read it there rather than inferring from any prose list.
+What is still outstanding is in `docs/release-readiness.md`. Planned direction lives in
 `docs/roadmap.md` and the `docs/plans/2026-08-13-simdlogs-production*.md`
 files; never present planned work as shipped behavior. `README.md` and the
 `docs/` tree describe the current source; the authoritative "done" sets are

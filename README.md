@@ -369,13 +369,18 @@ The cluster layer is application-level sharding and replication, not a
 consensus system. There is no automatic membership, leader election, or
 cross-node transaction protocol.
 
-The router surface is **experimental, not production-safe**: the `streams`,
-`stream_ids`, plain `stats_query`, and `hits` merges decode stale envelopes
-and answer empty/bogus results, and `facets`, `tail`, `/alerts` and other
-endpoints are router-local, not federated. The enumeration here is
-representative, not complete — the full per-endpoint status is in
-[`docs/lld/cluster.md`](docs/lld/cluster.md); do not read an endpoint's
-absence from this list as federation.
+Every route is classified federated / router-local / refused, and the
+classification is checked against the mux by a test — so the per-endpoint
+status in [`docs/lld/cluster.md`](docs/lld/cluster.md) is derived rather than
+remembered. Read it there rather than inferring from prose. The stale merges
+this paragraph used to list are fixed and fixture-tested.
+
+**The cluster is still not released**, and the reasons are specific rather than
+general: the published benchmark table has no machine-checked provenance,
+repair refuses rather than resolves a divergence caused by compaction or
+retention (there is no lineage to tell a missed write from a deliberate
+delete), and no single command restores a cluster archive.
+[`docs/release-readiness.md`](docs/release-readiness.md) is the current list.
 
 ## Verification
 

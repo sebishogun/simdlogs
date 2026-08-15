@@ -5,7 +5,7 @@ with no test beside it is a promise nobody is keeping.
 
 ## HTTP surface
 
-42 routes, each classified federated / router-local / refused, and the
+46 routes, each classified federated / router-local / refused, and the
 classification is checked against the mux itself
 (`TestEverySurfaceRouteIsClassified`) — a handler added without being
 classified fails a build.
@@ -17,8 +17,12 @@ Frozen for ten routes as golden files in `internal/api/testdata/golden/`
 and the JSON type of each value, not the data: an array's length is data, a
 response with three rows and one with four are the same contract.
 
-A field **appearing** is compatible. A field **disappearing or changing type**
-breaks every client that reads it, and that is what the goldens catch. They are
+A field **disappearing or changing type** breaks every client that reads it,
+and that is what the goldens catch. A field **appearing** is compatible for a
+client, but it still fails the build: the comparison is over the whole shape
+file, so any change requires a deliberate regeneration. That is the intent --
+the build asks whether the change was meant, and the answer for an added field
+is yes. They are
 regenerated with `SIMDLOGS_WRITE_GOLDEN=1`, which is a decision that the
 contract changed — doing it to make a red build green is how a breaking change
 ships.
@@ -103,10 +107,15 @@ the next open ignores.
 
 ## What is not frozen
 
-- Everything behind `SIMDLOGS_*` environment variables (bench, soak, fixture
-  regeneration). These are development controls.
+- Most things behind `SIMDLOGS_*` environment variables (bench, soak, fixture
+  regeneration) are development controls. `SIMDLOGS_STREAM_FIELDS` is NOT: it
+  sets which fields identify a log stream, so it changes the schema of what is
+  ingested and is a production setting.
 - The internal Go packages. `internal/` is not an API.
-- Metric names are a contract (`TestMetricsContract` asserts both directions),
+- Metric names are a contract, asserted in both directions by
+  `TestEveryContractedMetricIsPresentAndTyped` and
+  `TestNoMetricIsEmittedOutsideTheContract`, with
+  `TestNoMetricCarriesAnUnboundedLabel` bounding cardinality,
   but metric VALUES and cardinality are not.
 - Query performance. The numbers in README and `docs/scale-curve.md` are
   measurements of a machine at a moment, and carry the machine with them.

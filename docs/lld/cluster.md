@@ -2,14 +2,20 @@
 
 Source: `internal/api/cluster.go`.
 
-> **Status: experimental, not production-safe.** The router's merge code for
-> four endpoints is stale — it decodes envelopes the backends no longer send
-> and answers bogus/empty results (details in "Merges per endpoint" below).
-> Several select surfaces are not federated at all and silently use the
-> router's local store in router mode. Until the defects below are fixed and
-> fixture-tested (planned in
-> `docs/plans/2026-08-13-simdlogs-production.md`, Phase D), do not treat any
-> router-mode answer as the cluster-wide answer.
+> **Status: not yet production-safe, for reasons stated below rather than the
+> ones this banner used to give.** The four stale merges it described are
+> fixed, and every route is classified and gated (see "The route surface"), so
+> those sentences were describing a state the file's own tables had already
+> moved past — a status block that ages is worse than none, because it is the
+> first thing a reader believes.
+>
+> What is actually outstanding: the published benchmark table has no
+> machine-checked provenance (`docs/release-readiness.md`), repair is an
+> operator action with no lineage tracking so it refuses rather than resolves a
+> compaction or retention divergence, and there is no single command that
+> restores a cluster archive. Correctness defects found by review are fixed and
+> tested; the list of what remains is in `docs/release-readiness.md` and
+> `CHANGELOG.md`, and both are kept current.
 
 ## The internal protocol
 
@@ -155,7 +161,9 @@ per-shard answers.
 
 `query.PlanDistributed` splits at the FIRST non-row-local pipe: the prefix goes
 to the shards, everything from that pipe onward runs once at the coordinator
-over the merged rows. `planQuery` rebuilds the shard query from the parsed
+over the merged rows. `planQuery` cuts the shard query from the raw text head
+plus that many pipe segments and then CHECKS the cut against the parse,
+refusing when they disagree. It is not rebuilt from the parsed
 filter plus that many pipe segments, counted rather than edited textually —
 `pipeSegments` walks the text with quote and nesting awareness so `_msg:~"a|b"`
 is not cut in half and half a regex sent to every shard.
@@ -202,7 +210,7 @@ shard index.
 
 ## The route surface
 
-42 routes. Each is federated, router-local by design, or refused — and the
+46 routes. Each is federated, router-local by design, or refused — and the
 classification is machine-checked against the mux, not maintained by hand.
 
 A select-router holds no data. Only a handler that knows it is a router fans
@@ -212,7 +220,7 @@ that genuinely holds no matching data, so nothing reports a problem and a
 dashboard shows an empty panel.
 
 Counting `len(s.backends) > 0` branches finds the handlers that DO federate —
-13 of 42. It cannot find the ones nobody remembered.
+14 of 46. It cannot find the ones nobody remembered.
 `TestNoRouterReadSilentlyReadsTheEmptyLocalStore` sends the same request to a
 router and to a storage node holding the data, and fails when the storage node
 answers with something and the router answers with nothing. It found three:
@@ -226,8 +234,9 @@ Three companion tests close the gaps a single comparison leaves:
   each handler decides for itself whether to forward. A router that kept a copy
   would put rows where no read ever looks — reads fan out. "Kept nothing" is
   observed by removing the backends and asking the same process again.
-- `TestARefusedSurfaceSaysSo` requires a refused surface to answer 501 with the
-  reason. Never 200-and-empty, which a client reads as "the cluster holds
+- `TestARefusedSurfaceSaysSo` requires a refused surface to answer an error
+  with the reason. All four answer 501; the test accepts any 4xx/5xx, so the
+  specific code is a convention rather than a gate. Never 200-and-empty, which a client reads as "the cluster holds
   nothing".
 
 Two of the fixtures had to be repaired before they measured anything: the hits
@@ -276,8 +285,10 @@ all, and a handler that returns without writing sends 200.
 `simdlogs_cluster_partial_reads_total` counts them, because a dashboard quietly
 running on partial answers is exactly the state this makes visible.
 
-All nine federated endpoints are covered by one-shard-down and all-shards-down
-tests: select, hits, stats_query, stats_query_range, field_names, field_values,
+Nine of the federated endpoints are covered by one-shard-down and
+all-shards-down tests (`cluster_failure_test.go`). `facets`, `/select/sql`,
+`stream_ids`, `stream_field_names` and `stream_field_values` are federated and
+NOT covered by those completeness tests: select, hits, stats_query, stats_query_range, field_names, field_values,
 streams, `_count` and `_search`.
 
 ## Replicated writes: idempotency and consistency
@@ -405,23 +416,24 @@ router-mode merge beyond `select` (and the working rows above) is verified**.
 
 ## Not federated in router mode
 
-These endpoints have no router branch in `internal/api/server.go`: in router
-mode they run against the router's OWN local store (which, with
-`-select-backends`, holds only what was written locally — normally nothing),
-or answer from router-local state. A client that points any of these at the
-router silently gets local/empty answers, not a cluster-wide one:
+Every route is now classified and the classification is checked against the mux
+(see "The route surface"), so this list is derived rather than remembered.
 
-- `/select/logsql/facets`
-- `/select/logsql/tail`
-- `/select/sql`
-- `/select/vector`
-- `/admin/backup` (backs up the router's local tenant stores only)
-- `/metrics`, `/alerts` (router-local counters and rules)
-- `/flags`, `/health`, `/-/healthy`, `/-/ready`, `/vmui`, `/` (UI)
+**Refused with 501**, because they cannot be answered correctly across shards
+in this build: `/select/logsql/tail`, `/select/vector`, `/admin/backup`,
+`/admin/acknowledge-degraded`.
 
-All six introspection endpoints answer the shared `{"values":[...]}` envelope
-locally; only `field_names`, `field_values`, `stream_field_names`,
-`stream_field_values` currently have a working router merge for it.
+**Router-local by design** — the answer is about this process, not the data:
+`/metrics`, `/alerts`, `/flags`, `/health`, `/-/healthy`, `/-/ready`, `/vmui`,
+`/`, and the two `/internal/replica/*` endpoints (one replica's own inventory;
+the cluster-wide view is `/admin/cluster/repair`).
+
+This section previously listed `/select/logsql/facets` and `/select/sql` as
+having no router branch. Both have one — `federatedFacets` and `federatedSQL`,
+added in 8.6 — and all six introspection endpoints merge through
+`federatedValueCounts`. The text had not moved with the code, and a reader
+checking whether an endpoint was safe would have been told the wrong thing by
+the same file that said the right thing four hundred lines earlier.
 
 ## Failure behavior
 
@@ -478,7 +490,8 @@ Three properties do the safety work:
 - **The receiver validates.** Bytes are hashed against the digest that was asked
   for and parsed as a group before anything is committed, so a peer that is
   compromised or on another format version cannot write into the store.
-- **Bounded per pass** — 64 groups, 1 GiB — and the report says what it left, so
+- **Bounded per pass** — 64 groups, 1 GiB, counted cluster-wide rather than per
+  shard — and the report says what it left, so
   "still diverging" is visible rather than inferred. An unreachable replica is
   never read as an empty one: its silence would otherwise make the union wrong
   in both directions at once.

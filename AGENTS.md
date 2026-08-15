@@ -189,13 +189,11 @@ release: the storage format and HTTP surface are not under a stable-version
 promise, so pin a commit when deploying. It ingests logs only — there is no
 metrics ingestion; `/metrics` and `/alerts` are export surfaces. The cluster
 layer is application-level sharding/replication with no consensus, no leader
-election, no transactions, no automatic membership — and it is experimental,
-not production-safe: the `streams`, `stream_ids`, plain `stats_query`, and
-`hits` router merges are stale and answer empty/bogus results, and `facets`,
-`tail`, `/alerts` and other endpoints are router-local, not federated. The
-enumeration is representative, not complete — the per-endpoint status lives
-in `docs/lld/cluster.md`; do not read an endpoint's absence from this list
-as federation. Planned direction lives in
+election, no transactions, no automatic membership. Every route is classified
+federated / router-local / refused and the classification is checked against
+the mux, so the per-endpoint status in `docs/lld/cluster.md` is derived rather
+than remembered — read it there rather than inferring from any prose list.
+What is still outstanding is in `docs/release-readiness.md`. Planned direction lives in
 `docs/roadmap.md` and the `docs/plans/2026-08-13-simdlogs-production*.md`
 files; never present planned work as shipped behavior. `README.md` and the
 `docs/` tree describe the current source; the authoritative "done" sets are

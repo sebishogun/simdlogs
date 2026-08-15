@@ -1,7 +1,16 @@
 # Runbook: backup and restore
 
-Every procedure here is executed by a test. A runbook nobody has run is a
-document, not a procedure.
+The single-node backup, restore and equality check are executed by a test
+(`TestDrillARestoredBackupAnswersIdentically`), and the cluster backup's
+refusal path is too. What is NOT covered by a test: the `simdlogs restore` CLI
+itself — the drill calls `storage.RestoreTar` directly, so `-tenant`,
+`-dry-run` and `-allow-unverified` have no command-level test, and
+`-allow-unverified` is the one with a documented exit-code contract.
+
+`-tenant` and `-allow-unverified` are mutually exclusive in practice: a
+pre-format-1 archive carries no manifest, so its tenant is unknown and
+`-tenant` refuses it ("its tenant is unknown", exit 1). Follow one or the
+other, not both.
 
 ## Single node
 
@@ -62,15 +71,30 @@ count, row content and query answers across five query shapes.
 
 ### Take a coordinated backup
 
-    curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" -X POST \
+    curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
+      -H "AccountID: $TENANT" -H "ProjectID: 0" -X POST \
       http://router:9428/admin/cluster/backup > cluster.tar
+
+**One tenant per archive, the same as the single-node form.** The tenant
+headers are not optional: without them the router resolves the credential's
+default tenant and captures that one, so a multi-tenant deployment following a
+header-less command backs up one tenant and gets an archive that presents
+itself as the cluster's. Loop over your tenants.
 
 One tar holding `cluster.json` and one archive per shard, each taken from a
 replica that holds the **whole** shard. Completeness is checked, not assumed.
 
 **If it answers 503**, some shard has no complete replica. That is the backup
 refusing to capture a short shard silently. Run `/admin/cluster/repair` until
-it reports `copied: 0` and `complete: true`, then retake.
+it reports `copied: 0`, `blocked: 0` and `complete: true`, then retake. A
+non-zero `blocked` means repair found a divergence it will not resolve — see
+`docs/runbooks/cluster-degraded.md`.
+
+**If the transfer ends abruptly**, that is deliberate. A shard that fails after
+the archive has started aborts the connection rather than finishing the tar, so
+`curl` reports a truncated download and exits non-zero. A short archive that
+parses is the outcome worth avoiding: it restores as a cluster missing shards
+with nothing to say so. Always check curl's exit status.
 
 ### Read the manifest before restoring
 
@@ -79,10 +103,21 @@ gigabytes:
 
     tar -xOf cluster.tar cluster.json | jq .
 
-Check `shards` against the topology you are restoring into. A mismatch is
-refused — restoring an N-shard archive into an M-shard cluster puts rows where
-no query looks for them — and the per-shard `highWatermark` values show how far
-apart the archives were taken.
+Check `shards` against the topology you are restoring into: restoring an
+N-shard archive into an M-shard cluster puts rows where no query looks for them.
+
+**Check it by hand.** `ValidateClusterBackup` encodes these rules and has no
+caller outside its tests — there is no cluster-restore command for it to run
+in, and it lives in `internal/`, so a consumer cannot call it either. The rules
+are: the format and protocol must match this build, the shard count must match
+the target, no shard may appear twice, and every shard must name an archive.
+
+`highWatermark` is each shard's NEWEST ROW TIMESTAMP at the moment its source
+was chosen — not when its archive was written. `Spread()` is therefore the skew
+between shards' newest data, not the wall-clock interval between captures: a
+shard that stopped ingesting an hour ago reports an hour of spread even if
+every archive was taken in the same second. It is computed from `cluster.json`
+by hand; no endpoint or command reports it.
 
 ### Restore a cluster
 

@@ -37,11 +37,12 @@ What it is not (current, unambiguously):
   ingest exists.
 - **Not a consensus system.** The cluster layer has no leader election, no
   automatic membership, no cross-node transactions, no consensus protocol.
-  Shards and replicas are configured statically. The router surface is
-  **experimental, not production-safe**: the `streams`, `stream_ids`, plain
-  `stats_query`, and `hits` merges are stale and answer bogus/empty results,
-  and `facets`, `tail`, `/alerts` and other endpoints are router-local —
-  representative, not complete (see [`lld/cluster.md`](lld/cluster.md)).
+  Shards and replicas are configured statically. Every route is classified
+  federated / router-local / refused, and the classification is checked
+  against the mux, so an endpoint's status is derived rather than remembered
+  (see [`lld/cluster.md`](lld/cluster.md)). The stale merges this paragraph
+  used to list are fixed; what remains outstanding is in
+  [`release-readiness.md`](release-readiness.md).
 - **Not released.** There is no tag and no stable-version promise; the storage
   format and HTTP surface may change. Pin a commit to deploy.
 - **Not full Elasticsearch.** `/_search` and `/_count` cover a log-relevant
@@ -108,13 +109,11 @@ committed assembly; every kernel has a portable fallback) and
 6. In router mode, queries fan out to one live replica per shard and the
    router merges — where a merge exists. Only `/select/logsql/query` (sort by
    `_time` descending, apply `limit`), `stats_query_range`, `field_names`,
-   `field_values`, `stream_field_names`, `stream_field_values`, `/_search`
-   and `/_count` merge correctly today. The `streams`, `stream_ids`, plain
-   `stats_query`, and `hits` merges decode stale envelopes and answer
-   empty/bogus results, and `facets`, `tail`, `/alerts` and other endpoints
-   are router-local, not federated. The enumeration here is representative,
-   not complete — the per-endpoint status is in
-   [`lld/cluster.md`](lld/cluster.md); the cluster surface is
+   `field_values`, `stream_field_names`, `stream_field_values`, `/_search`,
+   `/_count`, `facets` and `/select/sql` all merge. `tail` and `/select/vector`
+   answer 501 on a router rather than pretending. The per-endpoint status is
+   the table in [`lld/cluster.md`](lld/cluster.md), which is checked against
+   the mux by a test; the cluster surface is
    experimental, not production-safe.
 
 ### Ops loops

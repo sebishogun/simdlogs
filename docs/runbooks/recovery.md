@@ -67,9 +67,17 @@ Reads **fail** with 503 rather than returning the surviving shards' rows. That
 is deliberate: a partial answer with a 200 is indistinguishable from a smaller
 result set. Tested by `TestChaosAWholeShardDownFailsTheRead`.
 
-Bring a replica of that shard back, or accept the outage. There is no
-`allow_partial_response` for the whole-shard case at the router's read path
-beyond the documented completeness gate.
+Bring a replica of that shard back, or accept the outage.
+
+**There IS an opt-in for a partial answer**, and this runbook used to deny it in
+the one section where an operator would want it:
+
+    curl -sS 'http://router:9428/select/logsql/query?query=*&allow_partial_response=1'
+
+With a shard fully down that answers `206 Partial Content` and
+`X-Simdlogs-Partial: true`, carrying the surviving shards' rows. It is opt-in
+because the default must not be a short answer with a 200; a caller that asks
+for it has said it can handle one.
 
 ## Process killed mid-write
 

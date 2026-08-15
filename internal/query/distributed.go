@@ -27,10 +27,15 @@ import "fmt"
 //
 // The planner is deliberately CONSERVATIVE at the boundary: the shard part is
 // the longest row-local PREFIX, and everything from the first non-row-local
-// pipe onward runs at the coordinator over the merged rows. A more aggressive
-// split -- pushing an aggregate down and merging partial states -- is correct
-// only for aggregates whose partial state is mergeable, and is applied only to
-// those, only when the aggregate is the whole remaining pipeline.
+// pipe onward runs at the coordinator over the merged rows.
+//
+// It does NOT push aggregates down. An earlier version of this paragraph
+// described a pushdown "applied only when the aggregate is the whole remaining
+// pipeline", and PlanDistributed has never done that -- a mergeable count or
+// sum still runs once at the coordinator over the merged rows. That is correct
+// and slower than it could be; putting a partial state on the wire is the
+// change that would make it faster, and a subtly wrong partial state is a
+// number nobody can spot.
 
 // PipeClass is where a pipe may run.
 type PipeClass uint8

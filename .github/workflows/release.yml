@@ -58,7 +58,7 @@ jobs:
           - {goos: darwin, goarch: amd64}
           - {goos: darwin, goarch: arm64}
           # 386 is absent because the dependency does not compile for it; see
-          # docs/compatibility.md. Listing it would assert a platform that
+          # docs/verification.md. Listing it would assert a platform that
           # cannot be built.
     steps:
       - uses: actions/checkout@v4
