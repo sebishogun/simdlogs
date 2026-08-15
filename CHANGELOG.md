@@ -61,13 +61,17 @@ No version has been tagged. This section is what a first release would carry.
 
 ### Not included
 
-180 of the 222 commits are documentation, refactors and internal work.
-They are in the git history and not here: a changelog is what changed for a
-user of the software.
+As of `7efa127` the history is 226 commits: 19 `feat`, 25 `fix`, 40 `docs`,
+6 `test`, 2 `refactor`, 2 `release`, 1 `chore` and 131 with no conventional
+prefix — 0 `perf`. Everything not listed above is documentation, refactors and
+internal work; it is in the git history and not here, because a changelog is
+what changed for a user of the software.
 
-(An earlier version of this line said "132 chore commits". That number matched
-nothing — one commit is prefixed `chore:`. The counts above are computed from
-the history each time this file is regenerated.)
+The sha is part of the claim. A bare count goes stale on the next commit and
+then reads as current — which is how the earlier version of this line came to
+say "132 chore commits", a number that matched nothing (exactly one commit is
+prefixed `chore:`). `TestTheChangelogCommitCountsAreReal` recomputes these from
+the history at that sha and fails if any of them is wrong.
 
 **Known limitations**, stated because a changelog that lists only what works is
 an advertisement:
