@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"go/ast"
 	"go/importer"
 	"go/parser"
@@ -181,4 +182,47 @@ func typeNameOf(e ast.Expr) string {
 		return id.Name
 	}
 	return ""
+}
+
+// The coordinator's byte budget actually fires.
+//
+// ApplyPipes called q.exceeded(0), so MaxBytes could never trip -- at the one
+// place that holds every matching row in the cluster at once, which is what
+// that budget exists for. The deadline half of exceeded worked, so the call
+// looked like a budget check and enforced half of one.
+func TestTheCoordinatorByteBudgetFires(t *testing.T) {
+	rows := make([]Row, 200)
+	for i := range rows {
+		rows[i] = Row{NoTime: true, Fields: []Field{
+			{Key: "k", Value: strings.Repeat("v", 100)},
+		}}
+	}
+	q, err := ParseLogsQL("* | fields k")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Unbounded: the rows come through.
+	if got := ApplyPipes(q, rows); len(got) != len(rows) {
+		t.Fatalf("with no budget %d of %d rows survived", len(got), len(rows))
+	}
+
+	bounded, err := ParseLogsQL("* | fields k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Bound the way the coordinator binds it: an UNBOUND query has nowhere to
+	// record why it stopped (stopReason is allocated by bindContext), so it
+	// would return nil rows and a nil error -- which is the silent empty
+	// answer, not the budget working.
+	bounded.bindContext(context.Background(), Limits{})
+	bounded.MaxBytes = 1024 // far below 200 rows of ~109 bytes
+	if got := ApplyPipes(bounded, rows); got != nil {
+		t.Errorf("MaxBytes=%d let %d rows (~%d bytes) through",
+			bounded.MaxBytes, len(got), 200*109)
+	}
+	if err := bounded.StopErr(); err == nil {
+		t.Error("the query was not stopped, so nothing tells the caller the " +
+			"answer would have been truncated")
+	}
 }

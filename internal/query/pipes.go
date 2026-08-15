@@ -1453,8 +1453,25 @@ func PipesProject(pipes []Pipe) bool {
 // none: skipping them would answer the query as if the pipe were not there,
 // which is the silent-wrong-answer shape this whole area is about.
 func ApplyPipes(q *Query, rows []Row) []Row {
+	// The materialized size, passed to exceeded rather than a literal zero.
+	//
+	// It was `q.exceeded(0)`, so MaxBytes could not fire here -- at the ONE
+	// place holding every matching row in the cluster at once, which is what
+	// that budget was written for. The deadline half of exceeded worked and
+	// hid it: the call looked like a budget check and enforced half of one.
+	//
+	// Recomputed per pipe because a pipe changes the set. That is one pass
+	// over rows per pipe, the same order as the pipe itself, and it is only
+	// paid when a budget is set.
+	measure := q.MaxBytes > 0
 	for _, p := range q.Pipes {
-		if q.exceeded(0) {
+		var size int64
+		if measure {
+			for i := range rows {
+				size += rowBytes(rows[i])
+			}
+		}
+		if q.exceeded(size) {
 			return nil
 		}
 		switch p.(type) {
@@ -1464,6 +1481,15 @@ func ApplyPipes(q *Query, rows []Row) []Row {
 			return nil
 		}
 		rows = p.apply(rows)
+		if measure {
+			var after int64
+			for i := range rows {
+				after += rowBytes(rows[i])
+			}
+			if q.exceeded(after) {
+				return nil
+			}
+		}
 		if q.maxPipeRows > 0 && len(rows) > q.maxPipeRows {
 			q.stop(fmt.Errorf("%w: %T produced %d rows, ceiling is %d",
 				ErrPipeRowLimit, p, len(rows), q.maxPipeRows))

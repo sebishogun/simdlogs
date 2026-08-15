@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"github.com/sebishogun/simdlogs/internal/storage"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -262,5 +263,61 @@ func TestTheAdoptEndpointValidatesWhatItIsGiven(t *testing.T) {
 	}
 	if got := rowCount(t, node); got != 0 {
 		t.Fatalf("%d rows landed in the store from refused adoptions", got)
+	}
+}
+
+// Three replicas: the union's own members are checked against each other, not
+// only against what the destination already had.
+//
+// The overlap guard read the destination's PRE-PASS inventory. With two
+// replicas that is symmetric and enough; with three it is not:
+//
+//	A = {g1[0,10], g2[10,20]}   uncompacted
+//	B = {G[0,20]}               compacted
+//	C = {}                      missed the range, or restored empty
+//
+// All three of g1, g2 and G overlap nothing in C's empty inventory, so all
+// three were copied and C held the range twice -- reported as copied: 3,
+// blocked: 0, complete: true, which is exactly the duplication the guard's own
+// comment says it prevents.
+func TestRepairDoesNotCopyOverlappingMembersOfOneUnion(t *testing.T) {
+	have := []storage.GroupDigest{}
+	union := []storage.GroupDigest{
+		{Digest: "g1", TimeMin: 0, TimeMax: 10},
+		{Digest: "g2", TimeMin: 11, TimeMax: 20},
+		{Digest: "G", TimeMin: 0, TimeMax: 20},
+	}
+
+	// What the pass does now: the inventory grows as it copies.
+	spans := append([]storage.GroupDigest(nil), have...)
+	var copied, blocked []string
+	for _, g := range union {
+		if overlapping(spans, g) != "" {
+			blocked = append(blocked, g.Digest)
+			continue
+		}
+		copied = append(copied, g.Digest)
+		spans = append(spans, g)
+	}
+	if len(copied) != 2 || len(blocked) != 1 {
+		t.Fatalf("copied %v, blocked %v; want two disjoint groups copied and the "+
+			"one covering both blocked", copied, blocked)
+	}
+	if blocked[0] != "G" {
+		t.Errorf("blocked %q, want G -- the compacted group covering the two "+
+			"already copied", blocked[0])
+	}
+
+	// And the old shape, kept here so the difference is visible rather than
+	// asserted: checking only the pre-pass inventory copies all three.
+	var wouldCopy int
+	for _, g := range union {
+		if overlapping(have, g) == "" {
+			wouldCopy++
+		}
+	}
+	if wouldCopy != 3 {
+		t.Errorf("checking only the pre-pass inventory copies %d of 3; this test "+
+			"is asserting a difference that does not exist", wouldCopy)
 	}
 }

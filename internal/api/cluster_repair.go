@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"time"
 
 	obs "github.com/sebishogun/simdlogs/internal/observability"
@@ -295,7 +296,33 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 			for _, g := range st.Groups {
 				have[g.Digest] = true
 			}
-			for digest, g := range union {
+			// The spans this destination holds, GROWN as the pass copies.
+			//
+			// The overlap guard checked st.Groups, the destination's inventory
+			// as it was before the pass, and never the union's members against
+			// each other. With two replicas that is enough, because the guard
+			// is symmetric. With three it is not:
+			//
+			//   A = {g1[0,10], g2[10,20]}   uncompacted
+			//   B = {G[0,20]}               compacted
+			//   C = {}                      missed the range, or restored empty
+			//   union = {g1, g2, G}
+			//
+			// Every one of the three overlaps NOTHING in C's empty inventory,
+			// so all three were copied and C ended up holding the range twice
+			// -- reported as copied: 3, blocked: 0, complete: true. That is the
+			// outcome the comment below says this guard prevents.
+			spans := append([]storage.GroupDigest(nil), st.Groups...)
+			// Deterministic order, so two runs against the same divergence
+			// block the same group rather than whichever the map yielded
+			// first.
+			digests := make([]string, 0, len(union))
+			for d := range union {
+				digests = append(digests, d)
+			}
+			sort.Strings(digests)
+			for _, digest := range digests {
+				g := union[digest]
 				if have[digest] {
 					continue
 				}
@@ -325,7 +352,7 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 				// Overlapping means REFUSE. Repair's promise is that it never
 				// makes a replica worse, and duplicating or resurrecting rows
 				// is worse than leaving a divergence an operator can see.
-				if blocked := overlapping(st.Groups, g); blocked != "" {
+				if blocked := overlapping(spans, g); blocked != "" {
 					sr.Blocked++
 					rep.Blocked++
 					rep.Complete = false
@@ -385,6 +412,10 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 				sr.Copied++
 				budget -= moved
 				rep.Bytes += moved
+				// The destination now holds this span, so a later member of
+				// the same union that covers it is blocked rather than copied
+				// on top.
+				spans = append(spans, g)
 			}
 		}
 		rep.Shards = append(rep.Shards, sr)
