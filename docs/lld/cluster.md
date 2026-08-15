@@ -200,6 +200,41 @@ produce exactly the right answer — `| stats by (level)` passed against the
 defect it was written to catch. The group-by key must not be a function of the
 shard index.
 
+## The route surface
+
+42 routes. Each is federated, router-local by design, or refused — and the
+classification is machine-checked against the mux, not maintained by hand.
+
+A select-router holds no data. Only a handler that knows it is a router fans
+out; every other one runs against that empty local store and answers 200 with
+nothing. `{"facets":[]}` and `{"count":0}` are indistinguishable from a cluster
+that genuinely holds no matching data, so nothing reports a problem and a
+dashboard shows an empty panel.
+
+Counting `len(s.backends) > 0` branches finds the handlers that DO federate —
+13 of 42. It cannot find the ones nobody remembered.
+`TestNoRouterReadSilentlyReadsTheEmptyLocalStore` sends the same request to a
+router and to a storage node holding the data, and fails when the storage node
+answers with something and the router answers with nothing. It found three:
+`/select/logsql/facets`, plain `/select/logsql/stats_query`, and `/select/sql`.
+
+Three companion tests close the gaps a single comparison leaves:
+
+- `TestEverySurfaceRouteIsClassified` walks the mux's own registered paths, so a
+  new handler that nobody classified fails rather than going uncovered.
+- `TestEveryWriteRouteForwardsToTheShards` checks all 13 ingest routes, because
+  each handler decides for itself whether to forward. A router that kept a copy
+  would put rows where no read ever looks — reads fan out. "Kept nothing" is
+  observed by removing the backends and asking the same process again.
+- `TestARefusedSurfaceSaysSo` requires a refused surface to answer 501 with the
+  reason. Never 200-and-empty, which a client reads as "the cluster holds
+  nothing".
+
+Two of the fixtures had to be repaired before they measured anything: the hits
+request used the default time window, which does not cover the corpus, and the
+stream-field endpoints ran against a node with no stream fields configured. Both
+subtests were skipping, and a skip reads as covered.
+
 ## Read completeness
 
 Every merge consumed a `[][]byte` with a nil entry for a shard that did not
@@ -345,12 +380,17 @@ data to every member.
 |---|---|---|
 | `/select/logsql/query` | `federatedSelect`, after `planQuery` splits the pipeline (see **Distributed query planning**). Bare filters and the row-local prefix run on the shards; rows merge in time order (newest first, parsed from each line's `_time`) and `limit` applies across the merged set. Rows are kept as slices into each shard's response body (no per-row string copies — that was the router's dominant cost); the timestamp parse uses the fast RFC3339Nano path, and only a query with a coordinator half pays the decode back into fields. | works |
 | `/select/logsql/hits` | `federatedHits` decodes the dense series shape the backend actually answers (`{"hits":[{"fields":..,"timestamps":[..],"values":[..],"total":N}]}`) and merges by label set, summing buckets per timestamp. Fixed in 8.4; it previously decoded the older object shape and answered one bogus zero bucket for any non-empty store. | works |
-| `/select/logsql/stats_query` (plain, no `by=` param) | `federatedStatsQuery` decodes `{"count":N}` from each backend, but the backend answers the Prometheus vector envelope `{"status":"success","data":{"resultType":"vector","result":[...]}}`. No `count` field exists: **the router always answers `{"count":0}`**. | **broken** (bogus zero) |
+| `/select/logsql/stats_query` (plain, no `by=` param) | `federatedVector` decodes the Prometheus instant-vector envelope the backend actually answers and sums values per metric label set. Fixed in 8.6; it previously decoded a `{"count":N}` field no backend emits, so the router answered `{"count":0}` for every query against every cluster. | works |
 | `/select/logsql/stats_query` (`by=` param) | The backend's `by=` extension answers `{"stats":[{value,hits}]}`, which `federatedStatsQuery` decodes and sums per value. | works |
 | `/select/logsql/stats_query_range` | `federatedMatrix`: each shard's series concatenated (shards hold disjoint groups, so a series is one shard's); decodes the backend's `{"data":{"result":[...]}}` envelope. | works |
 | `/select/logsql/field_values`, `stream_field_values`, `field_names`, `stream_field_names` | All four route to `federatedValueCounts` (key `"values"`): backends answer `{"values":[...]}` and hits are SUMMED per value, sorted by count desc then value. (`federatedStrings` exists in `cluster.go` but is not wired to any route.) | works |
 | `/select/logsql/streams` | Routes to `federatedValueCounts`, which reads the `{"values":[...]}` envelope the backend actually answers. Fixed in 8.4; the router previously looked for a `"streams"` key that no backend emits and answered an empty list however many streams the shards held. | works |
 | `/select/logsql/stream_ids` | Same path and same 8.4 fix (the key was `"stream_ids"` against the same `{"values":[...]}` envelope). | works |
+| `/select/logsql/facets` | `federatedFacets`: hits sum per (field, value), then `limit` and `max_values_per_field` apply to the MERGED list, so "the top 10 values" is the cluster's. Added in 8.6; the handler had no router branch at all and faceted the router's empty store. | works |
+| `/select/sql` | `federatedSQL`: federated when the parsed pipeline is entirely row-local, refused with the reason otherwise. Added in 8.6; it previously queried the router's empty store. | partial by design |
+| `/select/logsql/tail` | Refused (501). A cluster tail is a long-lived stream from every shard merged by arrival time, and the merge has no completeness signal — a shard that stops answering drops out with nothing to say so. It previously tailed the router's empty store and streamed forever without ever yielding a row. | refused |
+| `/select/vector` | Refused (501). k-NN across shards needs each shard's top k merged by distance; one shard's neighbours, or a concatenation, answer a different question. | refused |
+| `/admin/backup`, `/admin/acknowledge-degraded` | Refused (501). A router's backup of its own empty store restores as an empty cluster, and acknowledging degradation here clears nothing on the shards that are degraded. Coordinated forms are task 8.7. | refused |
 | `/_search` | `federatedESSearch`: hits merged, `hits.total` summed, `relation: "eq"`. | works |
 | `/_count` | `federatedESCount`: counts summed. | works |
 

@@ -4118,3 +4118,54 @@ scratch slice is reused, and a row that introduces no column sorts nothing.
 property nobody executed. The fixture asserted an equality that held for a
 reason unrelated to the code under test, and the column order was never compared
 across two processes because a test only ever runs in one.
+
+## 39. Counting the handlers that federate cannot find the ones nobody wrote
+
+Task 8.6 asked for every router surface to be complete or explicitly refused.
+The obvious way to audit that is to count `len(s.backends) > 0` branches: 13 of
+42 routes have one. That number is useless. It lists the handlers somebody
+remembered to federate, which is the complement of what the audit is looking
+for.
+
+The test that works sends the same request to a router and to a storage node
+that HAS the data, and fails when the storage node answers with something and
+the router answers with nothing. It found three routes reading the router's own
+empty store:
+
+| Route | Storage node | Router |
+|---|---|---|
+| `/select/logsql/facets` | 30 faceted values | `{"facets":[]}` |
+| `/select/logsql/stats_query` | `{"result":[{"value":[…,"30"]}]}` | `{"count":0}` |
+| `/select/sql` | the matching rows | empty body |
+
+The `stats_query` one is the sharpest: `federatedStatsQuery` decoded a
+`{"count":N}` field, and no backend has ever emitted it — the handler answers
+the Prometheus instant-vector envelope. So the router answered **`{"count":0}`
+for every query against every cluster**, whatever the shards held. A confident
+zero, in the response shape a client is least likely to question.
+
+**Two more surfaces were worse than empty.** `/select/logsql/tail` tailed the
+router's empty store and streamed **forever** without yielding a row — the first
+run of this test took 240 s and reported nothing at all, because an unbounded
+client on a streaming endpoint hangs the package until `go test -timeout` kills
+it. `/select/vector` returned no neighbours. Both now answer 501 with the
+reason.
+
+**Two fixtures were skipping, and a skip reads as covered.** The hits request
+used the default time window, which does not cover the corpus, so the storage
+node answered empty too and the comparison was between two empty answers. The
+`stream_field_*` endpoints ran against a node with no stream fields configured,
+same result. Neither subtest could have failed. After fixing both, every read
+subtest bites.
+
+**One claim in the test itself was never executed:** the read test skipped
+writes with a comment naming `TestARouterStoresNothingItself`, which did not
+exist. It does now, per route — all 13 — because each ingest handler decides for
+itself whether to forward, and "kept nothing" is observed by removing the
+backends and asking the same process again rather than by reading its store.
+
+**The shape.** Entry 37 called this "a claim that was written and never
+executed". This is the audit-level version: a metric that counts the wrong
+population. If the question is "what did we forget", no count of what we
+remembered can answer it — only a comparison against something that knows the
+right answer.

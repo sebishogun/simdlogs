@@ -451,13 +451,6 @@ func (s *Server) replicateTo(r *http.Request, url string, body []byte, wid strin
 // correct distributed answer. Tenant headers propagate so each backend answers
 // for the same tenant.
 func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
-	// Rows are kept as slices into each shard's response body, not strings: the
-	// merge touches every row of every shard, and a string per row was the
-	// router's cost on a big result (a Scanner's Text() copies each line).
-	type row struct {
-		t    int64
-		line []byte
-	}
 	// The PLAN before the fan-out.
 	//
 	// The whole query used to go to every shard and the final rows were
@@ -479,6 +472,34 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 	bodies, w, ok := s.fanOutChecked(w, shardReq, "/select/logsql/query", nil)
 	if !ok {
 		return
+	}
+	s.mergeRows(w, r, bodies, coordPipes)
+}
+
+// federatedRows answers an NDJSON-row endpoint for the cluster: fan out
+// unchanged, merge in time order, apply `limit` across the merged set.
+//
+// For endpoints whose whole pipeline is row-local, which is the condition under
+// which concatenate-sort-limit is the correct distributed answer. A caller that
+// cannot guarantee that must plan first, as federatedSelect does.
+func (s *Server) federatedRows(w http.ResponseWriter, r *http.Request, path string) {
+	bodies, w, ok := s.fanOutChecked(w, r, path, nil)
+	if !ok {
+		return
+	}
+	s.mergeRows(w, r, bodies, nil)
+}
+
+// mergeRows merges shard NDJSON and applies the coordinator half of a plan.
+func (s *Server) mergeRows(
+	w http.ResponseWriter, r *http.Request, bodies [][]byte, coordPipes []query.Pipe,
+) {
+	// Rows are kept as slices into each shard's response body, not strings: the
+	// merge touches every row of every shard, and a string per row was the
+	// router's cost on a big result (a Scanner's Text() copies each line).
+	type row struct {
+		t    int64
+		line []byte
 	}
 	var mu sync.Mutex
 	var all []row
@@ -896,26 +917,32 @@ func matrixStamp(s string) float64 {
 	return f
 }
 
-// federatedStatsQuery merges stats across storage nodes: a total count is
-// summed; a group-by count sums each value's hits. (avg/quantile across shards
-// need sum+count / sketch merge -- a follow-up; count and count-by are exact.)
+// federatedStatsQuery merges stats across storage nodes.
+//
+// Two response shapes, because the endpoint has two. With `by=` the backend
+// answers this repository's `{"stats":[{value,hits}]}` extension and hits sum
+// per value. Without it the backend answers the Prometheus instant vector
+// envelope, which is federatedVector's job.
+//
+// That second case used to decode `{"count":N}` from each backend. No backend
+// emits that field, so the sum was always zero and the router answered
+// `{"count":0}` for every query against every cluster, however much data the
+// shards held -- a confident zero, and the shape a client is least likely to
+// question.
+//
+// Non-mergeable aggregates are refused here on the same rule the LogsQL
+// planner applies, so one binary does not answer the same aggregate two ways.
 func (s *Server) federatedStatsQuery(w http.ResponseWriter, r *http.Request) {
+	if r.FormValue("by") == "" {
+		s.federatedVector(w, r)
+		return
+	}
+	if !s.rejectNonMergeableStats(w, r) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	bodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/stats_query", nil)
 	if !ok {
-		return
-	}
-	if r.FormValue("by") == "" {
-		total := 0
-		for _, b := range bodies {
-			var v struct {
-				Count int `json:"count"`
-			}
-			if json.Unmarshal(b, &v) == nil {
-				total += v.Count
-			}
-		}
-		json.NewEncoder(w).Encode(map[string]any{"count": total})
 		return
 	}
 	type vc struct {
@@ -937,7 +964,15 @@ func (s *Server) federatedStatsQuery(w http.ResponseWriter, r *http.Request) {
 	for val, h := range merged {
 		stats = append(stats, vc{val, h})
 	}
-	sort.Slice(stats, func(i, j int) bool { return stats[i].Hits > stats[j].Hits })
+	// Value breaks the tie: without it, equal hit counts came out of a map in
+	// per-process order, so two routers over the same shards answered the same
+	// query with the rows in different orders.
+	sort.Slice(stats, func(i, j int) bool {
+		if stats[i].Hits != stats[j].Hits {
+			return stats[i].Hits > stats[j].Hits
+		}
+		return stats[i].Value < stats[j].Value
+	})
 	json.NewEncoder(w).Encode(map[string]any{"stats": stats})
 }
 

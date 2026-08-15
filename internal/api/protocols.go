@@ -40,6 +40,12 @@ const backupFlushTimeout = 10 * time.Second
 // truthful "this transfer did not complete". Before any byte is written a
 // clean 500 is still possible, and that path is taken.
 func (s *Server) backup(w http.ResponseWriter, r *http.Request) {
+	if s.refuseInRouterMode(w, r, "backup",
+		"a router's store is empty, so this would stream a valid backup of no "+
+			"data and restore as an empty cluster; the coordinated cluster backup "+
+			"is not in this build") {
+		return
+	}
 	tn := s.tn(r)
 	// One backup per tenant at a time. Each one holds a Snapshot for its whole
 	// duration, which pins every group it captured against unmapping, so N

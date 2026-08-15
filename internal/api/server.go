@@ -1166,6 +1166,12 @@ func (rs readerStore) Snapshot(_, _ int64) (*storage.Snapshot, error) {
 // polls for later ones, running the LogsQL filter over each and flushing
 // matches as NDJSON. The connection lives until the client disconnects.
 func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
+	if s.refuseInRouterMode(w, r, "live tail",
+		"a cluster tail is a long-lived stream from every shard merged by arrival "+
+			"time, and the merge has no completeness signal: a shard that stops "+
+			"answering drops out of the stream with nothing to say so") {
+		return
+	}
 	q, err := parseRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
@@ -1298,6 +1304,10 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 // interface VictoriaLogs does not have. Results stream as NDJSON like the
 // LogsQL select.
 func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 { // select-router: federate the row-local case, refuse the rest
+		s.federatedSQL(w, r)
+		return
+	}
 	q, err := query.ParseSQL(r.FormValue("query"))
 	if err != nil {
 		http.Error(w, err.Error(), 400)
@@ -1348,6 +1358,12 @@ func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
 // window comes from start/end params. Embeddings are bring-your-own (logs carry
 // a vector column).
 func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
+	if s.refuseInRouterMode(w, r, "vector search",
+		"a k-nearest-neighbour search over shards needs each shard's top k merged "+
+			"by distance, and returning one shard's neighbours or concatenating "+
+			"them both answer a different question") {
+		return
+	}
 	var body struct {
 		Field  string    `json:"field"`
 		Vector []float32 `json:"vector"`
@@ -1628,6 +1644,10 @@ func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
+	if len(s.backends) > 0 { // select-router: a facet over the router's own store is empty
+		s.federatedFacets(w, r)
+		return
+	}
 	q, err := selectQueryOf(r)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
@@ -2129,6 +2149,12 @@ func (s *Server) degradedLocked(key string, h storage.Health) {
 // tenants it accepted and what is still degraded, so the operator sees what
 // they just took responsibility for rather than a bare 200.
 func (s *Server) acknowledgeDegraded(w http.ResponseWriter, r *http.Request) {
+	if s.refuseInRouterMode(w, r, "acknowledging a degraded store",
+		"the router's own store is empty and never degrades; acknowledging here "+
+			"clears nothing on the shards that are actually degraded, and would "+
+			"report success for an operation that did nothing") {
+		return
+	}
 	if r.Method != http.MethodPost && r.Method != http.MethodPut {
 		w.Header().Set("Allow", "POST, PUT")
 		http.Error(w, "acknowledging a degraded store is a POST", http.StatusMethodNotAllowed)
