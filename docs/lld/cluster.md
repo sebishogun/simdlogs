@@ -74,6 +74,51 @@ was refused" — and the merge treated all three as an empty contribution.
 `bodiesOf` keeps the old `[][]byte` shape for merges that have not yet learned
 to report completeness (task 8.3).
 
+## Read completeness
+
+Every merge consumed a `[][]byte` with a nil entry for a shard that did not
+answer, and merged the rest. A cluster read with one shard down returned the
+other shards' rows, **HTTP 200**, with nothing anywhere in the response to say
+a third of the data was missing — indistinguishable from a query that genuinely
+matched fewer rows. Confident, plausible and silent.
+
+**The rule: a read fails unless every shard contributed a complete answer.**
+Not "every shard answered" — a shard serving from a degraded store answers, and
+says so in the envelope, and that answer is missing data too. It counts as
+missing, and the only difference is that it looks fine.
+
+A refusal is **503** with the shards named:
+
+```
+X-Simdlogs-Shards-Total: 3
+X-Simdlogs-Shards-Answered: 2
+X-Simdlogs-Shards-Missing: 1(unavailable)
+```
+
+**Partial answers are opt-in.** `allow_partial_response=1` — the reference's own
+parameter name — is answered **206** with `X-Simdlogs-Partial: true` and the
+same missing-shard headers. A dashboard that would rather draw something than
+nothing is a real use, and so is an operator triaging with a node down; but it
+has to be asked for, because a caller who did not ask has no way to know, and a
+monitoring system built on silently-partial answers alerts on the wrong thing
+at the worst time.
+
+206 rather than 200-with-a-header because a client that checks `resp.ok` sees
+200 for both. The gate returns the `http.ResponseWriter` the handler must use,
+and on a partial answer that writer forces 206 on the first write — the status
+cannot be set in the gate itself, because every handler sets its own
+Content-Type and then writes, so a `WriteHeader` there would be overtaken by
+the handler's first `Write` sending 200. `federatedSelect` writes its status
+explicitly for the same reason in reverse: an empty result writes no bytes at
+all, and a handler that returns without writing sends 200.
+
+`simdlogs_cluster_partial_reads_total` counts them, because a dashboard quietly
+running on partial answers is exactly the state this makes visible.
+
+All nine federated endpoints are covered by one-shard-down and all-shards-down
+tests: select, hits, stats_query, stats_query_range, field_names, field_values,
+streams, `_count` and `_search`.
+
 ## Replicated writes: idempotency and consistency
 
 `forwardWrite` replicated to every member of a shard and relayed the **last**

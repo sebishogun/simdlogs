@@ -81,6 +81,8 @@ var theContract = []metricSpec{
 		"reads refused by admission; NOT including clients that hung up while queued"},
 	{"simdlogs_query_streamed_total", "counter",
 		"bare selects answered a group at a time rather than materialized"},
+	{"simdlogs_cluster_partial_reads_total", "counter",
+		"cluster reads answered with shards missing, by explicit opt-in"},
 
 	// The reference's names, carrying the same numbers, so a dashboard written
 	// for VictoriaLogs graphs this server unchanged.

@@ -458,15 +458,22 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 		t    int64
 		line []byte
 	}
+	// The completeness gate BEFORE the merge. A shard that did not answer used
+	// to contribute nothing and the merge proceeded, so a cluster read with one
+	// shard down returned the other shards' rows with HTTP 200 and nothing to
+	// say a third of the data was missing.
+	bodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/query", nil)
+	if !ok {
+		return
+	}
 	var mu sync.Mutex
 	var all []row
 	var wg sync.WaitGroup
-	for _, sh := range s.shards() { // one live replica per shard
+	for _, body := range bodies {
 		wg.Add(1)
-		go func(sh []string) {
+		go func(body []byte) {
 			defer wg.Done()
-			body, ok := s.getFromShard(r, sh, "/select/logsql/query", nil)
-			if !ok {
+			if body == nil {
 				return
 			}
 			local := make([]row, 0, bytes.Count(body, []byte{'\n'}))
@@ -486,7 +493,7 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			all = append(all, local...)
 			mu.Unlock()
-		}(sh)
+		}(body)
 	}
 	wg.Wait()
 
@@ -498,6 +505,11 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Content-Type", ndjsonContentType)
+	// Explicit, because an EMPTY result writes no bytes -- and a handler that
+	// returns without writing sends 200 by default, which on a partial answer
+	// is exactly the confident-and-wrong status this whole mechanism exists to
+	// prevent. The partial writer upgrades this to 206.
+	w.WriteHeader(http.StatusOK)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	for i, rw := range all {
@@ -559,7 +571,11 @@ func (s *Server) fanOutPost(r *http.Request, path string, body []byte) [][]byte 
 func (s *Server) federatedESCount(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	total := 0
-	for _, b := range s.fanOutPost(r, "/_count", body) {
+	bodies, w, ok := s.fanOutChecked(w, r, "/_count", body)
+	if !ok {
+		return
+	}
+	for _, b := range bodies {
 		var v struct {
 			Count int `json:"count"`
 		}
@@ -576,7 +592,11 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	var hits []json.RawMessage
 	total := 0
-	for _, b := range s.fanOutPost(r, "/_search", body) {
+	bodies, w, ok := s.fanOutChecked(w, r, "/_search", body)
+	if !ok {
+		return
+	}
+	for _, b := range bodies {
 		var v struct {
 			Hits struct {
 				Total struct {
@@ -605,7 +625,11 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, path, key string) {
 	w.Header().Set("Content-Type", "application/json")
 	counts := map[string]int{}
-	for _, b := range s.fanOut(r, path) {
+	vcBodies, w, ok := s.fanOutChecked(w, r, path, nil)
+	if !ok {
+		return
+	}
+	for _, b := range vcBodies {
 		var v map[string][]query.ValueCount
 		if json.Unmarshal(b, &v) == nil {
 			for _, vc := range v[key] {
@@ -630,7 +654,11 @@ func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, pa
 func (s *Server) federatedStrings(w http.ResponseWriter, r *http.Request, path, key string) {
 	w.Header().Set("Content-Type", "application/json")
 	seen := map[string]struct{}{}
-	for _, b := range s.fanOut(r, path) {
+	strBodies, w, ok := s.fanOutChecked(w, r, path, nil)
+	if !ok {
+		return
+	}
+	for _, b := range strBodies {
 		var v map[string][]string
 		if json.Unmarshal(b, &v) == nil {
 			for _, x := range v[key] {
@@ -651,7 +679,11 @@ func (s *Server) federatedStrings(w http.ResponseWriter, r *http.Request, path, 
 func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	var result []json.RawMessage
-	for _, b := range s.fanOut(r, "/select/logsql/stats_query_range") {
+	srBodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/stats_query_range", nil)
+	if !ok {
+		return
+	}
+	for _, b := range srBodies {
 		var v struct {
 			Data struct {
 				Result []json.RawMessage `json:"result"`
@@ -672,7 +704,10 @@ func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
 // need sum+count / sketch merge -- a follow-up; count and count-by are exact.)
 func (s *Server) federatedStatsQuery(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	bodies := s.fanOut(r, "/select/logsql/stats_query")
+	bodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/stats_query", nil)
+	if !ok {
+		return
+	}
 	if r.FormValue("by") == "" {
 		total := 0
 		for _, b := range bodies {
@@ -717,7 +752,11 @@ func (s *Server) federatedHits(w http.ResponseWriter, r *http.Request) {
 		Count int    `json:"hits"`
 	}
 	merged := map[string]int{}
-	for _, b := range s.fanOut(r, "/select/logsql/hits") {
+	hitBodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/hits", nil)
+	if !ok {
+		return
+	}
+	for _, b := range hitBodies {
 		var v struct {
 			Hits []hit `json:"hits"`
 		}
@@ -835,3 +874,147 @@ func fastRFC3339Nano(s string) (int64, bool) {
 func (s *Server) SetIdentity(shard, replica int) {
 	s.shardID, s.replicaID = shard, replica
 }
+
+// Read completeness: what a router does when a shard cannot answer.
+//
+// # The failure
+//
+// Every merge consumed `[][]byte` with a nil entry for a shard that did not
+// answer, and merged the rest. So a cluster read with one shard down returned
+// the other shards' rows, with HTTP 200 and nothing anywhere in the response
+// to say a third of the data was missing. A caller cannot tell that from a
+// query that genuinely matched fewer rows, which makes it the worst kind of
+// wrong answer: confident, plausible, and silent.
+//
+// # The rule
+//
+// A read fails unless every shard contributed a COMPLETE answer. Not "every
+// shard answered" -- a shard whose store is degraded answers, and says so in
+// the envelope, and that answer is missing data too.
+//
+// # Why partial is opt-in rather than the default
+//
+// A dashboard that would rather draw something than nothing is a real use, and
+// so is an operator triaging with one node down. But it has to be ASKED for:
+// `allow_partial_response=1`, answered 206 with headers naming the shards that
+// are missing. The default is failure because the caller who did not ask has
+// no way to know, and a monitoring system built on silently-partial answers
+// alerts on the wrong thing at the worst time.
+
+// partialParam is the opt-in. Named for the reference's own parameter so a
+// client that already sets it keeps working.
+const partialParam = "allow_partial_response"
+
+// Response headers describing a partial answer.
+const (
+	HdrPartial        = "X-Simdlogs-Partial"
+	HdrShardsTotal    = "X-Simdlogs-Shards-Total"
+	HdrShardsAnswered = "X-Simdlogs-Shards-Answered"
+	HdrShardsMissing  = "X-Simdlogs-Shards-Missing"
+)
+
+// fanOutChecked fans out, then enforces the completeness rule.
+//
+// It returns the bodies and true when the caller may proceed to merge. When it
+// returns false it has already written the response, and the handler must
+// return immediately.
+// It returns the writer the handler must use: on a partial answer that writer
+// forces 206 on the first write. The status cannot be set here directly --
+// every handler sets its own Content-Type and then writes, so a WriteHeader in
+// this function would be overtaken by the handler's first Write, which sends
+// 200. Returning the writer makes the substitution visible at the call site
+// rather than hidden in a wrapper the handler does not know about.
+func (s *Server) fanOutChecked(
+	w http.ResponseWriter, r *http.Request, path string, body []byte,
+) ([][]byte, http.ResponseWriter, bool) {
+	peers := s.fanOutPeers(r, path, body)
+
+	var missing []string
+	var incomplete []string
+	for i, p := range peers {
+		switch {
+		case !p.OK():
+			missing = append(missing, fmt.Sprintf("%d(%s)", i, p.Class))
+		case !p.Complete:
+			// Answered, but from an incomplete store. Counted as missing for
+			// the completeness rule: a shard serving from a degraded store is
+			// missing data just as surely as one that did not answer, and the
+			// only difference is that this one looks fine.
+			incomplete = append(incomplete, strconv.Itoa(i))
+		}
+	}
+	bad := append(append([]string(nil), missing...), incomplete...)
+	if len(bad) == 0 {
+		return bodiesOf(peers), w, true
+	}
+
+	answered := len(peers) - len(bad)
+	w.Header().Set(HdrShardsTotal, strconv.Itoa(len(peers)))
+	w.Header().Set(HdrShardsAnswered, strconv.Itoa(answered))
+	w.Header().Set(HdrShardsMissing, strings.Join(bad, ","))
+
+	if r.FormValue(partialParam) != "1" {
+		obs.L().Error("cluster read refused: shards missing",
+			obs.FieldEvent, "cluster.read_incomplete",
+			obs.FieldRoute, r.URL.Path,
+			"shards_total", len(peers), "shards_answered", answered,
+			"missing", strings.Join(bad, ","),
+			obs.FieldErrorClass, string(obs.ClassUpstream))
+		s.writeErr(w, r, readSpec(), http.StatusServiceUnavailable, fmt.Sprintf(
+			"simdlogs: %d of %d shards could not answer completely (%s). "+
+				"This answer would have been missing data with no way for you to tell, "+
+				"so it is refused. Set %s=1 to accept a partial answer, which is "+
+				"returned as 206 with the missing shards named in %s",
+			len(bad), len(peers), strings.Join(bad, ","), partialParam, HdrShardsMissing))
+		return nil, w, false
+	}
+
+	// Asked for. 206, so a client that switches on the status sees it, and the
+	// headers say exactly what is missing.
+	obs.L().Warn("cluster read answered partially",
+		obs.FieldEvent, "cluster.read_partial",
+		obs.FieldRoute, r.URL.Path,
+		"shards_total", len(peers), "shards_answered", answered,
+		"missing", strings.Join(bad, ","))
+	w.Header().Set(HdrPartial, "true")
+	s.notePartialRead()
+	return bodiesOf(peers), &partialWriter{ResponseWriter: w}, true
+}
+
+// partialWriter answers 206 on the first write.
+//
+// A partial answer must be distinguishable by STATUS, not only by a header: a
+// client that checks `resp.ok` sees 200 for both, and the whole point is that
+// a caller cannot accidentally treat an incomplete answer as a complete one.
+type partialWriter struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (p *partialWriter) WriteHeader(code int) {
+	if p.wrote {
+		return
+	}
+	p.wrote = true
+	if code == http.StatusOK {
+		code = http.StatusPartialContent
+	}
+	p.ResponseWriter.WriteHeader(code)
+}
+
+func (p *partialWriter) Write(b []byte) (int, error) {
+	if !p.wrote {
+		p.WriteHeader(http.StatusPartialContent)
+	}
+	return p.ResponseWriter.Write(b)
+}
+
+// partialReads counts answers this router knowingly returned incomplete.
+var partialReads atomic.Int64
+
+func (s *Server) notePartialRead() { partialReads.Add(1) }
+
+// PartialReads is the count, for /metrics. An operator alerts on it: a
+// dashboard quietly running on partial answers is the state this whole
+// mechanism exists to make visible.
+func PartialReads() int64 { return partialReads.Load() }
