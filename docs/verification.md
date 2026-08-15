@@ -275,6 +275,33 @@ the soak report success while measuring nothing:
   batch boundary still flushes.
 - `stream_context` is memory-bounded (`streamContextCap = 2,000,000`).
 
+## Security and recovery drills
+
+`docs/security.md` states what is defended and what is not, with the test
+beside each claim. `docs/runbooks/` holds the procedures, and every procedure
+is executed by a test — a runbook nobody has run is a document, not a
+procedure.
+
+| Drill | Test |
+|---|---|
+| A tenant cannot read another's data, implicitly or by claiming its id | `TestDrillATenantCannotReadAnother` |
+| A role cannot reach another role's routes, including the internal ones | `TestDrillARoleCannotReachAnotherRolesRoutes` |
+| A client cannot forge the internal protocol header into access | `TestDrillAClientCannotForgeTheInternalProtocolHeader` |
+| A rejected credential is answered identically however close the guess | `TestDrillARejectedCredentialRevealsNothing` |
+| A restored backup answers identically to its origin | `TestDrillARestoredBackupAnswersIdentically` |
+| A corrupt group is refused, never served as data, and readiness says so | `TestDrillACorruptGroupIsRefusedNotServed` |
+| A lost replica is rebuilt from a healthy one, and the survivor is untouched | `TestDrillALostReplicaIsRebuiltByRepair` |
+
+Oversized bodies, decompression bombs and oversized syslog frames are covered
+by the tests named in `docs/security.md` rather than duplicated as drills: a
+second copy of a test is a second thing to keep in step and no extra coverage.
+
+RPO and RTO, and the limitations behind them, are in
+`docs/runbooks/backup-restore.md`. The short version: there is no incremental
+backup, so RPO is bounded by how often a full capture is affordable; and the
+spread between a cluster backup's shard archives is reported, not bounded,
+because no threshold is right for every deployment.
+
 ## Crash recovery
 
 - Append is write-temp-fsync-rename: a crash between temp and rename leaves a
