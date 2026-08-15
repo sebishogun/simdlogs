@@ -326,6 +326,61 @@ Environment: `SIMDLOGS_STREAM_FIELDS` (stream-field default before the
 default tenant opens, so a deployment can synthesize `_stream` without a
 code change).
 
+## Rules: metrics from logs, and alerts
+
+`-rules.file` is a JSON file of metric and alert rules, loaded and **validated
+at startup**. A bad rule is a startup failure, not a surprise an hour later: an
+invalid metric name does not fail its own rule, it corrupts the whole
+`/metrics` exposition, so one bad rule takes the scrape down for every series
+the server publishes and the failure lands nowhere near its cause.
+
+**Every rule needs a window.** Both rule kinds evaluated over `From, To = 0,
+1<<62` — all history — on a timer. That is wrong twice. A gauge whose answer is
+"how many errors, ever" only goes up, so it can never fall back below a
+threshold and an alert built on it fires once and forever; the `!holds` branch
+that clears an alert was unreachable for any monotonically counting query,
+which is most of them. And the cost of each evaluation grows with the store
+while the interval does not, so a rule that took 10 ms on Monday takes ten
+seconds a month later and the ticker running it has no idea. The maximum window
+is 24 h, because a recurring query over more than that is a scheduled outage.
+
+| field | meaning |
+| --- | --- |
+| `window` | how far back each evaluation looks. Required, positive, ≤ 24 h |
+| `interval` | how often it runs. Defaults to `window`; minimum 1 s |
+| `tenant` | `account:project`; empty is the default tenant. Rules used to be hard-wired to it, so a multi-tenant deployment could not use them |
+| `by` (metrics) | field to group by, one series per value, capped by `max_series` (default 1000, ceiling 10000) |
+| `op` (alerts) | `>` `>=` `<` `<=` `==` `!=`, **validated** — unvalidated it fell through `crossed`'s default and the alert never fired: present, listed, permanently silent |
+| `for` (alerts) | how long the condition must hold before firing. 0 fires on the first crossing, which is how a single spike pages someone |
+
+Durations are strings (`"5m"`), never bare numbers: `300` is ambiguous between
+seconds and nanoseconds and Go would read it as nanoseconds, which is not what
+anyone writing it means. Unknown keys are refused — a misspelled key is a rule
+that does not do what its author believes, and silence is how it stays that
+way.
+
+**Cardinality is capped and the cap is reported.** `by` on an arbitrary field
+is one series per distinct value, unbounded by construction on a log server
+(`by: request_id` is a series per request), and it falls over on the monitoring
+system rather than here. A truncated rule keeps its largest series by count and
+sets `simdlogs_rule_series_truncated{rule=...}` — a silently truncated set is a
+gauge answering about a subset chosen by the store's internal ordering.
+
+**Rules report their own health.** `simdlogs_rule_evaluations_total`,
+`_last_evaluation_seconds`, `_failing`, `_series_truncated`, and the same in
+`/alerts` JSON. A rule that has been failing for an hour used to look exactly
+like a rule reporting zero: the error was swallowed and the previous series
+left standing. A failed evaluation now keeps the last series rather than
+dropping to zero — zero is a value an alert acts on — and says it is stale.
+
+Evaluations run under the query budget (`ruleEvalTimeout`, the group-key and
+byte ceilings). A rule is the one query nobody is watching: it runs on a timer
+with no client to hang up, so an unbounded one is unbounded forever.
+
+**Reload semantics: there are none.** Changing rules means restarting. There is
+no management API and no reload endpoint, so there is no half-applied rule set
+and no way for the running configuration to differ from the file.
+
 ## Observability: metrics, structured logs, audit
 
 **The metric contract.** A metric name is an API — a dashboard, an alert rule

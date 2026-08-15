@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/sebishogun/simdlogs/internal/config"
 	"io"
 	"net"
 	"net/http"
@@ -86,11 +87,22 @@ func TestAlerting(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-	postBody(t, ts, `{"_time":1,"level":"error"}`+"\n"+`{"_time":2,"level":"error"}`+"\n")
-	if err := srv.AddAlertRule("many_errors", "level:=error", ">", 1, 0); err != nil { // 2 > 1 -> firing
+	// Timestamps INSIDE the rule's window. They used to be nanoseconds 1 and
+	// 2 -- 1970 -- which every rule saw because every rule evaluated over all
+	// history. A windowed rule correctly ignores them, which is the whole
+	// point: an alert on "errors in the last hour" must not be satisfied by
+	// errors from 1970, and with the old window it could never fall back below
+	// its threshold either.
+	now := time.Now().UnixNano()
+	postBody(t, ts, recentAt(now-int64(time.Minute), "error")+recentAt(now-int64(time.Second), "error"))
+	if err := srv.AddAlertRule(config.AlertRule{Name: "many_errors", Query: "level:=error",
+		Op: ">", Threshold: 1, Window: config.Duration(time.Hour),
+		Interval: config.Duration(time.Hour)}); err != nil { // 2 > 1 -> firing
 		t.Fatal(err)
 	}
-	if err := srv.AddAlertRule("too_many_errors", "level:=error", ">", 5, 0); err != nil { // 2 > 5 -> not
+	if err := srv.AddAlertRule(config.AlertRule{Name: "too_many_errors", Query: "level:=error",
+		Op: ">", Threshold: 5, Window: config.Duration(time.Hour),
+		Interval: config.Duration(time.Hour)}); err != nil { // 2 > 5 -> not
 		t.Fatal(err)
 	}
 	var resp struct {
@@ -117,11 +129,16 @@ func TestMetricsFromLogs(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-	postBody(t, ts, `{"_time":1,"level":"error"}`+"\n"+`{"_time":2,"level":"error"}`+"\n"+`{"_time":3,"level":"info"}`+"\n")
-	if err := srv.AddMetricRule("by_level", "*", "level", 0); err != nil {
+	now := time.Now().UnixNano()
+	postBody(t, ts, recentAt(now-int64(3*time.Minute), "error")+
+		recentAt(now-int64(2*time.Minute), "error")+
+		recentAt(now-int64(time.Minute), "info"))
+	if err := srv.AddMetricRule(config.MetricRule{Name: "by_level", Query: "*", By: "level",
+		Window: config.Duration(time.Hour), Interval: config.Duration(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.AddMetricRule("errors", "level:=error", "", 0); err != nil {
+	if err := srv.AddMetricRule(config.MetricRule{Name: "errors", Query: "level:=error",
+		Window: config.Duration(time.Hour), Interval: config.Duration(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 	r, err := http.Get(ts.URL + "/metrics")
@@ -733,4 +750,14 @@ func TestESBulkIngest(t *testing.T) {
 	if cnt.Count != 2 {
 		t.Fatalf("bulk _count level=error = %d want 2", cnt.Count)
 	}
+}
+
+// recentAt is one NDJSON record at an explicit nanosecond timestamp.
+//
+// Rule fixtures need timestamps inside the rule's window: a rule evaluates
+// over the last `window` and a record stamped in 1970 is outside every window
+// a rule may configure. Before rules had windows, every fixture timestamp
+// worked because every rule read all of history.
+func recentAt(ts int64, level string) string {
+	return fmt.Sprintf(`{"_time":%d,"level":%q}`, ts, level) + "\n"
 }

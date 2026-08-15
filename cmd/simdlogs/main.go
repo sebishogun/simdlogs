@@ -61,6 +61,14 @@ func main() {
 	queryQueueWait := flag.Duration("query-queue-wait", 0,
 		"how long a read may wait for an admission slot before 429; 0 refuses immediately, "+
 			"which is right for an interactive endpoint")
+	rulesFile := flag.String("rules.file", "",
+		"JSON file of metrics-from-logs and alert rules. Every rule needs a `window`: "+
+			"without one a rule evaluates over ALL history, so a gauge only ever grows, "+
+			"an alert fires once and never clears, and each evaluation costs more than "+
+			"the last. Rules are loaded and validated at startup -- a bad rule is a "+
+			"startup failure, because an invalid metric name corrupts the whole /metrics "+
+			"exposition rather than just its own rule. Changing rules means restarting; "+
+			"there is no reload endpoint and no half-applied rule set")
 	logFormat := flag.String("log.format", "text",
 		"`text` or `json`. JSON for a log pipeline; text is the default because it is "+
 			"what this process wrote before structured logging, and a silent format "+
@@ -217,6 +225,15 @@ func main() {
 	}); err != nil {
 		log.Fatalf("simdlogs: %v", err)
 	}
+	// Loaded and validated BEFORE the server starts serving, so a bad rule is
+	// a startup failure rather than a corrupted /metrics an hour later.
+	var rules *config.RuleSet
+	if *rulesFile != "" {
+		rules, err = config.LoadRules(*rulesFile)
+		if err != nil {
+			log.Fatalf("simdlogs: %v", err)
+		}
+	}
 	cfg.Limits.MaxVectorK = *maxVectorK
 	cfg.Limits.MaxVectorDim = *maxVectorDim
 	cfg.Limits.MaxVectorCandidates = *maxVectorCandidates
@@ -230,6 +247,24 @@ func main() {
 	srv, err2 := api.NewServerConfig(cfg)
 	if err2 != nil {
 		log.Fatal(err2)
+	}
+	if rules != nil {
+		// Registered after the server exists and before it serves. Each
+		// registration re-validates -- the file was already checked, so a
+		// failure here is a rule whose QUERY does not parse, which the file
+		// loader deliberately does not know how to check.
+		for _, m := range rules.Metrics {
+			if err := srv.AddMetricRule(m); err != nil {
+				log.Fatalf("simdlogs: %v", err)
+			}
+		}
+		for _, a := range rules.Alerts {
+			if err := srv.AddAlertRule(a); err != nil {
+				log.Fatalf("simdlogs: %v", err)
+			}
+		}
+		log.Printf("rules: %d metric, %d alert from %s",
+			len(rules.Metrics), len(rules.Alerts), *rulesFile)
 	}
 	if *authFile != "" {
 		ac, err := config.LoadAuth(*authFile)
