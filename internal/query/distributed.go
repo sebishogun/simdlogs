@@ -206,6 +206,21 @@ func PlanDistributed(pipes []Pipe) Plan {
 	var plan Plan
 	for i, p := range pipes {
 		class := ClassifyPipe(p)
+		// A pipe that strips _time stops the push-down, however row-local it
+		// is.
+		//
+		// The coordinator merges shard rows in TIME ORDER, and it reads that
+		// time from the row. A `fields` or `delete` applied on the shards
+		// removes it, so every merged row shares the key 0 and the order
+		// becomes whichever fan-out goroutine finished first: `* | fields _msg
+		// | limit 5` over three shards returned shard 2's first five rows.
+		//
+		// Run at the coordinator instead, the projection happens after the
+		// merge, which is where a single node does it too -- it projects after
+		// its scan, not before.
+		if class == PipeRowLocal && stripsTime(p) {
+			class = PipeCoordinatorOnly
+		}
 		if class == PipeRowLocal {
 			plan.ShardPipes = append(plan.ShardPipes, p)
 			continue
@@ -228,4 +243,30 @@ func PlanDistributed(pipes []Pipe) Plan {
 func Distributable(pipes []Pipe) (bool, string) {
 	p := PlanDistributed(pipes)
 	return p.Reject == "", p.Reject
+}
+
+// stripsTime reports whether a pipe removes _time from the rows it emits.
+//
+// Only the two projections can: `fields` keeps a named set, and `delete` drops
+// one. Every other row-local pipe adds or rewrites fields and leaves _time
+// alone. A pipe added later that can remove it belongs here -- the cost of
+// missing one is a merge ordered by goroutine completion, which looks like data
+// in a plausible but wrong order.
+func stripsTime(p Pipe) bool {
+	switch t := p.(type) {
+	case *FieldsPipe:
+		for _, f := range t.Keep {
+			if f == "_time" {
+				return false
+			}
+		}
+		return true
+	case *DeletePipe:
+		for _, f := range t.Drop {
+			if f == "_time" {
+				return true
+			}
+		}
+	}
+	return false
 }

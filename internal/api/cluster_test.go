@@ -145,8 +145,16 @@ func TestClusterFederation(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("federated select got %d rows, want 2 (one per backend):\n%s", len(lines), b)
 	}
-	// _time 2000 (two) is newer than 1000 (one), so it merges first.
-	if !strings.Contains(lines[0], "two") || !strings.Contains(lines[1], "one") {
-		t.Fatalf("merge order wrong:\n%s", b)
+	// OLDEST first, because this select carries no `limit`.
+	//
+	// This asserted newest-first, which is what the merge used to do
+	// unconditionally -- and it is what a single node does only when `limit` is
+	// set. `*` on one node answers oldest-first (scan order); `*&limit=N`
+	// answers the newest N, newest-first. An unlimited cluster select was
+	// coming back reversed relative to the server it is a cluster of, and this
+	// test was pinning the reversal.
+	if !strings.Contains(lines[0], "one") || !strings.Contains(lines[1], "two") {
+		t.Fatalf("merge order wrong -- an unlimited select is oldest-first, as a "+
+			"single node returns it:\n%s", b)
 	}
 }

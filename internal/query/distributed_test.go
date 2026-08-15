@@ -84,7 +84,12 @@ func TestNonMergeableAggregatesExplainThemselves(t *testing.T) {
 // The plan splits at the first non-row-local pipe, and everything from there
 // runs at the coordinator.
 func TestPlanSplitsAtTheFirstNonRowLocalPipe(t *testing.T) {
-	q, err := ParseLogsQL(`* | fields a, b | rename a as c | sort by (c) | limit 5`)
+	// `fields a, b` does not keep _time, so it stops the push-down even though
+	// it is row-local: the coordinator merges in time order and reads that time
+	// from the row, so a shard that projected it away leaves every merged row
+	// sharing the key 0 and the order becomes goroutine completion order. The
+	// query below keeps _time, so the split is the one this test is about.
+	q, err := ParseLogsQL(`* | fields _time, a, b | rename a as c | sort by (c) | limit 5`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,5 +144,42 @@ func TestAQuantileQueryIsRejected(t *testing.T) {
 	}
 	if !strings.Contains(plan.Reject, "sketch") {
 		t.Errorf("the refusal does not say what would fix it: %s", plan.Reject)
+	}
+}
+
+// A projection that drops _time is not pushed to the shards.
+//
+// It is row-local in shape, and pushing it down breaks the merge: the
+// coordinator orders shard rows by the time it reads from each row, so a shard
+// that projected _time away leaves every row sharing the key 0 and the order
+// becomes whichever fan-out goroutine finished first.
+func TestAProjectionThatDropsTimeStaysAtTheCoordinator(t *testing.T) {
+	for _, tc := range []struct {
+		q          string
+		wantShard  int
+		wantCoord  int
+		reasonNote string
+	}{
+		{`* | fields _msg | sort by (_msg)`, 0, 2, "fields without _time"},
+		{`* | fields _time, _msg | sort by (_msg)`, 1, 1, "fields keeping _time"},
+		{`* | delete _time | sort by (_msg)`, 0, 2, "delete of _time"},
+		{`* | delete _msg | sort by (level)`, 1, 1, "delete of another field"},
+		{`* | rename a as b | sort by (b)`, 1, 1, "rename touches no _time"},
+	} {
+		t.Run(tc.reasonNote, func(t *testing.T) {
+			q, err := ParseLogsQL(tc.q)
+			if err != nil {
+				t.Skipf("does not parse: %v", err)
+			}
+			plan := PlanDistributed(q.Pipes)
+			if len(plan.ShardPipes) != tc.wantShard {
+				t.Fatalf("%d shard pipes, want %d (%s)",
+					len(plan.ShardPipes), tc.wantShard, tc.reasonNote)
+			}
+			if len(plan.CoordinatorPipes) != tc.wantCoord {
+				t.Fatalf("%d coordinator pipes, want %d",
+					len(plan.CoordinatorPipes), tc.wantCoord)
+			}
+		})
 	}
 }

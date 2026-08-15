@@ -463,7 +463,7 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	shardReq := r.Clone(r.Context())
-	shardReq.URL.RawQuery = shardQueryURL(r, shardQuery)
+	shardReq.URL.RawQuery = shardQueryURL(r, shardQuery, coordPipes)
 
 	// The completeness gate BEFORE the merge. A shard that did not answer used
 	// to contribute nothing and the merge proceeded, so a cluster read with one
@@ -500,13 +500,26 @@ func (s *Server) mergeRows(
 	type row struct {
 		t    int64
 		line []byte
+		// shard and seq make the order TOTAL and reproducible.
+		//
+		// rowLineTime returns 0 for any line with no `"_time":"` -- which is
+		// every row after a projecting pipe -- so a whole result could share
+		// one key and the sort left it in the order the goroutines happened to
+		// finish. `* | fields _msg | limit 5` over three shards returned shard
+		// 2's first five, because shard 2's chunk landed first.
+		//
+		// Ties on t are broken by (shard, position within that shard), which is
+		// the order a single node would have produced: shards hold disjoint
+		// time ranges, and within a shard the scan order is preserved.
+		shard int
+		seq   int
 	}
 	var mu sync.Mutex
 	var all []row
 	var wg sync.WaitGroup
-	for _, body := range bodies {
+	for shardIdx, body := range bodies {
 		wg.Add(1)
-		go func(body []byte) {
+		go func(shardOf int, body []byte) {
 			defer wg.Done()
 			if body == nil {
 				return
@@ -523,12 +536,15 @@ func (s *Server) mergeRows(
 				if len(line) == 0 {
 					continue
 				}
-				local = append(local, row{t: rowLineTime(bytesToString(line)), line: line})
+				local = append(local, row{
+					t: rowLineTime(bytesToString(line)), line: line, shard: shardOf,
+					seq: len(local),
+				})
 			}
 			mu.Lock()
 			all = append(all, local...)
 			mu.Unlock()
-		}(body)
+		}(shardIdx, body)
 	}
 	wg.Wait()
 
@@ -541,7 +557,15 @@ func (s *Server) mergeRows(
 		// ascending; the bare-select path below keeps newest-first, because
 		// there `limit` means "the newest N" and that is the endpoint's
 		// documented meaning.
-		sort.Slice(all, func(i, j int) bool { return all[i].t < all[j].t })
+		sort.Slice(all, func(i, j int) bool {
+			if all[i].t != all[j].t {
+				return all[i].t < all[j].t
+			}
+			if all[i].shard != all[j].shard {
+				return all[i].shard < all[j].shard
+			}
+			return all[i].seq < all[j].seq
+		})
 
 		// The rows are parsed into fields ONLY here.
 		//
@@ -557,6 +581,23 @@ func (s *Server) mergeRows(
 		if err != nil {
 			s.writeErr(w, r, readSpec(), query.HTTPStatus(err), err.Error())
 			return
+		}
+
+		// The endpoint's `limit`, applied once, here -- and only where a single
+		// node would apply it. See limitBoundsOutput.
+		//
+		// `limit` means the NEWEST n, returned newest-first. Measured against a
+		// single node: `*` unlimited answers line 00 first and `*&limit=3`
+		// answers line 29 first, on the same data. Taking the first n of the
+		// ascending merge gave the OLDEST n -- the opposite rows, not merely
+		// the opposite order.
+		if n := endpointLimit(r); n > 0 && limitBoundsOutput(coordPipes) {
+			if len(merged) > n {
+				merged = merged[len(merged)-n:]
+			}
+			for i, j := 0, len(merged)-1; i < j; i, j = i+1, j-1 {
+				merged[i], merged[j] = merged[j], merged[i]
+			}
 		}
 		w.Header().Set("Content-Type", ndjsonContentType)
 		w.WriteHeader(http.StatusOK)
@@ -576,7 +617,33 @@ func (s *Server) mergeRows(
 		return
 	}
 
-	sort.Slice(all, func(i, j int) bool { return all[i].t > all[j].t }) // newest first
+	// The bare-select order, matching a single node exactly.
+	//
+	// Newest-first ONLY when `limit` is set. A single node answers `*` with
+	// line 00 first and `*&limit=3` with line 29 first on the same data --
+	// `limit` is LastN, "the newest N", and an unlimited select is scan order,
+	// which is oldest first. This path sorted newest-first unconditionally, so
+	// every unlimited cluster select came back reversed relative to the server
+	// it is a cluster of.
+	//
+	// The tiebreak is TOTAL. sort.Slice is not stable, so rows sharing a
+	// timestamp came back in an order that varied between identical requests:
+	// 40 requests over three shards of eight rows at one timestamp produced two
+	// distinct four-row answers. With `limit` that is different ROWS, not
+	// merely a different order.
+	newestFirst := endpointLimit(r) > 0
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].t != all[j].t {
+			if newestFirst {
+				return all[i].t > all[j].t
+			}
+			return all[i].t < all[j].t
+		}
+		if all[i].shard != all[j].shard {
+			return all[i].shard < all[j].shard
+		}
+		return all[i].seq < all[j].seq
+	})
 
 	limit := 0
 	if v := r.FormValue("limit"); v != "" {
@@ -670,9 +737,33 @@ func (s *Server) federatedESCount(w http.ResponseWriter, r *http.Request) {
 // federatedESSearch merges ES _search hits across storage nodes.
 func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
+
+	// The SHARDS are asked for from=0 and size=from+size.
+	//
+	// The client's body went to every shard verbatim, so each one skipped
+	// `from` of its OWN hits before answering -- and then the coordinator
+	// skipped `from` again over the concatenation. Measured, 2 shards x 6 docs,
+	// {"from":4,"size":4}:
+	//
+	//   single node   4 hits (a-04 a-05 b-00 b-01)
+	//   cluster       0 hits, "total":12, HTTP 200
+	//
+	// Each shard returned its last 2, the coordinator dropped 4 more, and rows
+	// 0-3 of every shard were unreachable from any page at all. A shard must
+	// return everything the coordinator might need to page over, which is the
+	// first from+size of that shard, and the paging happens once, here.
+	var want esQuery
+	dec0 := json.NewDecoder(bytes.NewReader(body))
+	dec0.DisallowUnknownFields()
+	_ = dec0.Decode(&want)
+	shardBody := body
+	if b, err := reframeESPaging(body, want); err == nil {
+		shardBody = b
+	}
+
 	var hits []json.RawMessage
 	total := 0
-	bodies, w, ok := s.fanOutChecked(w, r, "/_search", body)
+	bodies, w, ok := s.fanOutChecked(w, r, "/_search", shardBody)
 	if !ok {
 		return
 	}
@@ -697,10 +788,12 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 	// renders `size` results shows three pages' worth on one page, while one
 	// that paginates by `from` skips two thirds of the corpus on every step.
 	// The total was already cluster-wide; only the page was not.
-	var body2 esQuery
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	_ = dec.Decode(&body2) // already validated by the storage nodes
+	// Ordered before paging. The concatenation is in shard-response order, so
+	// without this a page is "whichever shard answered first", and two
+	// identical requests can return different documents.
+	sortESHits(hits)
+
+	body2 := want
 	if body2.From > 0 {
 		if body2.From >= len(hits) {
 			hits = nil
@@ -748,7 +841,21 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 // a parameter that must always take one value is a way to get it wrong again.
 func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, path string) {
 	counts := map[string]int{}
-	vcBodies, w, ok := s.fanOutChecked(w, r, path, nil)
+	// The SHARDS are asked without a limit.
+	//
+	// `limit` reached them too, so each returned only its own top N and the
+	// merge combined N truncated lists. Re-applying the limit afterwards then
+	// looked like it made the answer cluster-wide, and the comment below said
+	// so, but a value can only survive if it was already in some shard's top N:
+	//
+	//   svc counts per shard {big1:4, spread:3, second:2} x3, limit=2
+	//     single node   [spread:9, second:6]
+	//     cluster       [spread:9, big1:4]
+	//
+	// second has 6 hits cluster-wide and is displaced by one with 4, because
+	// second was third on every shard and never returned by any of them.
+	vcReq := withoutLimits(r)
+	vcBodies, w, ok := s.fanOutChecked(w, vcReq, path, nil)
 	if !ok {
 		return
 	}
@@ -833,6 +940,17 @@ type matrixSeries struct {
 // all, which is why stats_query_range over a cluster is restricted to additive
 // aggregates -- see the LLD.
 func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
+	// The same refusal the other two stats surfaces apply.
+	//
+	// This function's own doc comment said "stats_query_range over a cluster is
+	// meaningful only for additive aggregates" and nothing checked it, so it
+	// summed whatever came back: two shards averaging 10 answered 20, and a
+	// quantile was answered where /select/logsql/query and
+	// /select/logsql/stats_query both refuse it with 400. One binary, the same
+	// aggregate, three different answers depending on which endpoint was asked.
+	if !s.rejectNonMergeableStats(w, r) {
+		return
+	}
 	srBodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/stats_query_range", nil)
 	if !ok {
 		return
@@ -1328,3 +1446,61 @@ func (s *Server) notePartialRead() { partialReads.Add(1) }
 // dashboard quietly running on partial answers is the state this whole
 // mechanism exists to make visible.
 func PartialReads() int64 { return partialReads.Load() }
+
+// reframeESPaging rewrites a search body so the shards return enough for the
+// coordinator to page over: from=0, size=from+size.
+//
+// The original body is edited as JSON rather than re-marshalled from the parsed
+// struct, because esQuery does not carry every field a client may send and
+// re-marshalling would silently drop the ones it does not know.
+func reframeESPaging(body []byte, q esQuery) ([]byte, error) {
+	size := q.Size
+	if size <= 0 {
+		size = esDefaultSize
+	}
+	need := q.From + size
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	raw["from"] = json.RawMessage("0")
+	raw["size"] = json.RawMessage(strconv.Itoa(need))
+	return json.Marshal(raw)
+}
+
+// sortESHits orders merged hits by @timestamp, OLDEST FIRST.
+//
+// Oldest first because that is what a single node returns -- measured, not
+// assumed: `{"from":0,"size":2}` against one node answers doc-00 then doc-01.
+// A page has to be the same page whichever it is asked of, and the first
+// version of this sorted newest-first, which made every page a different set
+// of documents rather than a wrongly-ordered one.
+//
+// A hit whose timestamp cannot be read sorts last: an unreadable timestamp
+// should not displace a real document from page one.
+func sortESHits(hits []json.RawMessage) {
+	key := func(h json.RawMessage) string {
+		var v struct {
+			Source struct {
+				Time string `json:"@timestamp"`
+			} `json:"_source"`
+		}
+		if json.Unmarshal(h, &v) != nil {
+			return ""
+		}
+		return v.Source.Time
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		a, b := key(hits[i]), key(hits[j])
+		if a == b {
+			return false
+		}
+		if a == "" {
+			return false
+		}
+		if b == "" {
+			return true
+		}
+		return a < b // oldest first, as a single node returns them
+	})
+}

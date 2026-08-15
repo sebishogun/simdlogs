@@ -32,7 +32,10 @@ import (
 // them again here is what makes "the top 10 values" the cluster's top 10 rather
 // than the first shard's.
 func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
-	bodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/facets", nil)
+	// Without the limits, for the reason in federatedValueCounts: a shard that
+	// truncated to its own top N can never contribute a value that is popular
+	// across the cluster and unremarkable on each shard.
+	bodies, w, ok := s.fanOutChecked(w, withoutLimits(r), "/select/logsql/facets", nil)
 	if !ok {
 		return
 	}
