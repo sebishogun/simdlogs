@@ -4538,3 +4538,82 @@ documented a guarantee its error path abandoned; `ReplicaState.Err` documented
 a distinction its guard did not draw. In each one the correct behaviour was
 WRITTEN DOWN, in the same file, and the code did something else -- which is
 why reading did not find them and asking the cluster did.
+
+## 46. Round three: two of the fixes were the defect, and a gate its own reviewer bypassed on the first try
+
+Three reviewers went over the round-two commits. Two ran live two-shard
+clusters against a single node holding the same rows; one had reading only and
+said so. Between them they found that **two of the fixes had introduced the
+thing they were fixing**, and that one new guard was bypassable in one line.
+
+**The facets fix made every cluster answer carry fields a node drops.** The
+shards are sent `keep_const_fields=1` so a field constant on ONE shard survives
+to be judged over the union — sound, and the coordinator then applied only the
+cardinality half of `facetKeep` and never `distinct > 1 || keepConst`.
+Measured, two nodes of six rows against one node of twelve, `?query=*`:
+
+    cluster  _msg _stream _stream_id _time konst level n svc   8 fields
+    single   _msg                    _time       level n svc   4 fields
+
+`_stream_id` is a 48-hex-character value. Every field constant over the queried
+window — `_stream` and `_stream_id` whenever the filter selects one stream,
+`host` on a single-host cluster, the field just filtered on — appeared in a
+cluster facet list and not a node's, and facets drives the UI.
+
+**The three-replica repair fix made repair stop converging.** `overlapping`
+uses a CLOSED interval deliberately: a group whose `TimeMax` equals the next
+one's `TimeMin` shares a timestamp, and a duplicate row at the boundary is
+still a duplicate. That is right for a compacted group against its pieces and
+wrong for two ordinary pieces of ONE store, which by this file's own invariant
+cannot hold the same rows. Growing `spans` mid-pass made it reachable, and the
+block is recomputed identically every pass, so it never clears:
+
+    source: 72e6653f[t0,t0]  0f0565fe[t1,t2]  b621a270[t2,t3]
+    before  copied 3, blocked 0, complete true   -> destination 6 of 6 rows
+    after   copied 2, blocked 1, complete false  -> destination 3 of 6 rows
+            pass 2: copied 0, blocked 1          PERMANENTLY STUCK
+
+Rows sharing one nanosecond split across a size-triggered flush produce exactly
+that, on any client timestamping at second or millisecond granularity — syslog,
+most of them. Not silent (`complete: false`), but a hard stall on an ordinary
+shape, and the operator is told to investigate a compaction that never
+happened. Fixed by provenance: two groups held by one replica are known
+non-duplicates, so the guard skips them, and the union is walked in TIME order
+so the narrowest spelling wins rather than whichever hash sorted first.
+
+**The `_stream_id` fix turned a duplicate-key bug into a differing-value bug.**
+The skip was put on the field loop, and a shard runs the bare `*` with
+`withStream` true — so the ingested value was dropped AT THE SHARD and never
+crossed the wire, while a node's projection (`withStream` false, nothing
+synthesized) kept it. `| filter _stream_id:="CLIENT-SUPPLIED"` matched on a
+node and could not match on a cluster. The skip belongs on the SYNTHESIS.
+
+**The not-a-state guard was bypassed in one line.**
+`bytes.Contains(body, []byte("\"groups\""))` matches the quoted token anywhere,
+including inside a value: `{"note":"groups"}` passed it and read as an empty
+replica — the exact state `ReplicaState.Err`'s doc says must never be inferred.
+Its reviewer broke it on the first attempt. It unmarshals into
+`map[string]json.RawMessage` and tests for the KEY now.
+
+**And one that was fixed correctly but incompletely.** `release.yml` has FOUR
+checkout steps; three were given the input ref and the one that COMPILES was
+not, so a dry run of `v1.2.3` from `main` still built `main` and stamped it
+`v1.2.3`. Counting is not reviewing.
+
+**Measured, on the byte budget the same round made real.** Two routers over
+the same two shards, 200,000 rows, four coordinator pipes, interleaved eight
+times, minimum of each: 0.4009 s with the budget on, 0.3647 s off — 36.2 ms,
+9.9% of the request, for a bound that genuinely did nothing before (the same
+query at 1 MB answered 200 with 200,000 lines and now answers 413). The
+measurement was two passes per pipe where one suffices, because the post-pipe
+size of pipe k is the pre-pipe size of pipe k+1; carried forward now. And
+`measure` was `MaxBytes > 0` where `exceeded` also checks `maxMemory` against
+the same argument — the engine already has `countsBytes()` for that decision,
+and using anything else is the same limit-nothing-reads shape one layer down.
+
+**The shape.** Entry 45 said the correct behaviour was written down in the same
+file and the code did something else. This is the next turn of that: the FIX
+was written down correctly in its own commit message, and the code did
+something else — three times, in one sitting, by the person who had just
+written the rule. Reading did not find any of it. Two live clusters and an
+adversarial reader did.

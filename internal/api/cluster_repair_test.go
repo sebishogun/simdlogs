@@ -288,11 +288,17 @@ func TestRepairDoesNotCopyOverlappingMembersOfOneUnion(t *testing.T) {
 		{Digest: "G", TimeMin: 0, TimeMax: 20},
 	}
 
-	// What the pass does now: the inventory grows as it copies.
+	// A holds the two pieces, B holds the compacted group, C holds nothing.
+	holders := map[string]map[int]bool{
+		"g1": {0: true}, "g2": {0: true}, "G": {1: true},
+	}
+
+	// What the pass does now: the inventory grows as it copies, and a group
+	// sharing a holder with one already there is not a candidate for overlap.
 	spans := append([]storage.GroupDigest(nil), have...)
 	var copied, blocked []string
 	for _, g := range union {
-		if overlapping(spans, g) != "" {
+		if overlappingFrom(spans, g, holders) != "" {
 			blocked = append(blocked, g.Digest)
 			continue
 		}
@@ -319,5 +325,55 @@ func TestRepairDoesNotCopyOverlappingMembersOfOneUnion(t *testing.T) {
 	if wouldCopy != 3 {
 		t.Errorf("checking only the pre-pass inventory copies %d of 3; this test "+
 			"is asserting a difference that does not exist", wouldCopy)
+	}
+}
+
+// Two ordinary adjacent groups from ONE replica are both copied, even when
+// they share a boundary timestamp.
+//
+// overlapping uses a CLOSED interval on purpose -- a group whose TimeMax
+// equals the next one's TimeMin shares a timestamp, and a duplicate row at the
+// boundary is still a duplicate. That is right for a compacted group against
+// its pieces and wrong for two pieces of one store, which by this file's own
+// invariant cannot contain the same rows.
+//
+// It only became reachable when the three-replica fix started growing `spans`
+// mid-pass, and it was PERMANENT: copy g1, block g2, and every later pass
+// rebuilds the same state and blocks it again, so the destination stays short
+// forever while reporting a healthy store -- and a read that lands on it
+// answers fewer rows at HTTP 200 with Complete true, because Complete reports
+// local quarantine and not divergence from peers.
+//
+// Rows sharing one nanosecond split across a size-triggered flush produce
+// exactly this, on any client timestamping at second or millisecond
+// granularity.
+func TestAdjacentGroupsFromOneReplicaAreNotBlocked(t *testing.T) {
+	const T = 1767225600000000000
+	g1 := storage.GroupDigest{Digest: "g1", TimeMin: T - 100, TimeMax: T}
+	g2 := storage.GroupDigest{Digest: "g2", TimeMin: T, TimeMax: T + 100} // touching
+	holders := map[string]map[int]bool{"g1": {0: true}, "g2": {0: true}}
+
+	// Destination C is empty; the pass copies g1 then meets g2.
+	spans := []storage.GroupDigest{g1}
+	if blocked := overlappingFrom(spans, g2, holders); blocked != "" {
+		t.Errorf("g2[%d,%d] blocked by %s after g1[%d,%d] was copied; both come "+
+			"from replica 0, which cannot hold the same rows twice -- and this "+
+			"block never clears, so the destination is short forever",
+			g2.TimeMin, g2.TimeMax, blocked, g1.TimeMin, g1.TimeMax)
+	}
+
+	// And the guard still fires when they come from DIFFERENT stores, which is
+	// the compaction case it exists for.
+	other := map[string]map[int]bool{"g1": {0: true}, "g2": {1: true}}
+	if overlappingFrom(spans, g2, other) == "" {
+		t.Error("two touching groups from different replicas were not blocked; " +
+			"that is the compaction divergence the guard is for")
+	}
+
+	// The raw predicate is unchanged: it is the closed interval, deliberately.
+	if overlapping(spans, g2) == "" {
+		t.Error("overlapping no longer treats a shared boundary as an overlap; " +
+			"the closed interval is the point and this test would then be " +
+			"asserting nothing")
 	}
 }

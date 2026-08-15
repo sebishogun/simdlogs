@@ -1114,25 +1114,16 @@ func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 		first = false
 	}
 	stream := ""
+	sawStreamID := false
 	for _, f := range row.Fields {
 		if f.Key == "_time" {
 			continue
 		}
-		// The same skip _time gets, for the same reason: _stream_id is
-		// SYNTHESIZED below from stream membership, so a row carrying a field
-		// of that name -- it is not a reserved ingest name, so a client can
-		// send one -- produced an object with the key twice. Go's
-		// json.Unmarshal then takes the last, a first-wins parser takes the
-		// other, and a single node gave a third answer, all at HTTP 200.
-		//
-		// The synthesized value wins because that is what the name means to a
-		// client grouping by stream. The ingested value is still in the store
-		// and still reachable under any other name.
-		if withStream && f.Key == "_stream_id" {
-			continue
-		}
 		if f.Key == "_stream" {
 			stream = f.Value
+		}
+		if f.Key == "_stream_id" {
+			sawStreamID = true
 		}
 		if !first {
 			buf = append(buf, ',')
@@ -1159,16 +1150,34 @@ func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 			buf = appendJSONString(buf, stream)
 			buf = append(buf, '"')
 		}
-		if !first {
-			buf = append(buf, ',')
+		// Not written when the ROW already carried one.
+		//
+		// _stream_id is not a reserved ingest name, so a client can send a
+		// field of that name, and emitting the synthesized pair on top of it
+		// produced an object with the key TWICE: Go's json.Unmarshal takes the
+		// last, a first-wins parser takes the other, and a projection -- which
+		// runs with withStream false and so never synthesized -- gave a third
+		// answer.
+		//
+		// Skipping the SYNTHESIS rather than the row's field is what makes the
+		// cluster and the node agree. The first version of this skipped the
+		// field instead, and a shard runs the bare `*` with withStream true --
+		// so the ingested value was dropped AT THE SHARD and never crossed the
+		// wire, while a node's projection kept it. The duplicate-key bug became
+		// a differing-value bug, and `| filter _stream_id:="..."` matched on a
+		// node and could not match on a cluster.
+		if !sawStreamID {
+			if !first {
+				buf = append(buf, ',')
+			}
+			buf = append(buf, `"_stream_id":"`...)
+			if stream == query.EmptyStream {
+				buf = append(buf, emptyStreamID...) // hashed once, not per row
+			} else {
+				buf = append(buf, query.StreamID(stream)...)
+			}
+			buf = append(buf, '"')
 		}
-		buf = append(buf, `"_stream_id":"`...)
-		if stream == query.EmptyStream {
-			buf = append(buf, emptyStreamID...) // hashed once, not per row
-		} else {
-			buf = append(buf, query.StreamID(stream)...)
-		}
-		buf = append(buf, '"')
 	}
 	buf = append(buf, '}', '\n')
 	return buf

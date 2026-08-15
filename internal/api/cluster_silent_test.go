@@ -92,11 +92,13 @@ func TestTheFacetLimitTruncatesValuesNotFields(t *testing.T) {
 	body := `{"facets":[
 		{"field_name":"level","values":[{"field_value":"a","hits":5},{"field_value":"b","hits":4},{"field_value":"c","hits":3}]},
 		{"field_name":"svc","values":[{"field_value":"x","hits":9},{"field_value":"y","hits":2}]},
-		{"field_name":"host","values":[{"field_value":"h1","hits":7}]}]}`
+		{"field_name":"host","values":[{"field_value":"h1","hits":7},{"field_value":"h2","hits":1}]}]}`
 	var saw string
 	a := facetShard(t, &saw, body)
 	ts := router(t, a.URL)
 
+	// Every field here has two or more distinct values, so none is dropped by
+	// the const rule and what is left to measure is the limit.
 	_, got, raw := getJSONFrom(t, ts, "/select/logsql/facets?query=*&limit=2")
 	facets, _ := got["facets"].([]any)
 	if len(facets) != 3 {
@@ -274,16 +276,33 @@ func TestARowWithItsOwnStreamIDDoesNotDuplicateTheKey(t *testing.T) {
 	if n := strings.Count(string(line), `"_stream_id"`); n != 1 {
 		t.Fatalf("the encoded row carries _stream_id %d times: %s", n, line)
 	}
-	// And the synthesized value is the one that survives, which is what the
-	// name means to a client grouping by stream.
-	if strings.Contains(string(line), "CLIENT-SUPPLIED") {
-		t.Errorf("the client's value won over the synthesized one: %s", line)
+	// The ROW's value survives, and the synthesis is what is skipped.
+	//
+	// The other way round -- skipping the field -- makes a cluster and a node
+	// disagree on the VALUE rather than on the key count: a shard runs the
+	// bare `*` with withStream true, so the ingested value would be dropped at
+	// the shard and never cross the wire, while a node's projection (withStream
+	// false, nothing synthesized) keeps it.
+	if !strings.Contains(string(line), "CLIENT-SUPPLIED") {
+		t.Errorf("the row's own _stream_id was dropped in favour of the "+
+			"synthesized one, so a cluster and a node return different values "+
+			"for the same row: %s", line)
 	}
-	// Without withStream nothing is synthesized, so the row's own field is
-	// the answer and is emitted unchanged.
 	plain := appendRowJSON(nil, row, false)
 	if !strings.Contains(string(plain), "CLIENT-SUPPLIED") {
 		t.Errorf("without the synthesized pair the row's own field vanished: %s", plain)
+	}
+	if string(plain) == string(line) {
+		// Not required, but if they were identical the withStream flag would
+		// be doing nothing here and this test would not be measuring it.
+		t.Logf("note: withStream made no difference for this row: %s", line)
+	}
+
+	// A row with NO _stream_id of its own still gets the synthesized pair,
+	// which is what the field means to a client grouping by stream.
+	plainRow := query.Row{Time: 1, Fields: []query.Field{{Key: "_msg", Value: "a"}}}
+	if got := appendRowJSON(nil, plainRow, true); !strings.Contains(string(got), `"_stream_id"`) {
+		t.Errorf("a row with no _stream_id of its own lost the synthesized one: %s", got)
 	}
 }
 
@@ -295,5 +314,99 @@ func queryRowWithStreamID() query.Row {
 			{Key: "_msg", Value: "a"},
 			{Key: "_stream_id", Value: "CLIENT-SUPPLIED"},
 		},
+	}
+}
+
+// A field constant across the whole cluster is dropped, the way a node drops
+// one constant across its store.
+//
+// REGRESSION introduced by the facets fix: the shards are sent
+// `keep_const_fields=1` so that a field constant on ONE shard survives to be
+// judged over the union -- and the coordinator applied only the cardinality
+// half of facetKeep, never the const half. Measured, two nodes of six rows
+// against one node of twelve, `?query=*`: the cluster returned seven fields
+// and the node returned four.
+func TestAFieldConstantAcrossTheClusterIsDropped(t *testing.T) {
+	// Both shards see `svc` as the same single value; `level` varies.
+	body := func(svc string) string {
+		return `{"facets":[
+			{"field_name":"level","values":[{"field_value":"a","hits":5},{"field_value":"b","hits":4}]},
+			{"field_name":"svc","values":[{"field_value":"` + svc + `","hits":9}]}]}`
+	}
+	var s1, s2 string
+	a := facetShard(t, &s1, body("api"))
+	b := facetShard(t, &s2, body("api"))
+	ts := router(t, a.URL, b.URL)
+
+	_, got, raw := getJSONFrom(t, ts, "/select/logsql/facets?query=*")
+	names := facetNames(got)
+	if len(names) != 1 || names[0] != "level" {
+		t.Errorf("cluster returned %v; svc is one value across the whole cluster "+
+			"and a node would drop it: %s", names, raw)
+	}
+
+	// keep_const_fields=1 keeps it, which is what the parameter is for.
+	_, got, raw = getJSONFrom(t, ts, "/select/logsql/facets?query=*&keep_const_fields=1")
+	if names = facetNames(got); len(names) != 2 {
+		t.Errorf("with keep_const_fields=1 the cluster returned %v, want both: %s",
+			names, raw)
+	}
+
+	// A field constant on EACH shard and varied across them is kept, which is
+	// why the shards are asked to keep theirs.
+	var t1, t2 string
+	c := facetShard(t, &t1, body("api"))
+	d := facetShard(t, &t2, body("web"))
+	ts2 := router(t, c.URL, d.URL)
+	_, got, raw = getJSONFrom(t, ts2, "/select/logsql/facets?query=*")
+	if names = facetNames(got); len(names) != 2 {
+		t.Errorf("svc is constant on each shard and varied across them, so the "+
+			"cluster must keep it; got %v: %s", names, raw)
+	}
+}
+
+func facetNames(got map[string]any) []string {
+	var out []string
+	for _, f := range got["facets"].([]any) {
+		out = append(out, f.(map[string]any)["field_name"].(string))
+	}
+	return out
+}
+
+// A truncated shard response is refused, including when the cut lands right
+// after a nested value's closing brace.
+//
+// looksLikeJSONObject first checked only the first and last byte, so a row
+// with a nested value cut after that value's `}` ended in the right character
+// and went to the client as a row. It balances the braces now, string-aware.
+func TestATruncatedShardLineIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		refuse     bool
+	}{
+		{"cut mid-string", `{"_time":"2026-01-01T00:00:00Z","_msg":"hel`, true},
+		{"cut after a nested brace", `{"_time":"2026-01-01T00:00:00Z","ctx":{"a":1}`, true},
+		{"brace inside a string", `{"_msg":"a } b"}`, false},
+		{"nested and whole", `{"_msg":"a","ctx":{"a":1}}`, false},
+		{"trailing bytes", `{"_msg":"a"} extra`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			good := goodShard(t)
+			bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writeEnvelope(w.Header(), 0, 0, true, 1, "")
+				w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(bad.Close)
+			ts := router(t, good.URL, bad.URL)
+
+			resp, body := callEndpoint(t, ts, struct{ name, path, method, body string }{
+				"", "/select/logsql/query?query=*", "GET", "",
+			})
+			refused := resp.StatusCode/100 != 2
+			if refused != tc.refuse {
+				t.Errorf("answered %d for %s; want refused=%v.\n  body: %s",
+					resp.StatusCode, tc.body, tc.refuse, truncate(body, 200))
+			}
+		})
 	}
 }

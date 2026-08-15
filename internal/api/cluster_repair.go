@@ -216,6 +216,12 @@ type RepairReport struct {
 	// later pass finishes: a blocked group is work no pass will ever do, and it
 	// needs an operator.
 	Blocked int `json:"blocked"`
+	// Declined is groups a destination refused because it already had them --
+	// its reported state was stale by the time the transfer landed. Not an
+	// error and not a copy; recorded because a pass where every group is
+	// declined and nothing else is counted would otherwise be indistinguishable
+	// from a shard that was already in step.
+	Declined int `json:"declined"`
 	// Complete is false when any replica could not be reached, or when the
 	// bounds cut the pass short. A caller that treats an incomplete pass as
 	// convergence has re-created the problem repair exists to solve.
@@ -230,6 +236,7 @@ type ShardRepair struct {
 	Copied    int            `json:"copied"`
 	Remaining int            `json:"remaining"`
 	Blocked   int            `json:"blocked"`
+	Declined  int            `json:"declined"`
 	// Divergent is how many groups were not held by every reachable replica
 	// when the pass started. Zero means the shard was already in step.
 	Divergent int `json:"divergent"`
@@ -271,12 +278,25 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 		// treated as empty: a node that could not be asked may hold groups
 		// nobody else has, and repairing "into" it would copy the shard twice.
 		union := map[string]storage.GroupDigest{}
+		// Which replicas hold each group.
+		//
+		// Two groups held by ONE replica cannot contain the same rows: they
+		// come from one store, and groups within one store do not overlap.
+		// That is what tells a legitimately adjacent pair from a compacted
+		// alternative, and without it the overlap guard blocks the pair --
+		// permanently, because the block is recomputed identically on every
+		// pass. See holdersShare below.
+		holders := map[string]map[int]bool{}
 		for _, st := range states {
 			if st.Err != "" {
 				continue
 			}
 			for _, g := range st.Groups {
 				union[g.Digest] = g
+				if holders[g.Digest] == nil {
+					holders[g.Digest] = map[int]bool{}
+				}
+				holders[g.Digest][st.Replica] = true
 			}
 		}
 		for _, st := range states {
@@ -313,14 +333,29 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 			// -- reported as copied: 3, blocked: 0, complete: true. That is the
 			// outcome the comment below says this guard prevents.
 			spans := append([]storage.GroupDigest(nil), st.Groups...)
-			// Deterministic order, so two runs against the same divergence
-			// block the same group rather than whichever the map yielded
-			// first.
+			// TIME order, then digest for ties.
+			//
+			// Deterministic, so two runs against one divergence block the same
+			// group. And time order rather than digest order because the
+			// ordering decides which spelling of a diverged range wins: a hash
+			// is uncorrelated with anything, so a compacted group could be
+			// copied first and then block both of the pieces it replaced,
+			// leaving the destination with fewer, coarser groups than either
+			// source. Narrowest first is the conservative direction.
 			digests := make([]string, 0, len(union))
 			for d := range union {
 				digests = append(digests, d)
 			}
-			sort.Strings(digests)
+			sort.Slice(digests, func(i, j int) bool {
+				a, b := union[digests[i]], union[digests[j]]
+				if a.TimeMin != b.TimeMin {
+					return a.TimeMin < b.TimeMin
+				}
+				if a.TimeMax != b.TimeMax {
+					return a.TimeMax < b.TimeMax
+				}
+				return digests[i] < digests[j]
+			})
 			for _, digest := range digests {
 				g := union[digest]
 				if have[digest] {
@@ -352,7 +387,7 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 				// Overlapping means REFUSE. Repair's promise is that it never
 				// makes a replica worse, and duplicating or resurrecting rows
 				// is worse than leaving a divergence an operator can see.
-				if blocked := overlapping(spans, g); blocked != "" {
+				if blocked := overlappingFrom(spans, g, holders); blocked != "" {
 					sr.Blocked++
 					rep.Blocked++
 					rep.Complete = false
@@ -398,8 +433,17 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 				if errors.Is(err, errAlreadyHeld) {
 					// The destination declined because it already had the
 					// group -- its state was stale by the time the PUT landed.
-					// Nothing moved, so nothing is counted; the pass is still
-					// complete, because the group IS where it needs to be.
+					// Nothing moved, so nothing is counted as COPIED, and the
+					// pass is still complete, because the group IS where it
+					// needs to be.
+					//
+					// Counted separately rather than passed over in silence: a
+					// peer that declines EVERYTHING otherwise reports copied 0,
+					// remaining 0, blocked 0, complete true -- a clean bill of
+					// health for a replica that may hold nothing, on nothing
+					// but that replica's word.
+					sr.Declined++
+					rep.Declined++
 					continue
 				}
 				if err != nil {
@@ -589,6 +633,49 @@ func shortDigest(d string) string {
 // already has rows from that range. It may hold them as the groups g was
 // compacted from, or it may have dropped them to retention. Either way the
 // digests differ for a reason other than a missed write, and copying is unsafe.
+// overlappingFrom is overlapping, skipping any group that shares a holder
+// with g.
+//
+// The overlap guard is a heuristic for "these two spellings may be the same
+// rows", and it is right about a compacted group against its pieces. It is
+// WRONG about two ordinary adjacent groups from one store: overlapping uses a
+// CLOSED interval, deliberately, so a group whose TimeMax equals the next
+// one's TimeMin trips it -- and rows sharing one nanosecond split across a
+// size-triggered flush produce exactly that, on any client timestamping at
+// second or millisecond granularity.
+//
+// Before this pass grew `spans` mid-copy that was harmless: the guard only saw
+// the destination's own groups, which cannot overlap each other. Growing spans
+// made it reachable AND permanent -- copy g1, block g2, and every later pass
+// rebuilds the same state and blocks it again, so the destination is short
+// forever while reporting a healthy store. Reviewer C traced that; it is a
+// defect introduced by the three-replica fix, not by the original guard.
+//
+// Sharing a holder is the discriminator: one replica holding both means they
+// came from one store, and this file's own invariant is that groups within one
+// store do not overlap.
+func overlappingFrom(have []storage.GroupDigest, g storage.GroupDigest,
+	holders map[string]map[int]bool) string {
+	var candidates []storage.GroupDigest
+	for _, h := range have {
+		if holdersShare(holders[h.Digest], holders[g.Digest]) {
+			continue
+		}
+		candidates = append(candidates, h)
+	}
+	return overlapping(candidates, g)
+}
+
+// holdersShare reports whether one replica holds both groups.
+func holdersShare(a, b map[int]bool) bool {
+	for r := range a {
+		if b[r] {
+			return true
+		}
+	}
+	return false
+}
+
 func overlapping(have []storage.GroupDigest, g storage.GroupDigest) string {
 	for _, h := range have {
 		// Closed intervals: a group whose max equals another's min shares a

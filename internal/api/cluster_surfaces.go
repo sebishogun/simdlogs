@@ -95,6 +95,8 @@ func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
 	// missing from the cluster answer.
 	limit := intParam(r, "limit", query.DefaultFacetLimit)
 	maxValues := intParam(r, "max_values_per_field", query.DefaultFacetMaxValues)
+	// The CALLER's keep_const_fields, not the one forced on the shards.
+	keepConst := r.FormValue("keep_const_fields") == "1"
 	out := make([]query.FieldFacet, 0, len(fieldOrder))
 	for _, name := range fieldOrder {
 		fa := byField[name]
@@ -102,12 +104,23 @@ func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
 		for _, v := range fa.order {
 			vals = append(vals, query.FacetValue{FieldValue: v, Hits: fa.hits[v]})
 		}
-		// A field with more distinct values across the CLUSTER than
-		// max_values_per_field allows is dropped whole, which is what
-		// facetKeep does on a node. Applying it here rather than at the shards
-		// is the point: a field can be under the cap on each shard and over it
-		// on the union.
-		if maxValues > 0 && len(vals) > maxValues {
+		// facetKeep, WHOLE, over the union: `distinct == 0 || (max > 0 &&
+		// distinct > max)` drops it, and then `distinct > 1 || keepConst`
+		// decides. Both halves, applied here rather than at the shards,
+		// because a field can be under the cap on each shard and over it on
+		// the union, and constant on each shard and varied across it.
+		//
+		// The const half was missing, and shipping only the cardinality half
+		// was a REGRESSION: the shards are sent keep_const_fields=1 so a field
+		// that is constant on one shard survives to be judged here, and
+		// nothing here judged it. Measured on two nodes holding six rows each
+		// against a single node holding all twelve, `?query=*`: the cluster
+		// returned 7 fields (_msg _stream _stream_id _time level n service) and
+		// the node returned 4. Every field constant over the queried window --
+		// _stream and _stream_id whenever the filter selects one stream, host
+		// on a single-host cluster, the field just filtered on -- appeared in
+		// a cluster facet list and not a node's.
+		if !facetKeepUnion(len(vals), maxValues, keepConst) {
 			continue
 		}
 		sort.Slice(vals, func(i, j int) bool {
@@ -123,6 +136,16 @@ func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"facets": out})
+}
+
+// facetKeepUnion is query.facetKeep over the merged distribution. It is
+// duplicated rather than exported because the rule belongs to the engine and
+// the coordinator has to apply the same one to a set the engine never sees.
+func facetKeepUnion(distinct, maxPerField int, keepConst bool) bool {
+	if distinct == 0 || (maxPerField > 0 && distinct > maxPerField) {
+		return false
+	}
+	return distinct > 1 || keepConst
 }
 
 // vectorSeries is one entry of the Prometheus instant-vector envelope.

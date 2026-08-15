@@ -70,11 +70,13 @@ import (
 //
 // # Anything that is not a flat JSON object is the whole line as _msg
 //
-// The contract, which is stricter than the Decoder's and pinned by
-// TestRowScannerMatchesTheDecoder:
+// The contract, stricter than encoding/json's and pinned by
+// TestRowScannerMatchesTheDecoder, which compares against rawMessageRow --
+// encoding/json reading each VALUE as a json.RawMessage. Not against the token
+// stream, which flattens nested values into fields that never existed:
 //
-//   - A line that is a valid JSON object decodes to the same row the Decoder
-//     produced, field for field and in the same order.
+//   - A line that is a valid JSON object decodes to the same row that
+//     reference produces, field for field and in the same order.
 //   - Anything else -- not valid JSON, valid JSON that is not an object, or a
 //     valid object with bytes after it -- is the whole line as _msg.
 //
@@ -239,8 +241,7 @@ func scanJSONString(b []byte, i int, buf *[]byte) (string, int, bool) {
 	}
 	i++
 	start := i
-	// Fast path: no escape and no byte that needs coercing, so the value is
-	// one copy of a contiguous span.
+	// Fast path: no escape, so the value is one copy of a contiguous span.
 	for i < len(b) {
 		c := b[i]
 		if c == '"' {
@@ -520,26 +521,30 @@ func bufStr(buf *[]byte, off int) string {
 // mergeRows makes before treating a shard's line as data.
 //
 // It is deliberately structural rather than a full parse. mergeRows keeps lines
-// as byte slices and only the coordinator-pipes path decodes them, so a full
-// parse here would undo that; and the case this exists for -- a proxy's HTML
-// error page, a plain-text error, an empty body -- is caught by the first byte.
-// A line that starts with '{' and ends with '}' but is not valid JSON still
-// reaches jsonLineToRow, which answers rawRow for it.
+// as byte slices and re-emits them verbatim on the bare-select path, so a full
+// parse here would undo the reason that path is fast.
+//
+// What it catches: a proxy's HTML error page, a plain-text error, an empty
+// body, and -- because the braces must BALANCE -- a response truncated
+// anywhere, including right after a nested value's closing brace, which the
+// first-and-last-byte version let through.
+//
+// What it does not: `{not json at all}`, which is balanced and reaches the
+// client verbatim on the bare path. An earlier version of this comment said
+// such a line "still reaches jsonLineToRow, which answers rawRow for it",
+// which is true only when a coordinator half exists; without one nothing
+// decodes. A shard emitting that is a protocol violation this router cannot
+// detect without paying for a parse on every row of every read.
 func looksLikeJSONObject(line []byte) bool {
 	i := skipWS(line, 0)
 	if i >= len(line) || line[i] != '{' {
 		return false
 	}
-	for j := len(line) - 1; j >= i; j-- {
-		switch line[j] {
-		case ' ', '\t', '\r':
-			continue
-		case '}':
-			return true
-		}
-		return false
-	}
-	return false
+	// Balanced, string-aware, and nothing after the closing brace. That is
+	// what separates a truncated row from a whole one: a response cut after an
+	// inner `}` ends in the right byte and is not an object.
+	end, ok := scanComposite(line, i)
+	return ok && skipWS(line, end) == len(line)
 }
 
 // truncateLine is a shard's line cut to n bytes for an error message.

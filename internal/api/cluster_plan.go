@@ -204,8 +204,10 @@ func (s *Server) applyCoordinatorPipes(
 	r *http.Request, rows []query.Row, pipes []query.Pipe,
 ) ([]query.Row, error) {
 	q := &query.Query{Pipes: pipes, MatAll: true}
-	stopped := s.applyQueryBudget(r, q)
-	_ = stopped
+	// The returned flag is not read: applyQueryBudget binds the query, so
+	// every stop() records a reason and q.StopErr() below is the whole signal.
+	// It was assigned to `_` with no explanation, which reads as a hole.
+	s.applyQueryBudget(r, q)
 	out := query.ApplyPipes(q, rows)
 	if err := q.StopErr(); err != nil {
 		return nil, err
