@@ -54,7 +54,13 @@ limitations as well:
 ## What has not been run here
 
 - The GitHub workflows (`ci`, `cross`, `fuzz`, `release`). They are authored
-  and their YAML parses; none has been observed running.
+  and their YAML parses; none has been observed running. That is how
+  `release.yml`'s dry-run path stayed broken through several reviews: the
+  `tag` input was read as `${GITHUB_REF_NAME:-inputs.tag}`, and
+  `GITHUB_REF_NAME` is always set -- on a dispatch it is the BRANCH -- so a
+  "dry run" would have built `simdlogs_main_linux_amd64` and then published a
+  GitHub release named `main`. Corrected (the input is used on dispatch, and
+  the publish step is gated on a tag ref), and still never executed.
 - The one-hour and 24-hour soak modes. The 60-second and 45-second runs pass.
 - A fuzz campaign longer than ~10 s per target.
 - Any measurement on a quiet machine.

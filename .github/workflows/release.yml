@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build (for a dry run)'
+        description: 'Tag to build (dry run: builds and checks, publishes nothing)'
         required: true
 
 permissions:
@@ -76,9 +76,20 @@ jobs:
           # inside it, which is both a leak and a reason two builds of the same
           # source differ.
           CGO_ENABLED: '0'
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          # GITHUB_REF_NAME is ALWAYS set -- on a workflow_dispatch it is the
+          # BRANCH -- so `${GITHUB_REF_NAME:-input}` never reached the input and
+          # a dry run built artifacts called simdlogs_main_linux_amd64.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            VERSION="${DISPATCH_TAG}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "${VERSION}" ]; then
+            echo "no version to build" >&2; exit 1
+          fi
           NAME="simdlogs_${VERSION}_${GOOS}_${GOARCH}"
           mkdir -p dist
           go build -trimpath \
@@ -134,7 +145,11 @@ jobs:
         with:
           subject-path: 'staged/*.tar.gz'
 
+      # A dry run builds, checksums, SBOMs and attests, and stops here. Without
+      # this the dispatch created a GitHub release named after the branch --
+      # the input said "for a dry run" and the job published either way.
       - name: release
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -158,5 +173,5 @@ jobs:
           push: false
           platforms: linux/amd64,linux/arm64
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
             COMMIT=${{ github.sha }}
