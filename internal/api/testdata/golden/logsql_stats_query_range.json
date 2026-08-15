@@ -1,0 +1,18 @@
+{
+  "data": {
+    "result": [
+      {
+        "metric": {
+          "__name__": "string"
+        },
+        "values": [
+          [
+            "MIXED ELEMENT SHAPES"
+          ]
+        ]
+      }
+    ],
+    "resultType": "string"
+  },
+  "status": "string"
+}

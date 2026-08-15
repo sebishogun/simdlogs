@@ -1,0 +1,8 @@
+{
+  "values": [
+    {
+      "hits": "number",
+      "value": "string"
+    }
+  ]
+}

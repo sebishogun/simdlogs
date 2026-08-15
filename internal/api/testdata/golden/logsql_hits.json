@@ -1,0 +1,14 @@
+{
+  "hits": [
+    {
+      "fields": {},
+      "timestamps": [
+        "string"
+      ],
+      "total": "number",
+      "values": [
+        "number"
+      ]
+    }
+  ]
+}

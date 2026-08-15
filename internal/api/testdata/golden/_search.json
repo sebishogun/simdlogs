@@ -1,0 +1,19 @@
+{
+  "hits": {
+    "hits": [
+      {
+        "_source": {
+          "@timestamp": "string",
+          "_msg": "string",
+          "level": "string",
+          "n": "string",
+          "user": "string"
+        }
+      }
+    ],
+    "total": {
+      "relation": "string",
+      "value": "number"
+    }
+  }
+}
