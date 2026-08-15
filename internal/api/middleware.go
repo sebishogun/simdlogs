@@ -16,6 +16,7 @@ import (
 
 	"github.com/sebishogun/simdlogs/internal/config"
 	"github.com/sebishogun/simdlogs/internal/ingest"
+	"github.com/sebishogun/simdlogs/internal/query"
 )
 
 // errorFormat selects the error envelope a route answers with, so an OTLP
@@ -199,6 +200,23 @@ func (s *Server) guard(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 			defer release()
+			// Per-tenant admission, after the global class limit and only for
+			// reads. A global limit alone lets one tenant fill it: on a shared
+			// server the tenant with the most aggressive dashboard takes every
+			// slot and every other tenant sees 429 for work the server had
+			// room to do.
+			//
+			// After, not before: the global gate is the cheaper check and the
+			// one that protects the process, and taking a tenant slot only to
+			// be refused globally would hold it for the length of the refusal.
+			if s.admission != nil && !spec.write && !spec.stream {
+				rel, err := s.admission.Acquire(r.Context(), tenantKeyOf(r))
+				if err != nil {
+					s.writeErr(w, r, spec, query.HTTPStatus(err), err.Error())
+					return
+				}
+				defer rel()
+			}
 		}
 
 		limit := s.limits.MaxBodyBytes

@@ -1,7 +1,6 @@
 package query
 
 import (
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -20,7 +19,13 @@ const parallelMinGroups = 4
 // execution: each group is independent work, one SIMD-scanned group per
 // worker.
 func runParallel(groups []*storage.Reader, q *Query) []Row {
-	workers := runtime.GOMAXPROCS(0)
+	// From the server's budget, not GOMAXPROCS. Ten concurrent queries on a
+	// 32-core box used to spawn 320 workers for 32 cores, all doing
+	// memory-bound column decode and evicting each other's cache lines. See
+	// budget.go.
+	want := len(groups)
+	workers, releaseWorkers := scanWorkers(want)
+	defer releaseWorkers()
 	if workers > len(groups) {
 		workers = len(groups)
 	}
@@ -107,7 +112,13 @@ var mergePresize = true
 // its groups into a local map, merged at the end. The window at scale spans
 // hundreds of groups, so this is the aggregation's parallelism.
 func histogramParallel(groups []*storage.Reader, q *Query, step int64) map[int64]int {
-	workers := runtime.GOMAXPROCS(0)
+	// From the server's budget, not GOMAXPROCS. Ten concurrent queries on a
+	// 32-core box used to spawn 320 workers for 32 cores, all doing
+	// memory-bound column decode and evicting each other's cache lines. See
+	// budget.go.
+	want := len(groups)
+	workers, releaseWorkers := scanWorkers(want)
+	defer releaseWorkers()
 	if workers > len(groups) {
 		workers = len(groups)
 	}
@@ -148,7 +159,13 @@ func histogramParallel(groups []*storage.Reader, q *Query, step int64) map[int64
 
 // countParallel is Count fanned across groups; partials sum, no ordering.
 func countParallel(groups []*storage.Reader, q *Query) int {
-	workers := runtime.GOMAXPROCS(0)
+	// From the server's budget, not GOMAXPROCS. Ten concurrent queries on a
+	// 32-core box used to spawn 320 workers for 32 cores, all doing
+	// memory-bound column decode and evicting each other's cache lines. See
+	// budget.go.
+	want := len(groups)
+	workers, releaseWorkers := scanWorkers(want)
+	defer releaseWorkers()
 	if workers > len(groups) {
 		workers = len(groups)
 	}

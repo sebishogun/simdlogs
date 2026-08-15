@@ -391,6 +391,17 @@ func tenantRefOf(r *http.Request) *tenantRef {
 // ingest middleware, and it writes nothing and never resolves a tenant. A
 // middleware that assumed every ingest route had one turned that endpoint into
 // a 500.
+// tenantKeyOf is the request's tenant identity for admission accounting.
+//
+// Read from the headers rather than from the resolved tenant, because
+// admission runs in the middleware chain and a resolved tenant means a store
+// is already open -- which is work the limit exists to decide about. The
+// resolver stamps these headers before any handler runs, so by this point they
+// are the AUTHORISED tenant and not whatever the client asked for.
+func tenantKeyOf(r *http.Request) string {
+	return r.Header.Get("AccountID") + ":" + r.Header.Get("ProjectID")
+}
+
 func tenantOf(r *http.Request) *tenant {
 	ref, ok := r.Context().Value(tenantKey{}).(*tenantRef)
 	if !ok || ref == nil {

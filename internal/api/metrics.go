@@ -145,6 +145,23 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		"gauge", reject)
 	m("simdlogs_storage_over_quota_tenants", "Tenants at or above their byte quota.",
 		"gauge", over)
+	// Query governance: what the scan workers and the admission slots are
+	// doing. The worker gauge is the one that says whether the fan-out budget
+	// is the bottleneck; the rejection counter is what an operator alerts on.
+	if s.workers != nil {
+		m("simdlogs_scan_workers_total", "Scan worker slots available to all queries.",
+			"gauge", int64(s.workers.Total()))
+		m("simdlogs_scan_workers_in_use", "Scan worker slots currently held.",
+			"gauge", int64(s.workers.InUse()))
+	}
+	if s.admission != nil {
+		inFlight, queuedQ, rejectedQ := s.admission.Stats()
+		m("simdlogs_query_admission_in_flight", "Queries admitted and running.", "gauge", inFlight)
+		m("simdlogs_query_admission_queued", "Queries waiting for an admission slot.",
+			"gauge", queuedQ)
+		m("simdlogs_query_admission_rejected_total", "Queries refused by admission.",
+			"counter", rejectedQ)
+	}
 	rejDisk, rejQuota := storage.RejectedWrites()
 	m("simdlogs_writes_rejected_disk_total", "Writes refused because free space is below the reserve.",
 		"counter", rejDisk)

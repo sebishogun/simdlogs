@@ -42,6 +42,24 @@ type Limits struct {
 	// opened as many as it liked.
 	MaxConcurrentTail int
 	MaxOpenTenants    int
+
+	// MaxQueriesPerTenant bounds reads in flight for ONE tenant.
+	// MaxConcurrentQuery is process-wide and cannot express this: with only
+	// that, the tenant with the most aggressive dashboard takes every slot and
+	// every other tenant is refused work the server had room to do. 0 is
+	// unbounded.
+	MaxQueriesPerTenant int
+
+	// QueryQueueWait is how long a read may wait for a slot before being
+	// refused. 0 refuses immediately, which is right for an interactive
+	// endpoint: a client that would have waited would rather be told now, and
+	// a queue deeper than the client's patience does work nobody collects.
+	QueryQueueWait time.Duration
+
+	// MaxScanWorkers bounds the goroutines every concurrent scan draws from,
+	// in total rather than each. 0 means GOMAXPROCS, which is the right number
+	// for the machine and was previously the number taken by each query.
+	MaxScanWorkers int
 }
 
 // Storage is the disk budget. The zero value enforces nothing, which is the

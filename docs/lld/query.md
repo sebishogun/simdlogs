@@ -165,6 +165,52 @@ the answer. `MaxMemory` shares the byte accounting, which is gated on
 zero and the ceiling could never be reached, which is a limit that is
 configuration nothing reads.
 
+## Admission and the worker budget (`budget.go`)
+
+Two separate questions with two separate mechanisms.
+
+**How many workers a running scan may use.** Three fan-out sites in
+`parallel.go` sized themselves at `runtime.GOMAXPROCS(0)` — the right number
+for one query on an idle machine and the wrong one for every other case: ten
+concurrent queries on a 32-core box spawned 320 workers for 32 cores, all doing
+memory-bound column decode and evicting each other's cache lines. They now draw
+from a process-wide `WorkerBudget` installed by the server
+(`-max-scan-workers`, default `GOMAXPROCS`). `Acquire` never blocks — a query
+that waited for its full share would stall behind another scan for no gain, it
+can make progress with fewer — and never grants zero, because a scan with no
+workers cannot finish.
+
+**Whether a query starts at all.** `Admission` bounds reads per tenant
+(`-max-queries-per-tenant`) and, optionally, globally. Per tenant as well as
+globally because a process-wide limit alone lets one tenant fill it: the tenant
+with the most aggressive dashboard takes every slot and everyone else sees 429
+for work the server had room to do. The per-tenant slot is taken **first** and
+the global one second; the other order deadlocks, since a query holding a
+global slot while waiting for a tenant slot blocks the query that would have
+released it.
+
+Applied in `guard` (`middleware.go`), after the class semaphore and only for
+reads — the global gate is the cheaper check, and taking a tenant slot only to
+be refused globally would hold it for the length of the refusal. Writes are
+never refused by it: an ingest request does not hold memory for the length of a
+scan, and dropping data an agent cannot re-send is a worse failure than a slow
+query.
+
+| Outcome | Error | Status |
+| --- | --- | --- |
+| tenant at its limit | `ErrRejected` | 429 |
+| queue wait elapsed | `ErrQueueTimeout` (wraps `ErrRejected`) | 429 |
+| execution deadline | `ErrDeadlineExceeded` | 504 |
+
+A queue timeout is 429 and not 504: the server never started the query, so
+nothing timed out except the wait for permission, and 504 would send a client
+to shorten a time range that was never scanned. `-query-queue-wait` defaults to
+0 — refuse immediately, which is right for an interactive endpoint, and a queue
+deeper than the client's patience does work nobody collects.
+
+`/metrics` exposes `simdlogs_scan_workers_total`, `_in_use`,
+`simdlogs_query_admission_in_flight`, `_queued` and `_rejected_total`.
+
 ## Streams
 
 `stream.go`. A stream is a distinct `_stream` label set `{k="v",...}` (keys
@@ -205,7 +251,8 @@ optimization, not a claim.
 ## Parallelism summary
 
 - Ingest: sharded parse (`NumCPU/3` writers) + flush pool (`min(4, NumCPU)`).
-- Query: per-group worker pool at ≥ 4 groups; Count/Histogram have their own
-  parallel paths (partial maps/counts merged at the end).
+- Query: per-group worker pool at ≥ 4 groups, drawn from the process-wide
+  `WorkerBudget` rather than sized at `GOMAXPROCS` per query; Count/Histogram
+  have their own parallel paths (partial maps/counts merged at the end).
 - Cluster: fan-out per shard with one live replica each (see
   `lld/cluster.md`).

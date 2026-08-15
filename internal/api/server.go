@@ -94,6 +94,12 @@ type Server struct {
 	// the life of the process.
 	auth     *authState
 	querySem chan struct{} // MaxConcurrentQuery
+	// admission bounds reads per tenant, which the class semaphores cannot:
+	// they are process-wide, so one tenant can hold every slot.
+	admission *query.Admission
+	// workers is the shared scan worker budget. Without it every concurrent
+	// query sized its own fan-out at GOMAXPROCS.
+	workers  *query.WorkerBudget
 	writeSem chan struct{} // MaxConcurrentWrite
 	tailSem  chan struct{} // MaxConcurrentTail
 	// Syslog listeners accept outside the HTTP server, so shutdown has to
@@ -209,6 +215,21 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	if n := c.Limits.MaxConcurrentTail; n > 0 {
 		srv.tailSem = make(chan struct{}, n)
 	}
+	if n := c.Limits.MaxQueriesPerTenant; n > 0 {
+		srv.admission = query.NewAdmission(query.AdmissionConfig{
+			MaxPerTenant: n,
+			Wait:         c.Limits.QueryQueueWait,
+		})
+	}
+	// The scan worker budget is process-wide and installed once. Three scan
+	// paths used to size their fan-out at GOMAXPROCS EACH, so ten concurrent
+	// queries on a 32-core box spawned 320 workers for 32 cores -- all doing
+	// memory-bound column decode and evicting each other's cache lines.
+	//
+	// Installed even when nothing else is configured, because the default it
+	// replaces is the pathological one.
+	srv.workers = query.NewWorkerBudget(c.Limits.MaxScanWorkers)
+	query.SetWorkerBudget(srv.workers)
 	srv.compact = c.Compact
 	if len(c.StreamFields) > 0 {
 		srv.strmFlds = append([]string(nil), c.StreamFields...)

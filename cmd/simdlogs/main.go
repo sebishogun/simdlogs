@@ -53,6 +53,17 @@ func main() {
 	compactMaxIn := flag.Int64("compact-max-input-bytes", 0,
 		"refuse to read and rewrite more than this many bytes in one pass, per tenant; "+
 			"0 means no bound")
+	maxPerTenantQ := flag.Int("max-queries-per-tenant", 0,
+		"bound reads in flight for ONE tenant; 0 is unbounded. -max-concurrent-query is "+
+			"process-wide and cannot express this: with only that, one tenant's dashboard "+
+			"takes every slot and every other tenant is refused work the server had room for")
+	queryQueueWait := flag.Duration("query-queue-wait", 0,
+		"how long a read may wait for an admission slot before 429; 0 refuses immediately, "+
+			"which is right for an interactive endpoint")
+	maxScanWorkers := flag.Int("max-scan-workers", 0,
+		"total scan goroutines shared by all concurrent queries; 0 means GOMAXPROCS. "+
+			"Each query used to take GOMAXPROCS of its own, so ten concurrent queries on a "+
+			"32-core box ran 320 workers for 32 cores")
 	reserveWarn := flag.Int64("storage-reserve-warn-bytes", 0,
 		"free space at which readiness degrades while writes are still accepted; 0 disables. "+
 			"Bytes rather than a percentage: what has to be protected is room for the "+
@@ -153,6 +164,9 @@ func main() {
 	cfg.Limits.MaxQueryDuration = *maxQueryDur
 	cfg.Limits.MaxQueryBytes = *maxQueryBytes
 	cfg.Limits.MaxOpenTenants = *maxTenants
+	cfg.Limits.MaxQueriesPerTenant = *maxPerTenantQ
+	cfg.Limits.QueryQueueWait = *queryQueueWait
+	cfg.Limits.MaxScanWorkers = *maxScanWorkers
 	cfg.Storage.ReserveWarnBytes = *reserveWarn
 	cfg.Storage.ReserveRejectBytes = *reserveReject
 	cfg.Storage.MaxTenantBytes = *tenantBytes
