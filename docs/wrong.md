@@ -4291,3 +4291,49 @@ reasons is worse than none, because the next person reads it as a defect.
 **The shape.** Entry 40's peer-4xx was a classification that let unhandled cases
 fall through to success. This is the same thing in a data field: a position
 nobody filled in, defaulting to a value that means something specific and wrong.
+
+## 42. A soak that reported 172,037 writes while every request was refused
+
+Task 9.2's soak found four defects, all of them in the soak.
+
+**The load generator counted refusals as successes.** `post` treated any status
+below 500 as fine. Every request was coming back 400 — `AccountID` must be
+numeric and the generator was sending `t0` — so the first run reported:
+
+    writes=172037 reads=57887 churns=45741 backups=13 restarts=3 failures=0
+    baseline  goroutines=40 mappings=155 rss=33MB files=2 disk=0MB
+    final     goroutines=10 mappings=155 rss=35MB files=2 disk=0MB
+
+Flat, clean, and entirely meaningless. `files=2` was the only thing on the page
+that said so: 172,037 writes and two files on disk.
+
+**The bounds could only pass if nothing happened.** They compared raw numbers
+against a warm-up baseline, so the first run with real load failed every one of
+them — mappings 1060 to 6585 against a bound of 2184 — while the store had gone
+from 1028 group files to 7602. That is the system working: a store holding more
+data maps more groups. An absolute bound on a quantity that grows with the data
+passes exactly when the test is broken, which is what had just happened.
+
+Rewritten as ratios: mappings per 100 groups, KB resident per MB stored,
+manifest bytes per group. Goroutines stay absolute, because they are the one
+measurement here that does not grow with the data.
+
+**Two of the four rewritten bounds were then skipped in silence.** The manifest
+was measured in kilobytes and every manifest was under one, so it read as 0 on
+every sample; and the mapping bound was a difference (`mappings - files`) that
+went negative, because not every file is mapped. Both returned 0, both were
+skipped by the `from == 0` guard, and the run printed PASS. A skipped bound
+reads as a passing bound, so the summary now names every bound it could not
+measure. In bytes, against group files only, the manifest bound reads **36 bytes
+per group at both ends of a 45-second run** — flat, which is what it should be.
+
+**Unbounded tenant churn.** A fresh tenant id from a 2^20 space every iteration
+created 92,589 tenants, 92,601 files and 92,798 mappings in twenty seconds. That
+is not a leak test. Tenants have to RECUR for eviction and reopen to happen at
+all, so churn now walks a ring of 64.
+
+**The shape.** Every one of these is the same failure as the fixture in entry 38
+and the vacuous subtests in entry 39: a test that cannot fail. What is new here
+is that three of them were passing *loudly* — printing six-figure counters and a
+clean resource table — which is more convincing than silence and exactly as
+empty.

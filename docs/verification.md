@@ -222,6 +222,48 @@ is attributed rather than buried.
 tests 25 times, and 5 times under `-race`. One pass proves the mechanism
 exists; the failures worth finding need a particular interleaving.
 
+## Soak
+
+`scripts/soak.sh` — `dev` (1 hour, the default), `release` (24 hours), or any
+duration up to a 24-hour ceiling. Opt-in through `SIMDLOGS_SOAK`, and the
+opt-in is guarded by tests that run in the ordinary suite: a change that made
+the soak default-on would otherwise be found by whoever's machine fell over.
+
+Concurrent ingest, queries, bounded tenant churn, backups (each holding a
+snapshot for its whole stream), the ops surfaces, and listener restarts — all
+overlapping, because each in isolation is already covered and what a soak adds
+is the overlap.
+
+**The bounds are ratios, and that is the design.** A store holding more data
+maps more groups, uses more memory and occupies more disk; an absolute bound on
+those numbers can only pass if nothing happened. What isolates a leak is the
+relationship:
+
+| Bound | Isolates |
+|---|---|
+| goroutines | the one quantity that does not grow with data: a goroutine per request that is never joined |
+| mappings per 100 groups | a mapping that outlived its group — no resident pages, so invisible in RSS until the address space runs out |
+| KB resident per MB stored | memory growing *faster* than the data it serves |
+| manifest bytes per group | a manifest that never compacts, invisible in total disk use because the groups dwarf it |
+
+Every bound reports, including ones it could not measure. A skipped bound reads
+as a passing bound, and two of these were being skipped on every sample while
+the summary said the run was clean.
+
+Three of the harness's own defects are worth knowing about, because each made
+the soak report success while measuring nothing:
+
+- The load generator counted any status below 500 as a successful write. Every
+  request was being refused 400 — `AccountID` must be numeric — and the run
+  reported **172,037 writes** against a flat resource profile.
+- Tenant churn drew a fresh tenant id from a 2^20 space every iteration, which
+  created 92,589 tenants in twenty seconds. That is not a leak test; it is a
+  memory-exhaustion test with no assertion. Churn now walks a ring of 64, so
+  tenants recur and eviction and reopen actually happen.
+- Unpaced, the generators ran at benchmark speed: 624 MB of store in twenty
+  seconds, which is terabytes over the release mode. A soak is about duration,
+  not throughput.
+
 ## Malformed input
 
 - Parser panic-safety across malformed queries (`internal/query/hardening_test.go`):
