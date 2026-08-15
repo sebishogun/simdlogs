@@ -26,6 +26,11 @@ func TestClusterScaling(t *testing.T) {
 	if os.Getenv("SIMDLOGS_CLUSTER") == "" {
 		t.Skip("set SIMDLOGS_CLUSTER=1 to run the cluster scaling benchmark")
 	}
+	// A cluster number is meaningless without the single-node number it is
+	// compared against, and both have to come from the same quiet machine --
+	// which is what this gate is for.
+	facts := requireQuiet(t)
+	defer func() { t.Logf("measured at: %s", facts) }()
 	const N = 400_000
 	const needle = "NEEDLEclusterc0ffee42deadbeef01"
 	body := clusterCorpus(N, needle)

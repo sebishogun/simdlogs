@@ -31,6 +31,11 @@ func TestRealistic(t *testing.T) {
 	if os.Getenv("SIMDLOGS_REAL") == "" {
 		t.Skip("set SIMDLOGS_REAL=1 to run the realistic head-to-head")
 	}
+	// The quiet-machine rule, enforced rather than documented. It refuses
+	// above load 1 and the refusal names the override; an overridden run
+	// stamps itself unquotable in the output.
+	facts := requireQuiet(t)
+	defer func() { t.Logf("measured at: %s", facts) }()
 	N := 1_000_000
 	if v := os.Getenv("SIMDLOGS_REAL_N"); v != "" {
 		if x, err := strconv.Atoi(v); err == nil {

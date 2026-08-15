@@ -33,6 +33,8 @@ func TestScaleVsVL(t *testing.T) {
 	if os.Getenv("SIMDLOGS_SCALEVL") == "" {
 		t.Skip("set SIMDLOGS_SCALEVL=1 to run the scale head-to-head")
 	}
+	facts := requireQuiet(t)
+	defer func() { t.Logf("measured at: %s", facts) }()
 	N := 100_000_000
 	if v := os.Getenv("SIMDLOGS_SCALEVL_N"); v != "" {
 		if x, err := strconv.Atoi(v); err == nil {
