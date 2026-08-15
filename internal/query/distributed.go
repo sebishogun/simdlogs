@@ -79,6 +79,13 @@ func (c PipeClass) String() string {
 // about runs at the coordinator, which is slower and correct -- and the
 // alternative default, "assume it is row-local", is exactly how a new pipe
 // would silently start returning per-shard answers.
+// Four of the cases below return what the final default returns. They are not
+// redundant and they are not a gate: they are where the reason for each pipe is
+// written down, and a test that asserted their return value would pass with the
+// case deleted. What makes the default unreachable is
+// TestEveryPipeIsClassifiedExplicitly, which takes the set of pipes from the
+// package source and requires a case for each -- so a pipe added to the
+// language cannot silently become coordinator-only.
 func ClassifyPipe(p Pipe) PipeClass {
 	switch pp := p.(type) {
 	// Row-local: each output row is a function of one input row.

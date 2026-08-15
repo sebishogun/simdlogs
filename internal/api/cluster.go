@@ -485,7 +485,7 @@ func (s *Server) federatedRows(w http.ResponseWriter, r *http.Request, path stri
 
 // mergeRows merges shard NDJSON and applies the coordinator half of a plan.
 func (s *Server) mergeRows(
-	w http.ResponseWriter, r *http.Request, bodies [][]byte, coordPipes []query.Pipe,
+	w http.ResponseWriter, r *http.Request, answers []shardAnswer, coordPipes []query.Pipe,
 ) {
 	// Rows are kept as slices into each shard's response body, not strings: the
 	// merge touches every row of every shard, and a string per row was the
@@ -510,13 +510,10 @@ func (s *Server) mergeRows(
 	var mu sync.Mutex
 	var all []row
 	var wg sync.WaitGroup
-	for shardIdx, body := range bodies {
+	for _, a := range answers {
 		wg.Add(1)
 		go func(shardOf int, body []byte) {
 			defer wg.Done()
-			if body == nil {
-				return
-			}
 			local := make([]row, 0, bytes.Count(body, []byte{'\n'}))
 			for start := 0; start < len(body); {
 				e := bytes.IndexByte(body[start:], '\n')
@@ -537,7 +534,7 @@ func (s *Server) mergeRows(
 			mu.Lock()
 			all = append(all, local...)
 			mu.Unlock()
-		}(shardIdx, body)
+		}(a.shard, a.body)
 	}
 	wg.Wait()
 
@@ -684,21 +681,55 @@ func (s *Server) fanOutPeers(r *http.Request, path string, body []byte) []PeerRe
 
 // bodiesOf keeps the [][]byte shape the existing merges consume. Each merge
 // moves to the PeerResponse form as it learns to report completeness (8.3).
-func bodiesOf(rs []PeerResponse) [][]byte {
-	out := make([][]byte, len(rs))
+// mergeDecode unmarshals one shard's answer into v, refusing rather than
+// skipping when it will not parse.
+//
+// A shard that answered 200 with a body this coordinator cannot read has NOT
+// contributed its rows. Skipping it produces a short answer that looks
+// complete -- which is exactly what the completeness rule in fanOutChecked
+// exists to prevent, one layer down and invisible to it, because as far as the
+// fan-out is concerned that shard answered fine. Six merges used to `continue`
+// here.
+func (s *Server) mergeDecode(w http.ResponseWriter, r *http.Request, a shardAnswer, v any) bool {
+	shard := a.shard
+	if err := json.Unmarshal(a.body, v); err != nil {
+		obs.L().Error("cluster read refused: unreadable shard answer",
+			obs.FieldEvent, "cluster.read_unreadable",
+			obs.FieldRoute, r.URL.Path,
+			"shard", shard,
+			"error", err.Error(),
+			obs.FieldErrorClass, string(obs.ClassUpstream))
+		s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+			"simdlogs: shard %d answered 200 with a body this coordinator could not "+
+				"parse (%v). Its rows are missing from this answer with no way for you "+
+				"to tell, so the answer is refused rather than returned short.",
+			shard, err))
+		return false
+	}
+	return true
+}
+
+// shardAnswer is one shard's response body with the shard it came from.
+//
+// This used to be a [][]byte indexed by shard with a nil for any shard that did
+// not answer, and every merge told the two apart by testing the body for nil.
+// That is the same value json.Unmarshal fails on, so "this shard is absent and
+// the caller opted into a partial answer" and "this shard sent something
+// unreadable" arrived at the merge indistinguishable. Absent shards are now
+// absent from the slice, and anything in it is an answer that has to parse.
+type shardAnswer struct {
+	shard int
+	body  []byte
+}
+
+func answersOf(rs []PeerResponse) []shardAnswer {
+	out := make([]shardAnswer, 0, len(rs))
 	for i, p := range rs {
 		if p.OK() {
-			out[i] = p.Body
+			out = append(out, shardAnswer{shard: i, body: p.Body})
 		}
 	}
 	return out
-}
-
-// fanOutPost sends the same POST (body + tenant headers) to every backend and
-// returns the response bodies -- the ES surface fans out this way, since its
-// query is a JSON body rather than URL params.
-func (s *Server) fanOutPost(r *http.Request, path string, body []byte) [][]byte {
-	return bodiesOf(s.fanOutPeers(r, path, body))
 }
 
 // federatedESCount sums the ES _count across storage nodes.
@@ -709,13 +740,14 @@ func (s *Server) federatedESCount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	for _, b := range bodies {
+	for _, a := range bodies {
 		var v struct {
 			Count int `json:"count"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			total += v.Count
+		if !s.mergeDecode(w, r, a, &v) {
+			return
 		}
+		total += v.Count
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"count": total})
@@ -754,7 +786,7 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	for _, b := range bodies {
+	for _, a := range bodies {
 		var v struct {
 			Hits struct {
 				Total struct {
@@ -763,10 +795,11 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 				Hits []json.RawMessage `json:"hits"`
 			} `json:"hits"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			total += v.Hits.Total.Value
-			hits = append(hits, v.Hits.Hits...)
+		if !s.mergeDecode(w, r, a, &v) {
+			return
 		}
+		total += v.Hits.Total.Value
+		hits = append(hits, v.Hits.Hits...)
 	}
 	// from/size applied to the MERGED hits.
 	//
@@ -846,14 +879,15 @@ func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, pa
 	if !ok {
 		return
 	}
-	for _, b := range vcBodies {
+	for _, a := range vcBodies {
 		var v struct {
 			Values []query.ValueCount `json:"values"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			for _, vc := range v.Values {
-				counts[vc.Value] += vc.Count
-			}
+		if !s.mergeDecode(w, r, a, &v) {
+			return
+		}
+		for _, vc := range v.Values {
+			counts[vc.Value] += vc.Count
 		}
 	}
 	out := make([]query.ValueCount, 0, len(counts))
@@ -925,14 +959,14 @@ func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
 	}
 	byLabels := map[string]*acc{}
 	var labelOrder []string
-	for _, b := range srBodies {
+	for _, a := range srBodies {
 		var v struct {
 			Data struct {
 				Result []matrixSeries `json:"result"`
 			} `json:"data"`
 		}
-		if json.Unmarshal(b, &v) != nil {
-			continue
+		if !s.mergeDecode(w, r, a, &v) {
+			return
 		}
 		for _, se := range v.Data.Result {
 			key := labelKey(se.Metric)
@@ -1031,14 +1065,15 @@ func (s *Server) federatedStatsQuery(w http.ResponseWriter, r *http.Request) {
 		Hits  int    `json:"hits"`
 	}
 	merged := map[string]int{}
-	for _, b := range bodies {
+	for _, a := range bodies {
 		var v struct {
 			Stats []vc `json:"stats"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			for _, s := range v.Stats {
-				merged[s.Value] += s.Hits
-			}
+		if !s.mergeDecode(w, r, a, &v) {
+			return
+		}
+		for _, s := range v.Stats {
+			merged[s.Value] += s.Hits
 		}
 	}
 	stats := make([]vc, 0, len(merged))
@@ -1084,38 +1119,63 @@ func (s *Server) federatedHits(w http.ResponseWriter, r *http.Request) {
 	}
 	// Merged by LABEL SET first: a shard contributes its own series per label
 	// set, and two shards' `{level=error}` are the same series, not two.
+	// Buckets are keyed by NANOSECONDS, not by the shard's timestamp text.
+	//
+	// RFC3339Nano omits trailing zeros in the fractional second, so the format
+	// is not fixed-width and lexicographic order is not time order: '.' (0x2E)
+	// sorts before 'Z' (0x5A), which puts `00:00:00.5Z` BEFORE `00:00:00Z`.
+	// `step` is a time.Duration off the query string, so `step=500ms` produces
+	// exactly that mix -- whole seconds with no fraction interleaved with half
+	// seconds that have one. Sorting the text drew the graph out of order.
 	type acc struct {
 		fields  map[string]string
-		buckets map[string]int
+		buckets map[int64]int
 		total   int
 	}
 	byLabels := map[string]*acc{}
 	var order []string
-	for _, b := range hitBodies {
+	for _, ans := range hitBodies {
 		var v struct {
 			Hits []clusterHitSeries `json:"hits"`
 		}
-		if json.Unmarshal(b, &v) != nil {
-			continue
+		if !s.mergeDecode(w, r, ans, &v) {
+			return
 		}
 		for _, se := range v.Hits {
 			key := labelKey(se.Fields)
 			a := byLabels[key]
 			if a == nil {
-				a = &acc{fields: se.Fields, buckets: map[string]int{}}
+				a = &acc{fields: se.Fields, buckets: map[int64]int{}}
 				if a.fields == nil {
 					a.fields = map[string]string{}
 				}
 				byLabels[key] = a
 				order = append(order, key)
 			}
+			// The dense shape means the two arrays are indexed together, so
+			// unequal lengths are a protocol violation, not a short read to
+			// absorb: truncating to the shorter one drops counts silently.
+			if len(se.Timestamps) != len(se.Values) {
+				s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+					"simdlogs: shard %d returned %d timestamps and %d values for one "+
+						"series; the dense shape indexes them together, so this answer "+
+						"is refused rather than truncated to the shorter array",
+					ans.shard, len(se.Timestamps), len(se.Values)))
+				return
+			}
 			// Buckets summed per timestamp: shards cover the same window, so
 			// the same bucket appears on each and the cluster's count for it
 			// is the sum.
-			for i := range se.Timestamps {
-				if i < len(se.Values) {
-					a.buckets[se.Timestamps[i]] += se.Values[i]
+			for j, ts := range se.Timestamps {
+				t, err := time.Parse(time.RFC3339Nano, ts)
+				if err != nil {
+					s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+						"simdlogs: shard %d returned bucket timestamp %q, which is not "+
+							"RFC3339: it cannot be ordered against the other shards' "+
+							"buckets, so the answer is refused", ans.shard, ts))
+					return
 				}
+				a.buckets[t.UnixNano()] += se.Values[j]
 			}
 			a.total += se.Total
 		}
@@ -1125,15 +1185,17 @@ func (s *Server) federatedHits(w http.ResponseWriter, r *http.Request) {
 	out := make([]clusterHitSeries, 0, len(order))
 	for _, key := range order {
 		a := byLabels[key]
-		stamps := make([]string, 0, len(a.buckets))
+		ns := make([]int64, 0, len(a.buckets))
 		for t := range a.buckets {
-			stamps = append(stamps, t)
+			ns = append(ns, t)
 		}
 		// Ascending and gap-free is what the dense shape means: a client
 		// indexes the two arrays together.
-		sort.Strings(stamps)
-		vals := make([]int, 0, len(stamps))
-		for _, t := range stamps {
+		sort.Slice(ns, func(i, j int) bool { return ns[i] < ns[j] })
+		stamps := make([]string, 0, len(ns))
+		vals := make([]int, 0, len(ns))
+		for _, t := range ns {
+			stamps = append(stamps, time.Unix(0, t).UTC().Format(time.RFC3339Nano))
 			vals = append(vals, a.buckets[t])
 		}
 		out = append(out, clusterHitSeries{
@@ -1317,7 +1379,7 @@ const (
 // rather than hidden in a wrapper the handler does not know about.
 func (s *Server) fanOutChecked(
 	w http.ResponseWriter, r *http.Request, path string, body []byte,
-) ([][]byte, http.ResponseWriter, bool) {
+) ([]shardAnswer, http.ResponseWriter, bool) {
 	peers := s.fanOutPeers(r, path, body)
 
 	var missing []string
@@ -1336,7 +1398,7 @@ func (s *Server) fanOutChecked(
 	}
 	bad := append(append([]string(nil), missing...), incomplete...)
 	if len(bad) == 0 {
-		return bodiesOf(peers), w, true
+		return answersOf(peers), w, true
 	}
 
 	answered := len(peers) - len(bad)
@@ -1369,7 +1431,7 @@ func (s *Server) fanOutChecked(
 		"missing", strings.Join(bad, ","))
 	w.Header().Set(HdrPartial, "true")
 	s.notePartialRead()
-	return bodiesOf(peers), &partialWriter{ResponseWriter: w}, true
+	return answersOf(peers), &partialWriter{ResponseWriter: w}, true
 }
 
 // partialWriter answers 206 on the first write.

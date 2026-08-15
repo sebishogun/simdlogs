@@ -285,10 +285,12 @@ all, and a handler that returns without writing sends 200.
 `simdlogs_cluster_partial_reads_total` counts them, because a dashboard quietly
 running on partial answers is exactly the state this makes visible.
 
-Nine of the federated endpoints are covered by one-shard-down and
-all-shards-down tests (`cluster_failure_test.go`). `facets`, `/select/sql`,
-`stream_ids`, `stream_field_names` and `stream_field_values` are federated and
-NOT covered by those completeness tests: select, hits, stats_query, stats_query_range, field_names, field_values,
+All fourteen federated reads are covered by one-shard-down and all-shards-down
+tests (`cluster_failure_test.go`). The list used to be hand-kept and had
+drifted to nine while this page said "all nine"; the set is now derived from
+`surfaceRoutes()` by `TestEveryFederatedReadIsInTheCompletenessSuite`, which
+fails in both directions -- a federated read missing from the suite, and an
+entry in the suite that does not federate: select, hits, stats_query, stats_query_range, field_names, field_values,
 streams, `_count` and `_search`.
 
 ## Replicated writes: idempotency and consistency

@@ -1,14 +1,11 @@
 package api
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/query"
@@ -214,93 +211,6 @@ func (s *Server) applyCoordinatorPipes(
 		return nil, err
 	}
 	return out, nil
-}
-
-// jsonLineToRow decodes one NDJSON row back into the engine's Row.
-//
-// A round trip: the storage node encoded a Row to JSON and the coordinator
-// decodes it to apply pipes. That is the cost of running a pipe over merged
-// rows, and it is paid only when a query has a coordinator half -- a bare
-// filter never decodes.
-//
-// # Field order is preserved, not sorted
-//
-// The order fields come back in is the order they go out in, because a client
-// reading NDJSON sees it. Sorting the keys here -- which the first version did,
-// for "determinism" -- meant a clustered read returned the same row with its
-// fields rearranged relative to a single-node read of the same data. The order
-// IS deterministic without sorting: it is the order the storage node emitted,
-// which is the order the row was ingested in.
-//
-// # _time and its absence
-//
-// _time is lifted back out of the fields, because the engine carries it
-// separately and a pipe that sorts by time reads Row.Time rather than a field
-// named _time. A line with NO _time is a row that genuinely has none -- a stats
-// result, or a projection that dropped it -- and it is marked NoTime so the
-// re-encode does not invent a 1970 timestamp for it.
-func jsonLineToRow(line []byte) query.Row {
-	dec := json.NewDecoder(bytes.NewReader(line))
-	dec.UseNumber()
-	tok, err := dec.Token()
-	if err != nil || tok != json.Delim('{') {
-		return rawRow(line)
-	}
-	row := query.Row{NoTime: true}
-	for dec.More() {
-		kt, err := dec.Token()
-		if err != nil {
-			return rawRow(line)
-		}
-		key, ok := kt.(string)
-		if !ok {
-			return rawRow(line)
-		}
-		vt, err := dec.Token()
-		if err != nil {
-			return rawRow(line)
-		}
-		val := jsonScalar(vt)
-		if key == "_time" && row.NoTime {
-			if t, terr := time.Parse(time.RFC3339Nano, val); terr == nil {
-				row.Time, row.NoTime = t.UnixNano(), false
-				continue
-			}
-		}
-		row.Fields = append(row.Fields, query.Field{Key: key, Value: val})
-	}
-	return row
-}
-
-// rawRow is what a line this coordinator cannot decode becomes.
-//
-// A line that fails to parse here is one this cluster's own storage nodes
-// encoded, so it is a bug rather than bad input -- but dropping the row
-// silently would turn a formatting bug into a missing-data bug, which is far
-// harder to notice. It comes through carrying its raw text, where it is
-// visible.
-func rawRow(line []byte) query.Row {
-	return query.Row{Fields: []query.Field{{Key: "_msg", Value: string(line)}}}
-}
-
-// jsonScalar renders one decoded JSON scalar as the string the engine holds.
-//
-// Every field in this engine is a string; the storage nodes encode them as JSON
-// strings, so this is normally the identity. It handles the other scalars
-// because a hand-written peer or a future encoder emitting a bare number should
-// not silently become an empty field.
-func jsonScalar(v any) string {
-	switch t := v.(type) {
-	case string:
-		return t
-	case json.Number:
-		return t.String()
-	case bool:
-		return strconv.FormatBool(t)
-	case nil:
-		return ""
-	}
-	return fmt.Sprint(v)
 }
 
 // endpointLimit is the `limit` query parameter, or 0 when absent or unusable.

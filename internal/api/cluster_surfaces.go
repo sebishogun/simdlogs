@@ -49,12 +49,12 @@ func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
 	}
 	byField := map[string]*fieldAcc{}
 	var fieldOrder []string
-	for _, b := range bodies {
+	for _, a := range bodies {
 		var v struct {
 			Facets []query.FieldFacet `json:"facets"`
 		}
-		if json.Unmarshal(b, &v) != nil {
-			continue
+		if !s.mergeDecode(w, r, a, &v) {
+			return
 		}
 		for _, f := range v.Facets {
 			fa := byField[f.FieldName]
@@ -136,14 +136,14 @@ func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
 	// one of its terms is not a smaller sum, it is a different number, and the
 	// caller has to be told.
 	unparseable := 0
-	for _, b := range bodies {
+	for _, a := range bodies {
 		var v struct {
 			Data struct {
 				Result []vectorSeries `json:"result"`
 			} `json:"data"`
 		}
-		if json.Unmarshal(b, &v) != nil {
-			continue
+		if !s.mergeDecode(w, r, a, &v) {
+			return
 		}
 		for _, se := range v.Data.Result {
 			key := labelKey(se.Metric)

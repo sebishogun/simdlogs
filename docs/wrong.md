@@ -4337,3 +4337,100 @@ and the vacuous subtests in entry 39: a test that cannot fail. What is new here
 is that three of them were passing *loudly* — printing six-figure counters and a
 clean resource table — which is more convincing than silence and exactly as
 empty.
+
+## 43. A merge that skipped the shard it could not read, and a graph drawn out of order
+
+**The claim under test.** `fanOutChecked` refuses a cluster read when a shard
+did not answer or answered from an incomplete store — the completeness rule
+that entry 30 exists for. So a clustered read is either complete, or refused,
+or explicitly 206 with the missing shards named.
+
+**What the code did.** Eight merges unmarshalled each shard's body and, on
+failure, `continue`d. A shard that answered **200 with a complete envelope and
+an unreadable body** was therefore dropped, and the read returned the other
+shards' rows with HTTP 200 and no marker anywhere. The completeness rule cannot
+see that case: as far as the fan-out is concerned, the shard answered fine. The
+rule was one layer above the only layer that knew.
+
+The reason the two were ever confusable is that `bodiesOf` returned a
+`[][]byte` indexed by shard with `nil` for any shard that did not answer — and
+`nil` is exactly what `json.Unmarshal` fails on. "Absent, and the caller opted
+into a partial answer" and "present but unreadable" arrived at the merge as the
+same value. Absent shards are now absent from the slice (`shardAnswer` carries
+the shard number so a refusal can name the node), and anything in the slice is
+an answer that has to parse.
+
+**The second defect, in the same function.** `/select/logsql/hits` merged its
+buckets into a `map[string]int` keyed by the shard's RFC3339Nano text and
+emitted them `sort.Strings`-ordered. RFC3339Nano drops trailing zeros in the
+fractional second, so the format is not fixed-width, and `'.'` (0x2E) sorts
+before `'Z'` (0x5A):
+
+    "2026-01-01T00:00:00.5Z"  <  "2026-01-01T00:00:00Z"     // lexicographic
+     2026-01-01T00:00:00.5     >   2026-01-01T00:00:00      // actual
+
+`step` is a `time.Duration` off the query string, so `step=500ms` produces
+exactly that mix — whole-second buckets with no fraction interleaved with half
+seconds that have one. The two arrays are indexed together by the client, so
+the points were plotted in the wrong order. Buckets are now keyed by
+nanoseconds and formatted only on the way out.
+
+Two more shapes in the same merge were being absorbed rather than reported: a
+series whose `timestamps` and `values` arrays are different lengths (the old
+code truncated to the shorter one, dropping a bucket's count), and a bucket
+timestamp that will not parse (unorderable against the other shards'). Both are
+now refused.
+
+**Also here.** `federatedEndpoints`, the table driving the one-shard-down and
+all-shards-down suite, was hand-kept and had drifted to nine of the fourteen
+federated reads — while `docs/lld/cluster.md` said "all nine federated
+endpoints are covered". Both statements were true of the *table* and neither
+was true of the *router*. The set is now derived from `surfaceRoutes()`, which
+the mux-count test already ties to the real mux, and the gate fails in both
+directions.
+
+**The shape.** Entry 42 was tests that cannot fail. This is the same thing one
+level up: a *rule* that cannot fire, because the layer that enforces it cannot
+observe the case it is meant to catch. A completeness check above the merge is
+not a completeness check — it is a check on the transport.
+
+## 44. 147 allocations to decode one row, and the differential that found the bug in the replacement
+
+**Measured, `internal/api`, ten-field NDJSON row (Zen 5, load average 26 — the
+timing is indicative, the allocation counts are exact and layout-independent):**
+
+| implementation | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| `encoding/json` Decoder | 4881–5277 | 4448 | 147 |
+| byte scanner | 383–450 | 576 | 2 |
+
+`jsonLineToRow` is the coordinator's per-row cost for any clustered query with
+a coordinator half: a `json.Decoder` over a `bytes.Reader` per row, its
+512-byte read buffer, and an `any` box plus a string per token. The replacement
+scans the line directly and allocates twice — one byte buffer that every key
+and value aliases via `unsafe.String`, and one `Field` slice sized from a count
+taken over the line rather than guessed.
+
+**What the differential caught.** The scanner was tested against the Decoder as
+the specification, the way `internal/ref` is used in the sibling repositories,
+and the first run failed on *every ordinary row*: the `_time` lift `continue`d
+without recording that a pair had been consumed, so the separator check used
+`len(row.Fields) > 0` — which is still 0 after a lifted `_time` — and the comma
+before the second key was read as the start of a key. Every row whose first
+field is `_time`, which is every row a storage node emits, fell back to
+`rawRow`. A hand-written test over a few lines would very likely have used a
+row starting with `_msg`.
+
+The fuzz differential then found two more in 28M executions: invalid UTF-8 in a
+string, which `encoding/json` coerces to U+FFFD and the scanner was copying
+raw; and `{"":{0}}`, where the brace-balancing composite scanner accepted a
+nested value that is not JSON.
+
+**Three places the Decoder was looser, which the scanner deliberately is not.**
+A truncated object returned the fields read so far (`{` alone was an empty
+row); trailing bytes were ignored (`{"a":1} garbage` and `{"a":1}{"b":2}` both
+decoded to the first object); and a nested value was flattened by the token
+stream, so `{"a":{"b":1}}` became a field `a` with value `"{"` followed by a
+field `b` — a row that exists nowhere. The contract is now two-sided and
+pinned: a valid JSON object decodes to exactly what the Decoder produced, and
+anything else is the whole line as `_msg`.

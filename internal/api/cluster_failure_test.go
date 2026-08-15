@@ -35,6 +35,15 @@ var federatedEndpoints = []struct {
 	{"streams", "/select/logsql/streams?query=*", "GET", ""},
 	{"es_count", "/_count", "POST", `{"query":{"match_all":{}}}`},
 	{"es_search", "/_search", "POST", `{"query":{"match_all":{}}}`},
+	// These five federate too and were absent from this table, so the
+	// completeness rule was asserted for nine of the fourteen federated routes
+	// and assumed for the rest. docs/lld/cluster.md said "all nine", which was
+	// true of the table and not of the router.
+	{"facets", "/select/logsql/facets?query=*", "GET", ""},
+	{"sql", "/select/sql?query=SELECT+%2A+FROM+logs", "GET", ""},
+	{"stream_ids", "/select/logsql/stream_ids?query=*", "GET", ""},
+	{"stream_field_names", "/select/logsql/stream_field_names?query=*", "GET", ""},
+	{"stream_field_values", "/select/logsql/stream_field_values?query=*&field=level", "GET", ""},
 }
 
 // goodShard answers every read with a plausible empty-but-valid body and a
@@ -52,8 +61,11 @@ func goodShard(t *testing.T) *httptest.Server {
 			w.Write([]byte(`{"count":0}`))
 		case r.URL.Path == "/_search":
 			w.Write([]byte(`{"hits":{"total":{"value":0},"hits":[]}}`))
+		case strings.Contains(r.URL.Path, "facets"):
+			w.Write([]byte(`{"facets":[]}`))
 		case strings.Contains(r.URL.Path, "field_names"),
 			strings.Contains(r.URL.Path, "field_values"),
+			strings.Contains(r.URL.Path, "stream_ids"),
 			strings.Contains(r.URL.Path, "streams"):
 			w.Write([]byte(`{"values":[]}`))
 		default:
@@ -244,3 +256,44 @@ func TestClientCancellationReachesThePeers(t *testing.T) {
 }
 
 var _ = fmt.Sprint
+
+// The completeness suite covers every federated READ, derived rather than
+// listed twice.
+//
+// federatedEndpoints was a hand-kept list that had drifted to nine of the
+// fourteen federated reads while docs/lld/cluster.md said "all nine federated
+// endpoints are covered". Both were true of the list and neither was true of
+// the router. surfaceRoutes() already classifies every route the mux
+// registers, so the set is taken from there and the list has to keep up.
+func TestEveryFederatedReadIsInTheCompletenessSuite(t *testing.T) {
+	covered := map[string]bool{}
+	for _, e := range federatedEndpoints {
+		path, _, _ := strings.Cut(e.path, "?")
+		covered[path] = true
+	}
+	for _, sr := range surfaceRoutes() {
+		if sr.kind != federated || sr.write {
+			continue
+		}
+		if !covered[sr.path] {
+			t.Errorf("%s federates and is not in federatedEndpoints, so no test says "+
+				"what it does when a shard is missing", sr.path)
+		}
+	}
+	// And nothing in the list that is not a federated read: an entry for a
+	// route that does not federate asserts the rule against a route it does
+	// not apply to, which is a passing test that measures nothing.
+	real := map[string]bool{}
+	for _, sr := range surfaceRoutes() {
+		if sr.kind == federated && !sr.write {
+			real[sr.path] = true
+		}
+	}
+	for _, e := range federatedEndpoints {
+		path, _, _ := strings.Cut(e.path, "?")
+		if !real[path] {
+			t.Errorf("federatedEndpoints lists %s, which surfaceRoutes() does not "+
+				"classify as a federated read", path)
+		}
+	}
+}
