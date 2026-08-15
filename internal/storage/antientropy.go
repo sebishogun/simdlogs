@@ -269,3 +269,7 @@ func digestBytes(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
+
+// DigestForTest is digestBytes, exported for tests in other packages that need
+// to address a group by content without duplicating the hash.
+func DigestForTest(b []byte) string { return digestBytes(b) }

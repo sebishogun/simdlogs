@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/query"
 )
 
@@ -131,6 +132,10 @@ func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
 	}
 	byLabels := map[string]*acc{}
 	var order []string
+	// unparseable counts shard values this router could not read. A sum missing
+	// one of its terms is not a smaller sum, it is a different number, and the
+	// caller has to be told.
+	unparseable := 0
 	for _, b := range bodies {
 		var v struct {
 			Data struct {
@@ -154,9 +159,16 @@ func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
 			}
 			f, err := strconv.ParseFloat(fmt.Sprint(se.Value[1]), 64)
 			if err != nil {
-				// A value this router cannot parse is one its own storage nodes
-				// produced. Skipping it silently would understate the total, so
-				// it is reported as an incomplete answer instead.
+				// The comment here said "skipping it silently would understate
+				// the total, so it is reported as an incomplete answer
+				// instead", and the code was a bare `continue` -- so a shard
+				// reporting an unparseable value was dropped and the answer
+				// came back 200 with no partial marker at all. Now it is what
+				// the comment always said it was.
+				obs.L().Warn("a shard reported a value this router cannot parse",
+					obs.FieldEvent, "cluster.vector_unparseable",
+					obs.FieldRoute, r.URL.Path, "value", fmt.Sprint(se.Value[1]))
+				unparseable++
 				continue
 			}
 			a.sum += f
@@ -171,6 +183,13 @@ func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
 			// parses it expects one.
 			Value: [2]any{a.stamp, strconv.FormatFloat(a.sum, 'f', -1, 64)},
 		})
+	}
+	if unparseable > 0 {
+		s.writeErr(w, r, adminSpec(), http.StatusBadGateway, fmt.Sprintf(
+			"simdlogs: %d shard value(s) could not be read, so this total would be "+
+				"missing terms. A sum short of a term is a different number, not a "+
+				"smaller one", unparseable))
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{

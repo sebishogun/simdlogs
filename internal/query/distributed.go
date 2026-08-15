@@ -225,17 +225,45 @@ func PlanDistributed(pipes []Pipe) Plan {
 			plan.ShardPipes = append(plan.ShardPipes, p)
 			continue
 		}
-		// A stats pipe whose aggregates have no mergeable state is refused,
-		// not answered.
-		if sp, ok := p.(*StatsPipe); ok && class == PipeCoordinatorOnly {
-			if why := NonMergeableReason(sp.Aggs); why != "" {
-				plan.Reject = why
-			}
-		}
 		plan.CoordinatorPipes = append(plan.CoordinatorPipes, pipes[i:]...)
+		plan.Reject = rejectReason(plan.CoordinatorPipes)
 		return plan
 	}
+	plan.Reject = rejectReason(plan.CoordinatorPipes)
 	return plan
+}
+
+// rejectReason explains why a pipeline cannot be answered across shards, or ""
+// when it can.
+//
+// It scans EVERY coordinator pipe, not only the one at the split point. The
+// check used to fire only when a stats pipe happened to be first past the
+// split, so the same aggregate was refused in one pipe order and answered in
+// another:
+//
+//   - | stats avg(n) a              400, "average of averages"
+//   - | sort by (n) | stats avg(n) a   200, {"a":"14.5"}
+//
+// Both run the aggregate once, at the coordinator, over the merged rows -- so
+// the second answer was correct and the first refusal was over-strict. That
+// inconsistency is worse than either policy: whichever a client tried first
+// became the one they believed.
+//
+// The refusal is kept rather than dropped because it is not always
+// over-strict: an aggregate the coordinator computes over merged rows is fine,
+// and one a shard computes and the coordinator sums is not. Which of those
+// happens is decided by the pushdown, and the pushdown is what may change.
+func rejectReason(coord []Pipe) string {
+	for _, p := range coord {
+		sp, ok := p.(*StatsPipe)
+		if !ok {
+			continue
+		}
+		if why := NonMergeableReason(sp.Aggs); why != "" {
+			return why
+		}
+	}
+	return ""
 }
 
 // Distributable reports whether a pipeline can be answered across shards. It

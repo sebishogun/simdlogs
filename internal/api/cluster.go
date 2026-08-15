@@ -56,13 +56,6 @@ func (s *Server) shards() [][]string {
 	return out
 }
 
-// getFromShard tries each replica in the shard in turn until one returns a
-// body, so a read tolerates a downed replica. ok is false if all replicas fail.
-func (s *Server) getFromShard(r *http.Request, shard []string, path string, post []byte) ([]byte, bool) {
-	resp := s.askShard(r, 0, shard, path, post)
-	return resp.Body, resp.OK()
-}
-
 // askShard asks one shard, trying its replicas in order, and returns the
 // PeerResponse -- including when every replica failed.
 //
@@ -668,12 +661,6 @@ func (s *Server) mergeRows(
 	}
 }
 
-// fanOut sends the GET to one live replica of each shard concurrently and
-// returns the response bodies (one per shard), so replicated data is read once.
-func (s *Server) fanOut(r *http.Request, path string) [][]byte {
-	return bodiesOf(s.fanOutPeers(r, path, nil))
-}
-
 // fanOutPeers asks every shard and returns one PeerResponse each, in shard
 // order -- including the failures.
 //
@@ -890,30 +877,6 @@ func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, pa
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"values": out})
-}
-
-// federatedStrings merges a string list under key across storage nodes (union).
-func (s *Server) federatedStrings(w http.ResponseWriter, r *http.Request, path, key string) {
-	w.Header().Set("Content-Type", "application/json")
-	seen := map[string]struct{}{}
-	strBodies, w, ok := s.fanOutChecked(w, r, path, nil)
-	if !ok {
-		return
-	}
-	for _, b := range strBodies {
-		var v map[string][]string
-		if json.Unmarshal(b, &v) == nil {
-			for _, x := range v[key] {
-				seen[x] = struct{}{}
-			}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for x := range seen {
-		out = append(out, x)
-	}
-	sort.Strings(out)
-	json.NewEncoder(w).Encode(map[string]any{key: out})
 }
 
 // federatedMatrix merges stats_query_range across storage nodes by concatenating

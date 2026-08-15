@@ -135,37 +135,6 @@ func (s *Server) planQuery(w http.ResponseWriter, r *http.Request) (shardQuery s
 	return shardQuery, plan.CoordinatorPipes, true
 }
 
-// queryHead is everything before the first pipe: the filter.
-//
-// LogsQL's pipe separator is `|` at the top level, and a `|` can appear inside
-// a quoted string or a parenthesised subquery. This walks the text rather than
-// splitting on the byte, because splitting would cut `_msg:~"a|b"` in half and
-// send half a regex to every shard.
-func queryHead(raw string) string {
-	depth := 0
-	var quote byte
-	for i := 0; i < len(raw); i++ {
-		c := raw[i]
-		switch {
-		case quote != 0:
-			if c == '\\' {
-				i++
-			} else if c == quote {
-				quote = 0
-			}
-		case c == '"' || c == '\'' || c == '`':
-			quote = c
-		case c == '(' || c == '[' || c == '{':
-			depth++
-		case c == ')' || c == ']' || c == '}':
-			depth--
-		case c == '|' && depth == 0:
-			return strings.TrimSpace(raw[:i])
-		}
-	}
-	return strings.TrimSpace(raw)
-}
-
 // pipeSegments splits a query's text into its top-level pipe segments, with
 // the same quote and nesting awareness as queryHead.
 func pipeSegments(raw string) []string {
