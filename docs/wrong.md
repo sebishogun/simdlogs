@@ -4071,3 +4071,50 @@ compiles. The tests were green throughout. What found them was two independent
 adversaries running mutations — and the single most useful signal in both
 reports is the revert-probe list, because a guard you can delete with the suite
 still green is a guard that was never doing anything.
+
+## 38. A test fixture that agreed with the defect, and column order decided by a map seed
+
+Task 8.5 split LogsQL execution between shards and coordinator. Two things
+turned up that were not the planner, and both were found by measurement rather
+than by reading.
+
+**The differential test passed one case for the wrong reason.** The fixture
+built 30 rows, assigned `level` as `i%3`, and sent row `i` to shard `i%3`. Both
+moduli are 3, so each level lived entirely on one shard — and a router that
+aggregated per shard and concatenated therefore produced *exactly* the right
+answer for `| stats by (level) count()`: three rows, ten each. The subtest was
+green with the planner disabled. Changing the level to `(i/3+i)%3` puts all
+three levels on all three shards and keeps ten rows per level; the same subtest
+then reports **9 rows where a single node reports 3**. With the planner
+disabled, **10 of 15 pipe shapes fail; before the fixture fix, 9 did**.
+
+A group-by key that is a function of the shard index cannot test a cross-shard
+merge. The fixture has to disagree with the defect, and this one agreed with it.
+
+**A group's column order was Go's map iteration order.** `Writer.addVec`
+registered a new column the first time it saw the name, iterating the record's
+`map[string]string`. Go randomises that per process, so:
+
+- two storage nodes given identical records built groups whose columns were in
+  different orders;
+- the same row read back from two shards came out with its fields permuted, and
+  a client reading NDJSON from a router saw the shape change by shard;
+- a group's bytes were not reproducible for identical input.
+
+Measured directly: eight identical queries in one process returned a byte-identical
+first row, and three separate `go test` processes over the same input returned
+`{"_time","n","_msg","level","user"}` once and `{"_time","_msg","level","user","n"}`
+twice. Stable within a process, a coin flip across processes — which is why no
+test had ever seen it.
+
+Fixed by registering only the names that are NEW, sorted, so column order is a
+function of the data. Sorting the whole list per record would cost more and give
+a worse order (a field first seen in record 900 ahead of one from record 1), so
+the sort is per record and the order between records stays first-seen.
+`BenchmarkAddSteadyState`: **0 allocs/op, 287–308 ns/op over three runs** — the
+scratch slice is reused, and a row that introduces no column sorts nothing.
+
+**The shape.** Both are the same failure as entry 37's, one level down: a
+property nobody executed. The fixture asserted an equality that held for a
+reason unrelated to the code under test, and the column order was never compared
+across two processes because a test only ever runs in one.

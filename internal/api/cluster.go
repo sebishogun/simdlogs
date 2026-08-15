@@ -458,11 +458,25 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 		t    int64
 		line []byte
 	}
+	// The PLAN before the fan-out.
+	//
+	// The whole query used to go to every shard and the final rows were
+	// concatenated: `| stats count()` answered once per shard, `| sort |
+	// limit 10` returned each shard's top ten, `| uniq` returned each shard's
+	// distinct values. Only the row-local prefix is distributable; everything
+	// from the first non-row-local pipe runs here, once, over the merged rows.
+	shardQuery, coordPipes, ok := s.planQuery(w, r)
+	if !ok {
+		return
+	}
+	shardReq := r.Clone(r.Context())
+	shardReq.URL.RawQuery = shardQueryURL(r, shardQuery)
+
 	// The completeness gate BEFORE the merge. A shard that did not answer used
 	// to contribute nothing and the merge proceeded, so a cluster read with one
 	// shard down returned the other shards' rows with HTTP 200 and nothing to
 	// say a third of the data was missing.
-	bodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/query", nil)
+	bodies, w, ok := s.fanOutChecked(w, shardReq, "/select/logsql/query", nil)
 	if !ok {
 		return
 	}
@@ -497,7 +511,52 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 
+	// The coordinator half of the plan, applied ONCE over the merged rows.
+	if len(coordPipes) > 0 {
+		// The order the pipes see must be the order a single storage node would
+		// have given them, or a pipe that reads POSITION -- offset, limit
+		// without a sort, tail -- answers a different question on a cluster than
+		// on one node. A node scans oldest-first, so the coordinator half sorts
+		// ascending; the bare-select path below keeps newest-first, because
+		// there `limit` means "the newest N" and that is the endpoint's
+		// documented meaning.
+		sort.Slice(all, func(i, j int) bool { return all[i].t < all[j].t })
+
+		// The rows are parsed into fields ONLY here.
+		//
+		// The merge keeps raw NDJSON lines because it only has to order and
+		// re-emit them, and a string per row was the router's cost on a big
+		// result. A pipe operates on fields, so this path has to pay the
+		// decode -- and only this path does.
+		qrows := make([]query.Row, 0, len(all))
+		for _, rw := range all {
+			qrows = append(qrows, jsonLineToRow(rw.line))
+		}
+		merged, err := s.applyCoordinatorPipes(r, qrows, coordPipes)
+		if err != nil {
+			s.writeErr(w, r, readSpec(), query.HTTPStatus(err), err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", ndjsonContentType)
+		w.WriteHeader(http.StatusOK)
+		bw := bufio.NewWriter(w)
+		defer bw.Flush()
+		var buf []byte
+		for _, row := range merged {
+			// withStream is FALSE here, unlike every direct read: these rows
+			// came back from a storage node that already stamped the pair, and
+			// they survived the round trip as ordinary fields. Asking for it
+			// again appended a second _stream_id to every row -- valid JSON,
+			// duplicate key, and the two decoders in this repo disagree about
+			// which one wins.
+			buf = appendRowJSON(buf[:0], row, false)
+			bw.Write(buf)
+		}
+		return
+	}
+
 	sort.Slice(all, func(i, j int) bool { return all[i].t > all[j].t }) // newest first
+
 	limit := 0
 	if v := r.FormValue("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {

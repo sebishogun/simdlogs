@@ -1439,3 +1439,39 @@ func PipesProject(pipes []Pipe) bool {
 	// emits whole records, so the engine must materialize every column for them.
 	return false
 }
+
+// ApplyPipes runs a pipe chain over rows that are already materialized.
+//
+// It exists for the cluster coordinator, which has merged rows from several
+// shards and must apply the non-distributable half of a plan to them ONCE. The
+// scan-side entry points all start from a store; this one starts from rows,
+// because at that point there is no store to start from -- the rows came off
+// the wire.
+//
+// Store-aware pipes are refused rather than skipped. join, union and
+// stream_context each run a subquery against a store, and a coordinator has
+// none: skipping them would answer the query as if the pipe were not there,
+// which is the silent-wrong-answer shape this whole area is about.
+func ApplyPipes(q *Query, rows []Row) []Row {
+	for _, p := range q.Pipes {
+		if q.exceeded(0) {
+			return nil
+		}
+		switch p.(type) {
+		case *JoinPipe, *UnionPipe, *StreamContextPipe:
+			q.stop(fmt.Errorf("%w: %T cannot run at a cluster coordinator, which has no "+
+				"store to run its subquery against", ErrRejected, p))
+			return nil
+		}
+		rows = p.apply(rows)
+		if q.maxPipeRows > 0 && len(rows) > q.maxPipeRows {
+			q.stop(fmt.Errorf("%w: %T produced %d rows, ceiling is %d",
+				ErrPipeRowLimit, p, len(rows), q.maxPipeRows))
+			return nil
+		}
+		if q.stopErr() != nil {
+			return nil
+		}
+	}
+	return rows
+}

@@ -46,6 +46,9 @@ type Writer struct {
 	ts       []int64
 	cols     map[string]*colBuf
 	colOrder []string
+	// newCols is scratch for the names one record introduces, so registering
+	// them in a deterministic order costs no allocation on the per-row path.
+	newCols  []string
 	strmFlds []string // fields that identify a log stream; synthesize _stream from them
 	// vecFlds is which fields are embeddings and at what dimension; vecs
 	// holds their flat row-major data for the batch being built. Separate
@@ -471,6 +474,22 @@ func (w *Writer) addVec(ts int64, fields map[string]string, streamOverridden boo
 	dropPayloadStream := len(w.strmFlds) > 0 && !streamOverridden
 	row := len(w.ts)
 	w.ts = append(w.ts, ts)
+	// New columns are registered in SORTED order, not in the order this map
+	// iterates.
+	//
+	// A group's column order is the order its columns were first seen, and
+	// `range` over a map is randomised per process. So the same records written
+	// by two processes produced groups whose columns were in different orders,
+	// and a row read back came out with its fields permuted -- differently on
+	// every node. In a cluster that is visible: one shard answers
+	// {_msg, level, user} and its neighbour answers {user, _msg, level} for the
+	// same row, and a client reading NDJSON sees the shape change by shard.
+	//
+	// Sorting only the names that are NEW keeps this off the per-row path: a
+	// row that introduces no column sorts nothing, which is every row after the
+	// first in a uniform stream. The scratch slice is reused, so the common
+	// case allocates nothing.
+	w.newCols = w.newCols[:0]
 	for k, v := range fields {
 		if k == "_stream" && dropPayloadStream {
 			continue
@@ -486,9 +505,8 @@ func (w *Writer) addVec(ts int64, fields map[string]string, streamOverridden boo
 		}
 		cb := w.cols[k]
 		if cb == nil {
-			cb = &colBuf{name: k, vals: make([]string, row)} // backfill prior rows
-			w.cols[k] = cb
-			w.colOrder = append(w.colOrder, k)
+			w.newCols = append(w.newCols, k) // registered below, in order
+			continue
 		}
 		// backfill any gap (rows added before this column existed)
 		for len(cb.vals) < row {
@@ -496,6 +514,17 @@ func (w *Writer) addVec(ts int64, fields map[string]string, streamOverridden boo
 		}
 		cb.vals = append(cb.vals, v)
 		w.bytes += len(k) + len(v)
+	}
+	if len(w.newCols) > 0 {
+		sort.Strings(w.newCols)
+		for _, k := range w.newCols {
+			cb := &colBuf{name: k, vals: make([]string, row)} // backfill prior rows
+			w.cols[k] = cb
+			w.colOrder = append(w.colOrder, k)
+			v := fields[k]
+			cb.vals = append(cb.vals, v)
+			w.bytes += len(k) + len(v)
+		}
 	}
 	// The embeddings, into the flat per-column buffer.
 	//

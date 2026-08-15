@@ -117,6 +117,89 @@ renders `size` results shows three pages on one, and one that paginates by
 `from` skips two thirds of the corpus per step. `from`/`size` now apply to the
 merged hits; `hits.total` was already the cluster-wide count and stays it.
 
+## Distributed query planning
+
+The router used to send the whole query string to every shard and concatenate
+the final rows. For a bare filter that is right. For a pipeline it is wrong, and
+wrong in the way that is hardest to catch: every answer is a plausible number.
+
+| Query | What three shards returned | The answer |
+|---|---|---|
+| `* \| stats count() n` | three rows, each a shard-local count | a client reading the first row gets a third of the count |
+| `* \| sort by (t) \| limit 10` | each shard's top ten, concatenated | thirty rows; the true top ten only by luck |
+| `* \| uniq by (user)` | each shard's distinct users | anyone active on two shards counted twice |
+
+`query.ClassifyPipe` puts every pipe in one of four classes:
+
+- **row-local** — each output row is a function of one input row (filters,
+  `fields`, `rename`, `delete`, `format`, `extract`, `math`, the `unpack`
+  family, …). Applying it per shard and merging equals applying it after
+  merging, so it runs where the data already is.
+- **mergeable-aggregate** — `count`, `sum`, `min`, `max`, `sum_len`,
+  `count_empty`: partial state a coordinator can combine.
+- **global-order** — `sort`, `limit`, `offset`, `tail`, `top`, `uniq`, `rank`.
+  A shard cannot know whether its own best row is the cluster's.
+- **coordinator-only** — subqueries (`join`, `union`, `stream_context`),
+  introspection pipes, `sample`, and any aggregate with no mergeable partial
+  state.
+
+`sample` is classed coordinator-only although its shape is row-local: each
+shard sampling 10% of its own rows does yield 10% of the cluster, but the
+selection is per shard, so a caller asking for a sample of the cluster gets a
+stratified one instead.
+
+**The default is coordinator-only.** A pipe the classifier has not been taught
+about runs at the coordinator — slower and correct. The other default, "assume
+row-local", is precisely how a newly added pipe would start silently returning
+per-shard answers.
+
+`query.PlanDistributed` splits at the FIRST non-row-local pipe: the prefix goes
+to the shards, everything from that pipe onward runs once at the coordinator
+over the merged rows. `planQuery` rebuilds the shard query from the parsed
+filter plus that many pipe segments, counted rather than edited textually —
+`pipeSegments` walks the text with quote and nesting awareness so `_msg:~"a|b"`
+is not cut in half and half a regex sent to every shard.
+
+A prefix is also why a count suffices: the nth kept pipe is the nth text
+segment after the head, by construction. A planner that reordered or took from
+the middle could not name its pipes in the original text, and re-serialising a
+parsed pipe would mean writing a printer for every pipe in the language and
+keeping it exactly in step with the parser.
+
+**Order into the coordinator half is ascending.** A storage node scans
+oldest-first, so a pipe that reads position — `offset`, `limit` without a sort,
+`tail` — must see the same order it would see on one node. The bare-select path
+keeps newest-first, because there `limit` means "the newest N".
+
+### Refused rather than answered
+
+An aggregate with no mergeable partial state is a 400 carrying the reason, not
+a number:
+
+| Aggregate | Why | What to do instead |
+|---|---|---|
+| `quantile()` | a quantile of a union is not any function of the shards' quantiles — the median of medians is not the median | needs a mergeable sketch (t-digest, DDSketch) with a documented error bound; not in this build |
+| `avg()` | averaging averages is wrong whenever shards hold different row counts: 10, 20, 30 over 1, 1 and 1000 rows averages to 20 where the true mean is 29.97 | `sum()` and `count()`, which do merge |
+| `uniq()`, `count_uniq()` | summing per-shard distinct counts double-counts every value on more than one shard | needs an HLL sketch on the wire |
+| `histogram()`, `rate()` | no merge in this build; `rate` would need each shard's window coverage | — |
+
+A wrong percentile looks exactly like a latency, and capacity decisions get
+made from it. Refusing is the answer until a sketch exists and is tested
+against the exact single-node result.
+
+### The test that would have caught it
+
+`TestSingleNodeAndClusterAgree` (`internal/api/cluster_differential_test.go`)
+ingests one corpus into a single node and the same corpus split across three
+real storage nodes behind a real router, then asserts the answers are identical
+for fifteen pipe shapes. With the planner disabled, ten of the fifteen fail.
+
+The fixture itself needed a fix: `level` was `i%3` and the shard was also `i%3`,
+so each level lived entirely on one shard and per-shard aggregation happened to
+produce exactly the right answer — `| stats by (level)` passed against the
+defect it was written to catch. The group-by key must not be a function of the
+shard index.
+
 ## Read completeness
 
 Every merge consumed a `[][]byte` with a nil entry for a shard that did not
@@ -260,14 +343,14 @@ data to every member.
 
 | Endpoint | Merge | Status |
 |---|---|---|
-| `/select/logsql/query` | `federatedSelect`: query all shards concurrently; rows merge in time order (newest first, parsed from each line's `_time`), `limit` applies across the merged set. Rows are kept as slices into each shard's response body (no per-row string copies — that was the router's dominant cost); the timestamp parse uses the fast RFC3339Nano path. | works |
-| `/select/logsql/hits` | `federatedHits` decodes `{"hits":[{"_time":..,"hits":..}]}` — the OLD object shape — but the backend `selectHits` now answers the dense series shape `{"hits":[{"fields":..,"timestamps":[..],"values":[..],"total":N}]}`. Each dense series object decodes as `{"_time":"","hits":0}` and all collapse into one map entry: **the router answers exactly `{"hits":[{"_time":"","hits":0}]}` — one bogus zero bucket — for any non-empty store**. | **broken** (bogus zero bucket) |
+| `/select/logsql/query` | `federatedSelect`, after `planQuery` splits the pipeline (see **Distributed query planning**). Bare filters and the row-local prefix run on the shards; rows merge in time order (newest first, parsed from each line's `_time`) and `limit` applies across the merged set. Rows are kept as slices into each shard's response body (no per-row string copies — that was the router's dominant cost); the timestamp parse uses the fast RFC3339Nano path, and only a query with a coordinator half pays the decode back into fields. | works |
+| `/select/logsql/hits` | `federatedHits` decodes the dense series shape the backend actually answers (`{"hits":[{"fields":..,"timestamps":[..],"values":[..],"total":N}]}`) and merges by label set, summing buckets per timestamp. Fixed in 8.4; it previously decoded the older object shape and answered one bogus zero bucket for any non-empty store. | works |
 | `/select/logsql/stats_query` (plain, no `by=` param) | `federatedStatsQuery` decodes `{"count":N}` from each backend, but the backend answers the Prometheus vector envelope `{"status":"success","data":{"resultType":"vector","result":[...]}}`. No `count` field exists: **the router always answers `{"count":0}`**. | **broken** (bogus zero) |
 | `/select/logsql/stats_query` (`by=` param) | The backend's `by=` extension answers `{"stats":[{value,hits}]}`, which `federatedStatsQuery` decodes and sums per value. | works |
 | `/select/logsql/stats_query_range` | `federatedMatrix`: each shard's series concatenated (shards hold disjoint groups, so a series is one shard's); decodes the backend's `{"data":{"result":[...]}}` envelope. | works |
 | `/select/logsql/field_values`, `stream_field_values`, `field_names`, `stream_field_names` | All four route to `federatedValueCounts` (key `"values"`): backends answer `{"values":[...]}` and hits are SUMMED per value, sorted by count desc then value. (`federatedStrings` exists in `cluster.go` but is not wired to any route.) | works |
-| `/select/logsql/streams` | Router sends key `"streams"`, but the backend `streams` handler answers the shared `{"values":[...]}` envelope — `v["streams"]` does not exist: **the router answers `{"streams":[]}` even when backends hold streams**. | **broken** (empty answer) |
-| `/select/logsql/stream_ids` | Same key mismatch (`"stream_ids"` vs `{"values":[...]}`): **always `{"stream_ids":[]}`**. | **broken** (empty answer) |
+| `/select/logsql/streams` | Routes to `federatedValueCounts`, which reads the `{"values":[...]}` envelope the backend actually answers. Fixed in 8.4; the router previously looked for a `"streams"` key that no backend emits and answered an empty list however many streams the shards held. | works |
+| `/select/logsql/stream_ids` | Same path and same 8.4 fix (the key was `"stream_ids"` against the same `{"values":[...]}` envelope). | works |
 | `/_search` | `federatedESSearch`: hits merged, `hits.total` summed, `relation: "eq"`. | works |
 | `/_count` | `federatedESCount`: counts summed. | works |
 
@@ -323,9 +406,17 @@ envelope defects above are exactly what such a benchmark cannot see.
 ## What this is not
 
 No consensus, no leader election, no transactions, no automatic membership
-discovery, no cross-node query planning beyond one-replica-per-shard fan-out,
-no shard rebalancing when the backend list changes (the operator restarts the
-router with the new list), no merge for avg/quantile stats, and — today — no
-correct merge for `streams`, `stream_ids`, plain `stats_query`, or `hits`,
-plus no federation at all for the endpoints listed above. Those are roadmap
-items with measurable exits, not current behavior.
+discovery, and no shard rebalancing when the backend list changes (the operator
+restarts the router with the new list).
+
+Query planning splits row-local work from coordinator work and refuses what it
+cannot merge, but it does not push aggregates down: a mergeable `count`/`sum`
+still runs once at the coordinator over the merged rows rather than as partial
+state on the wire. That is correct and slower than it could be. Pushing one
+down means putting a partial state on the wire, and a partial state that is
+subtly wrong is a number nobody can spot.
+
+There is still no merge for avg/quantile/distinct stats — those are refused
+with the reason — and plain `stats_query` without `by=` decodes a `count` field
+the backend does not emit. No federation at all for the endpoints listed above.
+Those are roadmap items with measurable exits, not current behavior.
