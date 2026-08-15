@@ -32,6 +32,14 @@ type Snapshot struct {
 	// store's time order. Valid until Close.
 	Groups []*Reader
 
+	// GroupIDs are the manifest ids of Groups, index for index. Pagination
+	// needs a row identity that survives a second query, and the position of a
+	// group WITHIN a snapshot does not: compaction, retention and cold
+	// demotion all change it. The manifest id is assigned once by AppendGroup
+	// and never reused, so a (time, group id, row index) tuple names the same
+	// row for as long as the row exists.
+	GroupIDs []uint64
+
 	entries []*groupEntry
 	// closed is atomic: two concurrent Close calls both passed a plain-bool
 	// check and released every entry twice, driving refs below zero and
@@ -53,6 +61,7 @@ func (s *Snapshot) Close() error {
 	}
 	s.entries = nil
 	s.Groups = nil
+	s.GroupIDs = nil
 	return firstErr
 }
 
@@ -134,6 +143,7 @@ func (s *Store) Snapshot(from, to int64) (*Snapshot, error) {
 		}
 		snap.entries = append(snap.entries, g)
 		snap.Groups = append(snap.Groups, g.reader)
+		snap.GroupIDs = append(snap.GroupIDs, g.id)
 	}
 	return snap, nil
 }
@@ -175,6 +185,7 @@ func (s *Store) SnapshotAllWithSeq() (*Snapshot, uint64, error) {
 		}
 		snap.entries = append(snap.entries, g)
 		snap.Groups = append(snap.Groups, g.reader)
+		snap.GroupIDs = append(snap.GroupIDs, g.id)
 	}
 	return snap, s.man.seq, nil
 }
@@ -198,6 +209,7 @@ func (s *Store) SnapshotAfterID(cursor uint64) (*Snapshot, uint64, error) {
 		}
 		snap.entries = append(snap.entries, g)
 		snap.Groups = append(snap.Groups, g.reader)
+		snap.GroupIDs = append(snap.GroupIDs, g.id)
 		if g.id+1 > next {
 			next = g.id + 1
 		}

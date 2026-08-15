@@ -196,6 +196,43 @@ recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
 | `-search.maxRows` | cap on rows a select may return; 0 = built-in default, -1 = unlimited. Over it the query errors 413 — for EVERY pipe shape, not only a bare select |
 | `-search.maxGroupKeys` | cap on an aggregate's distinct `by` keys (stats/uniq/top); 0 = unbounded |
 | `-search.maxPipeRows` | cap on the rows one pipe may produce (join fanout, union, stream_context); 0 = unbounded |
+
+**Cursor pagination.** `/select/logsql/query` takes `page_size=N` and
+optionally `direction=oldest|newest` and `cursor=<token>`. A page that has more
+returns the next cursor in the **`X-Simdlogs-Cursor`** response header — not in
+the body, because the body is NDJSON and a trailing object of a different shape
+is a row as far as every client reading the stream is concerned. Page until the
+header is absent and every row is seen exactly once.
+
+Pagination is opt-in: without `page_size` the endpoint answers exactly as it
+did. The total order it imposes — `(timestamp, group id, row index)` — is a
+promise the unpaginated path never made, and imposing it on every select would
+change answers.
+
+The tuple exists because a timestamp is not an identity. Log timestamps collide
+constantly, and "after time T" either repeats every row at T or drops all but
+one of them. The group id is the manifest id, assigned once by `AppendGroup`
+and never reused, so it survives compaction and restart; a group's *position*
+in a snapshot does not.
+
+The cursor is HMAC-SHA256 signed and carries the tenant, a hash of the query
+text and its **resolved** window, the direction, and the tuple. Everything in
+it is attacker-controlled on the way back, so all four are checked: a cursor
+replayed against another tenant, another query, a relative window that has
+since moved, or the other direction is **400**, not a wrong page. 400 rather
+than 403 for the tenant case — the tenant middleware already made the
+authorization decision, and 403 here would tell a prober that its forged cursor
+was otherwise well-formed.
+
+The signing key is random per process and never persisted. A cursor that
+survived a restart would resume into a store that has since compacted, retired
+and re-ingested, so "your cursor expired, start again" is the answer. A
+select-router forwarding a cursor to a node that did not issue it gets a clean
+rejection rather than a wrong page.
+
+Each page is one snapshot, so rows appended mid-walk are not in it — including
+rows that sort *before* the cursor, which is exactly what a timestamp-only walk
+gets wrong.
 | `-search.maxDuration` | wall-time cap for one query request (not the live tail); 0 = default, -1ns = unlimited |
 | `-search.maxQueryBytes` | cap on the bytes one query may materialize; 0 = default (256 MiB), -1 = unlimited. Over it the query errors 504 rather than returning a short answer. |
 | `-http.maxBodyBytes` | maximum request body; 0 = default, -1 = unlimited |

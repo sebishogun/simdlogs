@@ -41,6 +41,10 @@ type Server struct {
 	def     *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
 	// nStreamedSelects counts bare selects answered without materializing.
 	nStreamedSelects int64
+	// cursors signs pagination cursors. Per process and never persisted: a
+	// cursor that survived a restart would resume into a store that has since
+	// compacted, retired and re-ingested.
+	cursors *cursorSigner
 	// lastSyslogRefusal throttles the native transport's budget-refusal log.
 	// Nanos, atomic: written from every listener goroutine.
 	lastSyslogRefusal int64
@@ -235,6 +239,11 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	// replaces is the pathological one.
 	srv.workers = query.NewWorkerBudget(c.Limits.MaxScanWorkers)
 	query.SetWorkerBudget(srv.workers)
+	cs, err := newCursorSigner()
+	if err != nil {
+		return nil, err
+	}
+	srv.cursors = cs
 	srv.compact = c.Compact
 	if len(c.StreamFields) > 0 {
 		srv.strmFlds = append([]string(nil), c.StreamFields...)
@@ -880,6 +889,70 @@ func (s *Server) streamSelect(w http.ResponseWriter, r *http.Request, q *query.Q
 	panic(http.ErrAbortHandler)
 }
 
+// pagedSelect answers one page of a stable total order.
+//
+// The cursor is opaque and signed; see cursor.go for why. What it costs the
+// caller is one rule: page until `More` is false, and do not edit the token.
+func (s *Server) pagedSelect(w http.ResponseWriter, r *http.Request, q *query.Query,
+	stopped *atomic.Bool, size int,
+) {
+	dir := query.Oldest
+	if v := r.FormValue("direction"); v == "newest" {
+		dir = query.Newest
+	} else if v != "" && v != "oldest" {
+		http.Error(w, "simdlogs: direction must be `oldest` or `newest`", 400)
+		return
+	}
+	// The window is resolved BEFORE the hash, because a relative window
+	// (`_time:5m`) is a different absolute window on every request and a
+	// cursor bound to the unresolved text would slide forward as the clock
+	// moves -- repeating rows the caller has seen and skipping ones it has
+	// not.
+	query.ResolveWindow(q)
+	qh := queryHash(r.FormValue("query"), q.From, q.To)
+	tenant := tenantKeyOf(r)
+
+	var after *query.RowKey
+	if tok := r.FormValue("cursor"); tok != "" {
+		k, err := s.cursors.decode(tok, tenant, qh, dir)
+		if err != nil {
+			// 400, not 403. A cursor that names another tenant is a client
+			// holding a stale or hand-edited token, not an authorization
+			// decision about this request -- the tenant middleware already
+			// made that one, and answering 403 here would tell a prober that
+			// the cursor it forged was otherwise well-formed.
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		after = &k
+	}
+
+	page, err := query.ScanPage(s.tn(r).store, q, after, dir, size)
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
+	if err != nil {
+		s.writeErr(w, r, readSpec(), query.HTTPStatus(err), err.Error())
+		return
+	}
+	if page.More {
+		// The cursor goes in a header, not in the body: the body is NDJSON,
+		// one JSON object per row, and a trailing object of a different shape
+		// is a row as far as every client that reads the stream is concerned.
+		w.Header().Set("X-Simdlogs-Cursor", s.cursors.encode(cursorPayload{
+			tenant: tenant, queryHash: qh, dir: dir, key: page.Next,
+		}))
+	}
+	w.Header().Set("Content-Type", ndjsonContentType)
+	bw := bufio.NewWriterSize(w, 64<<10)
+	defer bw.Flush()
+	var buf []byte
+	for _, row := range page.Rows {
+		buf = appendRowJSON(buf[:0], row, q.MatAll)
+		bw.Write(buf)
+	}
+}
+
 func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 { // select-router: fan out to the storage nodes and merge
 		s.federatedSelect(w, r)
@@ -907,6 +980,14 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	stopped := s.applyQueryBudget(r, q)
+	if n := intParam(r, "page_size", 0); n > 0 {
+		// Pagination is opt-in per request. Without page_size the endpoint
+		// answers exactly as it did -- the ordering below is a total order the
+		// old path never promised, and imposing it on every select would
+		// change answers this campaign's whole point is not to change.
+		s.pagedSelect(w, r, q, stopped, n)
+		return
+	}
 	if query.Streamable(q) {
 		// No pipes, no `limit=`, and no row cap in force -- so nothing has to
 		// see the whole answer before the first byte can go out. That is
