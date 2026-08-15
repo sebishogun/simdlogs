@@ -315,6 +315,53 @@ Environment: `SIMDLOGS_STREAM_FIELDS` (stream-field default before the
 default tenant opens, so a deployment can synthesize `_stream` without a
 code change).
 
+## Elasticsearch and SQL contracts
+
+Both surfaces had the same defect: **a clause the server did not implement was
+silently dropped**. That is the worst failure a query surface can have — a
+dropped filter returns MORE documents than the client asked for, in a response
+that is structurally valid, and a client filtering `status:error` and getting
+every log line back cannot tell that from a store where everything is an error.
+
+**Elasticsearch.** The body is decoded with `DisallowUnknownFields`, so an
+unknown field is a 400 rather than a filter on the floor. `term`, `terms`,
+`match`, `prefix`, `exists`, `match_all`, `bool.must`, `bool.filter`,
+`bool.must_not` and `bool.should` map onto the planner's `Expr` tree — must_not
+and should are not expressible as an implicit AND of predicates, which is why
+they were dropped. `exists` maps to `NOT (field == "")`: a column the store
+does not hold reads as empty for every row, which is exactly what exists means
+here. It was decoded and never read before, so `exists` matched every document.
+
+A **non-time `range` is refused with 400**, not ignored; the comment that said
+"Phase 7" documented the gap for a reader of the file and for nobody sending
+the query. `minimum_should_match` is refused unless it is 1. A time range still
+becomes the window, which is what makes an ES time filter as cheap as a LogsQL
+one.
+
+`hits.total.value` is the number of **matching** documents. It was `len(rows)`
+after `size` had been pushed into the scan as a `Limit`, so `size=10` over a
+hundred matches answered `"total": 10` — and every ES client renders that as
+"10 results". The scan is unbounded by `size`; `from`/`size` page the whole
+result afterwards. No `size` at all is Elasticsearch's default of **10**, not
+every document. `_count` decodes strictly too; its decode error used to be
+discarded entirely, so a malformed body counted the whole store.
+
+**SQL.** The parser stopped after `LIMIT` and ignored whatever followed, so
+`LIMIT 5 OFFSET 10` dropped the OFFSET, `HAVING count(*) > 1` dropped the
+HAVING, and a `JOIN` answered about one table. A leftover token is now a 400
+naming it, with the supported subset spelled out in the message.
+
+SQL also had **no row cap at all** — `SELECT * FROM logs` materialized every
+matching row, and `ORDER BY` over an unbounded input is the shape task 6.4 was
+about. It takes `-search.maxRows` like the LogsQL select, and an explicit
+`LIMIT` becomes a `| limit` pipe that the scan honours, so a bounded query is
+answered rather than refused.
+
+Both handlers now run the scan **before** setting `Content-Type` and taking a
+writer, and both use the typed stop reason. They used to commit the response to
+NDJSON/JSON first, so a budget stop wrote its status into a response already on
+the wire, and reported the generic 504 whatever the cause.
+
 ## Metrics
 
 `metrics.go`. Own names (`simdlogs_tenants`, `simdlogs_groups`,

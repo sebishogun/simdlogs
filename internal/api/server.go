@@ -1267,18 +1267,39 @@ func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q.From, q.To = timeWindow(r)
-	if len(q.Pipes) == 0 {
+	if len(q.Pipes) == 0 || !query.PipesProject(q.Pipes) {
 		q.MatAll = true
+		// The same row cap the LogsQL select gets. SQL had none at all: a
+		// `SELECT * FROM logs` with no LIMIT materialized every matching row,
+		// and `ORDER BY` over an unbounded input is the exact shape task 6.4
+		// was about -- with the difference that nothing here even bounded it.
+		//
+		// An explicit LIMIT becomes a `| limit` pipe, which RunPipeline pushes
+		// into the scan, so a bounded query is answered rather than refused.
+		if q.Limit == 0 && s.maxRows > 0 {
+			q.MaxRows = s.maxRows
+		}
+	}
+	// The scan BEFORE the header. This handler used to set Content-Type and
+	// take a writer first, so a budget stop wrote its status into a response
+	// already committed to NDJSON -- and it used queryStopped rather than
+	// queryStoppedErr, so every cause reported the generic 504 whatever
+	// actually stopped it.
+	sqlStopped := s.applyQueryBudget(r, q)
+	sqlRows := query.RunPipeline(s.tn(r).store, q)
+	if s.queryStoppedErr(w, r, sqlStopped, q) {
+		return
+	}
+	if s.maxRows > 0 && len(sqlRows) > s.maxRows {
+		s.writeErr(w, r, readSpec(), http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("simdlogs: result exceeds -search.maxRows=%d; add a LIMIT, "+
+				"an aggregate, or narrow the query", s.maxRows))
+		return
 	}
 	w.Header().Set("Content-Type", ndjsonContentType)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	var buf []byte
-	sqlStopped := s.applyQueryBudget(r, q)
-	sqlRows := query.RunPipeline(s.tn(r).store, q)
-	if s.queryStopped(w, r, sqlStopped) {
-		return
-	}
 	for _, row := range sqlRows {
 		buf = appendRowJSON(buf[:0], row, q.MatAll)
 		bw.Write(buf)

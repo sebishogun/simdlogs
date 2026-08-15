@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -20,22 +21,47 @@ import (
 type esQuery struct {
 	Query esClause `json:"query"`
 	Size  int      `json:"size"`
+	From  int      `json:"from"`
 }
 
+// esClause is the supported subset. Every field a client can send is named
+// here, and the decoder is strict, so anything NOT named is a 400 rather than
+// a clause that is silently ignored.
+//
+// Silent ignoring is the failure this replaces, and it is the worst kind an
+// ES surface can have: a dropped filter returns MORE documents than the client
+// asked for, in a response that is structurally valid. `terms`, `must_not`,
+// `should`, `exists`, `match`, `wildcard` and every non-time `range` were all
+// parsed-and-dropped -- `exists` was even in the struct, decoded, and never
+// read. A client filtering `status:error` and getting every log line back has
+// no way to tell that from a store where everything is an error.
 type esClause struct {
-	Bool   *esBool            `json:"bool,omitempty"`
-	Term   map[string]any     `json:"term,omitempty"`
-	Range  map[string]esRange `json:"range,omitempty"`
-	Exists *esExists          `json:"exists,omitempty"`
+	Bool   *esBool             `json:"bool,omitempty"`
+	Term   map[string]any      `json:"term,omitempty"`
+	Terms  map[string][]any    `json:"terms,omitempty"`
+	Range  map[string]esRange  `json:"range,omitempty"`
+	Exists *esExists           `json:"exists,omitempty"`
+	Match  map[string]any      `json:"match,omitempty"`
+	Prefix map[string]esPrefix `json:"prefix,omitempty"`
+	// MatchAll is `{"match_all": {}}`, which every ES client sends for "no
+	// filter". Accepted and mapped to nothing.
+	MatchAll *struct{} `json:"match_all,omitempty"`
 }
 
 type esBool struct {
-	Must   []esClause `json:"must,omitempty"`
-	Filter []esClause `json:"filter,omitempty"`
+	Must    []esClause `json:"must,omitempty"`
+	Filter  []esClause `json:"filter,omitempty"`
+	MustNot []esClause `json:"must_not,omitempty"`
+	Should  []esClause `json:"should,omitempty"`
+	// MinimumShouldMatch is rejected unless it is 1, which is what `should`
+	// means on its own. Any other value changes the semantics of the whole
+	// clause, and answering it as if it were 1 is a wrong answer.
+	MinimumShouldMatch *int `json:"minimum_should_match,omitempty"`
 }
 
 type esRange struct {
 	Gte any `json:"gte,omitempty"`
+	Gt  any `json:"gt,omitempty"`
 	Lt  any `json:"lt,omitempty"`
 	Lte any `json:"lte,omitempty"`
 }
@@ -44,26 +70,60 @@ type esExists struct {
 	Field string `json:"field"`
 }
 
+type esPrefix struct {
+	Value any `json:"value,omitempty"`
+}
+
+// errESUnsupported is a DSL clause this server does not implement. It is a 400
+// with the clause named, never a filter dropped on the floor.
+var errESUnsupported = errors.New("simdlogs: unsupported Elasticsearch query clause")
+
 func (s *Server) esSearch(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
 		s.federatedESSearch(w, r)
 		return
 	}
-	var body esQuery
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	body, err := decodeESQuery(r)
+	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	q := esToQuery(body.Query)
-	if body.Size > 0 {
-		q.Limit = body.Size
-	}
-	q.MatAll = true // ES _source expects the whole document, not just filter fields
-	esStopped := s.applyQueryBudget(r, q)
-	rows := query.Run(s.tn(r).store, q)
-	if s.queryStopped(w, r, esStopped) {
+	q, err := esToQuery(body.Query)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
 		return
 	}
+	q.MatAll = true // ES _source expects the whole document, not just filter fields
+
+	// The scan is NOT limited to `size`. hits.total.value is documented as the
+	// number of matching documents, and it used to be len(rows) AFTER size had
+	// been pushed into the scan as a Limit -- so a search with size=10 over a
+	// million matches answered `"total": 10`, and every ES client renders that
+	// as "10 results". The page is taken after the count, from the same scan.
+	esStopped := s.applyQueryBudget(r, q)
+	rows := query.Run(s.tn(r).store, q)
+	if s.queryStoppedErr(w, r, esStopped, q) {
+		return
+	}
+	total := len(rows)
+
+	// from/size, in that order, over the whole result. Applied here rather
+	// than in the scan for the same reason: the scan's job is the total.
+	if body.From > 0 {
+		if body.From >= len(rows) {
+			rows = nil
+		} else {
+			rows = rows[body.From:]
+		}
+	}
+	size := body.Size
+	if size <= 0 {
+		size = esDefaultSize
+	}
+	if len(rows) > size {
+		rows = rows[:size]
+	}
+
 	hits := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
 		src := map[string]any{"@timestamp": time.Unix(0, row.Time).UTC().Format(time.RFC3339Nano)}
@@ -78,20 +138,34 @@ func (s *Server) esSearch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"hits": map[string]any{
-			"total": map[string]any{"value": len(rows), "relation": "eq"},
+			"total": map[string]any{"value": total, "relation": "eq"},
 			"hits":  hits,
 		},
 	})
 }
+
+// esDefaultSize is Elasticsearch's own default page size. A search with no
+// `size` used to return every matching document, which is not what any ES
+// client expects and not what the reference does.
+const esDefaultSize = 10
 
 func (s *Server) esCount(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
 		s.federatedESCount(w, r)
 		return
 	}
-	var body esQuery
-	json.NewDecoder(r.Body).Decode(&body)
-	q := esToQuery(body.Query)
+	body, err := decodeESQuery(r)
+	if err != nil {
+		// The decode error used to be discarded entirely, so a malformed body
+		// counted the whole store.
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	q, err := esToQuery(body.Query)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 	stopped := s.applyQueryBudget(r, q)
 	n := query.Count(s.tn(r).store, q)
 	if s.queryStoppedErr(w, r, stopped, q) {
@@ -101,41 +175,161 @@ func (s *Server) esCount(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"count": n})
 }
 
-// esToQuery maps the DSL subset onto the planner's Query. A range on a
-// time-typed field becomes the time window (the partition skip); term and
-// exists become predicates.
-func esToQuery(c esClause) *query.Query {
+// decodeESQuery reads the body STRICTLY. An unknown field is a 400.
+//
+// json.Decode ignores unknown fields by default, which on a query DSL means
+// every clause the server does not implement becomes "match all". Strictness
+// is the only way a client learns its filter was not applied.
+func decodeESQuery(r *http.Request) (esQuery, error) {
+	var body esQuery
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		return esQuery{}, fmt.Errorf("simdlogs: %w", err)
+	}
+	if body.Size < 0 || body.From < 0 {
+		return esQuery{}, fmt.Errorf("simdlogs: size and from must not be negative")
+	}
+	return body, nil
+}
+
+// esToQuery maps the supported DSL subset onto the planner's Query, and
+// REFUSES the rest.
+//
+// The output is an Expr tree rather than the flat implicit-AND Preds list,
+// because must_not and should are not expressible as an AND of predicates --
+// and a mapping that could not express them was the reason they were dropped.
+// A range on a time field still becomes the window (the partition skip), which
+// is what makes an ES time filter as cheap here as a LogsQL one.
+func esToQuery(c esClause) (*query.Query, error) {
 	q := &query.Query{To: int64(1) << 62}
-	var walk func(esClause)
-	walk = func(c esClause) {
-		if c.Bool != nil {
-			for _, m := range c.Bool.Must {
-				walk(m)
-			}
-			for _, m := range c.Bool.Filter {
-				walk(m)
-			}
-		}
-		for field, val := range c.Term {
-			q.Preds = append(q.Preds, query.Pred{Field: field, Kind: query.Eq, Value: toStr(val)})
-		}
-		for field, rg := range c.Range {
-			if field == "@timestamp" || field == "_time" {
-				if t, ok := esTime(rg.Gte); ok {
-					q.From = t
-				}
-				if t, ok := esTime(rg.Lt); ok {
-					q.To = t
-				} else if t, ok := esTime(rg.Lte); ok {
-					q.To = t + 1
-				}
-			}
-			// non-time ranges on dict columns are Phase 7 (numeric columns).
+	e, err := esClauseToExpr(c, q)
+	if err != nil {
+		return nil, err
+	}
+	q.Filter = e
+	return q, nil
+}
+
+// esClauseToExpr converts one clause. Time ranges are lifted onto q rather
+// than becoming predicates, so they drive the group skip.
+func esClauseToExpr(c esClause, q *query.Query) (*query.Expr, error) {
+	var kids []*query.Expr
+	add := func(e *query.Expr) {
+		if e != nil {
+			kids = append(kids, e)
 		}
 	}
-	walk(c)
-	return q
+
+	if c.Bool != nil {
+		if c.Bool.MinimumShouldMatch != nil && *c.Bool.MinimumShouldMatch != 1 {
+			return nil, fmt.Errorf("%w: minimum_should_match=%d (only 1 is supported)",
+				errESUnsupported, *c.Bool.MinimumShouldMatch)
+		}
+		for _, sub := range append(append([]esClause{}, c.Bool.Must...), c.Bool.Filter...) {
+			e, err := esClauseToExpr(sub, q)
+			if err != nil {
+				return nil, err
+			}
+			add(e)
+		}
+		for _, sub := range c.Bool.MustNot {
+			e, err := esClauseToExpr(sub, q)
+			if err != nil {
+				return nil, err
+			}
+			if e != nil {
+				add(&query.Expr{Op: query.OpNot, Child: e})
+			}
+		}
+		if len(c.Bool.Should) > 0 {
+			var or []*query.Expr
+			for _, sub := range c.Bool.Should {
+				e, err := esClauseToExpr(sub, q)
+				if err != nil {
+					return nil, err
+				}
+				if e != nil {
+					or = append(or, e)
+				}
+			}
+			if len(or) == 1 {
+				add(or[0])
+			} else if len(or) > 1 {
+				add(&query.Expr{Op: query.OpOr, Kids: or})
+			}
+		}
+	}
+
+	for field, val := range c.Term {
+		add(leaf(query.Pred{Field: field, Kind: query.Eq, Value: toStr(val)}))
+	}
+	for field, vals := range c.Terms {
+		set := make([]string, 0, len(vals))
+		for _, v := range vals {
+			set = append(set, toStr(v))
+		}
+		// An empty `terms` matches nothing in Elasticsearch, and mapping it to
+		// an empty In set would have matched everything.
+		add(leaf(query.Pred{Field: field, Kind: query.In, Values: set}))
+	}
+	for field, v := range c.Match {
+		// `match` on a keyword field is term equality; this store has no
+		// analyzed text fields, so that is the whole meaning it can have here.
+		// Mapped rather than refused because every ES client sends it, and
+		// substring semantics would be a different query than the client asked
+		// for.
+		add(leaf(query.Pred{Field: field, Kind: query.Eq, Value: toStr(v)}))
+	}
+	for field, p := range c.Prefix {
+		add(leaf(query.Pred{Field: field, Kind: query.Prefix, Value: toStr(p.Value)}))
+	}
+	if c.Exists != nil {
+		if c.Exists.Field == "" {
+			return nil, fmt.Errorf("%w: exists with no field", errESUnsupported)
+		}
+		// NOT (field == ""). A column this store does not hold reads as the
+		// empty value for every row, so "has a non-empty value" is exactly
+		// what exists means here. It was decoded and never read before, so
+		// `exists` matched every document.
+		add(&query.Expr{Op: query.OpNot,
+			Child: leaf(query.Pred{Field: c.Exists.Field, Kind: query.Eq, Value: ""})})
+	}
+
+	for field, rg := range c.Range {
+		if field == "@timestamp" || field == "_time" {
+			if t, ok := esTime(rg.Gte); ok {
+				q.From = t
+			} else if t, ok := esTime(rg.Gt); ok {
+				q.From = t + 1
+			}
+			if t, ok := esTime(rg.Lt); ok {
+				q.To = t
+			} else if t, ok := esTime(rg.Lte); ok {
+				q.To = t + 1
+			}
+			continue
+		}
+		// A non-time range is REFUSED, not dropped. Dropping it returned every
+		// document to a client that asked for a bounded set -- and the comment
+		// that said "Phase 7" documented the gap for a reader of this file and
+		// for nobody sending the query.
+		return nil, fmt.Errorf(
+			"%w: range on %q (only @timestamp/_time ranges are supported)",
+			errESUnsupported, field)
+	}
+
+	switch len(kids) {
+	case 0:
+		return nil, nil // match_all, or an empty query: no filter
+	case 1:
+		return kids[0], nil
+	default:
+		return &query.Expr{Op: query.OpAnd, Kids: kids}, nil
+	}
 }
+
+func leaf(p query.Pred) *query.Expr { return &query.Expr{Op: query.OpLeaf, Pred: p} }
 
 func esTime(v any) (int64, bool) {
 	s, ok := v.(string)
