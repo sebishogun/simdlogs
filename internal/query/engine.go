@@ -1049,6 +1049,17 @@ func Hits(s Store, q *Query, step int64, by string) []HitsSeries {
 	if step <= 0 {
 		step = int64(time.Minute)
 	}
+	// The budget is consulted before any work, not only inside the scan
+	// loops.
+	//
+	// Every other read path checks per group, which is enough while there is
+	// work to do -- and reports nothing when there is not. A query whose
+	// window holds no groups finished without ever asking, so an already-blown
+	// deadline produced a cheerful 200. That is a read path that does not obey
+	// the budget on exactly the inputs where obeying it is free.
+	if q.exceeded(0) {
+		return nil
+	}
 	if by == "" {
 		return []HitsSeries{fillHits(Histogram(s, q, step), q, step, map[string]string{})}
 	}

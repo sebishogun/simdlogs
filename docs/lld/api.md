@@ -326,6 +326,58 @@ Environment: `SIMDLOGS_STREAM_FIELDS` (stream-field default before the
 default tenant opens, so a deployment can synthesize `_stream` without a
 code change).
 
+## The embedded UI
+
+`ui.html`, `ui.go`. One self-contained page — inline CSS and script, no
+external assets — driving the same JSON endpoints as any other client.
+
+**The histogram never worked.** The page read `j.hits[i]._time` and `.hits`, a
+bag of `{time, count}` objects; `/select/logsql/hits` returns the reference's
+**dense** shape, one entry per series with parallel `timestamps` and `values`
+arrays. Every value was `undefined`, `max` stayed 1, every bar computed a `NaN`
+height, and the graph was permanently empty. It failed silently because the
+fetch's `.catch(function () {})` swallowed everything — including the error
+that would have said so. Both are fixed, and `ui_test.go` asserts the response
+shape *and* that the page's code (comments stripped) reads those field names.
+
+**The response is bounded.** Dense means its size is `window / step` and has
+nothing to do with how much data matched: with no window and a one-minute step
+that is a bucket per minute since 1970 — about 29 million, tens of megabytes,
+from an empty store — which the UI requested on every page load. An
+**unspecified** window is now defaulted to 240 steps ending now; an
+**explicit** window over 10,000 buckets is a 413 that says to narrow the range
+or raise the step. Unspecified is defaulted rather than refused because a
+caller that named no range did not ask for all of history, it just did not say.
+
+`query.Hits` also consults the budget before doing anything. Every read path
+checks per group, which reports nothing when there are no groups — so a query
+whose window held none finished without ever asking, and an already-blown
+deadline produced a cheerful 200.
+
+**No tenant selector.** It sent an arbitrary `AccountID` header, so without
+`-auth.config` the UI was a free tenant switcher: pick "tenant 3" from a
+dropdown, read someone else's logs. With auth configured the resolver refused
+it, making the control a dropdown that produced 403s. Either way the tenant is
+whatever the credential resolves to, decided by the server.
+
+**Security headers**, because this page renders log content — arbitrary
+attacker-influenced strings that arrived through an ingest endpoint — into a
+table. The renderer escapes them; a CSP is what stands between an escaping bug
+and script execution with the operator's session. `default-src 'none'`,
+`connect-src 'self'`, `frame-ancestors 'none'`, `base-uri 'none'`,
+`form-action 'none'`, plus `X-Frame-Options: DENY`, `X-Content-Type-Options:
+nosniff`, `Referrer-Policy: no-referrer` (the query is in the URL, and a query
+is a search over someone's logs) and an empty `Permissions-Policy`.
+`'unsafe-inline'` is required by the inline blocks and is stated rather than
+worked around: a nonce would mean the page could no longer be a static embedded
+byte slice.
+
+**Cancel and Load more.** The server already ends a scan whose client hangs up
+— the scan's context is the request's — so an `AbortController` was the whole
+mechanism and it simply was not wired to anything. Paging uses `page_size` and
+the `X-Simdlogs-Cursor` header, appending to the table rather than replacing
+it.
+
 ## Rules: metrics from logs, and alerts
 
 `-rules.file` is a JSON file of metric and alert rules, loaded and **validated

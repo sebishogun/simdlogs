@@ -63,8 +63,9 @@
     <label class="muted">from <input type="datetime-local" id="start"></label>
     <label class="muted">to <input type="datetime-local" id="end"></label>
     <label class="muted">limit <input id="limit" type="number" value="200" min="1" style="width:90px"></label>
-    <select id="tenant" title="AccountID (tenant)"><option value="">tenant 0</option></select>
     <button class="secondary" id="clear">Clear time</button>
+    <button class="secondary" id="more" hidden>Load more</button>
+    <button class="secondary" id="cancel" hidden>Cancel</button>
   </div>
   <div class="examples muted">
     try:
@@ -82,10 +83,15 @@
   var $ = function (id) { return document.getElementById(id); };
   var q = $("q"), out = $("out"), status = $("status"), hist = $("hist");
 
-  function headers() {
-    var t = $("tenant").value;
-    return t ? { "AccountID": t } : {};
-  }
+  // No tenant selector.
+  //
+  // It sent an arbitrary AccountID header, so on a deployment without
+  // -auth.config the UI was a free tenant switcher -- pick "tenant 3" from a
+  // dropdown and read someone else's logs. With auth configured the resolver
+  // refused it, which made the control a dropdown that produced 403s. Either
+  // way the answer is the same: the tenant is whatever the CREDENTIAL
+  // resolves to, decided by the server, and the browser does not get a say.
+  function headers() { return {}; }
   function toNano(v) { // datetime-local -> unix ns, or ""
     if (!v) return "";
     var ms = new Date(v).getTime();
@@ -104,7 +110,7 @@
     status.className = isErr ? "error" : "muted";
   }
 
-  function renderRows(text) {
+  function renderRows(text, append) {
     var lines = text.split("\n").filter(function (l) { return l.trim() !== ""; });
     var rows = [];
     var keys = [];
@@ -131,6 +137,18 @@
       html += "</tr>";
     });
     html += "</tbody>";
+    if (append) {
+      // Append the body rows to the existing table rather than replacing it,
+      // so paging does not throw away what the reader is looking at.
+      var tb = out.querySelector("tbody");
+      if (tb) {
+        var tmp = document.createElement("table");
+        tmp.innerHTML = html;
+        var add = tmp.querySelector("tbody");
+        while (add && add.firstChild) { tb.appendChild(add.firstChild); }
+        return rows.length;
+      }
+    }
     out.innerHTML = html;
     return rows.length;
   }
@@ -141,64 +159,131 @@
     });
   }
 
-  function loadHist() {
+  // The histogram reads the shape the endpoint actually returns.
+  //
+  // It read `j.hits[i]._time` and `.hits` -- a bag of {time, count} objects.
+  // /select/logsql/hits returns the reference's DENSE shape: one entry per
+  // series, each with parallel `timestamps` and `values` arrays. So every
+  // `h.hits` was undefined, `max` stayed 1, every bar computed a NaN height,
+  // and the graph was permanently empty. It failed silently because the
+  // catch() swallowed everything, including the error that would have said so.
+  function loadHist(signal) {
     hist.innerHTML = "";
     var p = params();
-    p.set("step", "1m");
-    fetch("/select/logsql/hits?" + p.toString(), { headers: headers() })
-      .then(function (r) { return r.json(); })
+    // A window, always, and a step that fits it.
+    //
+    // The histogram response is DENSE -- one bucket per step across the whole
+    // window whether or not anything is in it -- so its size is (window /
+    // step) and has nothing to do with how much data matched. With no window
+    // the page was asking for a bucket per minute since 1970: about 29 million
+    // of them, tens of megabytes, on every page load against an empty store.
+    var s = toNano($("start").value), e = toNano($("end").value);
+    var toN = e ? Number(e) : Date.now() * 1e6;
+    var fromN = s ? Number(s) : toN - 3600 * 1e9; // one hour by default
+    p.set("start", String(fromN));
+    p.set("end", String(toN));
+    // ~120 buckets across whatever window is showing, so the step follows the
+    // range instead of being fixed at a minute.
+    var stepNs = Math.max(1e9, Math.round((toN - fromN) / 120));
+    p.set("step", Math.round(stepNs / 1e6) + "ms");
+    fetch("/select/logsql/hits?" + p.toString(), { headers: headers(), signal: signal })
+      .then(function (r) {
+        if (!r.ok) { return r.text().then(function (t) { throw new Error(t || r.status); }); }
+        return r.json();
+      })
       .then(function (j) {
-        var hits = (j && j.hits) || [];
-        hits.sort(function (a, b) { return a._time < b._time ? -1 : 1; });
+        var series = (j && j.hits) || [];
+        // Buckets summed ACROSS series: the endpoint splits by `field` when
+        // asked, and the UI asks for one graph.
+        var buckets = {};
+        series.forEach(function (se) {
+          var ts = se.timestamps || [], vs = se.values || [];
+          for (var i = 0; i < ts.length && i < vs.length; i++) {
+            buckets[ts[i]] = (buckets[ts[i]] || 0) + vs[i];
+          }
+        });
+        var keys = Object.keys(buckets).sort();
+        if (!keys.length) { return; }
         var max = 1;
-        hits.forEach(function (h) { if (h.hits > max) max = h.hits; });
-        hits.forEach(function (h) {
+        keys.forEach(function (k) { if (buckets[k] > max) max = buckets[k]; });
+        keys.forEach(function (k) {
           var b = document.createElement("div");
           b.className = "b";
-          b.style.height = Math.max(1, Math.round((h.hits / max) * 58)) + "px";
-          b.title = h._time + ": " + h.hits;
+          b.style.height = Math.max(1, Math.round((buckets[k] / max) * 58)) + "px";
+          b.title = k + ": " + buckets[k];
           hist.appendChild(b);
         });
       })
-      .catch(function () {});
+      .catch(function (e) {
+        if (e && e.name === "AbortError") { return; }
+        // Reported, not swallowed. A silent catch is why the histogram was
+        // broken for as long as it was.
+        hist.textContent = "histogram unavailable: " + (e.message || e);
+      });
   }
 
-  function run() {
-    setStatus("running...");
-    out.innerHTML = "";
+  // Cancellation and pagination.
+  //
+  // A query with no cancel is a query the browser cannot stop: the tab holds
+  // the connection, the server keeps scanning, and clicking Run again just
+  // starts a second one. The server already ends a scan whose client hangs up
+  // (its context is the request's), so an AbortController is the whole
+  // mechanism -- it just was not wired to anything.
+  var inflight = null;
+  var cursor = "";
+
+  function run(append) {
+    if (inflight) { inflight.abort(); }
+    inflight = new AbortController();
+    $("cancel").hidden = false;
+    setStatus(append ? "loading more..." : "running...");
+    if (!append) { out.innerHTML = ""; cursor = ""; $("more").hidden = true; }
+
     var p = params();
-    p.set("limit", $("limit").value || "200");
+    p.set("page_size", $("limit").value || "200");
+    if (append && cursor) { p.set("cursor", cursor); }
     var t0 = performance.now();
-    fetch("/select/logsql/query?" + p.toString(), { headers: headers() })
+    var signal = inflight.signal;
+
+    fetch("/select/logsql/query?" + p.toString(), { headers: headers(), signal: signal })
       .then(function (r) {
         if (!r.ok) { return r.text().then(function (t) { throw new Error(t || r.status); }); }
+        // The next page's cursor is a header, not a body field: the body is
+        // NDJSON and a trailing object of another shape is a row to anything
+        // reading the stream.
+        cursor = r.headers.get("X-Simdlogs-Cursor") || "";
         return r.text();
       })
       .then(function (text) {
-        var n = renderRows(text);
+        var n = renderRows(text, append);
         var ms = Math.round(performance.now() - t0);
-        setStatus(n + " rows in " + ms + " ms");
-        loadHist();
+        setStatus(n + " rows in " + ms + " ms" + (cursor ? " (more available)" : ""));
+        $("more").hidden = !cursor;
+        $("cancel").hidden = true;
+        inflight = null;
+        if (!append) { loadHist(signal); }
       })
-      .catch(function (e) { setStatus(String(e.message || e), true); });
+      .catch(function (e) {
+        $("cancel").hidden = true;
+        inflight = null;
+        if (e && e.name === "AbortError") { setStatus("cancelled"); return; }
+        setStatus(String(e.message || e), true);
+      });
   }
 
-  $("run").addEventListener("click", run);
-  q.addEventListener("keydown", function (e) { if (e.key === "Enter") run(); });
+  $("run").addEventListener("click", function () { run(false); });
+  $("more").addEventListener("click", function () { run(true); });
+  $("cancel").addEventListener("click", function () {
+    if (inflight) { inflight.abort(); }
+  });
+  q.addEventListener("keydown", function (e) { if (e.key === "Enter") run(false); });
   $("clear").addEventListener("click", function () { $("start").value = ""; $("end").value = ""; });
   Array.prototype.forEach.call(document.querySelectorAll(".examples code"), function (c) {
-    c.addEventListener("click", function () { q.value = c.textContent; run(); });
+    c.addEventListener("click", function () { q.value = c.textContent; run(false); });
   });
 
-  // Seed a couple of tenant options so multitenant deployments are reachable.
-  for (var i = 1; i <= 4; i++) {
-    var o = document.createElement("option");
-    o.value = String(i); o.textContent = "tenant " + i;
-    $("tenant").appendChild(o);
-  }
-
   q.value = "*";
-  run();
+  run(false);
 })();
 </script>
 </body>

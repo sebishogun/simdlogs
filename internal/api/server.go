@@ -1368,6 +1368,17 @@ func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
 
 // selectHits returns per-bucket counts over the time window: the
 // reference's /select/logsql/hits shape (a histogram for dashboards).
+// maxHitsBuckets bounds a histogram response.
+//
+// 10,000 buckets is more than any graph can draw -- a 1920-pixel wide chart has
+// 1920 columns -- and small enough that the dense array stays a few hundred
+// kilobytes. Past it the caller is asking for a shape no renderer uses.
+const maxHitsBuckets = 10_000
+
+// defaultHitsBuckets is the window a request with no time range gets, measured
+// in steps. Enough to draw a graph, far short of the ceiling.
+const defaultHitsBuckets = 240
+
 func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
 		s.federatedHits(w, r)
@@ -1389,6 +1400,35 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 	by := r.FormValue("field")
 	if by == "" {
 		by = r.FormValue("fields")
+	}
+	// The bucket count is bounded BEFORE the scan.
+	//
+	// The response is dense -- one bucket per step across the whole window,
+	// present or not -- so its size is (window / step) and has nothing to do
+	// with how much data exists. With no window and the default one-minute
+	// step that is a bucket per minute since 1970: about 29 million of them,
+	// tens of megabytes of RFC3339 timestamps, from an EMPTY store.
+	//
+	// An UNSPECIFIED window is defaulted rather than refused. A caller that
+	// named no range did not ask for all of history, it just did not say; and
+	// answering an unstated question with a 413 breaks every client that was
+	// getting away with it. An EXPLICIT range too wide for its step is a
+	// refusal, because that one was asked for.
+	explicit := r.FormValue("start") != "" || r.FormValue("end") != ""
+	if step > 0 {
+		if !explicit && (q.To-q.From)/step > maxHitsBuckets {
+			q.To = time.Now().UnixNano()
+			q.From = q.To - step*defaultHitsBuckets
+		}
+		if n := (q.To - q.From) / step; n > maxHitsBuckets {
+			s.writeErr(w, r, readSpec(), http.StatusRequestEntityTooLarge, fmt.Sprintf(
+				"simdlogs: %d buckets requested (window %s at step %s); the maximum is %d. "+
+					"Narrow the time range or increase the step -- the response is dense, "+
+					"so its size is the window divided by the step and does not depend on "+
+					"how much data matched",
+				n, time.Duration(q.To-q.From), time.Duration(step), maxHitsBuckets))
+			return
+		}
 	}
 	stopped := s.applyQueryBudget(r, q)
 	series := query.Hits(s.tn(r).store, q, step, by)
