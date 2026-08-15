@@ -10,7 +10,50 @@ import (
 	"time"
 
 	"github.com/sebishogun/simdlogs/internal/ingest"
+	"github.com/sebishogun/simdlogs/internal/storage"
 )
+
+// syslogAdmits is the storage budget on the native transport.
+//
+// checkStorage covers the HTTP mux. These listeners take bytes off a socket
+// with no middleware anywhere near them, so the mux-wide check did nothing for
+// them: with the filesystem past the reject reserve and every HTTP insert
+// answering 507, one TCP frame and one UDP datagram each still landed a row,
+// and the rejection counters stayed at zero. That is exactly the one-side-only
+// shape checkStorage's own comment argued against, on the one path it did not
+// cover.
+//
+// Neither transport can answer. RFC 5426 has no reply at all and the TCP
+// framing carries no ack, so a refused message is dropped and counted -- the
+// counters and the log are the only signal, which is why both are written
+// here rather than left to a caller that has nowhere to send a status.
+func (s *Server) syslogAdmits(n int) bool {
+	err := s.def.store.CheckWrite()
+	if err == nil {
+		return true
+	}
+	storage.NoteRejectedWrite(err)
+	atomic.AddInt64(&s.nHTTPErrs, 1)
+	// Counted as skipped rows, not as an unaccounted drop: a message refused
+	// by the budget is data that did not land, and an operator diffing bytes
+	// received against rows stored has to see it somewhere.
+	s.countRows(0, 1, n)
+	// Throttled. A firehose against a full disk would otherwise write one log
+	// line per datagram to the same filesystem that has no room -- the log
+	// becoming the thing that finishes the disk off.
+	now := time.Now().UnixNano()
+	last := atomic.LoadInt64(&s.lastSyslogRefusal)
+	if now-last > int64(syslogRefusalLogInterval) &&
+		atomic.CompareAndSwapInt64(&s.lastSyslogRefusal, last, now) {
+		log.Printf("syslog: refusing messages, %d bytes dropped: %v", n, err)
+	}
+	return false
+}
+
+// syslogRefusalLogInterval throttles the refusal log. Long enough that a
+// sustained refusal is one line a minute rather than one per message, short
+// enough that an operator watching the log sees it start.
+const syslogRefusalLogInterval = 30 * time.Second
 
 // maxUDPDatagram is the largest UDP payload IPv4 can carry: 65535 total minus
 // a 20-byte IP header and an 8-byte UDP header. The kernel refuses a send
@@ -220,6 +263,9 @@ func (s *Server) serveSyslogUDP(c net.PacketConn, cfg SyslogConfig) {
 		// line-splitting entry point turned a datagram containing a newline
 		// into two rows -- the same defect the counted TCP path was fixed for,
 		// left in place on UDP while the LLD claimed otherwise.
+		if !s.syslogAdmits(n) {
+			continue
+		}
 		res, ierr := ingest.IngestSyslogMessage(s.def.w, buf[:n], fallback, nil)
 		s.countRows(res.Accepted, res.Rejected, n)
 		if ierr != nil {
@@ -388,6 +434,9 @@ func (s *Server) handleSyslogConn(conn net.Conn, cfg SyslogConfig) {
 		// through the line-splitting path turned a forwarded multi-line stack
 		// trace into one valid record plus a run of records that parse as
 		// nothing.
+		if !s.syslogAdmits(len(msg)) {
+			continue
+		}
 		var res ingest.Result
 		var ierr error
 		if counted {

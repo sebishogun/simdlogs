@@ -186,8 +186,22 @@ recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
 | `-compact-max-input-bytes` | refuse to rewrite more than this per pass, per tenant; 0 = no bound |
 | `-compact-max-group-bytes` | leave input groups larger than this alone; 0 = no bound |
 | `-storage-reserve-warn-bytes` | free space at which readiness degrades, writes still accepted; 0 disables |
-| `-storage-reserve-reject-bytes` | free space at which writes get 507; must be below the warn level |
+| `-storage-reserve-reject-bytes` | free space at which writes get 507; below the warn level when both are set |
 | `-storage-max-tenant-bytes` | refuse writes once one tenant's groups reach this many bytes |
+| `-compact` | compact mode: flate dicts, ~15% smaller groups, 2–10x slower value reads — cold archival only |
+| `-stream-fields` | comma-separated fields identifying a log stream |
+| `-syslog` | also listen for syslog on UDP/TCP |
+| `-select-backends` | peer node URLs; sets select-router mode (vmselect role) |
+| `-replicas` | replication factor for the backends |
+| `-search.maxRows` | cap on a bare select's rows; 0 = built-in default, -1 = unlimited |
+| `-search.maxDuration` | wall-time cap for one query request (not the live tail); 0 = default, -1ns = unlimited |
+| `-search.maxQueryBytes` | cap on the bytes one query may materialize; 0 = default (256 MiB), -1 = unlimited. Over it the query errors 504 rather than returning a short answer. |
+| `-http.maxBodyBytes` | maximum request body; 0 = default, -1 = unlimited |
+| `-tenants.max` | maximum tenants held open; 0 = default, -1 = unlimited |
+| `-auth.config` | JSON auth file (token hashes, cert mappings, roles, tenants). Absent = **unauthenticated** |
+| `-tls.certFile` / `-tls.keyFile` | PEM pair; serves HTTPS |
+| `-tls.clientCAFile` | PEM CA bundle; requires and verifies a client certificate (mTLS) |
+| `-tls.insecure` | serve plaintext on a non-loopback address, including `-syslog` (alias: `-insecure-http`) |
 
 **Storage budget.** Two thresholds and a per-tenant cap. WARN degrades
 `/-/ready` while the store still accepts everything, so an operator sees it
@@ -207,37 +221,48 @@ pass writes a manifest record before it can unlink anything.
 The check runs in the middleware every insert route shares, before the body is
 read: rows that reach the writer are the writer's, and refusing a request whose
 rows are already buffered would either drop them silently or report a failure
-for rows that will be written anyway. There are six HTTP write entry points
-reaching four functions; a check written into each is a check that will be
-missing from the seventh.
+for rows that will be written anyway. The mux registers fourteen ingest routes
+reaching eight distinct handlers; a check written into each is a check that
+will be missing from the ninth. (This paragraph said "six entry points reaching
+four functions" — both numbers were wrong, which is what a count nothing
+gates does.)
+
+The HTTP mux is not every write path. The native syslog listeners take bytes
+off a socket with no middleware anywhere near them; they call the budget
+themselves (`syslogAdmits`). Neither transport can answer — RFC 5426 has no
+reply and the TCP framing carries no ack — so a refused message is dropped,
+counted as a skipped row, and logged at most once every 30 seconds. A tenant
+whose store cannot even be opened (no space, no permission, EIO) answers 507
+too: that failure happens in the resolver, before the budget middleware runs,
+and used to fall through to a 400.
 
 The free-space sample is cached for about two seconds, so a burst of small
 writes is not a burst of `statfs` calls. That staleness is why the threshold is
 a RESERVE: there is room to be wrong by one interval's worth of writes. A
 filesystem that cannot be measured does NOT refuse writes — turning a `statfs`
 failure into a write outage is the protection causing the harm it exists to
-prevent — and on Windows free space is not measured at all, so only the
-per-tenant cap applies there.
+prevent. The per-tenant cap still applies there, because it is measured from
+the store's own groups and needs no filesystem call. That was false when first
+written: `QuotaState` returned at the `statfs` error before reaching the cap,
+so a platform without `statfs` enforced neither budget. `statfs` is
+implemented on linux, darwin and the BSDs; everywhere else — Windows,
+illumos, plan9 — only the tenant cap applies.
 
-Metrics: `simdlogs_storage_capacity_bytes`, `simdlogs_storage_warn_tenants`,
-`simdlogs_storage_reject_tenants`, `simdlogs_storage_over_quota_tenants`,
-`simdlogs_writes_rejected_disk_total`, `simdlogs_writes_rejected_quota_total`.
-The last two are separate counters because "the machine is full" and "this
-tenant is over its share" are different incidents with different fixes.
-| `-compact` | compact mode: flate dicts, ~15% smaller groups, 2–10x slower value reads — cold archival only |
-| `-stream-fields` | comma-separated fields identifying a log stream |
-| `-syslog` | also listen for syslog on UDP/TCP |
-| `-select-backends` | peer node URLs; sets select-router mode (vmselect role) |
-| `-replicas` | replication factor for the backends |
-| `-search.maxRows` | cap on a bare select's rows; 0 = built-in default, -1 = unlimited |
-| `-search.maxDuration` | wall-time cap for one query request (not the live tail); 0 = default, -1ns = unlimited |
-| `-search.maxQueryBytes` | cap on the bytes one query may materialize; 0 = default (256 MiB), -1 = unlimited. Over it the query errors 504 rather than returning a short answer. |
-| `-http.maxBodyBytes` | maximum request body; 0 = default, -1 = unlimited |
-| `-tenants.max` | maximum tenants held open; 0 = default, -1 = unlimited |
-| `-auth.config` | JSON auth file (token hashes, cert mappings, roles, tenants). Absent = **unauthenticated** |
-| `-tls.certFile` / `-tls.keyFile` | PEM pair; serves HTTPS |
-| `-tls.clientCAFile` | PEM CA bundle; requires and verifies a client certificate (mTLS) |
-| `-tls.insecure` | serve plaintext on a non-loopback address, including `-syslog` (alias: `-insecure-http`) |
+Metrics: `simdlogs_storage_capacity_bytes` (only when free space can be
+measured, since it comes from the filesystem total),
+`simdlogs_storage_warn_tenants`, `simdlogs_storage_reject_tenants`,
+`simdlogs_storage_over_quota_tenants`, `simdlogs_writes_rejected_disk_total`,
+`simdlogs_writes_rejected_quota_total`. The last two are separate counters
+because "the machine is full" and "this tenant is over its share" are
+different incidents with different fixes.
+
+**Not covered.** Background writers — compaction, recompaction, the writer's
+own flush, restore — do not consult the budget. A compaction pass writes its
+output before unlinking its inputs, so one pass can transiently grow the store
+while the reserve is exhausted; `-compact-max-input-bytes` bounds it and
+defaults to 0. On a cluster, `forwardWrite` relays the LAST replica's status,
+so one replica refusing on its own budget while another accepts is reported to
+the client as the accepting one's answer.
 
 Environment: `SIMDLOGS_STREAM_FIELDS` (stream-field default before the
 default tenant opens, so a deployment can synthesize `_stream` without a
@@ -250,7 +275,13 @@ code change).
 `simdlogs_query_requests_total`, `simdlogs_uptime_seconds`,
 `simdlogs_storage_corrupt_groups`, `simdlogs_storage_quarantined_groups`,
 `simdlogs_storage_degraded_tenants`,
-`simdlogs_storage_degraded_unacknowledged_tenants`) plus the same
+`simdlogs_storage_degraded_unacknowledged_tenants`,
+`simdlogs_storage_capacity_bytes`, `simdlogs_storage_warn_tenants`,
+`simdlogs_storage_reject_tenants`, `simdlogs_storage_over_quota_tenants`,
+`simdlogs_writes_rejected_disk_total`, `simdlogs_writes_rejected_quota_total`,
+`simdlogs_scan_workers_total`, `simdlogs_scan_workers_in_use`,
+`simdlogs_query_admission_in_flight`, `simdlogs_query_admission_queued`,
+`simdlogs_query_admission_rejected_total`) plus the same
 numbers under the reference's names (`vl_rows_ingested_total`,
 `vl_bytes_ingested_total`, `vl_rows_dropped_total`, `vl_http_requests_total`,
 `vl_http_errors_total`, `vl_live_tailing_requests`, `vl_partitions`,

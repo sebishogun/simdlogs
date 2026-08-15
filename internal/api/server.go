@@ -35,12 +35,15 @@ import (
 // tenant (AccountID:ProjectID headers, default 0:0) selects an isolated store;
 // see tenant.go.
 type Server struct {
-	dir      string
-	mu       sync.Mutex
-	tenants  map[string]*tenant
-	def      *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
-	strmFlds []string
-	compact  bool // compact mode default for new tenants (flate dict)
+	dir     string
+	mu      sync.Mutex
+	tenants map[string]*tenant
+	def     *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
+	// lastSyslogRefusal throttles the native transport's budget-refusal log.
+	// Nanos, atomic: written from every listener goroutine.
+	lastSyslogRefusal int64
+	strmFlds          []string
+	compact           bool // compact mode default for new tenants (flate dict)
 	// corruptionPolicy is what a tenant store does with an unreadable group.
 	// The zero value is storage.CorruptionFail, so a server configured with
 	// nothing refuses to open a damaged tenant rather than serving it short.
@@ -1694,15 +1697,22 @@ func (s *Server) storagePressure() []string {
 	var out []string
 	s.forEachTenantDetached(func(tn *tenant) {
 		st := tn.store.QuotaState()
-		switch {
-		case st.Err != nil:
+		// Not a switch. QuotaState sets Err whenever it sets OverQuota, so an
+		// `Err != nil` arm ahead of an `OverQuota` arm made the second one
+		// unreachable and "at its quota" could never print -- an operator
+		// paged on readiness saw only the refusal, never which of the two
+		// budgets produced it. Both are reported, and a store can be over its
+		// quota AND below the warn reserve at once.
+		if st.Err != nil {
 			out = append(out, fmt.Sprintf("%s: writes REJECTED: %v", tn.key, st.Err))
-		case st.Warn:
-			out = append(out, fmt.Sprintf("%s: %d bytes free, below the warn reserve",
-				tn.key, st.Usage.Free))
-		case st.OverQuota:
+		}
+		if st.OverQuota {
 			out = append(out, fmt.Sprintf("%s: %d bytes used, at its quota",
 				tn.key, st.StoreBytes))
+		}
+		if st.Warn {
+			out = append(out, fmt.Sprintf("%s: %d bytes free, below the warn reserve",
+				tn.key, st.Usage.Free))
 		}
 	})
 	return out

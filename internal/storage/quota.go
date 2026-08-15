@@ -116,7 +116,14 @@ func (q QuotaState) Accepting() bool { return q.Err == nil }
 // A test that had to really fill a disk would either be skipped everywhere or
 // would fill the developer's disk, so the thresholds would be exercised by
 // nothing. The indirection is the only way this gets tested at all.
-var diskUsageFn = statfsUsage
+type diskUsageFunc func(dir string) (DiskUsage, error)
+
+var diskUsageFn atomic.Pointer[diskUsageFunc]
+
+func init() {
+	fn := diskUsageFunc(statfsUsage)
+	diskUsageFn.Store(&fn)
+}
 
 // SetDiskUsageForTest replaces the free-space source and returns a restore
 // function. It panics outside a test binary, like the fault injector: a
@@ -126,9 +133,13 @@ func SetDiskUsageForTest(fn func(dir string) (DiskUsage, error)) func() {
 	if !testBinary() {
 		panic("storage: SetDiskUsageForTest called outside a test binary")
 	}
-	prev := diskUsageFn
-	diskUsageFn = fn
-	return func() { diskUsageFn = prev }
+	// Atomic, not a plain global. cachedUsage reads this on the write path
+	// while a test swaps it from another goroutine -- including the shipped
+	// tests, whose `defer restore()` runs with an httptest server still
+	// serving. -race reported it three ways.
+	next := diskUsageFunc(fn)
+	prev := diskUsageFn.Swap(&next)
+	return func() { diskUsageFn.Store(prev) }
 }
 
 // SetQuota installs the budget. Safe to call while the store is serving; the
@@ -158,28 +169,34 @@ func (s *Store) Quota() QuotaConfig {
 // one interval's worth of writes.
 func (s *Store) QuotaState() QuotaState {
 	q := s.Quota()
-	st := QuotaState{StoreBytes: s.DiskBytes()}
 	if q == (QuotaConfig{}) {
-		return st
+		// Before the size walk, not after. DiskBytes takes s.mu.RLock and
+		// sums every mapped group; an unconfigured deployment was paying for
+		// it on every write to answer a question no threshold was going to
+		// read.
+		return QuotaState{}
 	}
-	u, err := s.cachedUsage()
-	if err != nil {
-		// A filesystem that cannot be measured is not a filesystem to refuse
-		// writes on: the check exists to protect the store, and turning a
-		// statfs failure into a write outage is the protection causing the
-		// harm. Reported through the state so a metric can show it.
-		st.Usage = DiskUsage{}
-		return st
+	st := QuotaState{StoreBytes: s.DiskBytes()}
+	// The reserve needs the filesystem; the tenant cap does not. Sampling
+	// them separately is the point: an earlier version returned at the statfs
+	// error and so disabled the tenant cap along with the reserve, which made
+	// a platform without statfs enforce NOTHING -- while this file, the LLD
+	// and quota_other.go all said the tenant quota still applied there. A
+	// statfs failure now costs exactly the check that needs statfs.
+	if u, err := s.cachedUsage(); err == nil {
+		st.Usage = u
+		if q.ReserveWarnBytes > 0 && u.Free <= q.ReserveWarnBytes {
+			st.Warn = true
+		}
+		if q.ReserveRejectBytes > 0 && u.Free <= q.ReserveRejectBytes {
+			st.Reject = true
+			st.Err = fmt.Errorf("%w: %d bytes free, reserve is %d",
+				ErrDiskFull, u.Free, q.ReserveRejectBytes)
+		}
 	}
-	st.Usage = u
-	if q.ReserveWarnBytes > 0 && u.Free <= q.ReserveWarnBytes {
-		st.Warn = true
-	}
-	if q.ReserveRejectBytes > 0 && u.Free <= q.ReserveRejectBytes {
-		st.Reject = true
-		st.Err = fmt.Errorf("%w: %d bytes free, reserve is %d",
-			ErrDiskFull, u.Free, q.ReserveRejectBytes)
-	}
+	// A filesystem that cannot be measured is still not one to refuse writes
+	// on: the check exists to protect the store, and turning a statfs failure
+	// into a write outage is the protection causing the harm.
 	if q.MaxTenantBytes > 0 && st.StoreBytes >= q.MaxTenantBytes {
 		st.OverQuota = true
 		if st.Err == nil {
@@ -202,7 +219,7 @@ func (s *Store) cachedUsage() (DiskUsage, error) {
 			return *u, nil
 		}
 	}
-	u, err := diskUsageFn(s.dir)
+	u, err := (*diskUsageFn.Load())(s.dir)
 	if err != nil {
 		return DiskUsage{}, err
 	}

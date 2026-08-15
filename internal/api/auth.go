@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"strings"
 
+	"errors"
 	"github.com/sebishogun/simdlogs/internal/config"
+	"github.com/sebishogun/simdlogs/internal/storage"
+	"syscall"
 )
 
 type principalKey struct{}
@@ -255,5 +258,40 @@ func authStatus(err error) int {
 	if ae, ok := err.(*authError); ok {
 		return ae.code
 	}
+	// A tenant resolves by opening its store, so a filesystem that refuses --
+	// no space, no permission, an I/O error -- fails HERE, before any storage
+	// budget check the middleware would have run. The default used to answer
+	// 400: a client error code for a server storage condition, with the
+	// server's absolute path in the body. An agent treats 400 as permanent
+	// and drops the batch it cannot re-send, so the one condition that is
+	// certain to be transient was reported as the one that is certain not to
+	// be.
+	if isStorageErr(err) {
+		return http.StatusInsufficientStorage
+	}
 	return http.StatusBadRequest
+}
+
+// isStorageErr reports whether err is the filesystem refusing, as opposed to
+// the request being wrong.
+//
+// By errno rather than by string: the message is wrapped through OpenStore and
+// os.MkdirAll and its wording is not a contract, while ENOSPC, EDQUOT, EACCES,
+// EPERM, EROFS and EIO are.
+func isStorageErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, storage.ErrDiskFull) || errors.Is(err, storage.ErrQuotaExceeded) {
+		return true
+	}
+	for _, e := range []error{
+		syscall.ENOSPC, syscall.EDQUOT, syscall.EACCES,
+		syscall.EPERM, syscall.EROFS, syscall.EIO,
+	} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
 }

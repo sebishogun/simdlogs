@@ -70,9 +70,10 @@ func main() {
 			"RECOVERY, and a retention pass has to write a manifest record before it can "+
 			"unlink anything")
 	reserveReject := flag.Int64("storage-reserve-reject-bytes", 0,
-		"free space at which new writes are refused with 507; 0 disables. Must be below "+
-			"-storage-reserve-warn-bytes, or writes would stop before anything reported "+
-			"degraded. Queries, /metrics and retention keep working past it")
+		"free space at which new writes are refused with 507; 0 disables. When "+
+			"-storage-reserve-warn-bytes is also set it must be below it, or writes would "+
+			"stop before anything reported degraded. Queries, /metrics and retention keep "+
+			"working past it")
 	tenantBytes := flag.Int64("storage-max-tenant-bytes", 0,
 		"refuse writes once one tenant's own groups reach this many bytes; 0 is unbounded")
 	compactMaxGroup := flag.Int64("compact-max-group-bytes", 0,

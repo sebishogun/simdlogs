@@ -8,13 +8,18 @@ import (
 
 // checkStorage refuses a write when the tenant's storage budget says so.
 //
-// In the middleware every insert route shares, not in each handler. There are
-// six HTTP write entry points -- jsonline, logfmt, the Elasticsearch bulk
-// path, Loki, Datadog, OTLP, journald and syslog-over-HTTP between them reach
-// four different functions -- and a check written into each is a check that
-// will be missing from the seventh. This repo has recorded the one-side-only
-// shape fifteen times; a budget enforced on five of six paths is that shape
-// with a storage bill attached.
+// In the middleware every insert route shares, not in each handler. The mux
+// registers fourteen ingest routes reaching eight distinct handlers --
+// insertJSONLine, insertLogfmt, esBulk, insertLoki, insertDatadog,
+// insertSyslog, insertOTLPLogs and insertJournald -- and a check written into
+// each is a check that will be missing from the ninth. (This comment said
+// "six entry points reaching four functions"; both numbers were wrong, which
+// is what a count nothing gates does.) This repo has recorded the
+// one-side-only shape fifteen times; a budget enforced on seven of eight
+// paths is that shape with a storage bill attached.
+//
+// The HTTP mux is not every write path. The native syslog listeners take
+// bytes off a socket with no middleware anywhere near them, so they check the budget themselves -- see syslogAdmits in syslog_listen.go.
 //
 // It runs BEFORE the body is read and parsed, so no row reaches the writer:
 // rows that reach it are the writer's, and refusing a request whose rows are

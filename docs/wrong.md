@@ -3879,3 +3879,51 @@ surface and neither reachable from a shipped path: `Store.Promote` re-adds a
 cold copy of a group compaction merged away (19 of 40 row shapes visible twice,
 serial and deterministic), and `Promote` overwrites the file of a reissued id.
 `Demote`/`Promote`/`ColdStore` have no non-test callers.
+
+## A budget in the middleware is not a budget on the machine
+
+The storage budget shipped with a check in the HTTP middleware and the argument
+that a single shared check beats one per handler -- "a check written into each
+is a check that will be missing from the seventh". A background review found
+the seventh. The native syslog listeners take bytes off a socket with no
+middleware anywhere near them: with the filesystem past the reject reserve and
+every HTTP insert answering 507, one RFC 5424 frame over TCP and one datagram
+over UDP each landed a row and the rejection counters stayed at zero. The
+argument was right and was applied to one transport.
+
+The same commit's `QuotaState` returned at the `statfs` error before it reached
+`MaxTenantBytes`, so an unmeasurable filesystem disabled BOTH budgets. Measured
+on a hook returning an error: 1776 bytes stored against `MaxTenantBytes: 1`
+gave `OverQuota=false`, `Err=nil`, `CheckWrite()=nil`. `quota_windows.go`
+always returns that error, so every platform it covered enforced nothing -- and
+that file's own comment, `QuotaState`'s comment, and `docs/lld/api.md` all said
+the tenant quota still applied there. Three statements of a claim, one code
+path, no test.
+
+**The cap is advisory at rate.** With `MaxTenantBytes` at 64 KiB, one client
+over HTTP pushed **119-125 MB (1816x-1916x the cap)** before the first 507. The
+store's own size is sampled at most once per 10 s and the free-space sample
+once per 2 s; between samples the cap is a number nothing reads. That is the
+same deliberate staleness the reserve is named for, applied to a budget that is
+not expressed as a reserve. Also measured: a store with zero groups is under
+any positive cap, so the first write is always accepted whatever its size
+(349,669 bytes against a cap of 1024). Recorded, not fixed -- shortening the
+interval puts a locked directory walk on the write path, which is what the
+cache exists to avoid.
+
+**Smaller ones from the same review.** `storagePressure`'s `case st.OverQuota`
+arm was dead: `QuotaState` sets `Err` whenever it sets `OverQuota`, so the
+`Err != nil` arm always won and "N bytes used, at its quota" could never print
+-- deleting the arm left every test green. `diskUsageFn` was a plain global
+read on the write path and written by `SetDiskUsageForTest`; `-race` reported
+it three ways against the SHIPPED tests, whose `defer restore()` runs with an
+httptest server still serving. `quota_unix.go` was tagged `!windows` against a
+syscall that does not exist on illumos, so `GOOS=illumos go build ./...`
+succeeded at the parent commit and failed at this one. A tenant whose store
+could not be opened answered 400 with the server's absolute path in the body --
+a permanent-looking code for a transient storage condition, which an agent
+responds to by dropping the batch. And the LLD's new prose was inserted inside
+the flags table, so twelve rows rendered as literal pipe text; the same
+paragraph said "six HTTP write entry points reaching four functions" where the
+mux registers fourteen routes reaching eight handlers. No docs gate covers that
+file, so nothing caught either.
