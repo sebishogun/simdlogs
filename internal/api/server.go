@@ -1589,7 +1589,7 @@ var errMissingQuery = errors.New("simdlogs: missing `query` arg")
 
 func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/field_names", "values")
+		s.federatedValueCounts(w, r, "/select/logsql/field_names")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -1607,7 +1607,7 @@ func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/field_values", "values")
+		s.federatedValueCounts(w, r, "/select/logsql/field_values")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -1783,7 +1783,7 @@ func intParam(r *http.Request, name string, def int) int {
 // streamsHandler lists the distinct _stream label sets in the window.
 func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/streams", "streams")
+		s.federatedValueCounts(w, r, "/select/logsql/streams")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -1802,7 +1802,7 @@ func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
 // streamIDsHandler lists the distinct stream ids in the window.
 func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/stream_ids", "stream_ids")
+		s.federatedValueCounts(w, r, "/select/logsql/stream_ids")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -1821,7 +1821,7 @@ func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
 // streamFieldNamesHandler lists the distinct stream label names.
 func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/stream_field_names", "values")
+		s.federatedValueCounts(w, r, "/select/logsql/stream_field_names")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -1840,7 +1840,7 @@ func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request)
 // streamFieldValuesHandler lists the distinct values of one stream label.
 func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request) {
 	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/stream_field_values", "values")
+		s.federatedValueCounts(w, r, "/select/logsql/stream_field_values")
 		return
 	}
 	q, err := selectQueryOf(r)

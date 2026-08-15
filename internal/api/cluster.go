@@ -622,17 +622,31 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 // federatedValueCounts fans a GET out to the storage nodes and merges the
 // value/hits list found under key, summing hits per value -- the cluster form
 // of streams/stream_ids/stream_field_values.
-func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, path, key string) {
-	w.Header().Set("Content-Type", "application/json")
+// The key is ALWAYS "values", whatever the path.
+//
+// Every one of these endpoints answers through writeValues on a storage node,
+// which emits {"values": [...]}. The router asked for "streams" on
+// /select/logsql/streams and "stream_ids" on /select/logsql/stream_ids --
+// keys no backend has ever sent -- so both merged an absent field and answered
+// an empty list, under a key a storage node does not use either. The same path
+// returned a different SHAPE depending on deployment mode, and the router's
+// half was empty.
+//
+// This is the "decodes envelopes the backends no longer send" the LLD banner
+// has been warning about. The key parameter is gone rather than corrected:
+// a parameter that must always take one value is a way to get it wrong again.
+func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, path string) {
 	counts := map[string]int{}
 	vcBodies, w, ok := s.fanOutChecked(w, r, path, nil)
 	if !ok {
 		return
 	}
 	for _, b := range vcBodies {
-		var v map[string][]query.ValueCount
+		var v struct {
+			Values []query.ValueCount `json:"values"`
+		}
 		if json.Unmarshal(b, &v) == nil {
-			for _, vc := range v[key] {
+			for _, vc := range v.Values {
 				counts[vc.Value] += vc.Count
 			}
 		}
@@ -647,7 +661,17 @@ func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, pa
 		}
 		return out[i].Value < out[j].Value
 	})
-	json.NewEncoder(w).Encode(map[string]any{key: out})
+	// The limit applies to the MERGED list.
+	//
+	// Each backend applies its own limit and the router merged what came back,
+	// so `limit=2` across three shards returned up to six values -- and the
+	// two kept from each shard are that shard's top two, which is not the
+	// cluster's top two. A cluster-wide question needs a cluster-wide answer.
+	if n := intParam(r, "limit", 0); n > 0 && len(out) > n {
+		out = out[:n]
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"values": out})
 }
 
 // federatedStrings merges a string list under key across storage nodes (union).
