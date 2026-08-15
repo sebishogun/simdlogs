@@ -1,6 +1,9 @@
 package query
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
@@ -57,6 +60,103 @@ type Query struct {
 	// parameter answers m19,m18,m17 where the pipe answers m0,m1,m2).
 	LastN  int
 	MatAll bool // materialize every column (full-record output: bare selects, live tail)
+
+	// Cancellation and the reason a scan stopped.
+	//
+	// Unexported and set only by Executor.bindContext: a Query built by hand
+	// has no context and behaves exactly as it did before, which is what
+	// every internal caller and every existing test relies on.
+	//
+	// ctx is read at the checkpoint the scan already had -- exceeded() --
+	// rather than at new ones, so every loop that already stopped for a byte
+	// budget stops for a cancelled context too, and no call site has to
+	// remember a second check.
+	ctx context.Context
+	// maxGroups bounds survivors after the prune; 0 is unbounded.
+	maxGroups int
+	// maxMemory bounds the working set; 0 is unbounded.
+	maxMemory int64
+	// stopReason is why the scan stopped, recorded once by the FIRST stop.
+	// A cancelled context and an exhausted budget can both become true while
+	// the scan unwinds, and reporting the second tells the caller to fix the
+	// wrong thing.
+	//
+	// A POINTER to the atomic, for the same reason Stopped is one: a Query is
+	// copied by value in four places -- subqueries, introspection, the
+	// executor -- and an embedded atomic makes the type uncopyable. Sharing it
+	// across the copy is also the behaviour that is wanted: a cancelled parent
+	// stops its subqueries, and a subquery that trips a budget is visible to
+	// the parent that will report it.
+	stopReason *atomic.Pointer[error]
+}
+
+// Bind attaches a context and a budget to a query run directly through Run or
+// RunPipeline rather than through an Executor.
+//
+// It exists because the HTTP layer has eighteen call sites that build a Query
+// and call the engine, and converting them all to Executor.Execute in one
+// change would be a rewrite of every read endpoint for a benefit -- typed stop
+// reasons -- that Bind delivers on its own. Executor is the API for new
+// callers; this is how the existing ones get cancellation.
+func (q *Query) Bind(ctx context.Context, lim Limits) { q.bindContext(ctx, lim) }
+
+// StopErr reports why a bound query stopped early, or nil.
+func (q *Query) StopErr() error { return q.stopErr() }
+
+// bindContext attaches a context and the executor's ceilings.
+func (q *Query) bindContext(ctx context.Context, lim Limits) {
+	q.ctx = ctx
+	q.maxGroups = lim.MaxGroups
+	q.maxMemory = lim.MaxMemory
+	q.stopReason = new(atomic.Pointer[error])
+	if lim.MaxRows > 0 && (q.MaxRows == 0 || lim.MaxRows < q.MaxRows) {
+		q.MaxRows = lim.MaxRows
+	}
+	if lim.MaxBytes > 0 && (q.MaxBytes == 0 || lim.MaxBytes < q.MaxBytes) {
+		q.MaxBytes = lim.MaxBytes
+	}
+	if q.Stopped == nil {
+		q.Stopped = new(atomic.Bool)
+	}
+}
+
+// countsBytes reports whether the scan has to total up materialized row sizes.
+//
+// The walk is per row and per field, measured at +2.4% to +6.9% instructions
+// depending on the corpus, so it runs only when something reads the answer.
+// MaxMemory is in the gate as well as MaxBytes: with only the memory ceiling
+// set, the total stayed at zero and the ceiling could never be reached -- a
+// limit that is configuration nothing reads, which is the state the Deadline
+// and MaxBytes fields were added to fix in the first place.
+func (q *Query) countsBytes() bool { return q.MaxBytes > 0 || q.maxMemory > 0 }
+
+// stopErr reports why the scan stopped, or nil.
+//
+// It also reports a row-limit overflow, which the scan signals by producing
+// more rows than MaxRows rather than by setting a reason: that check lives in
+// the scan loops and predates this, and turning a detected overflow into a
+// silent truncation is exactly the failure the executor exists to prevent.
+func (q *Query) stopErr() error {
+	if q.stopReason == nil {
+		return nil
+	}
+	if p := q.stopReason.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// stop records the first reason a scan ended early.
+func (q *Query) stop(err error) {
+	if q.Stopped != nil {
+		q.Stopped.Store(true)
+	}
+	if q.stopReason == nil {
+		return // no executor bound this query; the bool is the whole signal
+	}
+	// CompareAndSwap, not Store: two parallel workers can stop in the same
+	// instant, and the second must not overwrite the first's reason.
+	q.stopReason.CompareAndSwap(nil, &err)
 }
 
 // PredKind selects the comparison.
@@ -220,16 +320,33 @@ func rowBytes(r Row) int64 {
 // scan loop below is where they have to be checked, because the scan is what
 // costs.
 func (q *Query) exceeded(bytes int64) bool {
-	if !q.Deadline.IsZero() && time.Now().After(q.Deadline) {
-		if q.Stopped != nil {
-			q.Stopped.Store(true)
+	// The context first, and cheaply: ctx.Err() is one atomic load on a live
+	// context, which is what this is on every call but the last.
+	if q.ctx != nil {
+		if err := q.ctx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				q.stop(ErrDeadlineExceeded)
+			} else {
+				q.stop(ErrCanceled)
+			}
+			return true
 		}
+	}
+	if !q.Deadline.IsZero() && time.Now().After(q.Deadline) {
+		q.stop(ErrDeadlineExceeded)
 		return true
 	}
 	if q.MaxBytes > 0 && bytes > q.MaxBytes {
-		if q.Stopped != nil {
-			q.Stopped.Store(true)
-		}
+		q.stop(ErrByteLimit)
+		return true
+	}
+	if q.maxMemory > 0 && bytes > q.maxMemory {
+		// Checked against the same running total for now: the scan's working
+		// set and its cumulative output coincide while rows are accumulated
+		// into one slice. Stated rather than implied, because when a
+		// streaming sink lands (task 6.3) the two stop coinciding and this
+		// has to become the live figure rather than the running one.
+		q.stop(ErrMemoryLimit)
 		return true
 	}
 	return false
@@ -281,6 +398,15 @@ func Run(s Store, q *Query) []Row {
 			survivors = append(survivors, g)
 		}
 	}
+	// The group ceiling fires here: after the time window and the footer
+	// prune, before a single column is decoded. Before either, every query on
+	// a large store would trip it; after the scan, it would have cost what it
+	// exists to avoid.
+	if q.maxGroups > 0 && len(survivors) > q.maxGroups {
+		q.stop(fmt.Errorf("%w: %d groups survived the prune, ceiling is %d",
+			ErrTooManyGroups, len(survivors), q.maxGroups))
+		return nil
+	}
 	if q.LastN > 0 {
 		return runNewest(survivors, q)
 	}
@@ -308,7 +434,7 @@ func Run(s Store, q *Query) []Row {
 		// applyQueryBudget copies it onto every HTTP read, so a default
 		// deployment pays the walk on every query. Only an internal caller
 		// with no budget, or -search.maxQueryBytes=-1, skips it.
-		if q.MaxBytes > 0 {
+		if q.countsBytes() {
 			for _, r := range out[before:] {
 				bytes += rowBytes(r)
 			}
@@ -339,7 +465,7 @@ func runNewest(survivors []*storage.Reader, q *Query) []Row {
 	for i := len(survivors) - 1; i >= 0; i-- {
 		before := len(out)
 		out = appendMatches(out, survivors[i], q)
-		if q.MaxBytes > 0 {
+		if q.countsBytes() {
 			for _, r := range out[before:] {
 				bytes += rowBytes(r)
 			}

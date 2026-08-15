@@ -380,18 +380,67 @@ func (s *Server) applyQueryBudget(r *http.Request, q *query.Query) *atomic.Bool 
 	if n := s.limits.MaxQueryBytes; n > 0 {
 		q.MaxBytes = n
 	}
+	// The REQUEST's context, so a client that hangs up ends the scan.
+	//
+	// Go does not abort a handler when its context is cancelled, so before
+	// this a disconnected client's query ran to completion and threw the
+	// answer away -- the whole cost, none of the benefit, and on a server
+	// under load that is the difference between shedding work and doing it
+	// twice. The Deadline above is kept as well: it is what -search.maxDuration
+	// sets, and a caller with no context deadline still gets it.
+	q.Bind(r.Context(), query.Limits{})
 	return stopped
 }
 
 // queryStopped answers a query that hit a budget. A short result presented as
 // complete is the silent truncation this exists to prevent.
+//
+// The bool says THAT it stopped; qerr says WHY, when the query was bound to a
+// context. Every stop used to answer 504 whatever caused it, so a client that
+// disconnected, one that asked for too many bytes and one that ran out of time
+// were indistinguishable in an access log -- and a client retrying a 504
+// against a byte budget retried forever.
 func (s *Server) queryStopped(w http.ResponseWriter, r *http.Request, stopped *atomic.Bool) bool {
+	return s.queryStoppedErr(w, r, stopped, nil)
+}
+
+// queryStoppedErr is queryStopped with the query's own stop reason.
+func (s *Server) queryStoppedErr(w http.ResponseWriter, r *http.Request, stopped *atomic.Bool, q *query.Query) bool {
 	if stopped == nil || !stopped.Load() {
 		return false
 	}
-	s.writeErr(w, r, readSpec(), http.StatusGatewayTimeout,
-		"query exceeded its time or byte budget; narrow the window, add a filter, "+
-			"or raise -search.maxDuration / -search.maxQueryBytes")
+	status := http.StatusGatewayTimeout
+	msg := "query exceeded its time or byte budget; narrow the window, add a filter, " +
+		"or raise -search.maxDuration / -search.maxQueryBytes"
+	if q != nil {
+		if err := q.StopErr(); err != nil {
+			// The cause AND the remedy. A message that says only what went
+			// wrong leaves an operator to guess which knob moves it, and a
+			// regression test pins that these name the real flags -- the
+			// budget errors used to name flags that did not exist.
+			status = query.HTTPStatus(err)
+			switch {
+			case errors.Is(err, query.ErrDeadlineExceeded):
+				msg = err.Error() + "; narrow the window, add a filter, or raise " +
+					"-search.maxDuration"
+			case errors.Is(err, query.ErrByteLimit), errors.Is(err, query.ErrMemoryLimit):
+				msg = err.Error() + "; narrow the window, add a filter, or raise " +
+					"-search.maxQueryBytes"
+			case errors.Is(err, query.ErrRowLimit):
+				msg = err.Error() + "; add a `| limit N`, a stats pipe, or raise " +
+					"-search.maxRows"
+			default:
+				msg = err.Error()
+			}
+			if errors.Is(err, query.ErrCanceled) {
+				// Nobody is reading: the connection is gone. The status is for
+				// the access log, and writing a body to a closed connection is
+				// an error the handler would then log as a second failure.
+				return true
+			}
+		}
+	}
+	s.writeErr(w, r, readSpec(), status, msg)
 	return true
 }
 
@@ -744,7 +793,7 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	stopped := s.applyQueryBudget(r, q)
 	rows := query.RunPipeline(s.tn(r).store, q) // applies the pipe chain; == Run when there are none
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
 	if bareSelect && s.maxRows > 0 && len(rows) > s.maxRows {
@@ -1065,7 +1114,7 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 	}
 	stopped := s.applyQueryBudget(r, q)
 	series := query.Hits(s.tn(r).store, q, step, by)
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
 	// fields_limit keeps the busiest N series and folds the rest into one
@@ -1211,7 +1260,7 @@ func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
 	}
 	stopped := s.applyQueryBudget(r, q)
 	vals := query.FieldNameCounts(s.tn(r).store, q)
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
 	writeValues(w, limitValues(vals, r))
@@ -1229,7 +1278,7 @@ func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
 	}
 	stopped := s.applyQueryBudget(r, q)
 	vcs := query.StatsByField(s.tn(r).store, q, r.FormValue("field"))
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
 	query.SortValueCounts(vcs)
@@ -1250,7 +1299,7 @@ func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
 		intParam(r, "limit", query.DefaultFacetLimit),
 		intParam(r, "max_values_per_field", query.DefaultFacetMaxValues),
 		r.FormValue("keep_const_fields") == "1")
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
 	if facets == nil {
@@ -1282,7 +1331,7 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 	sq := &query.Query{From: from, To: to}
 	stopped := s.applyQueryBudget(r, sq)
 	samples, err := query.StatsQueryInstant(s.tn(r).store, r.FormValue("query"), from, to, time.Now().UnixNano(), sq)
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, sq) {
 		return
 	}
 	if err != nil {
@@ -1405,7 +1454,7 @@ func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	stopped := s.applyQueryBudget(r, q)
 	vals := query.Streams(s.tn(r).store, q)
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
 	writeValues(w, limitValues(vals, r))
@@ -1424,7 +1473,7 @@ func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	stopped := s.applyQueryBudget(r, q)
 	vals := query.StreamIDs(s.tn(r).store, q)
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
 	writeValues(w, limitValues(vals, r))
@@ -1443,7 +1492,7 @@ func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request)
 	}
 	stopped := s.applyQueryBudget(r, q)
 	vals := query.StreamFieldNames(s.tn(r).store, q)
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
 	writeValues(w, limitValues(vals, r))
@@ -1462,7 +1511,7 @@ func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request
 	}
 	stopped := s.applyQueryBudget(r, q)
 	vals := query.StreamFieldValues(s.tn(r).store, q, r.FormValue("field"))
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
 	writeValues(w, limitValues(vals, r))

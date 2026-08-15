@@ -601,8 +601,17 @@ func TestQueryBudgetsBoundTheScanNotOnlyThePrefilter(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer got.Body.Close()
-	if got.StatusCode != http.StatusGatewayTimeout {
-		t.Fatalf("status %d with a 1-byte query budget over %d rows, want 504",
+	// 413, not 504. The point of this test is that the budget bounds the SCAN
+	// rather than only the pre-filter, and that is what a non-200 says; the
+	// status itself moved when the executor gave each cause its own.
+	//
+	// A byte budget is "you asked for more than this server will give": the
+	// request is well-formed, and retrying it unchanged cannot succeed. 504
+	// said the opposite -- a timeout is transient, so a client with a retry
+	// policy retried the same doomed query forever, and an operator reading a
+	// status distribution could not tell it from a genuine timeout.
+	if got.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d with a 1-byte query budget over %d rows, want 413",
 			got.StatusCode, rows)
 	}
 }

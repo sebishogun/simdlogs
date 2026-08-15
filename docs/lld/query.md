@@ -105,6 +105,66 @@ group-skip, predicate bitsets, popcount. `Hits` buckets into
 step-aligned buckets, empty buckets present with zero counts (a graph needs
 the gap drawn), capped at `maxHitsBuckets = 100K`.
 
+## Cancellation and budgets (`executor.go`)
+
+Go does not abort a running handler when its request context is cancelled. A
+client that hangs up, a proxy that times out, a `-max-query-duration` that
+elapses — none of them stop a scan already walking groups. Before this the
+`Deadline` and `MaxBytes` fields on `Query` were the only thing that could end
+one, which is why they exist and why their own comment named this as the
+missing half.
+
+**Cancellation is threaded into the engine, not wrapped around it.** The scan
+already had a per-group checkpoint — `q.exceeded(bytes)`, called after every
+group in every scan loop and from every parallel worker — and that is where the
+context is read. Every call site that already stopped for a byte budget now
+also stops for a cancelled context, a deadline, a memory ceiling or a group
+ceiling, with no second check to remember at any of them. `RunPipeline` adds
+one more between pipes: a sort or a join over a large result is a phase with no
+group boundary in it, so a query cancelled during one used to run to completion
+and then discover nobody was waiting.
+
+**The reason is recorded, not returned.** `exceeded` returns a bool and the
+scan functions return rows; threading an error through all of them would touch
+the package for a value only the top of the stack reads. The FIRST stop records
+why, on the Query, and the caller reads it after. First, not last: a cancelled
+context and an exhausted budget can both become true while the scan unwinds,
+and reporting the second sends the caller to fix the wrong thing. The reason
+lives behind a *pointer* to an atomic, like `Stopped`, because a Query is
+copied by value in four places — subqueries, introspection, the executor — and
+sharing it across the copy is also the behaviour wanted: a cancelled parent
+stops its subqueries.
+
+`Executor{Store, Limits}` with `Execute(ctx, q, sink) error` is the API for new
+callers. `Query.Bind(ctx, Limits)` is how the existing ones get cancellation:
+the HTTP layer has eighteen sites that build a Query and call the engine, and
+converting them all in one change would rewrite every read endpoint for a
+benefit `Bind` delivers on its own.
+
+**Typed causes, stable statuses.** Each is a different thing for a client to do
+about it:
+
+| error | status | why |
+|---|---|---|
+| `ErrCanceled` | 499 | the client went away; nothing reads the body |
+| `ErrDeadlineExceeded` | 504 | transient, retryable |
+| `ErrRowLimit`, `ErrByteLimit`, `ErrTooManyGroups` | 413 | the request asks for more than the server gives; retrying it unchanged cannot succeed |
+| `ErrMemoryLimit` | 503 | about this server now, so retryable |
+| `ErrRejected` | 429 | admission control (task 6.2) |
+
+Every budget used to answer **504** whatever caused it, so a client that
+disconnected, one that asked for too many bytes and one that ran out of time
+were indistinguishable in an access log — and a client retrying a 504 against a
+byte budget retried forever. `TestQueryBudgetsBoundTheScanNotOnlyThePrefilter`
+moved from 504 to 413 with that change; it is a visible contract change.
+
+`MaxGroups` fires after the time window and the footer prune and before a
+single column is decoded — the only limit that protects the machine rather than
+the answer. `MaxMemory` shares the byte accounting, which is gated on
+`countsBytes()`: with only the memory ceiling set, the running total stayed at
+zero and the ceiling could never be reached, which is a limit that is
+configuration nothing reads.
+
 ## Streams
 
 `stream.go`. A stream is a distinct `_stream` label set `{k="v",...}` (keys

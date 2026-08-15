@@ -54,7 +54,7 @@ func runParallel(groups []*storage.Reader, q *Query) []Row {
 				rows := appendMatches(nil, groups[gi], q)
 				parts[gi] = rows
 				var n int64
-				if q.MaxBytes > 0 {
+				if q.countsBytes() {
 					for _, r := range rows {
 						n += rowBytes(r)
 					}

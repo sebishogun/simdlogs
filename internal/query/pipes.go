@@ -363,6 +363,17 @@ func RunPipeline(s Store, q *Query) []Row {
 		rows = Run(s, q)
 	}
 	for _, p := range pipes {
+		// Between pipes, not only during the scan. A sort or a join over a
+		// large result is a phase that runs for as long as the result is big,
+		// with no group boundary in it -- so a query cancelled during one used
+		// to run to completion and then discover nobody was waiting.
+		//
+		// Between rather than inside: a pipe that stopped halfway would return
+		// a partial result the executor then reports as complete, and the
+		// point of the checkpoint is to end the query, not to truncate it.
+		if q.exceeded(0) {
+			return nil
+		}
 		switch pp := p.(type) {
 		case *JoinPipe: // store-aware pipes run a subquery, so they cannot use apply(rows)
 			rows = pp.run(s, q, rows)

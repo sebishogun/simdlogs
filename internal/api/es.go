@@ -94,7 +94,7 @@ func (s *Server) esCount(w http.ResponseWriter, r *http.Request) {
 	q := esToQuery(body.Query)
 	stopped := s.applyQueryBudget(r, q)
 	n := query.Count(s.tn(r).store, q)
-	if s.queryStopped(w, r, stopped) {
+	if s.queryStoppedErr(w, r, stopped, q) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
