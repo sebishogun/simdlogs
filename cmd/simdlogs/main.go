@@ -19,6 +19,7 @@ import (
 	"github.com/sebishogun/simd"
 	"github.com/sebishogun/simdlogs/internal/api"
 	"github.com/sebishogun/simdlogs/internal/config"
+	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
 func main() {
@@ -34,6 +35,27 @@ func main() {
 	retention := flag.Duration("retention", 0, "drop data older than this (e.g. 720h); 0 disables")
 	tierDropPost := flag.Bool("recompact-drop-postings", false, "when recompacting, also drop the per-column inverted index (35% smaller total vs 8% for flate alone, but cold equality queries fall back to a scan -- what VictoriaLogs does for every query)")
 	tierAfter := flag.Duration("recompact-after", 0, "re-encode groups older than this with flate dictionaries (~17% smaller, slower value reads on cold data); 0 disables")
+	compactMin := flag.Int("compact-min-groups", 0,
+		"merge runs of at least this many small adjacent groups into one; 0 disables. "+
+			"A client sending one row per request writes one group per row, and every query "+
+			"walks the group list before it reads a column, so the cost is paid by every "+
+			"query. This is the group COUNT axis; -recompact-after is the group SIZE axis")
+	compactRows := flag.Int("compact-max-rows", 8192,
+		"cap an output group's rows. The time-window skip is per group, so a bigger group "+
+			"is a coarser skip: this trades the count against the skip")
+	compactAfter := flag.Duration("compact-after", time.Hour,
+		"only merge groups whose newest row is older than this, so compaction never "+
+			"rewrites the range ingest is still appending to")
+	compactEvery := flag.Duration("compact-every", time.Hour, "how often to run a compaction pass")
+	compactMaxOut := flag.Int("compact-max-outputs", 64,
+		"bound one pass to this many output groups PER TENANT, which bounds its I/O. "+
+			"There is no cross-tenant budget: each store enforces its own")
+	compactMaxIn := flag.Int64("compact-max-input-bytes", 0,
+		"refuse to read and rewrite more than this many bytes in one pass, per tenant; "+
+			"0 means no bound")
+	compactMaxGroup := flag.Int64("compact-max-group-bytes", 0,
+		"leave any input group larger than this alone -- merging one that is already big "+
+			"copies its bytes for no change in the group count; 0 means no bound")
 	streamFields := flag.String("stream-fields", "", "comma-separated fields that identify a log stream (synthesizes _stream)")
 	readinessReread := flag.Duration("readiness-reread-interval", 0,
 		"how often /-/ready re-reads the store directory of a degraded tenant that is not open, "+
@@ -170,6 +192,22 @@ func main() {
 		stopTier := srv.StartTiering(*tierAfter, time.Hour, *tierDropPost)
 		defer stopTier()
 		log.Printf("tiering: recompacting groups older than %s", *tierAfter)
+	}
+	if *compactMin > 0 {
+		// OlderThan is left unset here on purpose: StartCompactionAfter
+		// resolves it at the start of every pass, because a cutoff computed
+		// once at startup ages with the process.
+		opt := storage.CompactOptions{
+			MinGroups:        *compactMin,
+			MaxRowsPerOutput: *compactRows,
+			MaxOutputs:       *compactMaxOut,
+			MaxInputBytes:    *compactMaxIn,
+			MaxGroupBytes:    *compactMaxGroup,
+		}
+		stopCompact := srv.StartCompactionAfter(opt, *compactAfter, *compactEvery)
+		defer stopCompact()
+		log.Printf("compaction: merging runs of %d+ groups older than %s every %s, "+
+			"up to %d outputs a pass", *compactMin, *compactAfter, *compactEvery, *compactMaxOut)
 	}
 	if *retention > 0 {
 		stop := srv.StartRetention(*retention, time.Hour)

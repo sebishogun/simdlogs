@@ -116,6 +116,21 @@ type manifest struct {
 	records int // records appended since the last compaction
 	visible map[uint64]bool
 
+	// retired is every id a record explicitly REMOVED and no later record
+	// added back. It is not the complement of visible, and the difference is
+	// the whole point: an id that appears in no record at all -- because its
+	// commit never landed, or because replay stopped at a torn record before
+	// reaching it -- is absent from BOTH sets, and only this one licenses
+	// deleting its file.
+	//
+	// Reclaiming "everything not visible" instead deleted committed data. One
+	// flipped byte in the fifth of ten records left five group files, with the
+	// store reporting `healthy: 5 groups`; a MANIFEST truncated to zero left
+	// none of twenty. It also destroyed the documented recovery -- remove the
+	// MANIFEST and let the legacy path adopt the directory -- because there
+	// was nothing left to adopt.
+	retired map[uint64]bool
+
 	// preexisted is whether the MANIFEST file was on disk when this manifest
 	// was opened. It is the bootstrap discriminator; see openManifest.
 	preexisted bool
@@ -127,7 +142,7 @@ type manifest struct {
 // the sequence it belongs to never committed.
 func openManifest(dir string) (*manifest, error) {
 	path := filepath.Join(dir, ManifestFileName)
-	m := &manifest{path: path, visible: map[uint64]bool{}}
+	m := &manifest{path: path, visible: map[uint64]bool{}, retired: map[uint64]bool{}}
 
 	b, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
@@ -186,9 +201,15 @@ func (m *manifest) ensureOpen() error {
 func (m *manifest) apply(rec manifestRecord) {
 	for _, id := range rec.Add {
 		m.visible[id] = true
+		// An id that is added has not been retired, whatever an earlier record
+		// said. Ids are never reissued while a store is open, so this is
+		// defensive rather than reachable -- and a set that only grows is the
+		// kind that eventually licenses deleting a live file.
+		delete(m.retired, id)
 	}
 	for _, id := range rec.Remove {
 		delete(m.visible, id)
+		m.retired[id] = true
 	}
 	if rec.Seq > m.seq {
 		m.seq = rec.Seq
@@ -312,6 +333,15 @@ var ErrRollbackFailed = errors.New("storage: a failed manifest commit could not 
 // isVisible reports whether the manifest says a group id is part of the
 // store.
 func (m *manifest) isVisible(id uint64) bool { return m.visible[id] }
+
+// wasRetired reports whether a record removed this id and none added it back.
+//
+// A manifest fold (compact) rewrites the log as one Add record naming the
+// visible set, which drops this. That is a leak and not a loss: a file whose
+// removal was folded away stops being reclaimable and stays on disk. Stated
+// rather than fixed, because the fix is carrying a retired list through the
+// fold, and a list that grows forever in a file is its own problem.
+func (m *manifest) wasRetired(id uint64) bool { return m.retired[id] }
 
 // visibleIDs returns the committed ids in ascending order.
 func (m *manifest) visibleIDs() []uint64 {

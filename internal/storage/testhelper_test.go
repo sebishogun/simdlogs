@@ -39,6 +39,7 @@ const (
 	crashOpAppend          = "append"
 	crashOpManifestCompact = "manifest-compact"
 	crashOpRecompact       = "recompact"
+	crashOpGroupCompact    = "group-compact"
 )
 
 const (
@@ -143,7 +144,7 @@ func crashChild(phase, dir, op string, batches int) {
 	// and is acknowledged, which is what the parent asserts must survive.
 	crashOnBatch := batches - 1
 	batch := 0
-	if op == crashOpManifestCompact || op == crashOpRecompact {
+	if op == crashOpManifestCompact || op == crashOpRecompact || op == crashOpGroupCompact {
 		// The hook closure reads THIS variable, and the setup loop leaves
 		// batch past it. Without -1 ("fire on any batch") the hook could never
 		// match during the operation under test and every subtest would pass
@@ -186,6 +187,24 @@ func crashChild(phase, dir, op string, batches int) {
 		if _, _, _, err := st.Recompact(int64(1)<<62, true); err != nil {
 			fmt.Fprintf(os.Stderr, "CHILD_RECOMPACT_FAILED %v\n", err)
 			os.Exit(6)
+		}
+	case crashOpGroupCompact:
+		// The fourth caller of the durable write, and the one whose commit is
+		// a TRANSACTION rather than an append: its record adds the output and
+		// removes the inputs together. A kill anywhere in it must leave either
+		// the inputs or the output visible and never both.
+		//
+		// Injecting an error cannot test that. An error unwinds every defer,
+		// so the in-memory swap is undone and the store looks consistent
+		// whatever the manifest holds; only a kill leaves the two to be
+		// reconciled by the next open. Measured: committing the add and the
+		// removes as two records leaves the whole shipped suite green and
+		// duplicates every row under this lane.
+		crashChildAppend(st, faultPoint(-1), -1, &batch, rows, batches, suicide)
+		armed = true
+		if _, err := st.CompactGroups(CompactOptions{MinGroups: 2}); err != nil {
+			fmt.Fprintf(os.Stderr, "CHILD_GROUP_COMPACT_FAILED %v\n", err)
+			os.Exit(8)
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "CHILD_BAD_OP %s\n", op)

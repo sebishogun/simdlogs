@@ -3740,3 +3740,142 @@ reachable: Go's `os.Rename` returns `EEXIST` for an existing directory, but
 having found one it `Lstat`s OLDNAME and reports THAT error first — so a
 staging directory another restore already deleted yields `ENOENT` even though
 the destination exists.
+
+## Compaction: a zero value that rewrote the store, and a transaction with no test
+
+Fifteen findings from the compaction review. The ones that were not the code
+being wrong are the ones worth keeping.
+
+**`CompactOptions{}` merged a 500-group store into one group.** `minGroups()`
+floored at 2, and three documents plus the field's own comment read that floor
+as a refusal: *"the zero value compacts nothing"*. A floor is not a switch. The
+zero value is off now, and the test that was supposed to cover this was named
+`"the zero value compacts nothing beyond the floor"` and asserted only that the
+rows survived — the name conceded the gap and nobody read it as one.
+
+**The central transaction had no test, and the missing lane was the reason.**
+The design says the output's add and the inputs' removes go in one manifest
+record. Mutating that into two records left the entire suite green. It could
+not have done otherwise: `TestCompactionCrashMatrix` injects an ERROR, an error
+unwinds every defer, and a store that unwinds looks consistent whatever the
+manifest holds. A SIGKILL does not unwind. Under a process-kill lane the same
+mutant duplicates **every batch** at `manifest-append` and `manifest-sync`.
+Thirteen phases now, and the error matrix stays for what it does test.
+
+**Three thresholds were checked at the wrong granularity, twice over.** The
+byte budget was first checked only between runs — forty groups produced ten
+outputs against a one-byte ceiling. Fixed to check between batches, which the
+shipped test then passed only because it set a row cap of 4: a batch runs to
+`MaxRows` rows, so a store that fits in one batch was still read in full,
+184,845 bytes against a limit of 1. It bounds the batch as it accumulates now.
+And the group-count floor was applied per batch rather than per run, so
+`MinGroups: 10` with a row cap of 8 compacted nothing, ever, with no error and
+no stat.
+
+**One unmergeable group refused its whole batch.** Discovering unmergeability
+inside `mergeGroups` throws away everything alongside it: one vector column
+among sixty left all sixty unmerged, permanently. It is a candidacy question,
+so it belongs in `compactCandidate`, where such a group breaks the run like any
+other ineligible one.
+
+**Four data races for an early return.** An unlocked `len(s.groups)` pre-check,
+to skip a mutex acquisition on a path about to do file I/O, raced `Close`,
+`AppendGroup` and a second pass. Deleted.
+
+**A pass blocked every HTTP request for its duration.** `forEachTenant` holds
+the lock every request takes to resolve its tenant; a query during a
+50,000-group pass took 250.7 ms, and a 200,000-group pass takes 1.33 s. The
+tenants are snapshotted and marked in-flight now, and the pass runs outside the
+lock.
+
+**And a kill between the commit and the unlink leaked most of a store.**
+Tombstones live in memory; a restart drops them, and `OpenStore` deliberately
+ignored files the manifest does not name. For a failed append that residue is
+one file. For compaction it is every input of the batch — measured, 1 live
+group and 8 orphans after two reopens. `OpenStore` reclaims them now, which is
+safe there and nowhere else: it holds the exclusive lock and has not written a
+group yet.
+
+Two smaller ones with a shape worth naming. A merge that GREW the store was
+allowed, and the operator log printed "saved -0.0 MB" — `Recompact` has refused
+that since it was written, and the new code did not inherit the rule because
+nothing made it. And `mergeGroups` called the caching `DictIndices` on every
+column of every group it was about to unlink, filling a 256 MB query cache that
+is incremented in one place and decremented nowhere: ~32M merged rows retire
+the cache for the life of the process.
+
+**The measurements were wrong and the reason is the instrument again.** The
+first version claimed 582x from three runs at a 200-300x benchtime, whose
+spreads were 1.65x and 2.2x — at this repo's 8.3% floor a 2.2x spread makes a
+minimum-of-three meaningless, and its small-groups figure was four times what a
+2000x run measures. Six interleaved runs give 411x on the minimums and 252x on
+the least favourable pairing; an independent measurement at another load gave
+284x and 274x. What survives two sessions is a band of 250-410x, not a number.
+The disk figure, being deterministic, reproduced exactly.
+
+The table also mixed two fixtures: its group column was n=5,000, its byte
+column n=20,000, and it said "1 group" where n=20,000 gives 3. One table, two
+experiments, and the caption named only one of them.
+
+## The fix for the leak deleted committed data, and the doc comment argued the wrong precondition
+
+`reclaimOrphanGroups` was added last round to stop a killed compaction leaking
+its whole input set. It unlinked every `group-*.bin` the manifest did not name.
+The sign-off review measured what that does to a store whose manifest is torn:
+
+| fixture | group files before | after one open | health reports |
+|---|---|---|---|
+| one flipped byte in the 5th of 10 records | 10 | **5** | `healthy: 5 groups` |
+| MANIFEST truncated to zero, 20 groups | 20 | **0** | `healthy: 0 groups` |
+| the first record's CRC corrupted, 12 groups | 12 | **0** | clean |
+
+Replay stops at the first record that fails its checksum -- by design, and
+documented one file over -- so every group committed after a torn record is
+invisible. "Invisible" was read as "never committed", and the difference is
+data. It also destroyed the documented recovery: remove the MANIFEST and let
+the legacy path adopt the directory returns 20 of 20 rows without the reclaim
+and 0 of 20 with it, because there was nothing left to adopt. The repo had
+already identified this state as reachable -- `backup.go` carries a paragraph
+about a truncated manifest making a full directory read as empty -- and the
+reclaim upgraded that consequence from "invisible" to "gone".
+
+**The doc comment argued the wrong precondition, at length.** It has a careful
+paragraph about why the unlink is safe: the process holds the exclusive lock,
+it has not written a group yet, no concurrent writer can be mid-way through a
+file. All true, all verified, and none of it the precondition that fails. The
+one it never stated is that **the manifest must be a complete record of what
+was committed** -- which is exactly the assumption a checksummed append-only
+log with a documented stop-at-first-bad-record replay does not give you.
+
+The fix is to reclaim only ids a record explicitly REMOVED. An id in no record
+at all -- an append that crashed before its commit, or anything past a torn
+record -- is in neither the visible set nor the retired one, and only the
+retired set licenses an unlink. `manifest.compact()` folds the log to one Add
+record and drops the retired set, so a removal folded away stops being
+reclaimable: a leak, not a loss, and stated rather than fixed because carrying
+a forever-growing retired list in a file is its own problem.
+
+**The shape.** A leak was traded for a loss, and the trade was invisible
+because the change was tested against the failure it fixed and not against the
+failures it created. Every test written for it -- the crash matrix, the orphan
+count, the row oracles -- exercised a HEALTHY manifest, which is the one input
+for which the two rules agree.
+
+Three smaller ones from the same review. A batch was required to have *a*
+timestamp column but not to agree on WHICH: two groups, one with `_time` and
+one with `ts`, each got 0 in the other's column, so the output spanned from
+zero and a window that matched nothing returned every row -- the same failure
+the timestamp-less refusal exists for, reached through a second door. The
+detached tenant walk marked every tenant in-flight for the whole pass, and
+eviction skips in-flight tenants, so a long pass turned a would-be blocking
+request into `503 all are in use` -- a 250 ms stall traded for a hard
+rejection. And of the fifteen fixes the previous round claimed, five had no
+test: re-adding the deleted race, marking in-flight after the unlock, dropping
+the batch byte bound, restoring the caching decode, and taking the id before
+the size decision all left the suite green.
+
+Two findings are recorded and NOT fixed here, both outside this change's
+surface and neither reachable from a shipped path: `Store.Promote` re-adds a
+cold copy of a group compaction merged away (19 of 40 row shapes visible twice,
+serial and deterministic), and `Promote` overwrites the file of a reissued id.
+`Demote`/`Promote`/`ColdStore` have no non-test callers.

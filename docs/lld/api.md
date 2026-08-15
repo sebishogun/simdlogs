@@ -178,6 +178,13 @@ recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
 | `-retention` | drop data older than this (hourly); 0 disables |
 | `-recompact-after` | re-encode old groups with flate dicts (hourly); 0 disables |
 | `-recompact-drop-postings` | also drop the per-column inverted index when recompacting |
+| `-compact-min-groups` | merge runs of at least this many small adjacent groups into one; 0 disables |
+| `-compact-max-rows` | cap an output group's rows (the time skip is per group, so bigger is coarser) |
+| `-compact-after` | only merge groups older than this, so a pass never rewrites the live tail |
+| `-compact-every` | how often to run a compaction pass |
+| `-compact-max-outputs` | bound one pass to this many output groups per tenant |
+| `-compact-max-input-bytes` | refuse to rewrite more than this per pass, per tenant; 0 = no bound |
+| `-compact-max-group-bytes` | leave input groups larger than this alone; 0 = no bound |
 | `-compact` | compact mode: flate dicts, ~15% smaller groups, 2–10x slower value reads — cold archival only |
 | `-stream-fields` | comma-separated fields identifying a log stream |
 | `-syslog` | also listen for syslog on UDP/TCP |

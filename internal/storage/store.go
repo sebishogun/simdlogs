@@ -326,14 +326,60 @@ func OpenStoreWith(dir string, opts OpenOptions) (*Store, error) {
 				len(removals), cerr)
 		}
 	}
-	// Any group file the manifest does not name never committed -- a crash
-	// between the rename and the commit. It stays on disk untouched; nothing
-	// reads it, and an operator can inspect it.
+	// Any group file the manifest does not name is reclaimed here.
+	//
+	// It got there one of two ways and neither leaves data behind. A crash
+	// between a rename and its commit leaves an uncommitted file, which no
+	// reader will ever open because visibility is the manifest's. A crash
+	// between a compaction's commit and its unlink leaves the INPUTS it
+	// already merged, which the manifest has already stopped naming.
+	//
+	// The version that left them said "an operator can inspect it", and for a
+	// single failed append that is one file. Compaction changed the scale: a
+	// batch is up to a whole run of groups, so one kill leaked most of a
+	// store's bytes with nothing that would ever reclaim them -- the tombstone
+	// list is in memory and a restart drops it. Measured, a kill before the
+	// unlink followed by two reopens: 1 live group and 8 orphan files.
+	//
+	// Safe here and nowhere else: this process holds the directory's exclusive
+	// lock and has not written a group yet, so a file the manifest does not
+	// name cannot be one another writer is mid-way through. nextID was taken
+	// from the pre-removal glob above, so removing them now cannot make this
+	// open reissue an id; a LATER open computing a smaller nextID is the same
+	// state retention already produces by unlinking, and the quarantine
+	// directory -- which nextID also spans -- is untouched.
+	reclaimOrphanGroups(dir, onDisk, man)
 	s.sortGroups()
 	qn, readable := countQuarantined(dir)
 	s.health.setQuarantined(qn, readable)
 	s.health.setAcknowledged(readAcknowledgement(dir, qn))
 	return s, nil
+}
+
+// reclaimOrphanGroups unlinks group files the manifest does not name.
+//
+// Errors are ignored on purpose: a file that cannot be removed is disk, not
+// data, and refusing to open a store over it would turn a reclaimable leak
+// into an outage.
+func reclaimOrphanGroups(dir string, onDisk map[uint64]string, man *manifest) {
+	for id, path := range onDisk {
+		// RETIRED, not "not visible". A record has to have said this id was
+		// removed. An id nothing ever mentioned -- an append that crashed
+		// before its commit, or anything past a torn record replay stopped at
+		// -- is left alone, because "the manifest does not name it" and "the
+		// manifest recorded it gone" are different facts and only the second
+		// licenses an unlink. The first version conflated them and deleted
+		// committed groups out of a store that then called itself healthy.
+		if !man.wasRetired(id) || man.isVisible(id) {
+			continue
+		}
+		if quarantineRecordExists(dir, id) {
+			// Quarantined by an earlier open: the record is evidence and the
+			// id must stay accounted for.
+			continue
+		}
+		os.Remove(path)
+	}
 }
 
 // Health is the store's current health. A value copy, so a readiness probe
@@ -424,6 +470,13 @@ func (s *Store) AppendGroup(g *Group) (uint64, error) {
 
 // discardUncommitted removes a group file that was made durable but never
 // committed, so a failed append leaves nothing behind.
+//
+// It is still the only thing that reclaims one. reclaimOrphanGroups at open
+// does NOT: a file no record ever named cannot be told from one whose commit
+// is still coming, or from a committed group whose record replay could not
+// reach, so it is left alone. That is why this cleanup matters and why the
+// paragraph below, which used to end "only a human deleting files by hand can
+// reclaim", is still the truth for this case.
 //
 // The window is every step of AppendGroup from the rename onward: the last two
 // steps of writeFileAtomic -- opening the parent directory and fsyncing it --

@@ -123,8 +123,16 @@ committed assembly; every kernel has a portable fallback) and
   age; per-stream retention drops by `_stream` label set. Files unlink only
   after leaving the index.
 - `-recompact-after` (hourly): re-encode old groups' dictionaries with flate
-  (or also drop postings with `-recompact-drop-postings`); replaced mmaps are
-  retired for 5 minutes before unmapping.
+  (or also drop postings with `-recompact-drop-postings`). A replaced mapping
+  is retired and unmapped when its last reader releases it -- reference
+  counting, not a five-minute timer, which is what this line described until
+  `recompact.go` replaced it.
+- `-compact-min-groups` (0, off): merge runs of small adjacent groups into
+  fewer larger ones. The other axis from recompaction -- group COUNT rather
+  than group size -- because every query walks the group list before it reads
+  a column. `-compact-after` keeps a pass off the range ingest is still
+  appending to, and `-compact-max-outputs` / `-compact-max-input-bytes` /
+  `-compact-max-group-bytes` bound its I/O, per tenant.
 - `/admin/backup`: a self-describing tar — `BACKUP-MANIFEST` first, the group
   files, `BACKUP-COMPLETE` last — taken from a leased snapshot so a group
   retention removes mid-stream is still in it. Admin-only, one at a time per

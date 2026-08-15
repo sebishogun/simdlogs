@@ -80,6 +80,12 @@ func NonWriteFaultPointNames() []string {
 		faultPointName[faultLockOpened],
 		// Not a step of the write either: it is a step of a restore's cleanup.
 		faultPointName[faultRestoreCleanup],
+		// Compaction is not an ingest either: these fire in a background
+		// pass that rewrites groups already committed.
+		faultPointName[faultCompactWrite],
+		faultPointName[faultCompactWritten],
+		faultPointName[faultCompactCommit],
+		faultPointName[faultCompactUnlink],
 	}
 }
 

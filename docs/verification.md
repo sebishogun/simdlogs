@@ -224,8 +224,13 @@ signal, not an injected error: an injected error unwinds every defer — the tem
 file is removed, the manifest truncated back to a record boundary — which tests
 the *error handling*. Only a kill shows what is actually on disk.
 
-Two matrices, over the three callers of the durable write that they cover —
-`AppendGroup`, `manifest.compact` and `Store.Recompact`:
+Three matrices, over the four callers of the durable write that they cover —
+`AppendGroup`, `manifest.compact`, `Store.Recompact` and `Store.CompactGroups`.
+The third is compaction's own, thirteen phases, and it exists because
+compaction's commit is a TRANSACTION rather than an append: its record adds the
+output and removes the inputs together, and only a kill can show whether that
+is one record. Measured against a build that splits it in two, the rest of the
+suite stays green and every batch appears twice.
 
 | Matrix | Phases | Contract |
 |---|---|---|
@@ -251,7 +256,7 @@ Two tests exist to stop the matrix going vacuously green:
   is not smaller, so a too-small fixture makes every recompact subtest pass
   without the code under test writing a byte.
 
-**What is not in the matrix.** Seven paths write durably or commit; three are
+**What is not in the matrix.** Eight paths write durably or commit; four are
 covered. `Store.Promote` (`cold.go`) is structurally identical to
 `AppendGroup` — write the group, then commit an add. `Store.Demote` and
 retention's `dropGroups` commit a REMOVE and then unlink, which is the

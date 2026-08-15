@@ -405,3 +405,48 @@ func (s *Server) tenantDir(key string) string {
 	}
 	return filepath.Join(s.dir, "tenant-"+acc+"-"+proj)
 }
+
+// forEachTenantDetached calls fn for every open tenant WITHOUT holding the
+// server lock while fn runs.
+//
+// forEachTenant holds s.mu for the whole walk, and s.mu is what every request
+// takes to resolve its tenant. That is fine for the metrics walk it was
+// written for and not fine for an operation that does file I/O: a compaction
+// pass over 200,000 groups takes 1.3 seconds, and measured, a query issued
+// during a 50,000-group pass took 250.7ms end to end because it was waiting
+// for this lock.
+//
+// The tenants are snapshotted under the lock and marked in-flight, which is
+// the same mechanism a request uses to stop eviction closing a store it is
+// reading. Marked before the lock is released, or eviction can reclaim a
+// tenant between the snapshot and the call.
+func (s *Server) forEachTenantDetached(fn func(*tenant)) {
+	s.mu.Lock()
+	snapshot := make([]*tenant, 0, len(s.tenants))
+	for _, tn := range s.tenants {
+		tn.inFlight.Add(1)
+		snapshot = append(snapshot, tn)
+	}
+	s.mu.Unlock()
+	// Released as each one finishes, not all at the end. Eviction skips an
+	// in-flight tenant, so holding every one busy for the whole walk turns a
+	// long pass into `503 too many open tenants; all are in use` for any NEW
+	// tenant arriving during it -- where the locked walk made that request
+	// block and then succeed. One at a time, the window is one tenant's pass.
+	//
+	// The deferred loop is a backstop for a panic in fn, and double-release is
+	// impossible because done[] gates it.
+	done := make([]bool, len(snapshot))
+	defer func() {
+		for i, tn := range snapshot {
+			if !done[i] {
+				tn.inFlight.Add(-1)
+			}
+		}
+	}()
+	for i, tn := range snapshot {
+		fn(tn)
+		tn.inFlight.Add(-1)
+		done[i] = true
+	}
+}

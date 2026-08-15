@@ -68,6 +68,15 @@ const (
 	// asserting the end state -- which is identical whichever order they go
 	// in, and was identical while the order was wrong.
 	faultRestoreCleanup
+	// The four points a compaction pass can be killed at, in order: before
+	// the output is written, after it is durable and before it is committed,
+	// at the manifest commit itself, and after the commit with the inputs
+	// still on disk. Each leaves a different residue and the crash matrix
+	// asserts that none of them loses or duplicates a row.
+	faultCompactWrite
+	faultCompactWritten
+	faultCompactCommit
+	faultCompactUnlink
 )
 
 // faultPointName is for test output and for the crash matrix's subprocess
@@ -89,6 +98,10 @@ var faultPointName = map[faultPoint]string{
 	faultRestoreReleasing: "restore-releasing",
 	faultLockOpened:       "lock-opened",
 	faultRestoreCleanup:   "restore-cleanup",
+	faultCompactWrite:     "compact-write",
+	faultCompactWritten:   "compact-written",
+	faultCompactCommit:    "compact-commit",
+	faultCompactUnlink:    "compact-unlink",
 }
 
 var (

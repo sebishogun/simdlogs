@@ -345,8 +345,125 @@ and treat the help's 17% as an unmeasured source claim (a stale source
 comment, recorded in `docs/roadmap.md`).
 
 The subtlety is mmap lifetime: a query started before a swap still holds the
-old reader, so replaced mappings are retired and unmapped only after
-`retireGrace = 5 minutes` — longer than any request the server will serve.
+old reader, so a replaced mapping is retired and unmapped when its last reader
+releases it — reference counting, which `recompact.go` uses and which this line
+described as a five-minute grace period long after `retireGrace` stopped
+existing. The same correction was made in `docs/architecture.md` and not here,
+three lines above the section this round added; `docs/wrong.md` has now
+recorded that shape fifteen times.
+
+### Small-group compaction (`compact_groups.go`)
+
+The other axis: recompaction makes a group smaller, compaction makes there be
+fewer. A group is written per ingest request, so a client sending one row per
+call writes one group per row, and every query walks the group list before it
+touches a column — the time-window skip that makes a selective query cheap is
+per GROUP.
+
+`Store.CompactGroups` merges runs of small **adjacent** groups. Adjacent in the
+store's own timeMin order, so every output's span stays inside the span its
+inputs already covered and no output overlaps a group it did not come from;
+merging arbitrary groups would widen spans and make every query read more.
+Rows are concatenated in batch order and each input's rows keep their order, so
+the output presents them in exactly the sequence a query walking those groups
+would have seen. Sorting by timestamp instead would reorder rows sharing a
+timestamp, which is a change no caller asked for.
+
+**The column set is the union.** Groups written by different requests carry
+different fields, and taking the first group's set would drop every column the
+others had — a query that used to find a field would stop finding it, with a
+successful exit code. A row from a group without a column gets that column's
+zero value, which is what the store already returns for an absent field. A
+name carrying two TYPES across the batch refuses the batch rather than picking
+one.
+
+**The commit is one manifest record.** `manifest.commit(add, remove, receipt)`
+already writes an add-set and a remove-set in a single record, which is exactly
+the transaction this needs and is why `manifest.go` did not change. One record
+per OUTPUT, not per pass: a run of hundreds at the row cap is several outputs,
+and holding every input visible until the last landed would make a crash in the
+middle throw away all the work rather than the tail.
+
+Crash residues. Two lanes, and the difference between them is the point:
+
+`TestCompactionCrashMatrix` injects an ERROR at each of the four points. An
+error unwinds every defer, so at the first three `discardUncommitted` removes
+the output and only the inputs survive. The fourth is different and the
+paragraph that said "nothing but the inputs survives" at all four was wrong
+about it: `compact-unlink` fires AFTER the commit, so the output is committed,
+visible and correct, and what is left over is the inputs' files. That tests the error paths and cannot test the
+transaction, because a store that unwinds looks the same whatever the manifest
+holds. An earlier version of this table claimed a per-point on-disk residue
+from a test field that was never read, and got two of the four rows wrong.
+
+`TestCrashDuringGroupCompactionIsVisibilityNeutral` SIGKILLs a child at
+thirteen phases — the seven of the durable write, the two manifest phases that
+only this rewrite reaches because its commit writes a record, and its own four
+— and asserts every batch is visible exactly once after reopen. That is the
+lane the transaction claim needs: measured against a build that commits the add
+and the removes as two records, the whole rest of the suite stays green and
+every batch appears **twice**.
+
+A kill after the commit and before the unlink leaves the inputs on disk,
+unreferenced. Unlinks that fail in-process become tombstones, the same path
+retention uses; a restart drops that list, so `OpenStore` reclaims any group
+file the manifest does not name. It is safe there and nowhere else: the process
+holds the directory's exclusive lock and has not written a group yet. Without
+it one kill leaked most of a store's bytes permanently — measured, 1 live group
+and 8 orphan files after two reopens.
+
+**Every threshold is a refusal, and the zero value compacts nothing**:
+`MinGroups` — below 1 the pass is off entirely, and 1 is raised to 2 because
+one group is not a run. The floor is not the switch; an earlier version had
+only the floor and `CompactOptions{}` merged a 500-group store into one.
+`MaxRowsPerOutput` (0 means the format's `MaxRows`; a
+smaller value keeps the per-group skip fine-grained), `MaxInputBytes`,
+`MaxGroupBytes`, `OlderThan`, `MaxOutputs`. The byte and output budgets are
+checked before every batch, not only between runs — checked only between runs,
+a single run of forty groups produced ten outputs against a one-byte ceiling.
+
+`Server.StartCompactionAfter` resolves `OlderThan` at the start of every pass
+rather than once: a cutoff computed at startup ages with the process, and after
+a day of uptime "an hour ago" is "twenty-five hours ago", which stops excluding
+the range ingest is still appending to. It walks the tenants **detached** —
+snapshotted under the server lock and marked in-flight, then run without it.
+`forEachTenant` holds the lock every request needs to resolve its tenant, and a
+pass is file I/O measured in seconds: with it held, a query issued during a
+50,000-group pass took 250.7 ms. Retention and recompaction still use the
+locked walk; they are shorter, and that is a statement about this pass rather
+than a claim about them.
+
+The budgets are per TENANT, not per pass: each store enforces its own and there
+is no cross-tenant total.
+
+**Measured.** Two fixtures, kept apart because an earlier version of this
+table mixed them — its group column was n=5,000, its byte column n=20,000, and
+it said "1 group" where n=20,000 gives 3.
+
+*Query side*, 5,000 one-row groups against the same rows in one group, six
+interleaved runs at 2000x, load average 1.9 (above this repo's quiet-machine
+bar, stated because it is):
+
+| | min | spread |
+|---|---|---|
+| one row per request | 10,414 ns | 1.07x |
+| compacted to 1 group | 25.33 ns | 1.63x |
+
+**411x on the minimums, 252x on the least favourable pairing.** An independent
+measurement at a different load gave 284x and 274x, so the durable claim is a
+band of roughly 250–410x. The absolute nanoseconds are not reproducible across
+sessions and are not claimed; the ratio is. A previous version of this section
+said 582x, from three runs at a benchtime short enough that its spreads were
+1.65x and 2.2x — meaningless at an 8.3% floor.
+
+*Disk side*, deterministic and reproduced exactly by an independent
+measurement: at n=20,000, 11,056,723 bytes in 20,000 groups become 324,965 in
+3 — **34.0x**. One pass over 2,000 one-row groups costs about 10 ms.
+
+Defaults were chosen after these numbers, not before, and
+`-compact-min-groups` is 0: a store whose owner has not asked for a rewrite
+does not get one, and `CompactOptions{}` is a genuine no-op rather than a
+floor that reads like one.
 
 ### Cold tier (`cold.go`)
 
