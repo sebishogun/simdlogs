@@ -8,3 +8,6 @@ internal/bench/victoria-logs
 # whole build-out. Removing it from HEAD does not shrink the history, which
 # still holds the blob; rewriting that is a separate decision.
 /simdlogs
+
+# locality analysis artifacts: a per-checkout cache keyed by git SHA, not source
+.locality/
