@@ -6700,3 +6700,36 @@ does, and both passed unchanged.
 That is a fourth shape for entry 93's list: **a superseded API that survives as
 a test harness — scope it to tests rather than delete or keep**. The baseline is
 16 entries down to 9.
+
+## 95. The unwired baseline is empty, and none of it was one kind of thing
+
+Task #431 is closed. The gate's exemption list is 16 entries down to **8**, and
+all eight are deliberate test hooks that say so in their names. The "genuinely
+unwired" section is empty.
+
+What the sixteen actually were, which is the finding worth keeping:
+
+| shape | what to do | which |
+|---|---|---|
+| a mechanism with no reader | **wire it** | `ValidateClusterBackup`, `QuarantinedGroups` |
+| a name that lies about its category | **rename it** | `SetMaxRows`, `SetDirRereadInterval`, `routeCount`, `ExecuteCount` |
+| a constant nobody writes | **delete it** | `FieldRequestID`, `FieldStatus`, `FieldDurationMS`, `FieldRows` |
+| a superseded API kept alive by its own tests | **scope it to tests** | `RestoreTar` |
+| a wrapper that drops what makes the call safe | **delete it** | `SnapshotAll` |
+| dead code that reads as a live endpoint | **delete it** | `readiness` — 51 lines, no caller, while `/-/ready` goes elsewhere |
+| a deliberate test hook | **keep, and say so** | the eight that remain |
+
+Only two of the sixteen were the defect the gate was written for. Six were names
+that made a test-only helper look like production API — which is not nothing:
+that is exactly what made them read as unwired, and a reader scanning for what
+production uses was misled by every one.
+
+Two of the deletions closed a real hazard rather than tidying. `SnapshotAll`
+let a caller take a snapshot without the manifest sequence, and the sequence is
+what stops an archive declaring a watermark covering a group it does not
+contain. `readiness` was a whole superseded handler that an editor's jump-to
+would land on before the live one.
+
+The list ratchets both ways, so none of this can come back quietly: an
+exemption that gains a production reader fails the gate, and a new name without
+one fails it too.

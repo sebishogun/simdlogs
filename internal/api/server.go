@@ -610,12 +610,13 @@ func splitCSV(v string) []string {
 	return out
 }
 
-// registeredPaths records every path Handler() registers, in registration
-// order. It exists so the route audit can enumerate the real mux instead of a
-// hand-written list -- the list is what missed /_search and /_count.
-// routeCount is the number of paths Handler() registered, so the audit can
-// assert it saw all of them rather than compare against a constant.
-func (s *Server) routeCount() int {
+// routeCountForTest is how many patterns the mux registered.
+//
+// ForTest by name: the three callers are the route audit, the route-count gate
+// and the contract completeness check, all tests. It was on the unwired
+// baseline as having no production reader, which was true and was not the
+// finding -- the finding is that a helper only tests call should say so.
+func (s *Server) routeCountForTest() int {
 	s.routeMu.Lock()
 	defer s.routeMu.Unlock()
 	return len(s.routes)
@@ -2124,58 +2125,6 @@ func hexdig(n byte) byte {
 		return '0' + n
 	}
 	return 'a' + n - 10
-}
-
-// readiness answers whether this server should serve QUERIES.
-//
-// Liveness and readiness are different questions and used to give the same
-// answer. /health and /-/healthy stay unconditional: the process is up, and a
-// liveness probe that fails restarts it, which fixes nothing that a degraded
-// store suffers from. /insert/ready stays unconditional too, because the
-// degradation is on the read side and the store takes writes normally.
-//
-// /-/ready is the query-side probe, so a tenant serving less than it was given
-// takes this replica out of rotation until an operator acknowledges it.
-//
-// That is deliberately conservative. A degraded store WORKS -- it opens, it
-// serves, its queries return -- and that is exactly what makes it dangerous:
-// every query touching a quarantined group returns fewer rows and nothing in
-// the response says so. A replica silently answering short is worse than a
-// replica out of rotation, so the default is out.
-//
-// The body names every degraded tenant, because "not ready" without a reason
-// sends an operator to the logs of the wrong process.
-func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
-	var bad []tenantHealth
-	for _, t := range s.degradedSnapshot() {
-		if !t.health.Ready() {
-			bad = append(bad, t)
-		}
-	}
-	// Storage pressure degrades readiness BEFORE any write fails, which is the
-	// whole point of having a warn threshold as well as a reject one: an
-	// operator watching /-/ready gets the warning while the store is still
-	// accepting everything. A probe that only went red once writes started
-	// failing would report the outage rather than prevent it.
-	pressure := s.storagePressure()
-	if len(bad) == 0 && len(pressure) == 0 {
-		w.Write([]byte("OK"))
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusServiceUnavailable)
-	if len(bad) > 0 {
-		fmt.Fprintf(w, "NOT READY: %d degraded tenant(s)\n", len(bad))
-		for _, d := range bad {
-			fmt.Fprintf(w, "%s: %s\n", d.key, d.health)
-		}
-	}
-	if len(pressure) > 0 {
-		fmt.Fprintf(w, "NOT READY: %d tenant(s) under storage pressure\n", len(pressure))
-		for _, p := range pressure {
-			fmt.Fprintf(w, "%s\n", p)
-		}
-	}
 }
 
 // storagePressure describes every tenant at or past a storage threshold.

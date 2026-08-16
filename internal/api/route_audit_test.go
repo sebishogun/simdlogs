@@ -35,8 +35,8 @@ func TestNoUnauthenticatedDataRoute(t *testing.T) {
 	paths := srv.registeredPaths()
 	// The floor is the real registered count, not a round number: a fixed 30
 	// would not notice eleven routes vanishing from a mux of 41.
-	if len(paths) != srv.routeCount() {
-		t.Fatalf("enumerated %d routes, mux registered %d", len(paths), srv.routeCount())
+	if len(paths) != srv.routeCountForTest() {
+		t.Fatalf("enumerated %d routes, mux registered %d", len(paths), srv.routeCountForTest())
 	}
 	if len(paths) < 40 {
 		t.Fatalf("only %d routes enumerated; the audit is not seeing the whole mux", len(paths))

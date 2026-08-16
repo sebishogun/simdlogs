@@ -218,7 +218,7 @@ func TestCancellationReachesTheNewestFirstScan(t *testing.T) {
 func TestExecuteCount(t *testing.T) {
 	s := execStore(t, 10, 100)
 	e := &Executor{Store: s}
-	n, err := e.ExecuteCount(context.Background(), allRows(&Query{}))
+	n, err := e.ExecuteCountForTest(context.Background(), allRows(&Query{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestExecuteCount(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := e.ExecuteCount(ctx, allRows(&Query{})); !errors.Is(err, ErrCanceled) {
+	if _, err := e.ExecuteCountForTest(ctx, allRows(&Query{})); !errors.Is(err, ErrCanceled) {
 		t.Fatalf("%v, want ErrCanceled", err)
 	}
 }
@@ -326,7 +326,7 @@ func TestExecutorWithoutAStoreRefuses(t *testing.T) {
 		t.Fatalf("%v, want ErrRejected", err)
 	}
 	e2 := &Executor{}
-	if _, err := e2.ExecuteCount(context.Background(), &Query{}); !errors.Is(err, ErrRejected) {
+	if _, err := e2.ExecuteCountForTest(context.Background(), &Query{}); !errors.Is(err, ErrRejected) {
 		t.Fatalf("%v, want ErrRejected", err)
 	}
 }

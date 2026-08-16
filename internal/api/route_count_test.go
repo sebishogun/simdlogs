@@ -20,7 +20,7 @@ func TestTheDocumentedRouteCountIsTheRealOne(t *testing.T) {
 	}
 	defer srv.Close()
 	srv.Handler()
-	got := srv.routeCount()
+	got := srv.routeCountForTest()
 
 	for _, doc := range []string{
 		"../../docs/compatibility.md",

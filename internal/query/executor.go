@@ -213,11 +213,13 @@ func (e *Executor) Execute(ctx context.Context, q *Query, sink Sink) error {
 	return sink(rows)
 }
 
-// ExecuteCount is Execute for a query whose answer is a count.
+// ExecuteCountForTest runs a query and returns how many rows it produced.
 //
-// Separate rather than a flag, because the engine's count path never
-// materializes a row and so cannot be expressed as a sink that ignores them.
-func (e *Executor) ExecuteCount(ctx context.Context, q *Query) (int, error) {
+// ForTest by name: nothing in production counts this way -- the surfaces that
+// need a count use the stats pipeline -- and its three callers are tests of the
+// executor's cancellation and admission paths. It was on the unwired baseline
+// as an Executor method with no production caller.
+func (e *Executor) ExecuteCountForTest(ctx context.Context, q *Query) (int, error) {
 	if e == nil || e.Store == nil {
 		return 0, fmt.Errorf("%w: no store", ErrRejected)
 	}

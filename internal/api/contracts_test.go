@@ -333,8 +333,8 @@ func TestEveryRouteHasAContract(t *testing.T) {
 	}
 
 	paths := srv.registeredPaths()
-	if len(paths) != srv.routeCount() {
-		t.Fatalf("enumerated %d routes, the mux registered %d", len(paths), srv.routeCount())
+	if len(paths) != srv.routeCountForTest() {
+		t.Fatalf("enumerated %d routes, the mux registered %d", len(paths), srv.routeCountForTest())
 	}
 	if len(paths) < 40 {
 		t.Fatalf("only %d routes enumerated; this gate is not seeing the whole mux", len(paths))

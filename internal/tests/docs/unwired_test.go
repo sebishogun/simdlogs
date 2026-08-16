@@ -212,11 +212,19 @@ var exempt = map[string]string{
 	"FailAt":                      "arms a fault point; production never arms one",
 	"SetMaxRowsForTest":           "production sets the cap through config (-search.maxRows); every caller of this is a test, and the name now says so",
 	"SetDirRereadIntervalForTest": "the same, one flag over: -readiness-reread-interval arrives via config.DirRereadInterval",
+	"routeCountForTest":           "how many patterns the mux registered; the route audit, the route-count gate and the contract check call it, and all three are tests",
+	"ExecuteCountForTest":         "nothing in production counts this way -- the surfaces that need a count use the stats pipeline -- and its three callers test cancellation and admission",
 
-	// GENUINELY UNWIRED. Each is a mechanism that was built, documented with
-	// the failure it prevents, and never connected -- which is what this gate
-	// was written to surface. Listed so the gate can run today rather than
-	// staying off until every one is fixed.
+	// THIS SECTION IS EMPTY, and that is the goal state task #431 aimed at.
+	// Everything above is a deliberate test hook that says so in its name;
+	// nothing below it is a mechanism waiting to be wired.
+	//
+	// What used to be here, and what each turned out to be:
+	//
+	// readiness is gone: server.go had a SUPERSEDED readiness handler with no
+	// caller at all, 51 lines of it, while /-/ready goes to
+	// s.healthHandler(healthReady). Dead code that reads as a live endpoint is
+	// worse than either.
 	//
 	// SnapshotAll and RestoreTar are gone too. SnapshotAll was a two-line
 	// wrapper that dropped the manifest sequence -- the number that makes a
@@ -246,9 +254,6 @@ var exempt = map[string]string{
 	// now applies: encoding/json reads it by reflection at cluster_backup.go:196
 	// and it ships in cluster.json. Accurately: no Go code BRANCHES on it. The
 	// gate cannot see reflection and does not pretend to.
-	"routeCount":   "the audit DOES call it -- route_audit_test.go:38, route_count_test.go:23, contracts_test.go:333 -- and the audit is a test, which is the actual reason. The doc block at server.go:602 describes registeredPaths and is attached to routeCount, which is why the gate sees this name at all",
-	"ExecuteCount": "an Executor method with no PRODUCTION caller -- executor_test.go:221, :231 and :329 do call it, and an earlier version of this note said \"no caller\" flat",
-	"readiness":    "server.go:2045 is a SUPERSEDED readiness handler; /-/ready goes to s.healthHandler(healthReady) at server.go:716. The earlier reason blamed 'a name shared with unrelated prose', which describes a mechanism this gate does not have -- comments never contribute to uses",
 }
 
 // buildExcluded reports whether f is compiled for a DIFFERENT platform than
