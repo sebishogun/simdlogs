@@ -85,7 +85,7 @@ func TestMaxRowsCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.Close()
-	srv.SetMaxRows(5)
+	srv.SetMaxRowsForTest(5)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	// ingest 20 records

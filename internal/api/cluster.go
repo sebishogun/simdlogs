@@ -36,9 +36,14 @@ func (s *Server) SetBackends(urls []string) { s.backends = urls }
 // double-counted. r<=1 is plain sharding (no replication).
 func (s *Server) SetReplicas(r int) { s.replicas = r }
 
-// SetMaxRows caps how many rows a bare (no-pipe) select may return; 0 = unlimited.
-// Over the cap the query errors rather than truncating silently.
-func (s *Server) SetMaxRows(n int) { s.maxRows = n }
+// SetMaxRowsForTest caps how many rows a bare (no-pipe) select may return;
+// 0 = unlimited. Over the cap the query errors rather than truncating silently.
+//
+// ForTest BY NAME, because that is what it is: production sets the cap through
+// config (-search.maxRows reaches the server at NewServerConfig), and every
+// caller of this is a test. It was on the unwired baseline as "a dead exported
+// setter", which was half right -- the setter is not dead, its name was.
+func (s *Server) SetMaxRowsForTest(n int) { s.maxRows = n }
 
 // shards groups the backends into replica sets of size max(1, replicas).
 func (s *Server) shards() [][]string {

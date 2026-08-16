@@ -41,20 +41,22 @@ import (
 // Field names. Constants rather than literals at the call sites, because a
 // field name is the queryable part and `tenant` in one file with `tenant_id`
 // in another is two fields as far as any log backend is concerned.
+// Every one of these is used by a log line. Four more were declared and never
+// logged -- request_id, status, duration_ms, rows -- and a field name nobody
+// writes cannot cause the drift this block exists to prevent, while its
+// presence tells a reader those fields are in the logs. They are gone; the day
+// a request line needs `duration_ms`, the constant costs one line to add and
+// will then be true.
 const (
-	FieldRequestID  = "request_id"
 	FieldTenant     = "tenant"
 	FieldRoute      = "route"
 	FieldMethod     = "method"
-	FieldStatus     = "status"
 	FieldShard      = "shard"
 	FieldErrorClass = "error_class"
 	FieldEvent      = "event"
 	FieldSubject    = "subject"
 	FieldOutcome    = "outcome"
-	FieldDurationMS = "duration_ms"
 	FieldBytes      = "bytes"
-	FieldRows       = "rows"
 )
 
 // ErrorClass is the coarse kind of a failure, for alerting.

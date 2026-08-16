@@ -206,15 +206,21 @@ var exempt = map[string]string{
 	// path that production must never take, so "no production reader" is the
 	// design and not a defect. They are the reason this gate cannot simply
 	// fail on everything it finds.
-	"SetFaultHookForTest":     "fault injection: a test-only hook by name and by design",
-	"SetDiskUsageForTest":     "same -- a test forces a disk-usage reading production reads from the OS",
-	"NonWriteFaultPointNames": "the fault-point inventory a test enumerates; production injects nothing",
-	"FailAt":                  "arms a fault point; production never arms one",
+	"SetFaultHookForTest":         "fault injection: a test-only hook by name and by design",
+	"SetDiskUsageForTest":         "same -- a test forces a disk-usage reading production reads from the OS",
+	"NonWriteFaultPointNames":     "the fault-point inventory a test enumerates; production injects nothing",
+	"FailAt":                      "arms a fault point; production never arms one",
+	"SetMaxRowsForTest":           "production sets the cap through config (-search.maxRows); every caller of this is a test, and the name now says so",
+	"SetDirRereadIntervalForTest": "the same, one flag over: -readiness-reread-interval arrives via config.DirRereadInterval",
 
 	// GENUINELY UNWIRED. Each is a mechanism that was built, documented with
 	// the failure it prevents, and never connected -- which is what this gate
 	// was written to surface. Listed so the gate can run today rather than
 	// staying off until every one is fixed.
+	//
+	// The four Field* log-field constants are gone rather than exempted: a
+	// field name no log line writes cannot cause the drift its own comment
+	// warns about, and its presence says those fields are in the logs.
 	//
 	// QuarantinedGroups is NOT here any more either. /admin/storage/quarantine
 	// serves it through Store.Quarantined, so the LISTING an operator could not
@@ -232,17 +238,11 @@ var exempt = map[string]string{
 	// now applies: encoding/json reads it by reflection at cluster_backup.go:196
 	// and it ships in cluster.json. Accurately: no Go code BRANCHES on it. The
 	// gate cannot see reflection and does not pretend to.
-	"routeCount":           "the audit DOES call it -- route_audit_test.go:38, route_count_test.go:23, contracts_test.go:333 -- and the audit is a test, which is the actual reason. The doc block at server.go:602 describes registeredPaths and is attached to routeCount, which is why the gate sees this name at all",
-	"ExecuteCount":         "an Executor method with no PRODUCTION caller -- executor_test.go:221, :231 and :329 do call it, and an earlier version of this note said \"no caller\" flat",
-	"SnapshotAll":          "superseded by SnapshotAllWithSeq, which is what callers use",
-	"RestoreTar":           "the older unstaged restore path; protocols.go:27 says the staged one replaced it",
-	"SetMaxRows":           "a dead exported setter: -search.maxRows reaches the server through config (server.go:300), so the LIMIT works and this way of setting it has no caller",
-	"SetDirRereadInterval": "the same, one flag over: -readiness-reread-interval arrives via config.DirRereadInterval (server.go:244) and this setter is unused",
-	"readiness":            "server.go:2045 is a SUPERSEDED readiness handler; /-/ready goes to s.healthHandler(healthReady) at server.go:716. The earlier reason blamed 'a name shared with unrelated prose', which describes a mechanism this gate does not have -- comments never contribute to uses",
-	"FieldRequestID":       "a log field constant no log line uses",
-	"FieldStatus":          "same",
-	"FieldDurationMS":      "same",
-	"FieldRows":            "same",
+	"routeCount":   "the audit DOES call it -- route_audit_test.go:38, route_count_test.go:23, contracts_test.go:333 -- and the audit is a test, which is the actual reason. The doc block at server.go:602 describes registeredPaths and is attached to routeCount, which is why the gate sees this name at all",
+	"ExecuteCount": "an Executor method with no PRODUCTION caller -- executor_test.go:221, :231 and :329 do call it, and an earlier version of this note said \"no caller\" flat",
+	"SnapshotAll":  "superseded by SnapshotAllWithSeq, which is what callers use",
+	"RestoreTar":   "the older unstaged restore path; protocols.go:27 says the staged one replaced it",
+	"readiness":    "server.go:2045 is a SUPERSEDED readiness handler; /-/ready goes to s.healthHandler(healthReady) at server.go:716. The earlier reason blamed 'a name shared with unrelated prose', which describes a mechanism this gate does not have -- comments never contribute to uses",
 }
 
 // buildExcluded reports whether f is compiled for a DIFFERENT platform than

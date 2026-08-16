@@ -695,7 +695,7 @@ func TestDeletedTenantDirectoryClearsTheDegradation(t *testing.T) {
 	defer srv3.Close()
 	// The throttle is tested separately; here the question is whether the
 	// re-read clears the record at all.
-	srv3.SetDirRereadInterval(0)
+	srv3.SetDirRereadIntervalForTest(0)
 	ts3 := httptest.NewServer(srv3.Handler())
 	defer ts3.Close()
 	if code, _ := get(t, ts3, "/-/ready"); code != http.StatusServiceUnavailable {
@@ -758,7 +758,7 @@ func TestMetricsAgreeWithReadinessAboutAnUntouchedTenant(t *testing.T) {
 	defer srv3.Close()
 	// The throttle is tested separately; here the question is whether the
 	// re-read clears the record at all.
-	srv3.SetDirRereadInterval(0)
+	srv3.SetDirRereadIntervalForTest(0)
 	ts3 := httptest.NewServer(srv3.Handler())
 	defer ts3.Close()
 
@@ -840,7 +840,7 @@ func TestEmptyingTheQuarantineDirectoryClearsTheDegradation(t *testing.T) {
 	defer srv3.Close()
 	// The throttle is tested separately; here the question is whether the
 	// re-read clears the record at all.
-	srv3.SetDirRereadInterval(0)
+	srv3.SetDirRereadIntervalForTest(0)
 	ts3 := httptest.NewServer(srv3.Handler())
 	defer ts3.Close()
 	if code, _ := get(t, ts3, "/-/ready"); code != http.StatusServiceUnavailable {
@@ -964,7 +964,7 @@ func TestUnreadableDataDirectoryDoesNotDeleteTheRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv3.Close()
-	srv3.SetDirRereadInterval(0)
+	srv3.SetDirRereadIntervalForTest(0)
 	ts3 := httptest.NewServer(srv3.Handler())
 	defer ts3.Close()
 	if code, _ := get(t, ts3, "/-/ready"); code != http.StatusServiceUnavailable {
@@ -1035,7 +1035,7 @@ func TestDirectoryRereadIsThrottled(t *testing.T) {
 	defer ts3.Close()
 
 	// A long window, so the change is provably not seen.
-	srv3.SetDirRereadInterval(time.Hour)
+	srv3.SetDirRereadIntervalForTest(time.Hour)
 	if code, _ := get(t, ts3, "/-/ready"); code != http.StatusServiceUnavailable {
 		t.Fatalf("/-/ready = %d, want 503", code)
 	}
@@ -1054,7 +1054,7 @@ func TestDirectoryRereadIsThrottled(t *testing.T) {
 	}
 
 	// Zero: the very next probe re-reads.
-	srv3.SetDirRereadInterval(0)
+	srv3.SetDirRereadIntervalForTest(0)
 	if code, body := get(t, ts3, "/-/ready"); code != 200 {
 		t.Errorf("/-/ready = %d with the throttle off, want 200 (%s)", code, body)
 	}
@@ -1112,7 +1112,7 @@ func TestThrottledProbeDoesNotRevertToTheStartupRecord(t *testing.T) {
 	ts3 := httptest.NewServer(srv3.Handler())
 	defer ts3.Close()
 
-	srv3.SetDirRereadInterval(0)
+	srv3.SetDirRereadIntervalForTest(0)
 	if code, _ := get(t, ts3, "/-/ready"); code != http.StatusServiceUnavailable {
 		t.Fatalf("/-/ready = %d, want 503: the fixture is not degraded", code)
 	}
@@ -1143,7 +1143,7 @@ func TestThrottledProbeDoesNotRevertToTheStartupRecord(t *testing.T) {
 
 	// Now a THROTTLED probe must give the same answer, and the metrics must
 	// agree with it.
-	srv3.SetDirRereadInterval(time.Hour)
+	srv3.SetDirRereadIntervalForTest(time.Hour)
 	code2, body2 := get(t, ts3, "/-/ready")
 	if code2 != code {
 		t.Errorf("a throttled probe answered %d where the re-reading one answered %d (%s). "+

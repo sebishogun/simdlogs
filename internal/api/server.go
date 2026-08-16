@@ -2639,16 +2639,14 @@ func dirGone(path string) bool {
 // steady-state cost of a degraded fleet from every probe to four per second.
 const DefaultDirRereadEvery = 250 * time.Millisecond
 
-// SetDirRereadInterval sets how often the readiness snapshot re-reads the
-// store directories of degraded tenants that are not open. Zero means every
-// call.
+// SetDirRereadIntervalForTest sets how often readiness re-reads the data
+// directory.
 //
-// The ordinary way to set it is config.Config.DirRereadInterval, which the
-// -readiness-reread-interval flag fills in. This setter exists for a caller
-// that embeds the server and wants to change it at run time; it was briefly
-// the ONLY way, which made it an exported API reachable from nothing but the
-// tests -- the shape docs/wrong.md already names for this task.
-func (s *Server) SetDirRereadInterval(d time.Duration) {
+// ForTest by name: production sets it through config.DirRereadInterval
+// (-readiness-reread-interval), and every caller of this is a test that needs
+// the re-read to be immediate. It was on the unwired baseline as a dead
+// exported setter; the setter is not dead, its name was.
+func (s *Server) SetDirRereadIntervalForTest(d time.Duration) {
 	s.mu.Lock()
 	s.dirRereadEvery = d
 	s.mu.Unlock()

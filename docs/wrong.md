@@ -6640,3 +6640,33 @@ into:
 
 Three mutations redden it: answering `null`, letting a router answer, and making
 the store report nothing.
+
+## 93. Three shapes of "unwired", and only one of them was a defect
+
+Working down task #431's baseline turned up that "no production reader" is three
+different findings wearing one label, and the right answer differs for each.
+
+**A mechanism with no reader — wire it.** `ValidateClusterBackup` (entry 91) and
+`QuarantinedGroups` (entry 92). Both had an operator-visible gap behind them.
+
+**A name that lies about its category — rename it.** `SetMaxRows` and
+`SetDirRereadInterval` were listed as "a dead exported setter". They are not
+dead: fourteen tests call them, and production sets both through config
+(`-search.maxRows`, `-readiness-reread-interval`). They are test hooks whose
+names did not say so, which is why they read as unwired at all — the baseline
+already has a category for exactly this, holding `SetFaultHookForTest` and
+`FailAt`. `…ForTest` on both, and they move from "genuinely unwired" to
+"deliberate", which is what they always were.
+
+**A constant nobody writes — delete it.** `FieldRequestID`, `FieldStatus`,
+`FieldDurationMS` and `FieldRows` are log-field names, and no log line uses any
+of them. The block's own comment says field names are constants so that `tenant`
+in one file and `tenant_id` in another cannot become two fields — and a name
+nobody writes cannot cause that drift, while its presence tells a reader those
+fields are in the logs. Their only other references in the module were their own
+exemption entries. The day a request line needs `duration_ms`, the constant is
+one line and will then be true.
+
+The baseline is 16 entries down to 11. It is a ratchet in both directions, so
+none of these can come back quietly: an exemption that gains a reader fails the
+gate just as a new name without one does.

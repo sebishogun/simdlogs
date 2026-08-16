@@ -28,7 +28,7 @@ func streamServerWith(t *testing.T, rows int, maxRows int) (*Server, *httptest.S
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { srv.Close() })
-	srv.SetMaxRows(maxRows)
+	srv.SetMaxRowsForTest(maxRows)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
@@ -74,7 +74,7 @@ func TestStreamedAndMaterializedBodiesMatch(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("streamed: %d\n%s", code, sBody)
 	}
-	srv.SetMaxRows(rows * 10)
+	srv.SetMaxRowsForTest(rows * 10)
 	code, mBody := bodyOf(t, ts.URL+"/select/logsql/query?query=*")
 	if code != 200 {
 		t.Fatalf("materialized: %d\n%s", code, mBody)
@@ -198,9 +198,9 @@ func TestTheStreamingPathIsActuallyTaken(t *testing.T) {
 	}
 
 	// A capped select, a piped select and a newest-n tail must NOT take it.
-	srv.SetMaxRows(1000)
+	srv.SetMaxRowsForTest(1000)
 	bodyOf(t, ts.URL+"/select/logsql/query?query=*")
-	srv.SetMaxRows(-1)
+	srv.SetMaxRowsForTest(-1)
 	bodyOf(t, ts.URL+"/select/logsql/query?query=%2A%20%7C%20stats%20count%28%29%20n")
 	bodyOf(t, ts.URL+"/select/logsql/query?query=*&limit=3")
 	if got := atomic.LoadInt64(&srv.nStreamedSelects); got != 1 {
