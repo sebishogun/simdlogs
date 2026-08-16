@@ -2308,6 +2308,40 @@ func (s *Server) fanOutChecked(
 		w.Header().Set(HdrComplete, "false")
 	}
 
+	// EVERY SHARD REFUSED THE REQUEST: that is a 4xx, not a 503.
+	//
+	// PeerRejected's own doc says why -- "a 4xx that is not an auth or load
+	// problem. The router sent something this peer would not accept, so every
+	// replica will refuse it identically." Answering 503 told the client to
+	// retry a query that can never succeed, and sent the operator to look at a
+	// shard that is working. Measured on the same malformed query:
+	//
+	//	node   400  simdlogs: unknown pipe "nonsense"
+	//	router 503  1 of 1 shards could not answer completely (0(rejected))
+	//
+	// EVERY, not any: one shard refusing while another is unreachable is a
+	// degraded cluster, and telling the client to fix their query would be
+	// wrong about a shard that never judged it.
+	// No `len(peers) > 0` term: this point is past the `len(bad) == 0` early
+	// return, and bad is built from peers, so an empty peer list has already
+	// returned. A guard for it would be one nothing can reach -- checked by
+	// mutation, which is how it was found.
+	allRejected := true
+	for _, p := range peers {
+		if p.Class != PeerRejected {
+			allRejected = false
+			break
+		}
+	}
+	if allRejected {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, fmt.Sprintf(
+			"simdlogs: every shard refused this request (%s). That is the "+
+				"request, not the cluster: a retry will be refused the same "+
+				"way, and each shard's own answer says what it objected to",
+			strings.Join(bad, ",")))
+		return nil, w, false
+	}
+
 	if r.FormValue(partialParam) != "1" {
 		// The reason rides the REFUSAL too. A router that refuses answers 503,
 		// so its parent classes it as a failed peer -- `0(overloaded)`, from

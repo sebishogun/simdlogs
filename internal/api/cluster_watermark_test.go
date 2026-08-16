@@ -1005,3 +1005,73 @@ func TestAPublicClientNeverSeesTheEnvelope(t *testing.T) {
 		}
 	}
 }
+
+// A query the SHARDS refuse is the client's problem, and a router says so.
+//
+// PeerRejected's own doc says it: "a 4xx that is not an auth or load problem.
+// The router sent something this peer would not accept, so every replica will
+// refuse it identically." fanOutChecked put it in the missing bucket with
+// everything else and answered 503, so the same malformed query got
+//
+//	node   400  simdlogs: unknown pipe "nonsense"
+//	router 503  1 of 1 shards could not answer completely (0(rejected))
+//
+// 503 is retryable and 400 is not. A client following the router's answer
+// retries a query that can never succeed, against a cluster that is not broken
+// -- and an operator reading the message goes looking at shard 0.
+func TestAQueryTheShardsRefuseIsNotACluster503(t *testing.T) {
+	sh := newWMShard(t, 3, 1000)
+	// A shard that refuses the REQUEST, which is what a parse error is.
+	sh.ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(w.Header(), 0, 0, true, 1000, true, sh.gen.Load().(string), "")
+		w.Header().Set(HdrErrorClass, string(PeerRejected))
+		http.Error(w, `simdlogs: unknown pipe "nonsense"`, http.StatusBadRequest)
+	})
+	ts := wmRouter(t, sh.ts.URL)
+
+	code, _, raw := hitsTotal(t, ts, "*")
+	if code == http.StatusServiceUnavailable {
+		t.Fatalf("the router answered 503 for a query every shard refused as "+
+			"malformed. 503 is retryable and this is not: the client retries "+
+			"forever and the operator is sent to look at a healthy shard: %s", raw)
+	}
+	if code < 400 || code >= 500 {
+		t.Fatalf("answered %d, want a 4xx: %s", code, raw)
+	}
+	// And the shard's reason reaches the caller, or the 4xx says nothing about
+	// what to fix.
+	if !strings.Contains(raw, "rejected") && !strings.Contains(raw, "refused") {
+		t.Errorf("the answer does not say the shards refused the request: %s", raw)
+	}
+}
+
+// A MIX is still a 503: one shard refusing and another being unreachable is a
+// cluster problem, and answering 4xx would tell the client to fix a query that
+// the other shard never even judged.
+func TestAMixOfRefusalAndFailureIsStillACluster503(t *testing.T) {
+	rejecting := newWMShard(t, 3, 1000)
+	rejecting.ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+		w.Header().Set(HdrErrorClass, string(PeerRejected))
+		http.Error(w, "refused", http.StatusBadRequest)
+	})
+	dead := newWMShard(t, 3, 1000)
+	dead.dead.Store(true)
+
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	srv.SetBackends([]string{rejecting.ts.URL, dead.ts.URL})
+	srv.SetReplicas(1) // two shards
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	code, _, raw := hitsTotal(t, ts, "*")
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("answered %d, want 503: one shard refused the request and "+
+			"another could not answer at all, so the cluster is degraded and "+
+			"the client has nothing to fix: %s", code, raw)
+	}
+}

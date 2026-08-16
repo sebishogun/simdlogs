@@ -7281,3 +7281,50 @@ behaviour -- that arm is a peer below its own floor with no generation to prove
 a restart, which is reported and not refused, which is what the flag means. It
 is left because renaming a field across the protocol for a doc mismatch is a
 worse trade than the mismatch.
+
+## 104. A malformed query answered 503 through a router, so the client retried it forever
+
+Task #410's F3 said four read pairs disagree between a single node and a router
+on BODY SHAPE -- `/select/logsql/hits`, `/streams`, `/stream_ids`,
+`/stats_query` -- with a named root cause: `federatedValueCounts` was passed a
+key of `"streams"`/`"stream_ids"` while `writeValues` always emits under
+`"values"`.
+
+**Measured, that is fixed.** `federatedValueCounts` takes no key argument any
+more, and node and router answers are byte-identical on all four, plus
+`field_names` and `field_values`:
+
+	hits           {"hits":[{"fields":{},"timestamps":[...],"values":[1],"total":1}]}
+	streams        {"values":[{"value":"{}","hits":1}]}
+	stream_ids     {"values":[{"value":"0000...b5","hits":1}]}
+	stats_query    identical
+	field_names    identical
+	field_values   identical
+
+Recorded rather than left on the list: a finding that is fixed and still listed
+costs the next reader the same measurement.
+
+**The probe found a different one, and it is worse than the one it was looking
+for.** A query the shards refuse as malformed:
+
+	node    400  simdlogs: unknown pipe "nonsense"
+	router  503  1 of 1 shards could not answer completely (0(rejected))
+
+503 is retryable and 400 is not. A client following the router's answer retries
+a query that can never succeed, against a cluster that is not broken -- and an
+operator reading that message goes to look at shard 0, which is working.
+
+`PeerRejected`'s own doc already said what to do: "a 4xx that is not an auth or
+load problem. The router sent something this peer would not accept, so **every
+replica will refuse it identically**." `fanOutChecked` put it in the missing
+bucket with unreachable shards and degraded stores, and refused with 503 like
+the rest.
+
+EVERY shard, not any. One shard refusing while another is unreachable is a
+degraded cluster, and telling the client to fix their query would be wrong
+about a shard that never judged it. Mutating "every" to "any" reddens.
+
+And one guard came out. `allRejected := len(peers) > 0` looked like ordinary
+care and is unreachable: the code sits past the `len(bad) == 0` early return
+and `bad` is built from `peers`, so an empty list has already returned.
+Mutating it to `true` left the suite green, which is what said so.
