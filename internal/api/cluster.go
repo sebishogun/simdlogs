@@ -857,7 +857,7 @@ func (s *Server) checkWatermark(p *PeerResponse, shard int) {
 			// peer and both watermarks, and PartialReads is not touched -- but
 			// it no longer decides the answer. Turning it back into a refusal
 			// needs a watermark that does not move for reasons unrelated to
-			// replication, which is task #435.
+			// replication, which is task #434.
 			obs.L().Warn("shard answered from a replica behind the highest watermark seen",
 				obs.FieldEvent, "cluster.replica_lagging",
 				obs.FieldShard, shard, "replica", p.Replica, "peer", p.URL,
