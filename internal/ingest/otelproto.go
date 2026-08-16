@@ -224,8 +224,7 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				if mapped {
 					opts.apply(fields)
 				}
-				addWithStream(w, ts, fields, opts)
-				res.Accepted++
+				addOrReject(w, ts, fields, opts, &res, ordinal)
 				ordinal++
 			})
 		})

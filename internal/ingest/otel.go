@@ -389,8 +389,7 @@ func IngestOTLPLogsOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 				if mapped {
 					opts.apply(fields)
 				}
-				addWithStream(w, ts, fields, opts)
-				res.Accepted++
+				addOrReject(w, ts, fields, opts, &res, res.Accepted+res.Rejected)
 			}
 		}
 	}

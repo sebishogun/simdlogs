@@ -56,7 +56,12 @@ type Writer struct {
 	// through the dictionary would store the TEXT of 768 floats per row and
 	// make every one of them a distinct dictionary entry -- the worst case
 	// for a structure whose whole value is repetition.
-	vecFlds   VectorFields
+	vecFlds VectorFields
+	// hasVec mirrors len(vecFlds) > 0 without the mutex, so the per-record path
+	// can ask "is any field an embedding here" for the price of one atomic load
+	// rather than a lock. Almost every deployment configures none, and that
+	// case has to cost nothing.
+	hasVec    atomic.Bool
 	vecs      map[string][]float32
 	limits    RecordLimits
 	maxLine   int
@@ -274,6 +279,7 @@ func (w *Writer) SetVectorFields(v VectorFields) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.vecFlds = v
+	w.hasVec.Store(len(v) > 0)
 }
 
 // VectorFields reports the configured embedding fields.
@@ -281,22 +287,6 @@ func (w *Writer) VectorFields() VectorFields {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.vecFlds
-}
-
-// ValidateVector reports whether a record's value for a configured vector
-// field is storable, without storing it.
-//
-// Exported so the PARSE path refuses the record -- with a reason, counted in
-// Result.Rejected -- rather than the writer silently zero-filling it. A log
-// line stored with its embedding dropped is a line invisible to the search it
-// was ingested for, which is worse than a rejection the client can see.
-func (w *Writer) ValidateVector(field, text string) error {
-	dim, ok := w.VectorFields().Dim(field)
-	if !ok {
-		return nil
-	}
-	_, err := ParseVector(make([]float32, 0, dim), field, text, dim)
-	return err
 }
 
 // SetMaxDecompressedBytes bounds what one compressed body may expand to.
@@ -441,6 +431,17 @@ func (w *Writer) isStreamField(k string) bool {
 // 3 KiB of garbage per log line.
 func (w *Writer) AddVectors(ts int64, fields map[string]string, vecs map[string][]float32) {
 	w.addVec(ts, fields, false, vecs)
+}
+
+// AddStreamOverriddenVectors is AddVectors for a request that names its own
+// _stream_fields.
+//
+// addVec has taken both a stream-override flag and a vector map since it was
+// written; only three of the four pairings had a caller, and the missing one
+// was "this request labels its own streams AND carries an embedding". A record
+// hitting both had to lose one of them.
+func (w *Writer) AddStreamOverriddenVectors(ts int64, fields map[string]string, vecs map[string][]float32) {
+	w.addVec(ts, fields, true, vecs)
 }
 
 func (w *Writer) add(ts int64, fields map[string]string, streamOverridden bool) {

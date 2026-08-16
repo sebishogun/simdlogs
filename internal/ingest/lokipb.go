@@ -162,8 +162,7 @@ func IngestLokiProto(w *Writer, data []byte, fallback func() int64, opts *Option
 			if mapped {
 				opts.apply(fields)
 			}
-			addWithStream(w, ts, fields, opts)
-			res.Accepted++
+			addOrReject(w, ts, fields, opts, &res, res.Accepted+res.Rejected)
 		}
 	})
 	if !sawStream && len(raw) > 0 {

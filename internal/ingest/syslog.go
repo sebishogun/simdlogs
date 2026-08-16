@@ -41,8 +41,7 @@ func IngestSyslogOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 		if mapped {
 			opts.apply(fields)
 		}
-		addWithStream(w, ts, fields, opts)
-		res.Accepted++
+		addOrReject(w, ts, fields, opts, &res, res.Accepted+res.Rejected)
 	}
 	return res, nil
 }
@@ -68,8 +67,7 @@ func IngestSyslogMessage(w *Writer, msg []byte, fallback func() int64, opts *Opt
 	if !opts.Empty() {
 		opts.apply(fields)
 	}
-	addWithStream(w, ts, fields, opts)
-	res.Accepted++
+	addOrReject(w, ts, fields, opts, &res, res.Accepted+res.Rejected)
 	return res, nil
 }
 

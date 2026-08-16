@@ -191,7 +191,6 @@ var exempt = map[string]string{
 	// the failure it prevents, and never connected -- which is what this gate
 	// was written to surface. Listed so the gate can run today rather than
 	// staying off until every one is fixed.
-	"ValidateVector":        "its doc says the PARSE path calls it so a record is refused rather than silently zero-filled; no path does. The reviewer's own example",
 	"ReplicasConsulted":     "written into the manifest at cluster_backup.go:172 and read by nothing -- the same written-never-read shape as HighWatermark",
 	"Spread":                "a ClusterManifest method with no caller at all",
 	"routeCount":            "documented as feeding the audit; the audit does not call it",
@@ -200,8 +199,8 @@ var exempt = map[string]string{
 	"QuarantinedGroups":     "lists a store's quarantine; nothing production-side asks",
 	"SnapshotAll":           "superseded by SnapshotAllWithSeq, which is what callers use",
 	"RestoreTar":            "the older unstaged restore path; protocols.go:27 says the staged one replaced it",
-	"SetMaxRows":            "a configuration setter the command layer never calls, so the cap it documents is unreachable",
-	"SetDirRereadInterval":  "same shape: a flag exists at cmd/simdlogs/main.go:141 and this setter is not what it feeds",
+	"SetMaxRows":            "a dead exported setter: -search.maxRows reaches the server through config (server.go:300), so the LIMIT works and this way of setting it has no caller",
+	"SetDirRereadInterval":  "the same, one flag over: -readiness-reread-interval arrives via config.DirRereadInterval (server.go:244) and this setter is unused",
 	"readiness":             "a name shared with unrelated prose; the declaration this flags has no reader",
 	"FieldRequestID":        "a log field constant no log line uses",
 	"FieldStatus":           "same",

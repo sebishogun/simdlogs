@@ -100,8 +100,7 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 			if mapped {
 				opts.apply(fields)
 			}
-			addWithStream(w, ts, fields, opts)
-			res.Accepted++
+			addOrReject(w, ts, fields, opts, &res, ordinal)
 			ordinal++
 		}
 	}
