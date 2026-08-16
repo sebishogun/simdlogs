@@ -6149,3 +6149,92 @@ requires it to select rows.
 code, one saying `query` is not marked because marking it was inert, the next
 saying it is marked always and load-bearing. The first was true before the rule
 it depended on was removed in the same range. Deleted.
+
+## 80. The `_time` fix reached two of the three copies, and missed the one on the wire
+
+`packJSON` and `packLogfmt` were fixed to keep a `_time` FIELD that a `NoTime`
+row carries. `appendRowJSON` — the serializer the packs exist to mirror, and
+the one that writes the response — still dropped it. So one response answered
+the question both ways:
+
+```
+* | stats by (_time) count() c | pack_json as p
+  row  {"c":"1"}
+  p    {"_time":"2026-08-16T03:00:00Z","c":"1"}
+```
+
+against victoria-logs, which puts `_time` in both. That is verbatim the failure
+entry 73 says the pack fix existed to remove — "a client reading `p` got a
+different record from a client reading the row, out of one response" — inverted
+and still live. The whole suite was green with the fix and without it.
+
+The test asserts the two halves **agree**, not that either matches a literal:
+whatever the row says, the pack of the same row must say. Three shapes reach
+it: `stats by (_time)`, `rename x as _time`, `copy x as _time`.
+
+## 81. Three more routes on the wrong side of the form/document line
+
+Entry 78 split routes into "parses a form" and "reads its own body" and got the
+set wrong three ways.
+
+**`/select/vector` is a third document route.** It decodes a JSON body, and the
+pre-parse consumed it: 200 at the commit before the pre-parse, 400 `EOF` after,
+while `/_count` was fixed in the same commit. It is also the only route that
+reads parameters *and* a document, so `form` cannot be set correctly for it
+either way — `true` eats the document, `false` drops a multipart `start`/`end`.
+Its time window now comes from the URL, which is where it can only ever have
+been: the body is the document.
+
+**`/health`, `/-/healthy` and `/-/ready` leaked a temp file per request**, and
+the gate could not see it. They are registered bare — outside `guard`, so no
+pre-parse, no `RemoveAll` and **no `MaxBytesReader`** — and `health.go` called
+`r.FormValue("format")`. The leak needs a middleware that replaced the request
+first, and with authentication OFF `withTenant` makes no copy for these paths,
+so net/http cleans up and the gate passes. `withPrincipal` does copy. On an
+authenticated server, a 33 MiB multipart POST to each:
+
+```
+/health     200  multipart-105144472
+/-/healthy  200  multipart-842413133
+/-/ready    200  multipart-920247530     all three survive the close
+```
+
+Unbounded, on routes that answer unauthenticated callers by design. `format`
+reads the URL now, and the gate runs a second time against an authenticated
+server — the configuration in which the defect exists was the one it never
+built.
+
+**`adminSpec().form = true` was justified by a reader that did not exist.** The
+comment said "serveReplicaState reads `digest` through `r.FormValue`", which
+the same change had just made untrue by moving that read to the URL. No admin
+handler reads a form. It cost six routes exactly what entry 78 had removed from
+three — 128.2 MiB against 0.2 MiB of `TotalAlloc` for a 40 MiB multipart POST —
+including `/admin/acknowledge-degraded`, which is `nosem` and therefore chosen
+to stay answerable under load.
+
+## 82. A doubled count replaced by a wrong one, on the endpoint next to the one that was right
+
+Entry 78 stopped `FieldNameCounts` listing `_stream_id` twice by guarding the
+synthesized entry against the stored column. That kept the wrong number: the
+column counts rows that **supplied** the field, while every returned row
+**serializes** one. Six rows, three carrying `_stream_id`:
+
+| | `_stream_id` |
+|---|---|
+| `field_names` | 3 |
+| `facets` | 3 + 3 = **6** |
+| the rows themselves | all six carry one |
+
+So it went from disagreeing with itself to disagreeing with `facets` over the
+same store — which is the shape entry 77 was about, one step along.
+
+`FacetList` had already resolved the identical collision the other way: skip
+the stored column, emit from the authoritative source. `FieldNameCounts` does
+that now, so the two endpoints agree by construction rather than by both
+happening to be right.
+
+The fixture had to change too. Entry 78's gave the field to **all six** rows,
+which makes the column count and the row count coincide — the one ratio at
+which a fix that keeps the column's number passes. Three of six tells them
+apart, and both mutations (count the column; drop the synthesized entry) are
+red.

@@ -114,6 +114,27 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 				continue
 			}
 			names = append(names, name)
+			// The stored `_stream`/`_stream_id` columns are SKIPPED here and
+			// both names emitted below, from `total`, exactly as FacetList
+			// does it.
+			//
+			// The first fix guarded the synthesized entry against the stored
+			// column, which stopped the duplicate and kept the WRONG number:
+			// the column counts rows that SUPPLIED the field, while every
+			// returned row SERIALIZES one. Six rows, three carrying
+			// `_stream_id`:
+			//
+			//	field_names  _stream_id hits 3      <- rows that supplied it
+			//	facets       _stream_id 3 + 3 = 6   <- rows that carry one
+			//	the rows     all six carry a _stream_id
+			//
+			// so it disagreed with the facets endpoint over the same store,
+			// which is the shape entry 77 was about. Skipping the column and
+			// emitting from `total` makes the two endpoints agree by
+			// construction rather than by both happening to be right.
+			if name == "_stream" || name == "_stream_id" {
+				continue
+			}
 			counts[name] += rows - emptyValued(g, sel, name)
 		}
 	}
@@ -126,7 +147,8 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 	// _stream and _stream_id are synthesized onto every returned record, so they
 	// are fields the client can see and filter on -- listing only the stored
 	// columns hid two fields that queries plainly work against.
-	// BOTH names, not just `_stream`.
+	// Both names, unconditionally: the loop above skips the stored columns, so
+	// there is nothing left to collide with.
 	//
 	// `_stream_id` was appended unconditionally while `_stream` was guarded,
 	// so a store whose rows carry a client-supplied `_stream_id` column listed
@@ -141,25 +163,12 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 	// already correct -- this is the same defect one endpoint over, which is
 	// why the guard now covers both names in one pass instead of one name in
 	// a loop that can be copied wrong again.
-	hasStream, hasStreamID := false, false
-	for _, vc := range out {
-		switch vc.Value {
-		case "_stream":
-			hasStream = true
-		case "_stream_id":
-			hasStreamID = true
-		}
-	}
 	// `total` is the matching row count, already summed above -- calling Count
 	// here instead ran a second full pass over every group to learn a number
 	// the first pass had.
 	if n := total; n > 0 {
-		if !hasStream {
-			out = append(out, ValueCount{Value: "_stream", Count: n})
-		}
-		if !hasStreamID {
-			out = append(out, ValueCount{Value: "_stream_id", Count: n})
-		}
+		out = append(out, ValueCount{Value: "_stream", Count: n})
+		out = append(out, ValueCount{Value: "_stream_id", Count: n})
 	}
 	sortValueCounts(out)
 	return out

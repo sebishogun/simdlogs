@@ -164,10 +164,24 @@ func TestFieldNamesListsASynthesizedNameOnce(t *testing.T) {
 	router := httptest.NewServer(rs.Handler())
 	t.Cleanup(router.Close)
 
+	// HALF the rows supply the field, not all of them.
+	//
+	// With all six supplying it the stored column's count and the row count
+	// coincide, and a fix that keeps the column's number instead of the row
+	// count passes. It did: the first fix guarded the synthesized entry
+	// against the column and kept `hits: 3` where every one of the six rows
+	// serializes a `_stream_id`, disagreeing with the facets endpoint over the
+	// same store. Three of six is what tells the two numbers apart.
 	for i := 0; i < 6; i++ {
-		line := fmt.Sprintf(
-			`{"_time":"2026-08-16T03:00:%02dZ","_msg":"row %d","_stream_id":"deadbeef%02d","svc":"s%d"}`+"\n",
-			i, i, i, i%2)
+		var line string
+		if i%2 == 0 {
+			line = fmt.Sprintf(
+				`{"_time":"2026-08-16T03:00:%02dZ","_msg":"row %d","_stream_id":"deadbeef%02d","svc":"s%d"}`+"\n",
+				i, i, i, i%2)
+		} else {
+			line = fmt.Sprintf(
+				`{"_time":"2026-08-16T03:00:%02dZ","_msg":"row %d","svc":"s%d"}`+"\n", i, i, i%2)
+		}
 		postRaw(t, node, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson", line)
 		postRaw(t, shard, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson", line)
 	}
@@ -187,14 +201,60 @@ func TestFieldNamesListsASynthesizedNameOnce(t *testing.T) {
 			t.Errorf("the router lists %s %d times: %.400s", name, n, rBody)
 		}
 	}
-	// Six rows carry the field, so twelve is the shape of the summed duplicate.
-	if strings.Contains(rBody, `"hits":12`) {
-		t.Errorf("the router reports 12 hits where the cluster holds 6: %.400s", rBody)
+	// Six rows exist and every one of them SERIALIZES a `_stream_id`, so 6 is
+	// the answer on both. 12 is the summed duplicate; 3 is the stored
+	// column's count, which is the number the first fix kept.
+	for _, tc := range []struct {
+		name, body string
+	}{{"node", nBody}, {"router", rBody}} {
+		for _, name := range []string{"_stream", "_stream_id"} {
+			want := `{"value":"` + name + `","hits":6}`
+			if !strings.Contains(tc.body, want) {
+				t.Errorf("%s does not report %s at 6 hits, though all six rows "+
+					"serialize one: %.400s", tc.name, name, tc.body)
+			}
+		}
+	}
+	// And the facets endpoint over the same store must agree, since it is the
+	// disagreement that made the wrong number visible.
+	fCode, fBody := postRaw(t, node, "/select/logsql/facets?query=%2A", "", "")
+	if fCode != 200 {
+		t.Fatalf("facets answered %d", fCode)
+	}
+	if got, want := facetHits(t, fBody, "_stream_id"), 6; got != want {
+		t.Errorf("facets total %d hits for _stream_id and field_names says 6; "+
+			"two endpoints over one store: %.400s", got, fBody)
 	}
 	if nBody != rBody {
 		t.Errorf("the router and a single node disagree:\n  node   %.350s\n  router %.350s",
 			nBody, rBody)
 	}
+}
+
+// facetHits totals the hits a field's facet values report.
+func facetHits(t *testing.T, body, field string) int {
+	t.Helper()
+	var got struct {
+		Facets []struct {
+			FieldName string `json:"field_name"`
+			Values    []struct {
+				Hits int `json:"hits"`
+			} `json:"values"`
+		} `json:"facets"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("facets is not JSON: %v: %.300s", err, body)
+	}
+	n := 0
+	for _, f := range got.Facets {
+		if f.FieldName != field {
+			continue
+		}
+		for _, v := range f.Values {
+			n += v.Hits
+		}
+	}
+	return n
 }
 
 // A parameter sent in BOTH the URL and the body resolves the same way on a
@@ -319,5 +379,84 @@ func TestAFieldIsFacetedOnceAndTheRouterAgrees(t *testing.T) {
 	if nBody != rBody {
 		t.Errorf("the router and a single node disagree:\n  node   %.350s\n  router %.350s",
 			nBody, rBody)
+	}
+}
+
+// A row and its pack carry the same fields, out of one response.
+//
+// `_time` is emitted from r.Time when the row has one and skipped from the
+// field list so it is not written twice. That skip has to be conditional on
+// the emit, and it is in three places: packJSON, packLogfmt and appendRowJSON.
+// Two were fixed and the third -- the serializer the packs are supposed to
+// mirror, and the one on the wire -- was not, so a single response answered
+// the question two different ways:
+//
+//   - | stats by (_time) count() c | pack_json as p
+//     row  {"c":"1"}
+//     p    {"_time":"2026-08-16T03:00:00Z","c":"1"}
+//
+// which is exactly the failure the pack fix existed to remove ("a client
+// reading `p` got a different record from a client reading the row, out of one
+// response"), inverted. victoria-logs puts `_time` in both.
+//
+// ASSERTED AS AGREEMENT between the two halves rather than against a literal,
+// because that is the invariant: whatever the row says, the pack of the same
+// row must say. A literal would go stale the first time the format moved.
+func TestARowAndItsPackAgree(t *testing.T) {
+	node := singleNode(t)
+	for i := 0; i < 4; i++ {
+		line := fmt.Sprintf(
+			`{"_time":"2026-08-16T03:00:%02dZ","_msg":"row %d","level":"%s","svc":"s%d"}`+"\n",
+			i, i, []string{"error", "info"}[i%2], i%2)
+		postRaw(t, node, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson", line)
+	}
+
+	for _, q := range []string{
+		`* | stats by (_time) count() c | pack_json as p`,
+		`* | stats by (level) count() c | rename level as _time | pack_json as p`,
+		`* | stats by (svc) count() c | copy svc as _time | pack_json as p`,
+	} {
+		t.Run(q, func(t *testing.T) {
+			code, body := postRaw(t, node, "/select/logsql/query?query="+url.QueryEscape(q), "", "")
+			if code != 200 {
+				t.Fatalf("answered %d: %.200s", code, body)
+			}
+			lines := strings.Split(strings.TrimSpace(body), "\n")
+			if len(lines) == 0 || lines[0] == "" {
+				t.Fatalf("no rows: %.200s", body)
+			}
+			for _, ln := range lines {
+				var row map[string]string
+				if err := json.Unmarshal([]byte(ln), &row); err != nil {
+					t.Fatalf("row is not JSON: %v: %s", err, ln)
+				}
+				packed, ok := row["p"]
+				if !ok {
+					t.Fatalf("the row carries no pack: %s", ln)
+				}
+				var pack map[string]string
+				if err := json.Unmarshal([]byte(packed), &pack); err != nil {
+					t.Fatalf("the pack is not JSON: %v: %s", err, packed)
+				}
+				delete(row, "p")
+				for k, v := range row {
+					pv, ok := pack[k]
+					if !ok {
+						t.Errorf("the row carries %s=%q and its pack does not: row %s pack %s",
+							k, v, ln, packed)
+						continue
+					}
+					if pv != v {
+						t.Errorf("%s is %q in the row and %q in its pack: %s", k, v, pv, ln)
+					}
+				}
+				for k, v := range pack {
+					if _, ok := row[k]; !ok {
+						t.Errorf("the pack carries %s=%q and the row does not: row %s pack %s",
+							k, v, ln, packed)
+					}
+				}
+			}
+		})
 	}
 }

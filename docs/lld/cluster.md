@@ -456,7 +456,8 @@ HTTP 200.
 - **A body under any other content type is ignored**, as a node ignores it. The
   request is then refused for the reason that is true (no `query`), not for the
   header.
-- **The two Elasticsearch routes are different**: their body is a JSON document,
+- **Three routes carry a document, not a form**: `/_search`, `/_count` and
+  `/select/vector`. Their body is a JSON document,
   read unconditionally whatever the content type says — `curl -d` sends a form
   content type by default, and treating that as parameters left a real query
   document unread. They carry `routeSpec.form = false` for the same reason: the
@@ -464,7 +465,10 @@ HTTP 200.
   removed, and doing that on these two routes **consumed the document** —
   measured, `/_count` with a JSON body under `multipart/form-data` answered
   `400 simdlogs: EOF` on a node and `503` on a router, where every other
-  framing of the same document answers `200`.
+  framing of the same document answers `200`. `/select/vector` is the one that
+  reads parameters *as well as* a document, so `form` cannot be set correctly
+  for it either way: its `start` and `end` come from the URL now, the same rule
+  `protocols.go` states for the ingest routes.
 - **A parameter sent in both the URL and the body resolves as a node resolves
   it.** `r.Form` already encodes Go's own precedence — body-first for a
   urlencoded form, URL-first for multipart — so `withFormInURL` forwards
@@ -482,7 +486,11 @@ because the handler parses on a request copy the server never sees and
 ordinary response, so the list is not maintained by inspection:
 `TestNoRouteLeavesAMultipartTempFileBehind` posts a spilling multipart body to
 every path `Handler()` registered and fails on any file left behind, with a
-positive control proving it can see one. It found `/internal/replica/group`,
+positive control proving it can see one. It runs **twice**, against a plain
+server and an authenticated one: the leak needs a middleware that replaced the
+request, and with authentication off `withTenant` makes no copy for the health
+routes, so the one configuration in which `/health`, `/-/healthy` and `/-/ready`
+leaked was the one the first version of the gate never built. It found `/internal/replica/group`,
 whose handler read `digest` with `r.FormValue` before `io.ReadAll`-ing the body
 it was about to adopt — the URL is where the client already sends it.
 

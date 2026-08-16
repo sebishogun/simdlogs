@@ -733,7 +733,7 @@ func (s *Server) Handler() http.Handler {
 	handle("/", st(s.ui))
 	handle("/select/logsql/query", rd(s.selectQuery))
 	handle("/select/sql", rd(s.sqlQuery))        // SQL SELECT subset (beyond VL)
-	handle("/select/vector", rd(s.vectorSearch)) // k-NN over embeddings (beyond VL)
+	handle("/select/vector", es(s.vectorSearch)) // k-NN over embeddings (beyond VL); body is a JSON document
 	// The tail has no deadline: it is long-lived by design.
 	handle("/select/logsql/tail", s.requireAuth(config.RoleQuery, tailSpec(), s.guard(tailSpec(), s.tail))) // live tail: stream matching rows as they arrive
 	handle("/select/logsql/hits", rd(s.selectHits))
@@ -1136,7 +1136,25 @@ func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 	stream, streamID := "", ""
 	sawStream, sawStreamID := false, false
 	for _, f := range row.Fields {
-		if f.Key == "_time" {
+		// Conditional on the emit above, exactly as the pack is.
+		//
+		// THE THIRD COPY of this pattern and the one on the wire. packJSON and
+		// packLogfmt were fixed to keep a `_time` FIELD that a NoTime row
+		// carries; the serializer they are supposed to mirror still dropped
+		// it, so a response contained both answers at once:
+		//
+		//	* | stats by (_time) count() c
+		//	  VL        {"_time":"2026-08-16T03:00:00Z","c":"1"}
+		//	  this      {"c":"1"}
+		//	  ... | pack_json as p
+		//	            {"c":"1","p":"{\"_time\":\"…\",\"c\":\"1\"}"}
+		//
+		// which is verbatim the failure the pack fix existed to remove -- "a
+		// client reading `p` got a different record from a client reading the
+		// row, out of one response" -- inverted. Reachable through
+		// `stats by (_time)`, `rename x as _time`, `copy x as _time` and the
+		// router's jsonLineToRow.
+		if f.Key == "_time" && !row.NoTime {
 			continue
 		}
 		// A NON-EMPTY value counts as present. The store materializes a column
@@ -1438,7 +1456,7 @@ func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
 	if body.Field == "" {
 		body.Field = "emb"
 	}
-	from, to := timeWindow(r)
+	from, to := timeWindowURL(r) // the body is the document; see timeWindowURL
 	vq := &query.Query{From: from, To: to}
 	vStopped := s.applyQueryBudget(r, vq)
 	rows := query.VectorSearch(s.tn(r).store, from, to, body.Field, body.Vector, body.K,
@@ -2007,6 +2025,38 @@ func parseStepNs(s string, from, to int64) int64 {
 		return int64(n) * int64(time.Second)
 	}
 	return int64(time.Minute)
+}
+
+// timeWindowURL is timeWindow for a route whose BODY is a document.
+//
+// /select/vector decodes r.Body as JSON and also wants `start`/`end`.
+// r.FormValue parses the body for a form content type, and guard's multipart
+// pre-parse consumes it outright -- measured, the same JSON document under
+// multipart/form-data went from 200 to 400 "EOF" while application/json,
+// urlencoded and text/plain all answered 200. It is the third route in the
+// class the Elasticsearch pair defines, and the one where `form` cannot be set
+// correctly either way: false consumes nothing but drops the multipart time
+// window, true consumes the document.
+//
+// The URL is the only place these can be. A caller's body IS the JSON
+// document, so it cannot also be a urlencoded form carrying start and end;
+// there is no request that loses a parameter by this. protocols.go states the
+// same rule for the ingest routes, after a line-protocol write stored nothing
+// while answering 204.
+func timeWindowURL(r *http.Request) (int64, int64) {
+	q := r.URL.Query()
+	from, to := int64(0), int64(1)<<62
+	if v := q.Get("start"); v != "" {
+		if n, ok := parseTimeParam(v); ok {
+			from = n
+		}
+	}
+	if v := q.Get("end"); v != "" {
+		if n, ok := parseTimeParam(v); ok {
+			to = n
+		}
+	}
+	return from, to
 }
 
 func timeWindow(r *http.Request) (int64, int64) {

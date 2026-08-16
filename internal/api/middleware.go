@@ -473,8 +473,15 @@ func readSpec() routeSpec {
 }
 
 // rawBodySpec is a read route whose handler reads r.Body ITSELF: the two
-// Elasticsearch routes, whose body is a JSON document rather than a form.
-// Parsing a form for them consumes the body they are about to decode.
+// Elasticsearch routes and /select/vector, whose body is a JSON document
+// rather than a form. Parsing a form for them consumes the body they are about
+// to decode.
+//
+// THREE routes, not two. The first version of this comment said "the two
+// Elasticsearch routes" and /select/vector went on answering 400 "EOF" for a
+// multipart body it had answered 200 for before the pre-parse existed. It is
+// also the one that reads parameters as well as a document, so its `start` and
+// `end` moved to the URL -- see timeWindowURL.
 func rawBodySpec() routeSpec {
 	sp := readSpec()
 	sp.form = false
@@ -549,8 +556,31 @@ func opsSpec() routeSpec {
 
 // adminSpec is the administrative surface.
 func adminSpec() routeSpec {
-	// form: serveReplicaState reads `digest` through r.FormValue.
-	return routeSpec{methods: []string{http.MethodGet, http.MethodPost}, format: errText, form: true}
+	// form: FALSE. This said `true` with the note "serveReplicaState reads
+	// `digest` through r.FormValue" -- which was already untrue when it was
+	// written, because the same change moved that read to the URL. No admin
+	// handler reads a form: not serveReplicaState, serveReplicaGroup,
+	// repairCluster, clusterBackup, backup, flagsHandler or
+	// acknowledgeDegraded.
+	//
+	// It cost what the same commit had just removed from /metrics, / and
+	// /alerts. A 40 MiB multipart POST, server-side TotalAlloc delta, six
+	// admin routes:
+	//
+	//	              form:true   form:false
+	//	/flags        128.2 MiB      0.2 MiB
+	//	/admin/backup 128.2          0.2
+	//	… and four more, identically
+	//
+	// /admin/acknowledge-degraded is `nosem`, deliberately exempt from
+	// admission control, so that was unbounded buffering on a route chosen to
+	// stay answerable under load.
+	//
+	// What makes this safe to assert rather than to hope: if any admin handler
+	// did parse a form, it would parse it on a request copy and leak a temp
+	// file per request, and TestNoRouteLeavesAMultipartTempFileBehind posts a
+	// spilling body to every one of them.
+	return routeSpec{methods: []string{http.MethodGet, http.MethodPost}, format: errText}
 }
 
 // replicaGroupSpec is adminSpec with the ANTI-ENTROPY body limit.

@@ -273,7 +273,24 @@ func (s *Server) healthHandler(kind healthKind) http.HandlerFunc {
 			code = http.StatusServiceUnavailable
 		}
 
-		if r.FormValue("format") == "json" {
+		// FROM THE URL, never r.FormValue.
+		//
+		// The health routes are registered bare -- no guard, so no
+		// MaxBytesReader, no multipart pre-parse and no RemoveAll. FormValue
+		// parses a multipart body itself, and once authentication is enabled
+		// withPrincipal replaces the request with a copy, so net/http's
+		// finishRequest looks at a MultipartForm that is still nil and removes
+		// nothing. Measured on an authenticated server, a 33 MiB multipart
+		// POST to each:
+		//
+		//	/health     200  multipart-105144472
+		//	/-/healthy  200  multipart-842413133
+		//	/-/ready    200  multipart-920247530   all three survive the close
+		//
+		// Unbounded, on routes that are unauthenticated by design and have no
+		// body limit. Reading the URL means no body is parsed at all, which is
+		// right for a probe endpoint: it has no use for one.
+		if r.URL.Query().Get("format") == "json" {
 			if !s.healthDetailAllowed(r) {
 				// The state and nothing else. The full report names tenants,
 				// peer URLs and byte counts -- an internal inventory, and a

@@ -85,7 +85,7 @@ func TestNoRouteLeavesAMultipartTempFileBehind(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 	ctrlBefore := tempMultipartNames(t, tmp)
-	if code, _ := postDeadline(t, leaky, "/", `multipart/form-data; boundary=B`, body); code != 200 {
+	if code, _ := postDeadline(t, leaky, "/", `multipart/form-data; boundary=B`, body, ""); code != 200 {
 		t.Fatalf("the positive control answered %d", code)
 	}
 	leaky.Close()
@@ -116,7 +116,7 @@ func TestNoRouteLeavesAMultipartTempFileBehind(t *testing.T) {
 		// A DEADLINE per request, because the tail would otherwise hold this
 		// loop open forever. The route is not skipped: a tail that spills a
 		// file and then blocks is the worst version of this defect.
-		code, _ := postDeadline(t, ts, p, `multipart/form-data; boundary=B`, body)
+		code, _ := postDeadline(t, ts, p, `multipart/form-data; boundary=B`, body, "")
 		codes[p] = code
 		for _, n := range newNames(was, tempMultipartNames(t, tmp)) {
 			pending[n] = p
@@ -137,7 +137,7 @@ func TestNoRouteLeavesAMultipartTempFileBehind(t *testing.T) {
 	}
 }
 
-// The two Elasticsearch routes read their body THEMSELVES, so nothing upstream
+// The routes whose body is a DOCUMENT read it themselves, so nothing upstream
 // may consume it.
 //
 // guard's multipart parse was unconditional, and it drained the body before
@@ -152,7 +152,7 @@ func TestNoRouteLeavesAMultipartTempFileBehind(t *testing.T) {
 //
 // docs/lld/cluster.md states the rule these two break: "their body is a JSON
 // document, read unconditionally whatever the content type says."
-func TestTheElasticsearchRoutesReadTheirOwnBodyUnderEveryFraming(t *testing.T) {
+func TestADocumentBodyIsReadUnderEveryFraming(t *testing.T) {
 	srv, err := NewServer(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -166,8 +166,17 @@ func TestTheElasticsearchRoutesReadTheirOwnBodyUnderEveryFraming(t *testing.T) {
 		t.Fatalf("the fixture did not ingest: %d %.200s", code, rb)
 	}
 
-	const doc = `{"query":{"match_all":{}}}`
-	for _, path := range []string{"/_count", "/_search"} {
+	// THREE routes, not two. /select/vector decodes a JSON document as well,
+	// and it went from 200 to 400 "EOF" under multipart when the pre-parse was
+	// added -- bisected: 200 at 39e5716, 400 at 5ec8672, while /_count was
+	// fixed in the same commit. It is also the one that reads parameters
+	// beside the document, so `start`/`end` come from the URL now.
+	for _, tc := range []struct{ path, doc string }{
+		{"/_count", `{"query":{"match_all":{}}}`},
+		{"/_search", `{"query":{"match_all":{}}}`},
+		{"/select/vector", `{"field":"emb","vector":[1,0,0],"k":2}`},
+	} {
+		path, doc := tc.path, tc.doc
 		// The reference answer, from a framing that never went near the
 		// multipart path, so the multipart case is compared against a real
 		// answer rather than against "not an error".
@@ -194,7 +203,7 @@ func TestTheElasticsearchRoutesReadTheirOwnBodyUnderEveryFraming(t *testing.T) {
 
 // postDeadline POSTs with a bounded wait and returns 0 for a request that did
 // not finish in time.
-func postDeadline(t *testing.T, ts *httptest.Server, path, ct, body string) (int, string) {
+func postDeadline(t *testing.T, ts *httptest.Server, path, ct, body, token string) (int, string) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(body))
 	if err != nil {
@@ -202,6 +211,9 @@ func postDeadline(t *testing.T, ts *httptest.Server, path, ct, body string) (int
 	}
 	if ct != "" {
 		req.Header.Set("Content-Type", ct)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	c := &http.Client{Timeout: 3 * time.Second}
 	resp, err := c.Do(req)
@@ -237,4 +249,69 @@ func newNames(before, after map[string]bool) []string {
 		}
 	}
 	return out
+}
+
+// The same sweep against an AUTHENTICATED server, where the request is copied.
+//
+// The leak needs two things: a handler that parses a form, and a middleware
+// that replaced the request first -- net/http removes the temp file by looking
+// at the request the SERVER holds, so a form parsed on a copy is never cleaned
+// up. On a server with authentication off, withTenant makes no copy for the
+// health routes, so net/http cleans up correctly and the sweep above passes
+// even where a handler does parse a form.
+//
+// withPrincipal DOES copy, and /health, /-/healthy and /-/ready are registered
+// bare -- outside guard, so no pre-parse, no RemoveAll and no MaxBytesReader.
+// Measured before `format` moved to the URL, a 33 MiB multipart POST to each on
+// an authenticated server:
+//
+//	/health     200  multipart-105144472
+//	/-/healthy  200  multipart-842413133
+//	/-/ready    200  multipart-920247530     all three survived the close
+//
+// Unbounded, and on routes that answer unauthenticated callers by design. The
+// no-auth sweep is the one configuration in which they do not leak, and it was
+// the only one being run.
+func TestNoRouteLeavesATempFileBehindOnAnAuthenticatedServer(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	srv, ts := authedServer(t)
+	paths := srv.registeredPaths()
+	if len(paths) < 20 {
+		t.Fatalf("Handler() registered %d routes", len(paths))
+	}
+
+	pad := strings.Repeat("x", multipartMemory+(1<<20))
+	body := "--B\r\nContent-Disposition: form-data; name=\"query\"\r\n\r\n*\r\n" +
+		"--B\r\nContent-Disposition: form-data; name=\"pad\"; filename=\"pad.bin\"\r\n" +
+		"Content-Type: application/octet-stream\r\n\r\n" + pad + "\r\n--B--\r\n"
+
+	pending := map[string]string{}
+	codes := map[string]int{}
+	before := tempMultipartNames(t, tmp)
+	// The admin token: the widest role, so a route is reached rather than
+	// turned away at 403 before its handler runs.
+	for _, path := range paths {
+		p := path
+		if strings.HasSuffix(p, "/") && p != "/" {
+			p += "x"
+		}
+		was := tempMultipartNames(t, tmp)
+		code, _ := postDeadline(t, ts, p, `multipart/form-data; boundary=B`, body, tokAdmin)
+		codes[p] = code
+		for _, n := range newNames(was, tempMultipartNames(t, tmp)) {
+			pending[n] = p
+		}
+	}
+	ts.Close()
+	for _, n := range newNames(before, tempMultipartNames(t, tmp)) {
+		p, ok := pending[n]
+		if !ok {
+			p = "(unattributed)"
+		}
+		t.Errorf("%s (answered %d) left the multipart temp file %s behind on an "+
+			"authenticated server: a handler parsed a form on the request copy "+
+			"withPrincipal made", p, codes[p], n)
+	}
 }
