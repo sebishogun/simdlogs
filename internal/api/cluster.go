@@ -806,20 +806,23 @@ func withFormInURL(r *http.Request) *http.Request {
 // found four times over.
 //
 // This is the reader. The router remembers the highest watermark it has seen
-// from each shard; an answer below that came from a replica behind the one that
-// produced an earlier answer, so it is marked incomplete -- which routes it into
-// the completeness rule that already exists, and it becomes a 503, or an
-// explicitly-asked-for 206, instead of a short 200.
+// from each shard and LOGS when an answer comes in below it, naming the shard,
+// the peer and both numbers.
 //
 // # What it does not do
 //
-// One atomic per read, no extra replica asked, and it pays for that with a blind
-// spot: a router with no history for a shard -- freshly started, or one whose
-// only answer for that shard ever came from the lagging replica -- has nothing
-// to compare against and lets the answer through. Catching THAT needs a quorum
-// read, a request per replica on every query. The check is monotone and can only
-// mark an answer incomplete, never complete, so the blind spot costs a detection
-// and never produces a false assurance.
+// It does not refuse. The first version marked such an answer incomplete, which
+// made it a 503 -- and a watermark going backwards turned out not to be reliable
+// evidence of a lagging replica: tenant eviction, a topology change and
+// retention each lower it on a perfectly healthy cluster. See the comment at the
+// comparison below.
+//
+// It is also blind where it has no history: a router freshly started, or one
+// whose only answer for a shard ever came from the lagging replica, has nothing
+// to compare against. Catching that needs a quorum read, a request per replica
+// on every query.
+//
+// One atomic per read and no extra replica asked.
 func (s *Server) checkWatermark(p *PeerResponse, shard int) {
 	// A zero watermark is "the peer did not say", not "the epoch". A peer that
 	// omits the header is on an older protocol version, and treating silence as
@@ -831,12 +834,35 @@ func (s *Server) checkWatermark(p *PeerResponse, shard int) {
 	for {
 		hi := seen.Load()
 		if p.HighWatermark < hi {
+			// REPORTED, not refused.
+			//
+			// The first version marked the answer incomplete, which routed it
+			// into the completeness rule and produced a 503. That is wrong,
+			// because a watermark going backwards is not reliably evidence of a
+			// lagging replica -- three ways to produce it on a HEALTHY cluster
+			// were found, and each one is a hard outage:
+			//
+			//   - highWatermark() is the max over OPEN tenants, so evicting a
+			//     tenant lowers a node's reported watermark. A one-node,
+			//     one-replica cluster reading tenant 2 then tenant 1 refuses
+			//     itself, with nothing lagging and no replica to blame.
+			//   - the history is keyed by shard INDEX, and SetBackends may
+			//     repoint an index at a different machine, which inherits the
+			//     previous machine's floor.
+			//   - retention deleting the newest data lowers it legitimately.
+			//
+			// A false 503 is not the failure this was built to catch; it is a
+			// worse one, and it is unrecoverable within the process. The signal
+			// still reaches an operator -- the log line names the shard, the
+			// peer and both watermarks, and PartialReads is not touched -- but
+			// it no longer decides the answer. Turning it back into a refusal
+			// needs a watermark that does not move for reasons unrelated to
+			// replication, which is task #435.
 			obs.L().Warn("shard answered from a replica behind the highest watermark seen",
 				obs.FieldEvent, "cluster.replica_lagging",
 				obs.FieldShard, shard, "replica", p.Replica, "peer", p.URL,
 				"watermark", p.HighWatermark, "highest_seen", hi,
 				obs.FieldErrorClass, string(obs.ClassUpstream))
-			p.Complete = false
 			return
 		}
 		if p.HighWatermark == hi || seen.CompareAndSwap(hi, p.HighWatermark) {

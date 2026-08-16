@@ -9,18 +9,22 @@ import (
 	"testing"
 )
 
-// A read served by a replica that has fallen behind is not reported as complete.
+// A read served by a replica that has fallen behind is REPORTED.
 //
 // askShard returns the FIRST replica that answers, and PeerResponse.Complete is
 // that peer's report on its OWN store -- true, and useless here, because a
 // lagging replica's store is complete as far as it knows. Replica 0 holding 12
 // rows and replica 1 holding 8: kill replica 0 and the same query answers 8
-// instead of 12, HTTP 200, no header, nothing in the body to tell them apart.
+// instead of 12, HTTP 200, with nothing in the response to tell them apart.
 //
-// PeerResponse.HighWatermark exists for exactly this. Its own doc comment says
-// so: "what lets a caller tell no results from no results yet". It was populated
-// on the wire, parsed at cluster_client.go:250, and READ BY NO READ PATH -- the
-// mechanism was built, documented, and wired to nothing.
+// PeerResponse.HighWatermark exists for exactly this -- "what lets a caller tell
+// no results from no results yet" -- and was populated on the wire, parsed by
+// the client, and READ BY NO READ PATH.
+//
+// It is read now, and it LOGS. It does not refuse: a watermark going backwards
+// turned out to have three benign causes, each of which made the refusing
+// version outage a healthy cluster permanently. See checkWatermark and
+// TestABenignWatermarkDropDoesNotRefuseTheRead.
 
 // wmShard answers /select/logsql/hits with `hits` and the given watermark, and
 // stops answering once its `dead` flag is set.
@@ -99,30 +103,51 @@ func TestALaggingReplicaDoesNotServeAShortAnswerAsComplete(t *testing.T) {
 	}
 
 	// The leader goes away. The lagging replica answers, complete=true about its
-	// own store, with an older watermark. This used to be 12 -> 8 at HTTP 200.
+	// own store, with an older watermark.
+	//
+	// The answer is SERVED, and the lag is logged. An earlier version of this
+	// refused with 503, and that was wrong: a watermark going backwards is not
+	// reliable evidence of a lagging replica. Tenant eviction lowers it (the
+	// node reports the max over OPEN tenants), a topology change lowers it (the
+	// history is keyed by shard index), and retention lowers it -- each on a
+	// healthy cluster, each an unrecoverable 503. See checkWatermark.
 	leader.dead.Store(true)
 	code, total, raw = hitsTotal(t, ts, "*")
-	if code/100 == 2 {
-		t.Fatalf("the cluster answered %d total=%d from a replica behind the highest "+
-			"watermark it has seen (2000 -> 1000); the previous answer was 12. %s",
-			code, total, raw)
+	if code != 200 {
+		t.Fatalf("the cluster refused a read from a lagging replica (%d): a watermark "+
+			"going backwards has three benign causes and refusing on it outages a "+
+			"healthy cluster. %s", code, raw)
 	}
-	if code != http.StatusServiceUnavailable {
-		t.Errorf("refused with %d, want 503 (the completeness rule's status): %s", code, raw)
+	if total != 8 {
+		t.Errorf("the lagging replica's answer is total=%d, want 8: %s", total, raw)
 	}
+}
 
-	// Asked for explicitly, it comes back as a 206 that names the shard -- the
-	// same escape hatch every other incomplete read has, not a separate one.
-	resp, err := http.Get(ts.URL + "/select/logsql/hits?query=*&step=1h&" + partialParam + "=1")
-	if err != nil {
-		t.Fatal(err)
+// A watermark that goes backwards for a BENIGN reason does not refuse the read.
+//
+// Three ways to lower a node's reported watermark with nothing wrong: evicting a
+// tenant (highWatermark() is the max over OPEN tenants), repointing a shard
+// index at another machine, and retention deleting the newest data. Each one
+// produced a permanent 503 from the version of checkWatermark that refused.
+func TestABenignWatermarkDropDoesNotRefuseTheRead(t *testing.T) {
+	sh := newWMShard(t, 7, 5000)
+	ts := wmRouter(t, sh.ts.URL)
+
+	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 7 {
+		t.Fatalf("first read: %d total=%d %s", code, total, raw)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusPartialContent {
-		t.Errorf("with %s=1 the answer is %d, want 206", partialParam, resp.StatusCode)
-	}
-	if resp.Header.Get(HdrShardsMissing) == "" {
-		t.Errorf("the 206 does not name the shard in %s", HdrShardsMissing)
+	// The shard's watermark drops, as it does when a tenant is evicted.
+	sh.wm.Store(1000)
+	for i := 0; i < 3; i++ {
+		code, total, raw := hitsTotal(t, ts, "*")
+		if code != 200 {
+			t.Fatalf("read %d after a benign watermark drop answered %d -- and the "+
+				"version that refused never recovered, because the floor only rises: %s",
+				i, code, raw)
+		}
+		if total != 7 {
+			t.Errorf("read %d is total=%d, want 7: %s", i, total, raw)
+		}
 	}
 }
 
@@ -145,10 +170,12 @@ func TestAnUnchangedWatermarkIsNotLag(t *testing.T) {
 	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 9 {
 		t.Fatalf("after the watermark advanced: %d total=%d %s", code, total, raw)
 	}
-	// And now going back IS lag.
+	// And going back is REPORTED, not refused: the read is still served. See
+	// TestABenignWatermarkDropDoesNotRefuseTheRead for why.
 	sh.wm.Store(2000)
-	if code, _, raw := hitsTotal(t, ts, "*"); code/100 == 2 {
-		t.Errorf("a watermark that went backwards (3000 -> 2000) answered %d: %s", code, raw)
+	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 9 {
+		t.Errorf("a watermark that went backwards (3000 -> 2000) answered %d total=%d: %s",
+			code, total, raw)
 	}
 }
 

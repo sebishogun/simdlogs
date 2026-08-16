@@ -247,7 +247,25 @@ func (c *clusterClient) do(
 	// envelope exists to prevent.
 	out.Complete = resp.Header.Get(HdrComplete) == "true"
 	if hw := resp.Header.Get(HdrHighWatermark); hw != "" {
-		out.HighWatermark, _ = strconv.ParseInt(hw, 10, 64)
+		// The error is NOT discarded.
+		//
+		// strconv.ParseInt returns MaxInt64 on ErrRange, so `out.HighWatermark,
+		// _ = ...` recorded 9223372036854775807 for a malformed header -- above
+		// every real nanosecond timestamp. checkWatermark then treated every
+		// later answer from that shard as lagging and refused it, for the life
+		// of the process: one bad header, 503 forever.
+		//
+		// A peer whose envelope this node cannot read is PeerMalformed, which is
+		// what a body it cannot read already is. That refuses this one answer
+		// and poisons nothing.
+		n, err := strconv.ParseInt(hw, 10, 64)
+		if err != nil || n < 0 {
+			out.Class = PeerMalformed
+			out.Err = fmt.Errorf("peer sent an unreadable %s header %q: %w",
+				HdrHighWatermark, hw, err)
+			return out
+		}
+		out.HighWatermark = n
 	}
 	if id := resp.Header.Get(HdrTraceID); id != "" {
 		out.TraceID = id
