@@ -7079,3 +7079,59 @@ still compiled, and its own suite passes without the VictoriaLogs binary
 because every test there skips loudly when it is not staged. With the binary
 staged the differentials fail — which is to say the gate for this existed and
 was not run between the mutation and the commit.
+
+## 101. Every protobuf assertion was circular, and one severity finding was already fixed
+
+The rest of #410's OTLP round.
+
+**The wire shape was checked against itself.** The protobuf fixtures are built
+by `pbytes`/`pvarint`/`kv`/`anyString` in this repository and decoded by
+`eachField`/`decodeAnyValue` in this repository, so a matched pair of bugs -- a
+field number wrong in both, a wire type wrong in both -- produces a green suite
+and a decoder that cannot read what a real collector sends. Nothing in the
+package could tell the difference.
+
+A 32-byte golden, hand-derived from the field numbers in
+`opentelemetry/proto/logs/v1/logs.proto` and `common/v1/common.proto`:
+
+	0a 1e                       ExportLogsServiceRequest.resource_logs (1, LEN 30)
+	  0a 0a                     ResourceLogs.resource (1, LEN 10)
+	    0a 08                   Resource.attributes (1, LEN 8)
+	      0a 01 61              KeyValue.key = "a"
+	      12 03 0a 01 62        KeyValue.value = AnyValue{string_value:"b"}
+	  12 10                     ResourceLogs.scope_logs (2, LEN 16)
+	    12 0e                   ScopeLogs.log_records (2, LEN 14)
+	      09 0100000000000000   LogRecord.time_unix_nano (1, I64) = 1
+	      2a 03 0a 01 6d        LogRecord.body = AnyValue{string_value:"m"}
+
+Two assertions, and the pair is what closes the loop: the DECODER must read
+these bytes, and the fixture BUILDER must produce exactly them. Either alone
+leaves the other side free to drift. Both passed on the first run, which is
+the useful outcome -- the hand derivation and the builder agree, so the
+existing fixtures were the right bytes all along.
+
+Demonstrated on the mutation the circular tests cannot see: `Resource.attributes`
+moved from field 1 to field 2 in the decoder AND in every fixture. The JSON path
+has no field numbers, so the JSON-vs-protobuf differential compares identical
+ROWS and cannot notice; both golden assertions redden. (`TestOTLPProtoMatchesJSON`
+also reddened, because its own fixture lives in another file and was not part of
+the matched change -- which is the point: a matched change covering ALL the
+fixtures would have slipped past it too.)
+
+**And one reported finding was already closed.** Out-of-range severity numbers
+were reported as stored by the protobuf path and dropped by the JSON path.
+Measured on both encodings of the same record:
+
+| severityNumber | protobuf | JSON |
+|---|---|---|
+| 25 | dropped | dropped |
+| 100 | dropped | dropped |
+| 0 | dropped | dropped |
+| -3 | dropped | dropped |
+| 17 | `17` / `ERROR` | `17` / `ERROR` |
+| 24 | `24` / `FATAL4` | `24` / `FATAL4` |
+
+The `sevNum > 0 && sevNum < len(severityNumberName)` bound in
+`otlpRecordFields` is shared by both paths, so closing it for one closed it for
+both. Recorded as checked rather than left on the list: a finding that is fixed
+and still listed costs the next reader the same measurement.

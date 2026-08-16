@@ -1130,3 +1130,81 @@ func TestTheRowRendererRefusesAnAmbiguousField(t *testing.T) {
 		}
 	}
 }
+
+// A GOLDEN, hand-derived from the protobuf spec rather than from this
+// package's own writer.
+//
+// Every other protobuf assertion here is circular for the WIRE SHAPE: the
+// fixture is built by pbytes/pvarint/kv/anyString in this repository and
+// decoded by eachField/decodeAnyValue in this repository, so a matched pair of
+// bugs -- a field number wrong in both, a wire type wrong in both -- produces a
+// green suite and a decoder that cannot read what a real collector sends.
+// Nothing in the package could tell the difference.
+//
+// These 32 bytes were written out by hand from the field numbers in
+// opentelemetry/proto/logs/v1/logs.proto and common/v1/common.proto:
+//
+//	0a 1e                                  ExportLogsServiceRequest.resource_logs (1, LEN 30)
+//	  0a 0a                                ResourceLogs.resource (1, LEN 10)
+//	    0a 08                              Resource.attributes (1, LEN 8)
+//	      0a 01 61                         KeyValue.key (1, LEN 1) = "a"
+//	      12 03                            KeyValue.value (2, LEN 3)
+//	        0a 01 62                       AnyValue.string_value (1, LEN 1) = "b"
+//	  12 10                                ResourceLogs.scope_logs (2, LEN 16)
+//	    12 0e                              ScopeLogs.log_records (2, LEN 14)
+//	      09 0100000000000000              LogRecord.time_unix_nano (1, I64) = 1
+//	      2a 03                            LogRecord.body (5, LEN 3)
+//	        0a 01 6d                       AnyValue.string_value (1, LEN 1) = "m"
+//
+// Two assertions, and the pair is what closes the loop: the DECODER must read
+// these bytes, and the fixture BUILDER must produce exactly them. Either alone
+// leaves the other side free to drift.
+const otlpGoldenHex = "0a1e0a0a0a080a01611203" + "0a01621210120e09" +
+	"01000000000000002a030a016d"
+
+func TestTheProtobufDecoderReadsBytesThisPackageDidNotWrite(t *testing.T) {
+	golden, err := hex.DecodeString(otlpGoldenHex)
+	if err != nil {
+		t.Fatalf("the golden is not hex: %v", err)
+	}
+	if len(golden) != 32 {
+		t.Fatalf("the golden is %d bytes, and the derivation above says 32", len(golden))
+	}
+	rows, res := rowsOf(t, func(w *Writer) (Result, error) {
+		return IngestOTLPLogsProto(w, golden, func() int64 { return 0 }, nil)
+	})
+	if res.Accepted != 1 || len(rows) != 1 {
+		t.Fatalf("accepted %d, stored %d rows, want 1 each: the decoder cannot "+
+			"read a message written from the spec", res.Accepted, len(rows))
+	}
+	got := fieldsOfRow(rows[0])
+	if got["a"] != "b" {
+		t.Errorf(`resource attribute a=%q, want "b"`, got["a"])
+	}
+	if got["_msg"] != "m" {
+		t.Errorf(`_msg=%q, want "m"`, got["_msg"])
+	}
+}
+
+func TestTheFixtureBuilderProducesTheGoldenBytes(t *testing.T) {
+	var resource []byte
+	resource = pbytes(resource, 1, kv("a", anyString("b")))
+	var rec []byte
+	rec = pfixed64(rec, 1, 1)
+	rec = pbytes(rec, 5, anyString("m"))
+	var scope []byte
+	scope = pbytes(scope, 2, rec)
+	var rl []byte
+	rl = pbytes(rl, 1, resource)
+	rl = pbytes(rl, 2, scope)
+	built := pbytes(nil, 1, rl)
+
+	if got := hex.EncodeToString(built); got != otlpGoldenHex {
+		t.Errorf("the fixture builder does not produce the spec's bytes:\n"+
+			"  built  %s\n  golden %s\n"+
+			"Every other protobuf test in this file uses the builder and the "+
+			"decoder together, so a field number or wire type wrong in BOTH is "+
+			"invisible to all of them. This is the assertion that is not "+
+			"circular.", got, otlpGoldenHex)
+	}
+}
