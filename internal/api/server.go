@@ -1135,6 +1135,16 @@ func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 	}
 	stream, streamID := "", ""
 	sawStream, sawStreamID := false, false
+	// AT MOST ONCE, whichever source it comes from.
+	//
+	// A NoTime row can carry TWO `_time` fields -- `rename x as _time` does
+	// not overwrite an existing key and `copy x as _time` does not either --
+	// and the first version of this guard kept both, so
+	// `* | stats by (_time) count() c | copy _time as t2 | rename t2 as _time`
+	// emitted {"_time":"…","c":"1","_time":"…"}: one JSON object with a
+	// duplicate key, which every decoder resolves differently. The old
+	// unconditional skip dropped both, which was the other defect.
+	emittedTime := !row.NoTime
 	for _, f := range row.Fields {
 		// Conditional on the emit above, exactly as the pack is.
 		//
@@ -1154,8 +1164,11 @@ func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 		// row, out of one response" -- inverted. Reachable through
 		// `stats by (_time)`, `rename x as _time`, `copy x as _time` and the
 		// router's jsonLineToRow.
-		if f.Key == "_time" && !row.NoTime {
-			continue
+		if f.Key == "_time" {
+			if emittedTime {
+				continue
+			}
+			emittedTime = true
 		}
 		// A NON-EMPTY value counts as present. The store materializes a column
 		// for the whole group, so a row that never carried _stream_id comes

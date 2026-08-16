@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -141,9 +142,11 @@ func TestNoRouteLeavesAMultipartTempFileBehind(t *testing.T) {
 // may consume it.
 //
 // guard's multipart parse was unconditional, and it drained the body before
-// esCount and esSearch decoded it. Measured, a JSON document sent under
-// multipart/form-data (which is what a client behind a proxy that re-frames
-// uploads sends, and what the same document sent four other ways does fine):
+// esCount and esSearch decoded it. Measured, a JSON document sent with a
+// multipart Content-Type -- the header a proxy or a mis-set client library
+// puts on a body that is not one -- against the same document sent four other
+// ways. A REAL multipart envelope is a different case and answers 400 on all
+// three routes, correctly: it is not the document these routes take.
 //
 //	                      before the parse   with the parse
 //	/_count   node               200                400 "simdlogs: EOF"
@@ -313,5 +316,99 @@ func TestNoRouteLeavesATempFileBehindOnAnAuthenticatedServer(t *testing.T) {
 		t.Errorf("%s (answered %d) left the multipart temp file %s behind on an "+
 			"authenticated server: a handler parsed a form on the request copy "+
 			"withPrincipal made", p, codes[p], n)
+	}
+}
+
+// A route that reads a document must not read a form as well — and the body
+// after the document is where that goes wrong.
+//
+// json.Decode stops at the end of the first value, so a body that is a JSON
+// document FOLLOWED by a multipart envelope leaves the rest for whatever reads
+// next. With `form: false` there is no pre-parse and no deferred RemoveAll, so
+// an `r.FormValue` in the handler parses that tail on the request copy and the
+// temp file it spills is never removed. Measured on /select/vector before its
+// window moved to the URL:
+//
+//	timeWindow    (r.FormValue)  200, start applied, ONE temp file per request
+//	timeWindowURL (r.URL.Query)  200, start ignored, no temp file
+//
+// The gate above cannot see this shape: it posts a pure multipart envelope,
+// which fails the JSON decode before any form is touched.
+func TestADocumentRouteReadsNoFormFromTheBodyTail(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+
+	pad := strings.Repeat("x", multipartMemory+(1<<20))
+	// A document, a PREAMBLE, then a multipart envelope carrying a `start`
+	// that would narrow the window to nothing if it were read.
+	//
+	// The preamble is what makes the shape reachable. json.Decoder reads
+	// AHEAD into its own buffer and those bytes never return to r.Body, so a
+	// boundary placed immediately after the document is swallowed and the
+	// later parse finds nothing -- no leak, and a test written that way passes
+	// against the defect. Everything before the first boundary is a legal
+	// multipart preamble, so 64 KiB of it puts the boundary past the
+	// read-ahead and the tail is parseable again.
+	body := `{"field":"emb","vector":[1,0,0],"k":2}` + "\n" +
+		strings.Repeat("preamble\r\n", 8<<10) +
+		"--B\r\nContent-Disposition: form-data; name=\"start\"\r\n\r\n2099-01-01T00:00:00Z\r\n" +
+		"--B\r\nContent-Disposition: form-data; name=\"pad\"; filename=\"pad.bin\"\r\n" +
+		"Content-Type: application/octet-stream\r\n\r\n" + pad + "\r\n--B--\r\n"
+
+	before := tempMultipartNames(t, tmp)
+	code, rb := postDeadline(t, ts, "/select/vector", `multipart/form-data; boundary=B`, body, "")
+	if code != 200 {
+		t.Fatalf("answered %d: %.200s", code, rb)
+	}
+	ts.Close()
+	if leaked := newNames(before, tempMultipartNames(t, tmp)); len(leaked) > 0 {
+		t.Errorf("a document route parsed the multipart tail of its own body and "+
+			"left %d temp file(s) behind: %v -- the parameters must come from the "+
+			"URL, where a body cannot reach them", len(leaked), leaked)
+	}
+}
+
+// The admin routes do not buffer a body they never read.
+//
+// `adminSpec().form` was true, justified by a reader that had already been
+// moved to the URL, and the leak gate cannot see it: no admin handler parses a
+// form, so nothing is left behind either way. What IS visible is the cost --
+// guard's pre-parse reads and buffers the whole body first.
+//
+// Asserted with a wide margin rather than an exact number: a 4 MiB body costs
+// ~13 MiB of TotalAlloc with the pre-parse on and well under 1 MiB with it off,
+// so a limit of half the body size separates them without being a benchmark.
+func TestAnAdminRouteDoesNotBufferABodyItNeverReads(t *testing.T) {
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	const size = 4 << 20
+	pad := strings.Repeat("x", size)
+	body := "--B\r\nContent-Disposition: form-data; name=\"pad\"; filename=\"pad.bin\"\r\n" +
+		"Content-Type: application/octet-stream\r\n\r\n" + pad + "\r\n--B--\r\n"
+
+	for _, path := range []string{"/flags", "/admin/backup", "/admin/acknowledge-degraded"} {
+		var m0, m1 runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&m0)
+		postDeadline(t, ts, path, `multipart/form-data; boundary=B`, body, "")
+		runtime.ReadMemStats(&m1)
+		if grew := m1.TotalAlloc - m0.TotalAlloc; grew > size/2 {
+			t.Errorf("%s allocated %d bytes for a %d-byte body it never reads: "+
+				"the request-shape guard is parsing a form for a route that has "+
+				"no parameters", path, grew, size)
+		}
 	}
 }

@@ -6238,3 +6238,96 @@ which makes the column count and the row count coincide — the one ratio at
 which a fix that keeps the column's number passes. Three of six tells them
 apart, and both mutations (count the column; drop the synthesized entry) are
 red.
+
+## 83. The `_time` fix emitted it TWICE, and the test's own comparison hid it
+
+Entry 80 made the `_time` field survive on a `NoTime` row. A `NoTime` row can
+carry **two** `_time` fields — neither `rename x as _time` nor `copy x as _time`
+overwrites an existing key — and the new guard kept both:
+
+```
+* | stats by (_time) count() c | copy _time as t2 | rename t2 as _time
+
+before entry 80  {"c":"1"}
+after            {"_time":"…00Z","c":"1","_time":"…00Z"}
+victoria-logs    {"_time":"2026-08-16T03:00:00Z","c":"1"}
+```
+
+One JSON object with a duplicate key, which every decoder resolves differently.
+Reachable on the plain wire row, not only inside a pack.
+
+**And the test could not see it.** `TestARowAndItsPackAgree` unmarshalled both
+halves into `map[string]string`, and a map keeps the last value for a repeated
+key — so its comparison method erased precisely the failure the change enabled.
+It reads key SEQUENCES now, through `json.Decoder`, because neither a map nor a
+struct can report a duplicate. Both directions are probed: keeping duplicates
+reddens it (`the row repeats a key: [_time c _time p]`), and dropping `_time`
+again reddens it the other way.
+
+The rule in all three copies is now "emit that key at most once, whichever
+source it comes from".
+
+## 84. Making the node right made the node and the router disagree
+
+Entry 80 fixed `appendRowJSON`, and the router's `jsonLineToRow` lifts `_time`
+out of the fields into `Row.Time` and **dropped the field**. For
+`stats by (_time)` that field is the group key, so the merge grouped every row
+together:
+
+```
+* | stats by (_time) count() c      4 rows, 2 distinct timestamps
+  node    {"_time":"…03:00:00Z","c":"2"} {"_time":"…03:00:01Z","c":"2"}
+  router  {"c":"4"}
+```
+
+Both at HTTP 200. The router was wrong before the fix too, but so was the node —
+so this converted "both wrong" into "a cluster and a node disagree about a
+number", which is worse.
+
+The field is kept as well as lifted now. It costs nothing on the way out,
+because the serializer emits `_time` at most once, so an ordinary log row
+serializes byte for byte as before; and it costs no allocation, because the
+field slice is already sized by `countFields(line)`, which counts `_time`.
+
+Four tests encoded the old contract — including the reference decoders that
+`TestRowScannerMatchesTheDecoder` and `FuzzJSONLineToRow` compare against — and
+were updated with it. The new parity test compares a router against a node over
+the same rows rather than against a literal, and checks the group key is present
+at all, since two identical empty answers would satisfy a comparison.
+
+## 85. Three more from the same round
+
+**`timeWindowURL` had no test, and reproducing the defect needed a preamble.**
+The first attempt put the multipart envelope directly after the JSON document
+and passed against the defect. The reason is that `json.Decoder` reads AHEAD
+into its own buffer and those bytes never return to `r.Body`, so a boundary
+placed right after the document is swallowed and the later parse finds nothing.
+Everything before the first boundary is a legal multipart preamble, so 64 KiB of
+it puts the boundary past the read-ahead — and then reverting `/select/vector`
+to `r.FormValue` leaves one temp file per request, which is what the fix
+prevents.
+
+Entry 81 also had the mechanism backwards: it said `form: false` "drops the
+multipart `start`/`end`". Measured, `form: false` with an `r.FormValue` in the
+handler *reads* that tail and leaks, because there is no pre-parse and therefore
+no deferred `RemoveAll`. Reading the URL is what stops it.
+
+**`adminSpec().form = false` was unpinned.** No admin handler parses a form, so
+the leak gate cannot see the flag either way; what is visible is the cost.
+A 4 MiB multipart POST, server-side `TotalAlloc` delta:
+
+| route | `form: true` | `form: false` |
+|---|---|---|
+| `/flags` | 16.96 MB | < 2 MB |
+| `/admin/backup` | 16.97 MB | < 2 MB |
+| `/admin/acknowledge-degraded` | 16.96 MB | < 2 MB |
+
+Asserted with a wide margin rather than an exact number — half the body size
+separates them by an order of magnitude, so it is a check and not a benchmark.
+
+**Prose that stayed behind the code.** Four places still said "the two
+Elasticsearch routes" after the set became three; and the LLD said the leak gate
+"runs twice … with a positive control", where they are two separate functions
+and only the plain one has a control. What establishes the authenticated one is
+the mutation — reverting `format` to `r.FormValue` reddens it naming all three
+health routes — and the LLD says that now instead.

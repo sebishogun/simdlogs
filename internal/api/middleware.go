@@ -51,8 +51,8 @@ type routeSpec struct {
 	// look at one. Measured, a 40 MiB multipart POST, server-side TotalAlloc
 	// delta -- /metrics 0 -> 128 MiB, / 0 -> 128 MiB, /alerts 0 -> 128 MiB,
 	// plus a temp file written and deleted per request, on three routes that
-	// discard the body. And on the two Elasticsearch routes, which read the
-	// body themselves, the parse CONSUMED it: /_count with a JSON document
+	// discard the body. And on the routes that read the body themselves --
+	// /_search, /_count and /select/vector -- the parse CONSUMED it: /_count with a JSON document
 	// under multipart/form-data went from 200 to 400 ("simdlogs: EOF") on a
 	// node and to 503 on a router.
 	//

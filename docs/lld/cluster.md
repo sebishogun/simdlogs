@@ -462,7 +462,7 @@ HTTP 200.
   content type by default, and treating that as parameters left a real query
   document unread. They carry `routeSpec.form = false` for the same reason: the
   request-shape guard parses a multipart body up front so its temp file can be
-  removed, and doing that on these two routes **consumed the document** —
+  removed, and doing that on those three routes **consumed the document** —
   measured, `/_count` with a JSON body under `multipart/form-data` answered
   `400 simdlogs: EOF` on a node and `503` on a router, where every other
   framing of the same document answers `200`. `/select/vector` is the one that
@@ -479,15 +479,19 @@ HTTP 200.
 
 **Which routes parse a form at all** is per route, not global. `routeSpec.form`
 selects it, and it is wrong in both directions: parsing where the handler reads
-the raw body consumes it (the Elasticsearch routes above), and *not* parsing
+the raw body consumes it (the three document routes above), and *not* parsing
 where the handler calls `FormValue` leaks one multipart temp file per request,
 because the handler parses on a request copy the server never sees and
 `finishRequest` cleans up the original. Neither failure is visible in an
 ordinary response, so the list is not maintained by inspection:
 `TestNoRouteLeavesAMultipartTempFileBehind` posts a spilling multipart body to
-every path `Handler()` registered and fails on any file left behind, with a
-positive control proving it can see one. It runs **twice**, against a plain
-server and an authenticated one: the leak needs a middleware that replaced the
+every path `Handler()` registered and fails on any file left behind. The plain
+one carries a positive control -- a handler wired like a route whose spec forgot
+`form: true`, which must leave a file -- because its check is an absence and an
+absence has two causes. The authenticated one has no control; what establishes
+that it can see a leak is the mutation, reverting `format` to `r.FormValue`,
+which reddens it naming all three health routes. There are **two** of them, one against a plain server and one against an
+authenticated server: the leak needs a middleware that replaced the
 request, and with authentication off `withTenant` makes no copy for the health
 routes, so the one configuration in which `/health`, `/-/healthy` and `/-/ready`
 leaked was the one the first version of the gate never built. It found `/internal/replica/group`,

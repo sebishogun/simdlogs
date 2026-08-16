@@ -167,7 +167,21 @@ func jsonLineToRow(line []byte) query.Row {
 		if key == "_time" && row.NoTime {
 			if t, err := time.Parse(time.RFC3339Nano, val); err == nil {
 				row.Time, row.NoTime = t.UnixNano(), false
-				continue
+				// KEPT AS A FIELD TOO, not consumed.
+				//
+				// `continue` dropped it, and for `stats by (_time)` that is
+				// the GROUP KEY: the merge then grouped every row together
+				// and a node and a router answered different numbers for the
+				// same query, both at HTTP 200 --
+				//
+				//	* | stats by (_time) count() c   over 4 rows, 2 timestamps
+				//	  node   {"_time":"…00Z","c":"2"} {"_time":"…01Z","c":"2"}
+				//	  router {"c":"4"}
+				//
+				// Keeping it costs nothing on the way out: appendRowJSON
+				// emits `_time` from row.Time and then skips the field,
+				// because it emits that key at most once, so an ordinary log
+				// row serializes byte for byte as before.
 			}
 		}
 		if row.Fields == nil {

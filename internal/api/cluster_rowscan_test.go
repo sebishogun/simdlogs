@@ -59,8 +59,12 @@ func decoderRow(line []byte) query.Row {
 		val := decoderScalar(vt)
 		if key == "_time" && row.NoTime {
 			if t, terr := time.Parse(time.RFC3339Nano, val); terr == nil {
+				// Time lifted AND the field kept. `continue` here dropped the
+				// group key of `stats by (_time)`, so a router answered
+				// {"c":"4"} where a node answers two rows of "2". The
+				// serializer emits `_time` at most once, so an ordinary log
+				// row goes back out byte for byte.
 				row.Time, row.NoTime = t.UnixNano(), false
-				continue
 			}
 		}
 		row.Fields = append(row.Fields, query.Field{Key: key, Value: val})
@@ -323,8 +327,12 @@ func rawMessageRow(line []byte) query.Row {
 		}
 		if key == "_time" && row.NoTime {
 			if t, terr := time.Parse(time.RFC3339Nano, val); terr == nil {
+				// Time lifted AND the field kept. `continue` here dropped the
+				// group key of `stats by (_time)`, so a router answered
+				// {"c":"4"} where a node answers two rows of "2". The
+				// serializer emits `_time` at most once, so an ordinary log
+				// row goes back out byte for byte.
 				row.Time, row.NoTime = t.UnixNano(), false
-				continue
 			}
 		}
 		row.Fields = append(row.Fields, query.Field{Key: key, Value: val})
@@ -382,8 +390,9 @@ func rawValueText(raw json.RawMessage) (string, bool) {
 func TestRowScannerAllocatesTwicePerRow(t *testing.T) {
 	got := testing.AllocsPerRun(200, func() {
 		row := jsonLineToRow(benchLine)
-		if len(row.Fields) != 9 {
-			t.Fatalf("want 9 fields (10 minus the lifted _time), got %d", len(row.Fields))
+		if len(row.Fields) != 10 {
+			t.Fatalf("want 10 fields: the lifted _time is KEPT, so a "+
+				"`stats by (_time)` group key survives the merge; got %d", len(row.Fields))
 		}
 	})
 	if got > 2 {
@@ -401,7 +410,7 @@ func TestTheFieldSliceIsSizedFromTheLine(t *testing.T) {
 	}{
 		{`{"a":"b"}`, 1},
 		{`{"a":"b","c":"d"}`, 2},
-		{string(benchLine), 9},
+		{string(benchLine), 10},          // _time is kept as a field as well as lifted
 		{`{"a":{"b":1,"c":2},"d":3}`, 2}, // commas inside a nested value do not count
 		{`{"a":"x,y,z"}`, 1},             // nor inside a string
 	} {

@@ -148,6 +148,10 @@ func packJSON(r Row, keys []string) string {
 		// dropping the field as well would lose something the row DOES carry --
 		// the pack's job is to pack the row, not to improve it.
 		stream, id, hasStream := rowStreamPair(r)
+		// AT MOST ONCE: a NoTime row can carry two `_time` fields, because
+		// neither `rename x as _time` nor `copy x as _time` overwrites an
+		// existing key. Keeping both put a duplicate key in one JSON object.
+		emittedTime := !r.NoTime
 		for _, f := range r.Fields {
 			// Conditional on the emit above, exactly as the stream pair is.
 			// A NoTime row emits no `_time` from r.Time, so skipping the field
@@ -157,8 +161,11 @@ func packJSON(r Row, keys []string) string {
 			// over four rows: p was {"c":"1"} where the reference and this
 			// server's own previous build both give
 			// {"_time":"2026-08-16T03:00:00Z","c":"1"}.
-			if f.Key == "_time" && !r.NoTime {
-				continue // emitted from r.Time, above, as serialization does
+			if f.Key == "_time" {
+				if emittedTime {
+					continue // emitted from r.Time above, or already once here
+				}
+				emittedTime = true
 			}
 			if hasStream && (f.Key == "_stream" || f.Key == "_stream_id") {
 				continue
@@ -238,6 +245,10 @@ func packLogfmt(r Row, keys []string) string {
 		// dropping the field as well would lose something the row DOES carry --
 		// the pack's job is to pack the row, not to improve it.
 		stream, id, hasStream := rowStreamPair(r)
+		// AT MOST ONCE: a NoTime row can carry two `_time` fields, because
+		// neither `rename x as _time` nor `copy x as _time` overwrites an
+		// existing key. Keeping both put a duplicate key in one JSON object.
+		emittedTime := !r.NoTime
 		for _, f := range r.Fields {
 			// Conditional on the emit above, exactly as the stream pair is.
 			// A NoTime row emits no `_time` from r.Time, so skipping the field
@@ -247,8 +258,11 @@ func packLogfmt(r Row, keys []string) string {
 			// over four rows: p was {"c":"1"} where the reference and this
 			// server's own previous build both give
 			// {"_time":"2026-08-16T03:00:00Z","c":"1"}.
-			if f.Key == "_time" && !r.NoTime {
-				continue // emitted from r.Time, above, as serialization does
+			if f.Key == "_time" {
+				if emittedTime {
+					continue // emitted from r.Time above, or already once here
+				}
+				emittedTime = true
 			}
 			if hasStream && (f.Key == "_stream" || f.Key == "_stream_id") {
 				continue

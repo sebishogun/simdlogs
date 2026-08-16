@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -231,6 +232,48 @@ func TestFieldNamesListsASynthesizedNameOnce(t *testing.T) {
 	}
 }
 
+// jsonKeySequence is the keys of a flat JSON object IN ORDER, duplicates
+// included. encoding/json cannot report this -- unmarshalling into a map keeps
+// the last value for a repeated key and unmarshalling into a struct ignores
+// the extras -- so a duplicate key is invisible to every ordinary decode, and
+// this serializer has emitted one.
+func jsonKeySequence(t *testing.T, obj string) []string {
+	t.Helper()
+	dec := json.NewDecoder(strings.NewReader(obj))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		t.Fatalf("not a JSON object: %v: %s", err, obj)
+	}
+	var keys []string
+	for dec.More() {
+		k, err := dec.Token()
+		if err != nil {
+			t.Fatalf("reading a key: %v: %s", err, obj)
+		}
+		s, ok := k.(string)
+		if !ok {
+			t.Fatalf("a non-string key: %v: %s", k, obj)
+		}
+		keys = append(keys, s)
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			t.Fatalf("reading %s: %v: %s", s, err, obj)
+		}
+	}
+	return keys
+}
+
+func hasDuplicate(keys []string) bool {
+	seen := map[string]bool{}
+	for _, k := range keys {
+		if seen[k] {
+			return true
+		}
+		seen[k] = true
+	}
+	return false
+}
+
 // facetHits totals the hits a field's facet values report.
 func facetHits(t *testing.T, body, field string) int {
 	t.Helper()
@@ -415,6 +458,10 @@ func TestARowAndItsPackAgree(t *testing.T) {
 		`* | stats by (_time) count() c | pack_json as p`,
 		`* | stats by (level) count() c | rename level as _time | pack_json as p`,
 		`* | stats by (svc) count() c | copy svc as _time | pack_json as p`,
+		// TWO `_time` fields on one row: neither `rename` nor `copy`
+		// overwrites an existing key, so this is how a duplicate reaches the
+		// serializer. It emitted {"_time":"…","c":"1","_time":"…"}.
+		`* | stats by (_time) count() c | copy _time as t2 | rename t2 as _time | pack_json as p`,
 	} {
 		t.Run(q, func(t *testing.T) {
 			code, body := postRaw(t, node, "/select/logsql/query?query="+url.QueryEscape(q), "", "")
@@ -426,6 +473,15 @@ func TestARowAndItsPackAgree(t *testing.T) {
 				t.Fatalf("no rows: %.200s", body)
 			}
 			for _, ln := range lines {
+				// KEY SEQUENCES first, because a map collapses a duplicate key
+				// to the last one -- and a duplicate key is a defect this
+				// exact serializer has shipped. The first version of this test
+				// unmarshalled both halves into map[string]string and would
+				// have compared equal while the wire carried
+				// {"_time":"…","c":"1","_time":"…"}.
+				if k := jsonKeySequence(t, ln); hasDuplicate(k) {
+					t.Errorf("the row repeats a key: %v in %s", k, ln)
+				}
 				var row map[string]string
 				if err := json.Unmarshal([]byte(ln), &row); err != nil {
 					t.Fatalf("row is not JSON: %v: %s", err, ln)
@@ -433,6 +489,9 @@ func TestARowAndItsPackAgree(t *testing.T) {
 				packed, ok := row["p"]
 				if !ok {
 					t.Fatalf("the row carries no pack: %s", ln)
+				}
+				if k := jsonKeySequence(t, packed); hasDuplicate(k) {
+					t.Errorf("the pack repeats a key: %v in %s", k, packed)
 				}
 				var pack map[string]string
 				if err := json.Unmarshal([]byte(packed), &pack); err != nil {
@@ -459,4 +518,79 @@ func TestARowAndItsPackAgree(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A router answers `stats by (_time)` the same as a node.
+//
+// jsonLineToRow lifted `_time` out of the fields into Row.Time and dropped the
+// field. For `stats by (_time)` that field IS the group key, so the merge
+// grouped every row together:
+//
+//   - | stats by (_time) count() c      4 rows, 2 distinct timestamps
+//     node    {"_time":"…03:00:00Z","c":"2"} {"_time":"…03:00:01Z","c":"2"}
+//     router  {"c":"4"}
+//
+// both at HTTP 200. Fixing the serializer to keep the field made the node
+// right and left the router wrong, which is worse than both being wrong: a
+// cluster and a node now disagreed about a number.
+//
+// Compared against a node over the same rows rather than against a literal,
+// which is what makes it a parity test rather than a snapshot.
+func TestARouterGroupsByTimeAsANodeDoes(t *testing.T) {
+	node, router := loadedPairAtTimes(t)
+	for _, q := range []string{
+		`* | stats by (_time) count() c`,
+		`* | stats by (_time, level) count() c`,
+		`* | stats by (_time) count() c | pack_json as p`,
+	} {
+		t.Run(q, func(t *testing.T) {
+			path := "/select/logsql/query?query=" + url.QueryEscape(q)
+			nCode, nBody := postRaw(t, node, path, "", "")
+			rCode, rBody := postRaw(t, router, path, "", "")
+			if nCode != 200 || rCode != 200 {
+				t.Fatalf("node %d router %d", nCode, rCode)
+			}
+			if sortedLines(nBody) != sortedLines(rBody) {
+				t.Errorf("the router and a node disagree:\n  node   %s\n  router %s",
+					sortedLines(nBody), sortedLines(rBody))
+			}
+			// And the group key has to be THERE: two identical empty answers
+			// would satisfy the comparison above.
+			if !strings.Contains(nBody, `"_time"`) {
+				t.Errorf("neither carries the group key, so this compares nothing: %s", nBody)
+			}
+		})
+	}
+}
+
+// loadedPairAtTimes is a node and a one-shard router over four rows at two
+// distinct timestamps, so a grouping that collapses them is visible.
+func loadedPairAtTimes(t *testing.T) (node, router *httptest.Server) {
+	t.Helper()
+	node = singleNode(t)
+	shard := singleNode(t)
+	rs, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rs.Close() })
+	rs.SetBackends([]string{shard.URL})
+	rs.SetReplicas(1)
+	router = httptest.NewServer(rs.Handler())
+	t.Cleanup(router.Close)
+	for i := 0; i < 4; i++ {
+		line := fmt.Sprintf(
+			`{"_time":"2026-08-16T03:00:%02dZ","_msg":"row %d","level":"%s"}`+"\n",
+			i/2, i, []string{"error", "info"}[i%2])
+		postRaw(t, node, "/insert/jsonline", "application/x-ndjson", line)
+		postRaw(t, shard, "/insert/jsonline", "application/x-ndjson", line)
+	}
+	return node, router
+}
+
+// sortedLines normalizes the row ORDER, which a stats result does not fix.
+func sortedLines(body string) string {
+	lines := strings.Split(strings.TrimSpace(body), "\n")
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
 }
