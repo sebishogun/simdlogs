@@ -6485,3 +6485,40 @@ Thirteen query shapes are compared against a single node holding the same rows.
 Four mutations redden it: removing the pre-pipeline bound (6 subtests), keeping
 the merge ascending (9), pushing filtering pipes down anyway (1), and making
 `ChangesRowCount` always false (1).
+
+## 89. Two of the three reasons a watermark moved for nothing
+
+Task #434. `checkWatermark` reports a lagging replica and does not refuse,
+because the first version's 503 turned out to fire on a healthy cluster. Three
+causes were named in the comment; two are now closed and one is not, and the
+difference between "closed" and "named" is what decides whether the refusal can
+come back.
+
+**Closed: the watermark was the max over OPEN tenants and over data currently
+HELD.** `highWatermark()` scanned `forEachTenantDetached`, so evicting a tenant
+dropped it — a one-node cluster reading tenant 2 and then tenant 1 reported
+itself going backwards — and retention deleting the newest rows dropped it
+legitimately. It is a running maximum now, kept on the server rather than
+derived per call, so what it reports is *the newest timestamp this node has
+accepted*. That moves for exactly one reason.
+
+**Closed: the history was keyed by shard INDEX.** `SetBackends` may repoint an
+index at a different machine, and the new machine inherited the old one's floor
+— so a freshly added, legitimately empty replica read as lagging. The entry
+records **which peer** set the high, and a high set by a peer the topology no
+longer lists is replaced rather than enforced. Keeping the shard key matters:
+the signal wanted is cross-replica (two replicas of one shard holding 12 and 8
+rows), and a peer compared only against its own history cannot show that.
+
+**Open: a restart re-derives it from the stores that load.** A replica whose
+newest data retention already deleted comes back below its sibling with nothing
+wrong. The maximum is monotonic *within a process* and not across one, and
+closing that needs it to be durable. `TestARestartStillLowersTheWatermark`
+states the shape and says in its own failure message that when it stops holding,
+the refusal can be turned back on.
+
+Three mutations redden the tests: making the watermark non-monotonic, letting a
+departed peer's floor stand, and not recording which peer set the high. The
+second of those first appeared to survive — the mutation left `present`
+assigned and never read, which does not compile, and a grep for `--- FAIL`
+counts a build failure as zero.

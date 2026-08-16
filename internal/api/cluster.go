@@ -1000,63 +1000,118 @@ func (s *Server) checkWatermark(p *PeerResponse, shard int) {
 	if !p.OK() || p.HighWatermark == 0 {
 		return
 	}
-	seen := s.shardHW(shard)
-	for {
-		hi := seen.Load()
-		if p.HighWatermark < hi {
-			// REPORTED, not refused.
-			//
-			// The first version marked the answer incomplete, which routed it
-			// into the completeness rule and produced a 503. That is wrong,
-			// because a watermark going backwards is not reliably evidence of a
-			// lagging replica -- three ways to produce it on a HEALTHY cluster
-			// were found, and each one is a hard outage:
-			//
-			//   - highWatermark() is the max over OPEN tenants, so evicting a
-			//     tenant lowers a node's reported watermark. A one-node,
-			//     one-replica cluster reading tenant 2 then tenant 1 refuses
-			//     itself, with nothing lagging and no replica to blame.
-			//   - the history is keyed by shard INDEX, and SetBackends may
-			//     repoint an index at a different machine, which inherits the
-			//     previous machine's floor.
-			//   - retention deleting the newest data lowers it legitimately.
-			//
-			// A false 503 is not the failure this was built to catch; it is a
-			// worse one, and it is unrecoverable within the process. The signal
-			// still reaches an operator -- the log line names the shard, the
-			// peer and both watermarks, and PartialReads is not touched -- but
-			// it no longer decides the answer. Turning it back into a refusal
-			// needs a watermark that does not move for reasons unrelated to
-			// replication, which is task #434.
-			obs.L().Warn("shard answered from a replica behind the highest watermark seen",
-				obs.FieldEvent, "cluster.replica_lagging",
-				obs.FieldShard, shard, "replica", p.Replica, "peer", p.URL,
-				"watermark", p.HighWatermark, "highest_seen", hi,
-				obs.FieldErrorClass, string(obs.ClassUpstream))
-			return
-		}
-		if p.HighWatermark == hi || seen.CompareAndSwap(hi, p.HighWatermark) {
-			return
-		}
-		// Lost the race to another shard's goroutine; re-read and decide again.
+	// The shard's current replica set, so a high set by a machine that has
+	// since left the topology is discarded rather than enforced.
+	var members []string
+	if sh := s.shards(); shard >= 0 && shard < len(sh) {
+		members = sh[shard]
+	}
+	behind, prev := s.shardHW(shard).observe(p.URL, p.HighWatermark, members)
+	if behind {
+		// REPORTED, not refused.
+		//
+		// The first version marked the answer incomplete, which routed it into
+		// the completeness rule and produced a 503. Three ways to produce a
+		// backwards watermark on a HEALTHY cluster were found, and each one is
+		// a hard outage. Two are now closed:
+		//
+		//   - highWatermark() was the max over OPEN tenants and over the data
+		//     currently HELD, so evicting a tenant or expiring the newest rows
+		//     lowered it. It is a running maximum now: node-level, and it moves
+		//     only when a write arrives.
+		//   - the history was keyed by shard INDEX, so SetBackends repointing
+		//     an index at a different machine handed the new machine the old
+		//     one's floor. The entry records which peer set the high, and a
+		//     high from a peer no longer in the shard is replaced.
+		//
+		// ONE REMAINS, and it is why this still reports: a node restart
+		// re-derives the watermark from the stores that load, so a replica
+		// whose newest data retention already deleted comes back below its
+		// sibling with nothing wrong. Closing it needs the maximum to be
+		// durable, which is the rest of task #434.
+		//
+		// A false 503 is not the failure this was built to catch; it is a worse
+		// one, and it is unrecoverable within the process. The signal reaches an
+		// operator -- this line names the shard, the peer and both watermarks,
+		// and PartialReads is not touched -- but it does not decide the answer.
+		obs.L().Warn("shard answered from a replica behind the highest watermark seen",
+			obs.FieldEvent, "cluster.replica_lagging",
+			obs.FieldShard, shard, "replica", p.Replica, "peer", p.URL,
+			"watermark", p.HighWatermark, "highest_seen", prev,
+			obs.FieldErrorClass, string(obs.ClassUpstream))
+		return
+	}
+	if prev > 0 {
+		obs.L().Info("a shard's watermark floor was set by a peer that has left the topology",
+			obs.FieldEvent, "cluster.watermark_floor_reset",
+			obs.FieldShard, shard, "peer", p.URL,
+			"watermark", p.HighWatermark, "previous_floor", prev)
 	}
 }
 
 // shardHW is the per-shard highest watermark this router has observed. Created
 // on first use: the shard count is a runtime property of the backend list, and
 // sizing a slice from it would need re-sizing every time that list changes.
-func (s *Server) shardHW(shard int) *atomic.Int64 {
+func (s *Server) shardHW(shard int) *shardHigh {
 	s.hwMu.Lock()
 	defer s.hwMu.Unlock()
 	if s.hw == nil {
-		s.hw = map[int]*atomic.Int64{}
+		s.hw = map[int]*shardHigh{}
 	}
 	v, ok := s.hw[shard]
 	if !ok {
-		v = &atomic.Int64{}
+		v = &shardHigh{}
 		s.hw[shard] = v
 	}
 	return v
+}
+
+// shardHigh is the highest watermark seen for one shard and the peer that
+// reported it.
+//
+// The PEER is what makes a topology change survivable. The history used to be
+// a bare number keyed by shard index, and SetBackends may repoint an index at a
+// different machine -- which then inherited the previous machine's floor and
+// read as lagging while being perfectly healthy and legitimately empty. Knowing
+// who set the high lets that case be told apart from a replica that really is
+// behind its sibling.
+//
+// A small mutex rather than two atomics: the pair must move together, and this
+// is one lock per shard per read against a network round trip.
+type shardHigh struct {
+	mu   sync.Mutex
+	hw   int64
+	peer string
+}
+
+// observe records a peer's watermark and reports whether it is behind a high
+// set by a peer that is STILL a replica of this shard.
+//
+// stale is true when the recorded high came from a peer the topology no longer
+// lists, in which case the caller has nothing to compare against and the high
+// is replaced rather than enforced.
+func (h *shardHigh) observe(peer string, hw int64, members []string) (behind bool, prev int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if hw >= h.hw {
+		h.hw, h.peer = hw, peer
+		return false, 0
+	}
+	present := false
+	for _, m := range members {
+		if m == h.peer {
+			present = true
+			break
+		}
+	}
+	if !present {
+		// The machine that set this floor is gone. Adopt the live peer's value:
+		// there is no sibling to be behind.
+		prev = h.hw
+		h.hw, h.peer = hw, peer
+		return false, prev
+	}
+	return true, h.hw
 }
 
 // mergeDecode unmarshals one shard's answer into v, refusing rather than

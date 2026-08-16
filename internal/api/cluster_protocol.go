@@ -249,5 +249,29 @@ func (s *Server) highWatermark() int64 {
 			hw = t
 		}
 	})
-	return hw
+	// MONOTONIC, AND NODE-LEVEL. The scan above is the max over the tenants
+	// that are OPEN right now and over the data they currently HOLD, and both
+	// qualifiers moved it for reasons that have nothing to do with replication:
+	//
+	//   - evicting a tenant dropped it, so a one-node cluster reading tenant 2
+	//     and then tenant 1 reported itself going backwards;
+	//   - retention deleting the newest data dropped it legitimately.
+	//
+	// Neither is a replica falling behind, and both made the reader's refusal
+	// unsafe (see checkWatermark). Keeping the running maximum removes both:
+	// what this reports is the newest timestamp this NODE has accepted, which
+	// only ever moves when a write arrives.
+	//
+	// Within the process. A restart re-derives it from the stores that load,
+	// so a node whose newest data retention already deleted comes back lower --
+	// the remaining reason the reader still reports rather than refuses.
+	for {
+		prev := s.hwOwn.Load()
+		if hw <= prev {
+			return prev
+		}
+		if s.hwOwn.CompareAndSwap(prev, hw) {
+			return hw
+		}
+	}
 }

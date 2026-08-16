@@ -69,12 +69,23 @@ type Server struct {
 	// incomplete rather than that something was.
 	shardID   int
 	replicaID int
-	// hw is the highest HighWatermark this router has seen from each shard,
+	// hw is the highest HighWatermark this router has seen from each PEER,
 	// which is what makes a lagging replica's answer detectable at all -- see
 	// checkWatermark. hwMu guards creation of an entry; each entry is atomic
 	// because the fan-out writes them from one goroutine per shard.
+	//
+	// Keyed by shard, because the signal wanted is CROSS-REPLICA -- two
+	// replicas of one shard holding 12 and 8 rows -- and a peer compared only
+	// against its own history cannot show that. Each entry also records WHICH
+	// peer set the high, so a SetBackends that repoints an index at a different
+	// machine does not hand the new machine the old one's floor: a high set by
+	// a peer no longer in the shard is discarded rather than enforced.
 	hwMu sync.Mutex
-	hw   map[int]*atomic.Int64
+	hw   map[int]*shardHigh
+	// hwOwn is the newest timestamp THIS node has accepted, kept as a running
+	// maximum so that evicting a tenant or expiring data cannot lower what it
+	// reports. See highWatermark.
+	hwOwn atomic.Int64
 	// repairBusy admits one cluster repair at a time on this router. Repair
 	// mutates, and two overlapping passes read the same missing set before
 	// either writes it -- see repairCluster.
