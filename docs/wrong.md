@@ -6811,3 +6811,106 @@ What the fixtures mean now, which is the other half of the change:
 The superseded claim, corrected here rather than left standing: "#434 needs a
 durable watermark before lag can be refused (a restart still lowers it)". It
 does not. It needs to know which process answered.
+
+## 97. Entry 96's refusal was broader than entry 96's rule, and it outaged a healthy cluster
+
+A second reviewer, who did not write the change, took entry 96 apart. Three of
+its findings were wrong answers or false refusals, all three mine, and one of
+them says the headline of entry 96 was too strong.
+
+**The refusal did not match the rule as written.** Entry 96 states it as "same
+peer, same generation, lower watermark". The code refused ANY member's lower
+watermark against a single shard-wide floor. Proven with a fixture the lagging
+one cannot be told apart from: two replicas holding the **same twelve rows** at
+watermarks 2000 and 1999. Kill the first, and the second was refused
+
+	503 ... 1 of 1 shards could not answer completely (0)
+
+on an answer that would have been byte-identical — and refused permanently,
+because the floor only ever rose. On an idle shard it never cleared.
+
+That is not a fixable comparison. Two replicas of a shard taking writes are
+microseconds apart continuously, and a node-level running maximum survives
+retention, so they differ even holding identical data. Nothing in one peer's
+answer separates "replication is a millisecond behind" from "this replica lost
+a day". The first version of this check was reverted for exactly this outage;
+attaching a generation header to it did not change the comparison that caused
+it.
+
+**So the refusal is narrowed to the two observations that have no benign
+reading**, and the cross-replica case goes back to being reported:
+
+| observation | before | now |
+|---|---|---|
+| a peer below **its own floor**, same generation | refused | **refused** |
+| a peer reporting **zero** while a live sibling has data | **served at 200** | **refused** |
+| a peer below a **sibling's** watermark | refused | reported: 200 + `X-Simdlogs-Shards-Lagging` |
+| a peer that restarted | tolerated | tolerated |
+| a peer sending no generation | reported | reported |
+
+A process's watermark is a running maximum held in memory, so it cannot fall.
+The floor is now **per peer and per generation** — the highest that process has
+reported — which also fixes a second thing the shard-wide floor got wrong: with
+a last-report comparison the fall was a single-read event, refused once and
+then served short forever, because the next read compared 1000 against 1000.
+
+**Zero is not silence, and treating it as silence lost a whole shard at 200.**
+`if !p.OK() || p.HighWatermark == 0 { return }` read a reported zero as "the
+peer did not say". A replica that had lost its entire dataset reports zero, so
+the extreme case of the defect this check exists for — the whole shard's rows
+simply absent — was the one case it returned early on. The client had always
+known the difference, parsing the header only when present; `PeerResponse`
+threw it away by storing both as `int64(0)`. It carries `HasWatermark` now.
+
+Zero is unambiguous where "lower than a sibling" is not: a node holding nothing
+at all cannot be a correct replica of a shard a live member reports data for.
+That is why one refuses and the other does not.
+
+**A router signed its children's partial answer as whole.** `serveEnvelope`
+stamps `Complete` from this node's own degraded snapshot, before the handler
+runs, and the fan-out never lowered it. Measured on a real two-level cluster:
+
+	middle router -> 206, X-Simdlogs-Complete: true, missing=1(unavailable)
+
+The parent merges that as a whole answer, so a shard missing two levels down is
+invisible at the top. `fanOutChecked` now sets the header to false before it
+writes a byte — after the first write a header is dropped silently, which is
+why it cannot be done later.
+
+**And a router claimed a watermark of zero.** It holds no tenant data, so
+`highWatermark()` returns 0, and it sent that. With the zero-skip in place that
+made the whole check inert one level up; with the zero-skip removed it would
+have made every router look like a replica that lost its data. A node that did
+not answer from its own stores now omits the header entirely.
+
+Each of the six guards was probed by mutation, and all six redden:
+
+| mutation | failing tests |
+|---|---|
+| absent treated as zero again | 1 |
+| an empty replica is not refused | 2 |
+| a peer below its own floor is not refused | 6 |
+| a cross-replica shortfall is not reported | 3 |
+| a partial router still says complete | 1 |
+| a router claims a watermark | 1 |
+
+Three smaller things the same review found, fixed here: the restart branch
+logged "a peer that has left the topology" for a peer that had merely
+restarted — the departure case it shared a message with no longer exists, since
+marks are keyed by peer URL and dropped when the URL leaves the member list;
+`acknowledgeDegraded`'s doc comment had come to sit on top of `listQuarantined`,
+which does neither of the things it describes; and `storagePressure` lost its
+only production caller when `readiness` was deleted in entry 95's sweep, making
+it the seventh instance of the naming defect that sweep was about — it is
+`storagePressureForTest` now, with the exemption list at nine.
+
+**What is still open, stated plainly.** A replica genuinely behind its sibling
+still answers short at 200. It is named in `X-Simdlogs-Shards-Lagging` and
+logged, so it is not silent, but it is not refused — and it cannot be, from one
+answer, without refusing ordinary replication skew too. Catching it needs
+either a quorum read (a request per replica on every query) or an operator
+declaring how far apart their replicas are allowed to be. Neither is in the
+code. Entry 96's claim that "a genuinely lagging replica is refused" is true
+only of a replica that fell below its own floor, and this entry is the
+correction; entry 96 stays as it was written, because it is a record of what
+was believed at the time.

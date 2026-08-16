@@ -160,6 +160,17 @@ type PeerResponse struct {
 	// has ingested nothing since yesterday reports yesterday, and a merge that
 	// hid that would look identical to a shard that is up to date and empty.
 	HighWatermark int64
+	// BehindSibling is set by the reader when this peer's watermark is below
+	// one a live sibling reported. It never refuses -- see checkWatermark --
+	// but it is named in the response so the shortfall is not silent.
+	BehindSibling bool
+	// HasWatermark says the peer SENT one, which is not the same as sending 0.
+	//
+	// A peer that omits the header predates it. A peer that sends 0 has
+	// accepted nothing, ever -- and collapsing the two into int64(0) let a
+	// replica that had lost its whole dataset answer for a shard whose sibling
+	// held data, at 200, with the shard's rows simply absent.
+	HasWatermark bool
 	// TraceID ties this response to the request across nodes.
 	TraceID string
 
@@ -188,12 +199,19 @@ func (p PeerResponse) String() string {
 // write is silently dropped, which would make completeness look true (the zero
 // value a reader sees for a missing header is "absent", and the first version
 // of this treated absent as complete).
-func writeEnvelope(h headerSetter, shard, replica int, complete bool, highWatermark int64, generation, traceID string) {
+// writeEnvelope stamps the protocol headers. hasWatermark false OMITS the
+// watermark rather than sending zero: a node that did not answer from its own
+// stores has no watermark to report, and a zero from it is not a statement
+// about any shard. A router sending 0 is what made the whole check inert one
+// level up -- the parent compared a router's zero against a leaf's real value.
+func writeEnvelope(h headerSetter, shard, replica int, complete bool, highWatermark int64, hasWatermark bool, generation, traceID string) {
 	h.Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
 	h.Set(HdrShardID, strconv.Itoa(shard))
 	h.Set(HdrReplicaID, strconv.Itoa(replica))
 	h.Set(HdrComplete, strconv.FormatBool(complete))
-	h.Set(HdrHighWatermark, strconv.FormatInt(highWatermark, 10))
+	if hasWatermark {
+		h.Set(HdrHighWatermark, strconv.FormatInt(highWatermark, 10))
+	}
 	h.Set(HdrNodeGeneration, generation)
 	if traceID != "" {
 		h.Set(HdrTraceID, traceID)
@@ -263,8 +281,16 @@ func (s *Server) serveEnvelope(next http.Handler) http.Handler {
 				break
 			}
 		}
+		// A ROUTER CLAIMS NO WATERMARK. This node's watermark describes this
+		// node's own stores, and a node with backends did not answer this read
+		// from them -- its own store is empty and its watermark is zero, which
+		// says nothing about the shards that actually answered.
+		hw, hasHW := int64(0), len(s.backends) == 0
+		if hasHW {
+			hw = s.highWatermark()
+		}
 		writeEnvelope(w.Header(), s.shardID, s.replicaID, complete,
-			s.highWatermark(), s.generation, r.Header.Get(HdrTraceID))
+			hw, hasHW, s.generation, r.Header.Get(HdrTraceID))
 		next.ServeHTTP(w, r)
 	})
 }

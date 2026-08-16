@@ -21,7 +21,7 @@ import (
 func vectorShard(t *testing.T, name, value string) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, true, "gen-test", "")
 		fmt.Fprintf(w, `{"status":"success","data":{"resultType":"vector","result":[
 			{"metric":{"__name__":%q},"value":[1767225600,%q]}]}}`, name, value)
 	}))
@@ -33,7 +33,7 @@ func vectorShard(t *testing.T, name, value string) *httptest.Server {
 func rangeShard(t *testing.T, name, v1, v2 string) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, true, "gen-test", "")
 		fmt.Fprintf(w, `{"status":"success","data":{"resultType":"matrix","result":[
 			{"metric":{"__name__":%q},"values":[[1767225600,%q],[1767225660,%q]]}]}}`,
 			name, v1, v2)
@@ -183,7 +183,7 @@ func TestAnUnreadableMatrixPointIsRefused(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			good := rangeShard(t, "m", "1", "2")
 			bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
+				writeEnvelope(w.Header(), 0, 0, true, 1, true, "gen-test", "")
 				w.Write([]byte(tc.body))
 			}))
 			t.Cleanup(bad.Close)

@@ -31,7 +31,7 @@ func fixtureShard(t *testing.T, bodies map[string]string) *httptest.Server {
 			http.NotFound(w, r)
 			return
 		}
-		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, true, "gen-test", "")
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(body))
 	}))

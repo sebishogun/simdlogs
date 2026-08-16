@@ -79,7 +79,7 @@ func newRecordingShard(t *testing.T) *recordingShard {
 		sh.bd = append(sh.bd, "limit="+r.FormValue("limit")+
 			" max_values_per_field="+r.FormValue("max_values_per_field"))
 		sh.mu.Unlock()
-		writeEnvelope(w.Header(), 0, 0, true, 0, "gen-test", "")
+		writeEnvelope(w.Header(), 0, 0, true, 0, true, "gen-test", "")
 		w.Write([]byte(`{"hits":[{"timestamp":"1970-01-01T00:00:00Z","total":1}]}`))
 	}))
 	t.Cleanup(sh.ts.Close)

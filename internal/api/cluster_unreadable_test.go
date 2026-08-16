@@ -28,7 +28,7 @@ import (
 func garbageShard(t *testing.T) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, true, "gen-test", "")
 		w.Write([]byte(`{"hits":`)) // truncated: invalid for every shape
 	}))
 	t.Cleanup(ts.Close)
@@ -181,7 +181,7 @@ func truncate(s string, n int) string {
 func hitsShard(t *testing.T, stamps []string, vals []int) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, true, "gen-test", "")
 		if !strings.Contains(r.URL.Path, "hits") {
 			w.Write([]byte(`{"values":[]}`))
 			return

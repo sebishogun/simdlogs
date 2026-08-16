@@ -95,7 +95,7 @@ func TestOnePressureLineNamesEveryCauseRejectingFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lines := srv.storagePressure()
+	lines := srv.storagePressureForTest()
 	if len(lines) != 1 {
 		t.Fatalf("%d lines for one tenant: %v", len(lines), lines)
 	}
@@ -126,7 +126,7 @@ func TestTheStateWordDistinguishesRejectionFromDegradation(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	lines := srv.storagePressure()
+	lines := srv.storagePressureForTest()
 	if len(lines) != 1 || !strings.Contains(lines[0], "writes REJECTED") {
 		t.Fatalf("a refused tenant does not say so: %v", lines)
 	}
@@ -147,7 +147,7 @@ func TestTheStateWordDistinguishesRejectionFromDegradation(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	lines = srv2.storagePressure()
+	lines = srv2.storagePressureForTest()
 	if len(lines) != 1 {
 		t.Fatalf("%v", lines)
 	}

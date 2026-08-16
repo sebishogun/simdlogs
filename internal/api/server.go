@@ -2130,18 +2130,25 @@ func hexdig(n byte) byte {
 	return 'a' + n - 10
 }
 
-// storagePressure describes every tenant at or past a storage threshold.
+// storagePressureForTest describes every tenant at or past a storage threshold.
+//
+// TEST-ONLY, and named so. Its one production caller was `readiness`, a
+// superseded handler deleted with the rest of the unwired baseline; readiness
+// reaches the same facts through storagePressureConditions. The string
+// rendering is what the observed-contract tests assert against, which is why it
+// is kept rather than deleted -- but a name that does not say so is exactly
+// what made six other helpers read as production API.
 //
 // Detached, like the compaction walk: it samples every open store, and holding
 // the lock every request needs while doing that would make a readiness probe a
 // source of latency.
-// storagePressure is the typed conditions rendered as one line per tenant.
+// storagePressureForTest is the typed conditions rendered as one line per tenant.
 //
 // One function, not two. It and storagePressureConditions had drifted into
 // different wordings of the same facts -- which is how the dead OverQuota arm
 // survived, and how the "3 tenant(s)" count bug got in: two renderings of one
 // state, each tested against itself.
-func (s *Server) storagePressure() []string {
+func (s *Server) storagePressureForTest() []string {
 	conds := s.storagePressureConditions()
 	out := make([]string, 0, len(conds))
 	for _, c := range conds {
@@ -2249,12 +2256,6 @@ func (s *Server) degradedLocked(key string, h storage.Health) {
 	s.degraded[key] = h
 }
 
-// acknowledgeDegraded is the operator's accept button: POST it and every
-// degraded tenant becomes ready.
-//
-// Administrative, because it silences a readiness failure. It reports how many
-// tenants it accepted and what is still degraded, so the operator sees what
-// they just took responsibility for rather than a bare 200.
 // listQuarantined answers what this node has quarantined and why.
 //
 // The COUNT already reached an operator through the
@@ -2293,6 +2294,12 @@ func (s *Server) listQuarantined(w http.ResponseWriter, r *http.Request) {
 	}{len(recs), recs})
 }
 
+// acknowledgeDegraded is the operator's accept button: POST it and every
+// degraded tenant becomes ready.
+//
+// Administrative, because it silences a readiness failure. It reports how many
+// tenants it accepted and what is still degraded, so the operator sees what
+// they just took responsibility for rather than a bare 200.
 func (s *Server) acknowledgeDegraded(w http.ResponseWriter, r *http.Request) {
 	if s.refuseInRouterMode(w, r, "acknowledging a degraded store",
 		"the router's own store is empty and never degrades; acknowledging here "+

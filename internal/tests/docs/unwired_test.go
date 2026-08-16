@@ -214,6 +214,7 @@ var exempt = map[string]string{
 	"SetDirRereadIntervalForTest": "the same, one flag over: -readiness-reread-interval arrives via config.DirRereadInterval",
 	"routeCountForTest":           "how many patterns the mux registered; the route audit, the route-count gate and the contract check call it, and all three are tests",
 	"ExecuteCountForTest":         "nothing in production counts this way -- the surfaces that need a count use the stats pipeline -- and its three callers test cancellation and admission",
+	"storagePressureForTest":      "the string rendering of storagePressureConditions; its one production caller was the superseded readiness handler, deleted with the rest of this baseline, and readiness reaches the same facts through the typed conditions",
 
 	// THIS SECTION IS EMPTY, and that is the goal state task #431 aimed at.
 	// Everything above is a deliberate test hook that says so in its name;

@@ -64,7 +64,7 @@ func newWMShard(t *testing.T, hits, watermark int64) *wmShard {
 		}
 		// complete=true, because that is the whole point: this peer's own store
 		// IS complete. Only the watermark says it is behind.
-		writeEnvelope(w.Header(), 0, 0, true, sh.wm.Load(), sh.gen.Load().(string), "")
+		writeEnvelope(w.Header(), 0, 0, true, sh.wm.Load(), true, sh.gen.Load().(string), "")
 		fmt.Fprintf(w, `{"hits":[{"timestamp":"1970-01-01T00:00:00Z","total":%d}]}`, sh.hits.Load())
 	}))
 	t.Cleanup(sh.ts.Close)
@@ -107,7 +107,30 @@ func hitsTotal(t *testing.T, ts *httptest.Server, query string) (int, int64, str
 	return code, total, raw
 }
 
-func TestALaggingReplicaDoesNotServeAShortAnswerAsComplete(t *testing.T) {
+// A replica below a SIBLING's watermark is named in the answer, not refused.
+//
+// This test used to expect 503, and that was wrong -- proven by a second
+// reviewer with a fixture this one cannot be told apart from: two replicas
+// holding the SAME twelve rows, watermarks 2000 and 1999. Kill the first and
+// the second was refused forever, on an answer that would have been
+// byte-identical.
+//
+// From the router's side the two situations are the same observation. One
+// replica's watermark being lower than another's is the ORDINARY state of a
+// shard taking writes -- replicas are microseconds apart all the time, and a
+// running maximum that survives retention makes them differ even when they hold
+// identical data. Nothing in one peer's answer separates "replication is a
+// millisecond behind" from "this replica lost a day", and refusing on it turns
+// every replica failure into a read outage. That is the failure that got the
+// first version of this check reverted; repeating it with a generation header
+// attached would have repeated the outage.
+//
+// So the cross-replica case is REPORTED: 200, with the shard named in
+// X-Simdlogs-Shards-Lagging and a warning logged. Refusing is reserved for the
+// two observations that have no benign reading, each with its own test:
+// TestAPeerThatWentBackwardsInOneProcessIsRefused and
+// TestAnEmptyReplicaIsNotServedAsAWholeAnswer.
+func TestAReplicaBelowASiblingIsNamedRatherThanRefused(t *testing.T) {
 	leader := newWMShard(t, 12, 2000)
 	lagging := newWMShard(t, 8, 1000)
 	ts := wmRouter(t, leader.ts.URL, lagging.ts.URL)
@@ -117,38 +140,68 @@ func TestALaggingReplicaDoesNotServeAShortAnswerAsComplete(t *testing.T) {
 	if code != 200 || total != 12 {
 		t.Fatalf("with the leader up: %d total=%d %s", code, total, raw)
 	}
-
-	// The leader goes away. The lagging replica answers, complete=true about
-	// its own store, with an older watermark -- and it is a DIFFERENT machine,
-	// carrying its own generation, so its shortfall is not explained by a
-	// restart.
-	//
-	// This is refused now. The first version refused unconditionally and was
-	// reverted because three ways to lower a watermark on a healthy cluster
-	// were found; all three are closed, and the fourth guard is that both
-	// sides of the comparison must carry a generation. 8 of 12 rows served at
-	// 200 is the confident-and-wrong answer the envelope exists to prevent.
 	leader.dead.Store(true)
-	code, total, raw = hitsTotal(t, ts, "*")
+
+	// Four reads: a refusal here was also permanent, because the old floor only
+	// ever rose.
+	for i := 0; i < 4; i++ {
+		resp := getWithHeaders(t, ts, "/select/logsql/hits?query=*&step=1h")
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("read %d: %d. A replica below a sibling's watermark must "+
+				"be served -- ordinary replication skew looks exactly like "+
+				"this, and refusing it makes one replica failure a read "+
+				"outage: %s", i, resp.StatusCode, body)
+		}
+		if got := resp.Header.Get(HdrShardsLagging); got != "0" {
+			t.Errorf("read %d: %s = %q, want \"0\". Serving the short answer "+
+				"is the right call; serving it SILENTLY is not, and the header "+
+				"is the whole difference between an operator who can see it "+
+				"and one who cannot", i, HdrShardsLagging, got)
+		}
+	}
+}
+
+// A peer that went backwards INSIDE ONE PROCESS is refused.
+//
+// This is the one watermark observation with no benign reading. A node's
+// watermark is a running maximum held in memory, so within a single generation
+// it cannot fall: a lower report from the same process, carrying the same
+// generation, is data that was there and is not.
+//
+// Everything that used to make a fall benign is now visible as something else:
+// a restart carries a new generation, a tenant eviction and an expiry cannot
+// lower a running maximum, and a different replica is a different key.
+func TestAPeerThatWentBackwardsInOneProcessIsRefused(t *testing.T) {
+	sh := newWMShard(t, 12, 2000)
+	ts := wmRouter(t, sh.ts.URL)
+
+	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 12 {
+		t.Fatalf("first read: %d total=%d %s", code, total, raw)
+	}
+	// The SAME process, same generation, now reporting less than it did.
+	sh.wm.Store(1000)
+	sh.hits.Store(8)
+
+	code, total, raw := hitsTotal(t, ts, "*")
 	if code == 200 {
-		t.Fatalf("served total=%d at 200 from a replica behind the highest "+
-			"watermark seen, from a different machine: %s", total, raw)
+		t.Fatalf("served total=%d at 200 from a process whose own watermark "+
+			"fell inside one generation. A running maximum cannot fall: %s",
+			total, raw)
 	}
 	if code != http.StatusServiceUnavailable {
 		t.Errorf("answered %d, want 503: %s", code, raw)
 	}
-	// And the escape hatch still works, which is what makes the refusal
-	// recoverable rather than an outage: a caller that would rather have the
-	// short answer can ask for it.
-	// hitsTotal returns early on any non-200, so the body is read directly:
-	// 206 IS the answer here, not a failure to parse.
+	// The escape hatch is what makes the refusal recoverable rather than an
+	// outage: a caller that would rather have the short answer can ask.
 	code, _, raw = getJSONFrom(t, ts,
 		"/select/logsql/hits?query=*&step=1h&allow_partial_response=1")
 	if code != http.StatusPartialContent {
 		t.Errorf("with allow_partial_response=1: %d, want 206: %s", code, raw)
 	}
 	if !strings.Contains(raw, `"total":8`) && !strings.Contains(raw, `"total":"8"`) {
-		t.Errorf("the partial answer does not carry the lagging replica's 8: %s", raw)
+		t.Errorf("the partial answer does not carry the short 8: %s", raw)
 	}
 }
 
@@ -303,34 +356,45 @@ func TestATenantEvictionDoesNotLowerTheWatermark(t *testing.T) {
 // records which peer set the high.
 func TestAReplacedMachineDoesNotInheritTheOldFloor(t *testing.T) {
 	h := &shardHigh{}
+	members := []string{"http://old:1", "http://sib:1"}
+	h.observe("http://old:1", "g1", 100, members)
+	h.observe("http://sib:1", "g1", 50, members)
 
-	// The original machine sets a high.
-	if behind, _, _ := h.observe("http://old:1", "g1", 100, []string{"http://old:1", "http://sib:1"}); behind {
-		t.Fatal("the first report was called behind")
+	// SetBackends repoints the index: `old` is gone, `new` takes its place.
+	repointed := []string{"http://new:1", "http://sib:1"}
+	if behind, _, certain := h.observe("http://new:1", "g1", 10, repointed); behind && certain {
+		t.Error("a machine that replaced the one which set a floor of 100 was " +
+			"REFUSED at 10. It has no history of its own, and 100 is not a " +
+			"number it ever claimed")
 	}
-	// Its sibling, genuinely behind, is reported.
-	behind, prev, _ := h.observe("http://sib:1", "g1", 50, []string{"http://old:1", "http://sib:1"})
-	if !behind || prev != 100 {
-		t.Errorf("a sibling at 50 against a high of 100 gave behind=%v prev=%d, "+
-			"want true and 100 -- this is the cross-replica lag the check exists for",
-			behind, prev)
+	// Its OWN history is what binds it: 10 is now its floor, and dropping
+	// below that inside one process is the one refusable observation.
+	if behind, prev, certain := h.observe("http://new:1", "g1", 5, repointed); !behind || !certain || prev != 10 {
+		t.Errorf("the replacement falling from its own 10 to 5 gave behind=%v "+
+			"certain=%v prev=%d, want true true 10", behind, certain, prev)
 	}
-	// Now the topology repoints the index: `old` is gone, `new` is empty.
-	behind, prev, _ = h.observe("http://new:1", "g1", 0, []string{"http://new:1", "http://sib:1"})
-	if behind {
-		t.Error("a machine that replaced the one which set the floor was called " +
-			"lagging; it has never been asked before and cannot be behind anything")
+	// And the machine that left takes its mark with it, so a floor cannot
+	// outlive the membership that produced it -- nor can the map grow with
+	// every machine that has ever held the index.
+	h.mu.Lock()
+	_, stillThere := h.marks["http://old:1"]
+	h.mu.Unlock()
+	if stillThere {
+		t.Error("the replaced machine's mark outlived its membership")
 	}
-	if prev != 100 {
-		t.Errorf("the discarded floor was %d, want 100", prev)
-	}
-	// And the new machine's own history takes over: a peer below IT is behind.
-	if behind, _, _ := h.observe("http://new:1", "g1", 200, []string{"http://new:1", "http://sib:1"}); behind {
-		t.Fatal("the new machine's own advance was called behind")
-	}
-	if behind, prev, _ := h.observe("http://sib:1", "g1", 150, []string{"http://new:1", "http://sib:1"}); !behind || prev != 200 {
-		t.Errorf("after the replacement a sibling at 150 against 200 gave "+
-			"behind=%v prev=%d, want true and 200", behind, prev)
+}
+
+// An EMPTY replacement is a different case, and it is refused: see
+// TestAnEmptyReplicaIsNotServedAsAWholeAnswer. A machine holding nothing cannot
+// stand in for a shard a live sibling reports data for, however it got there.
+func TestAnEmptyReplacementIsRefusedRatherThanServed(t *testing.T) {
+	h := &shardHigh{}
+	members := []string{"http://a:1", "http://b:1"}
+	h.observe("http://a:1", "g1", 100, members)
+	behind, prev, certain := h.observe("http://b:1", "g1", 0, members)
+	if !behind || !certain || prev != 100 {
+		t.Errorf("a replica reporting zero against a sibling at 100 gave "+
+			"behind=%v certain=%v prev=%d, want true true 100", behind, certain, prev)
 	}
 }
 
@@ -444,4 +508,167 @@ func TestAPeerWithNoGenerationIsReportedNotRefused(t *testing.T) {
 			t.Errorf("read %d: total=%d, want 6", i, total)
 		}
 	}
+}
+
+// ---- the three the second reviewer proved, all of them mine ----
+
+// F1. A replica that has accepted NOTHING is not a whole answer.
+//
+// The extreme value of the exact defect this check exists to close, and the
+// check skipped it: `p.HighWatermark == 0` read a reported zero as "the peer
+// did not say" and returned before comparing anything. A replica that lost its
+// data reports 0, so the whole shard's rows went missing at HTTP 200.
+//
+// Absent and zero are different answers. The client already told them apart --
+// it parses the header only `if hw != ""` -- and PeerResponse threw the
+// distinction away by storing both as int64(0).
+//
+// Zero is unambiguous in a way that "lower than a sibling" is not: a node that
+// has accepted no data at all cannot be a correct replica of a shard that has
+// some. That is why this refuses and TestASiblingHoldingTheSameRowsIsNotRefused
+// does not.
+func TestAnEmptyReplicaIsNotServedAsAWholeAnswer(t *testing.T) {
+	leader := newWMShard(t, 12, 2000)
+	empty := newWMShard(t, 0, 0) // lost its data: nothing accepted, ever
+	ts := wmRouter(t, leader.ts.URL, empty.ts.URL)
+
+	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 12 {
+		t.Fatalf("with the leader up: %d total=%d %s", code, total, raw)
+	}
+	leader.dead.Store(true)
+
+	code, _, raw := hitsTotal(t, ts, "*")
+	if code == 200 {
+		t.Fatalf("a replica holding NO data answered 200 for a shard whose "+
+			"other replica held 12 rows: %s\n\nThat is the whole shard "+
+			"disappearing from the result with nothing to say so -- the worst "+
+			"case of the defect the watermark check was written for, and it was "+
+			"the one case the check returned early on.", raw)
+	}
+	if code != 503 {
+		t.Errorf("empty replica answered %d, want 503: %s", code, raw)
+	}
+}
+
+// F3. A sibling holding the SAME rows is not refused.
+//
+// Two replicas of one shard legitimately report different watermarks -- they
+// ingest independently and a millisecond apart is normal. Refusing the lower
+// one turns a single replica failure into a read outage on data that is not
+// missing, which is the failure that got the previous version of this check
+// reverted, and the floor only ever rises so on an idle shard it never clears.
+//
+// docs/wrong.md entry 96 states the rule as "same peer, same generation, lower
+// watermark". The code refused ANY member's lower watermark. This pins the
+// documented rule, which is also the defensible one: a single process's
+// watermark is a running maximum and cannot fall, so a fall within one
+// generation is evidence. A cross-replica difference is not.
+func TestASiblingHoldingTheSameRowsIsNotRefused(t *testing.T) {
+	a := newWMShard(t, 12, 2000)
+	b := newWMShard(t, 12, 1999) // same rows, one tick behind
+	ts := wmRouter(t, a.ts.URL, b.ts.URL)
+
+	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 12 {
+		t.Fatalf("with A up: %d total=%d %s", code, total, raw)
+	}
+	a.dead.Store(true)
+
+	// Four reads: the refusal was also permanent, because the floor only rises.
+	for i := 0; i < 4; i++ {
+		code, total, raw := hitsTotal(t, ts, "*")
+		if code != 200 {
+			t.Fatalf("read %d: replica B was refused %d while holding the SAME "+
+				"12 rows as the replica that died. Its answer would have been "+
+				"byte-identical. One replica failing must not be a read "+
+				"outage: %s", i, code, raw)
+		}
+		if total != 12 {
+			t.Errorf("read %d: total=%d, want 12", i, total)
+		}
+	}
+}
+
+// F2. A router does not sign its children's partial answer as whole.
+//
+// serveEnvelope stamps Complete from this node's OWN degraded snapshot, before
+// the handler runs, and the fan-out never lowers it. A middle router that
+// answered 206 with one shard missing still told its parent Complete: true, so
+// the parent merged a knowingly-partial answer as a whole one.
+//
+// The same stamp is why the generation and watermark check was inert one level
+// up: a router holds no tenant data, so it sent watermark 0, which the old
+// zero-skip then discarded. A node that did not answer from its own stores
+// sends no watermark at all now.
+func TestARouterDoesNotSignItsChildrensPartialAnswerAsWhole(t *testing.T) {
+	up := newWMShard(t, 7, 3000)
+	down := newWMShard(t, 5, 3000)
+	down.dead.Store(true)
+
+	// A real two-level cluster: top -> middle -> two shards, one of which
+	// cannot answer. Hand-stamping the internal header on a client request
+	// would test the middleware; this tests what a parent actually receives.
+	mid, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mid.Close() })
+	mid.SetBackends([]string{up.ts.URL, down.ts.URL})
+	mid.SetReplicas(1) // two separate shards
+	midTS := httptest.NewServer(mid.Handler())
+	t.Cleanup(midTS.Close)
+
+	top := wmRouter(t, midTS.URL)
+
+	// What the middle tells a PARENT, on the internal path the peer client uses.
+	req, err := http.NewRequest("GET", midTS.URL+
+		"/select/logsql/hits?query=*&step=1h&allow_partial_response=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(HdrInternal, "1")
+	req.Header.Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	complete := resp.Header.Get(HdrComplete)
+	if resp.StatusCode == 206 && complete == "true" {
+		t.Errorf("the middle router answered 206 partial and stamped %s: true. "+
+			"Its parent merges that as a whole answer, so a shard missing two "+
+			"levels down is invisible at the top: %s", HdrComplete, body)
+	}
+	// A router must not claim a watermark either: it answers from its children,
+	// not from a store of its own, and a parent comparing its zero against a
+	// leaf's real watermark is what made the whole check inert one level up.
+	if hw := resp.Header.Get(HdrHighWatermark); hw != "" && hw != "0" {
+		t.Logf("router watermark %q", hw)
+	}
+	if hw := resp.Header.Get(HdrHighWatermark); hw == "0" {
+		t.Errorf("the middle router sent %s=0. It holds no tenant data, so "+
+			"that zero is not a statement about any shard -- and treating a "+
+			"reported zero as real (which an empty replica requires) then "+
+			"makes every router look like it lost its data", HdrHighWatermark)
+	}
+
+	// And the end-to-end consequence: the TOP must not answer as if whole.
+	code, total, raw := hitsTotal(t, top, "*")
+	if code == 200 && total == 7 {
+		t.Errorf("the top router answered 200 with 7 of the cluster's 12 rows. "+
+			"The middle knew a shard was missing and said Complete: true, so "+
+			"nothing at the top could tell: %s", raw)
+	}
+}
+
+// getWithHeaders does one GET and hands back the response WITH its headers,
+// which getRaw and hitsTotal both discard. The headers are the finding here.
+func getWithHeaders(t *testing.T, ts *httptest.Server, path string) *http.Response {
+	t.Helper()
+	resp, err := http.Get(ts.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
 }

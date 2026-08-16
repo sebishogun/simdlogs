@@ -140,7 +140,7 @@ func TestAnInvalidBudgetRefusesToStart(t *testing.T) {
 
 // One tenant under pressure is ONE tenant, however many budgets it trips.
 //
-// storagePressure returns one string per finding and readiness prints
+// storagePressureForTest returns one string per finding and readiness prints
 // `len(pressure)` as "N tenant(s) under storage pressure". Splitting the
 // per-tenant switch into three independent ifs -- to fix a dead arm that could
 // never print -- made one tenant tripping the reject reserve, the warn reserve

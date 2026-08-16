@@ -314,6 +314,7 @@ func (c *clusterClient) do(
 			return out
 		}
 		out.HighWatermark = n
+		out.HasWatermark = true
 	}
 	if id := resp.Header.Get(HdrTraceID); id != "" {
 		out.TraceID = id

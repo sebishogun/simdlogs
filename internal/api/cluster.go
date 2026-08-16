@@ -999,10 +999,18 @@ func withFormInURL(r *http.Request) (*http.Request, []byte) {
 //
 // One atomic per read and no extra replica asked.
 func (s *Server) checkWatermark(p *PeerResponse, shard int) {
-	// A zero watermark is "the peer did not say", not "the epoch". A peer that
-	// omits the header is on an older protocol version, and treating silence as
-	// maximally-lagging would fail every read against it.
-	if !p.OK() || p.HighWatermark == 0 {
+	// ABSENT is not ZERO, and the two used to be the same value here.
+	//
+	// A peer that omits the header is on a build that predates it, and treating
+	// silence as maximally-lagging would fail every read against it. A peer that
+	// SENDS zero has accepted nothing, which is a statement -- and skipping it
+	// as if it were silence let a replica that had lost its entire dataset
+	// answer 200 for a shard whose sibling held twelve rows. The whole shard
+	// disappeared from the result with nothing to say so.
+	//
+	// The client always knew the difference: it parses the header only when it
+	// is present. PeerResponse threw that away by storing both as int64(0).
+	if !p.OK() || !p.HasWatermark {
 		return
 	}
 	// The shard's current replica set, so a high set by a machine that has
@@ -1050,13 +1058,24 @@ func (s *Server) checkWatermark(p *PeerResponse, shard int) {
 		// the answer is refused and the client retries.
 		if certain {
 			p.Complete = false
+			return
 		}
+		// NOT certain, so not refused -- and not silent either. The shard is
+		// named in the response, which is the difference between an operator
+		// who can see a short answer and one who cannot.
+		p.BehindSibling = true
 		return
 	}
 	if prev > 0 {
-		obs.L().Info("a shard's watermark floor was set by a peer that has left the topology",
+		// A RESTART, and nothing else reaches here. The message used to say the
+		// floor's owner "has left the topology", which it shared with a
+		// peer-replacement branch that no longer exists -- marks are keyed by
+		// peer URL and dropped when the URL leaves the member list, so there is
+		// nothing to report about that case and every line here was a restart
+		// being described as a departure.
+		obs.L().Info("a peer restarted, so its watermark floor starts again",
 			obs.FieldEvent, "cluster.watermark_floor_reset",
-			obs.FieldShard, shard, "peer", p.URL,
+			obs.FieldShard, shard, "peer", p.URL, "generation", p.Generation,
 			"watermark", p.HighWatermark, "previous_floor", prev)
 	}
 }
@@ -1090,65 +1109,142 @@ func (s *Server) shardHW(shard int) *shardHigh {
 //
 // A small mutex rather than two atomics: the pair must move together, and this
 // is one lock per shard per read against a network round trip.
-type shardHigh struct {
-	mu   sync.Mutex
-	hw   int64
-	peer string
-	gen  string
+// peerMark is one peer's last report: its watermark and the process that made
+// it. Keyed by peer URL rather than by shard index, so SetBackends repointing an
+// index at a different machine cannot hand the new machine the old one's floor.
+type peerMark struct {
+	hw int64
+	// floor is the highest this peer has reported WITHIN gen. A process's
+	// watermark is a running maximum, so its own floor is the one number it
+	// cannot go below; comparing against the last report instead made the fall
+	// a single-read event -- refused once, then silently served short forever,
+	// because the next read compared 1000 against 1000.
+	floor int64
+	gen   string
 }
 
-// observe records a peer's watermark and reports whether it is behind a high
-// set by a peer that is STILL a replica of this shard.
+// shardHigh is what this router has heard from each replica of one shard.
 //
-// stale is true when the recorded high came from a peer the topology no longer
-// lists, in which case the caller has nothing to compare against and the high
-// is replaced rather than enforced.
-// certain is false when either side of the comparison carries no generation --
-// a peer on a build that predates the header. Then a fall is still reported,
-// because it may be real, and it does not REFUSE: during a rolling upgrade an
-// old peer restarting looks exactly like one falling behind, and a false 503 is
-// the worse of the two failures.
+// PER PEER, not one floor for the shard. A single shared floor compared every
+// replica against the highest any of them had ever reported, which is not a
+// statement any of them made: two replicas of a shard are microseconds apart
+// under ordinary ingest, so the lower one was refused continuously on data that
+// was not missing, and because the floor only ever rose, one replica failing
+// became a permanent read outage on an idle shard. Measured: two replicas
+// holding the SAME twelve rows at watermarks 2000 and 1999, kill the first, and
+// the second was refused 503 forever with an answer that would have been
+// byte-identical.
+type shardHigh struct {
+	mu    sync.Mutex
+	marks map[string]peerMark
+}
+
+// observe records a peer's report and says whether it is evidence of loss.
+//
+// `certain` separates the two things this can see, because only one of them
+// justifies refusing a read:
+//
+//   - CERTAIN. A single process's watermark is a running maximum, so it cannot
+//     fall. The same peer, in the same generation, reporting lower than it did
+//     is either data loss or a lie, and there is no benign reading. So is a
+//     peer reporting ZERO -- it has accepted nothing, ever -- while a live
+//     member of the same shard has reported data.
+//
+//   - NOT CERTAIN, and reported only. A peer whose watermark is merely below a
+//     sibling's. That is the ordinary state of a replicated shard taking
+//     writes, and nothing in one peer's answer distinguishes "replication is a
+//     millisecond behind" from "this replica lost a day". Refusing it was the
+//     failure that got the first version of this check reverted, and narrowing
+//     the refusal to the two cases above is what makes the check deployable at
+//     all.
+//
+// certain is also false when either side of a comparison carries no generation:
+// a peer on a build predating the header cannot be told apart from one that
+// restarted, and a rolling upgrade must not produce a cluster-wide 503.
 func (h *shardHigh) observe(peer, gen string, hw int64, members []string) (behind bool, prev int64, certain bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if hw >= h.hw {
-		prevGen := h.gen
-		h.hw, h.peer, h.gen = hw, peer, gen
-		return false, 0, gen != "" && prevGen != ""
+	if h.marks == nil {
+		h.marks = make(map[string]peerMark, 2)
 	}
-	// THE PEER THAT SET THE FLOOR RESTARTED, so the floor is not evidence.
-	//
-	// This is the third of the three ways a watermark falls on a healthy
-	// cluster, and the one that kept this a log line instead of a refusal: a
-	// node re-derives its watermark from the stores that load, so a replica
-	// whose newest data retention already deleted comes back below its own
-	// previous report with nothing wrong.
-	//
-	// It needs no durable watermark, only the ability to tell the two apart --
-	// and a process that restarted says so by carrying a different generation.
-	// Only when the SAME peer is reporting: a different peer's lower answer is
-	// a genuine cross-replica comparison, and if that peer restarted its own
-	// floor is discarded when it next sets one.
-	if peer == h.peer && gen != "" && h.gen != "" && gen != h.gen {
-		prev = h.hw
-		h.hw, h.peer, h.gen = hw, peer, gen
-		return false, prev, true
-	}
-	present := false
-	for _, m := range members {
-		if m == h.peer {
-			present = true
-			break
+	old, seen := h.marks[peer]
+	// Same process: the floor is this peer's own running maximum. A different
+	// generation is a restart, which re-derives the watermark from the stores
+	// that load, so the floor starts again from what it now reports.
+	sameProcess := seen && gen != "" && old.gen != "" && gen == old.gen
+	unknownProcess := seen && (gen == "" || old.gen == "")
+	mk := peerMark{hw: hw, gen: gen, floor: hw}
+	if sameProcess || unknownProcess {
+		mk.floor = old.floor
+		if hw > mk.floor {
+			mk.floor = hw
 		}
 	}
-	if !present {
-		// The machine that set this floor is gone. Adopt the live peer's value:
-		// there is no sibling to be behind.
-		prev = h.hw
-		h.hw, h.peer, h.gen = hw, peer, gen
-		return false, prev, true
+	h.marks[peer] = mk
+	// Forget peers the topology no longer lists, so a replaced machine's report
+	// cannot outlive it and the map cannot grow without bound.
+	if len(members) > 0 {
+		for u := range h.marks {
+			if u == peer {
+				continue
+			}
+			live := false
+			for _, m := range members {
+				if m == u {
+					live = true
+					break
+				}
+			}
+			if !live {
+				delete(h.marks, u)
+			}
+		}
 	}
-	return true, h.hw, gen != "" && h.gen != ""
+
+	// A PEER BELOW ITS OWN FLOOR.
+	if seen && hw < old.floor {
+		switch {
+		case sameProcess:
+			return true, old.floor, true
+		case unknownProcess:
+			// A build without the header: a restart and a loss look the same.
+			return true, old.floor, false
+		default:
+			// It restarted. Not evidence, and the mark above already re-based.
+			return false, old.floor, true
+		}
+	}
+
+	// A PEER THAT HAS ACCEPTED NOTHING, standing in for a shard that has data.
+	//
+	// Zero is unambiguous where "lower than a sibling" is not: a node holding
+	// no data at all cannot be a correct replica of a shard some live member
+	// reports data for. It is also the extreme case of the defect this whole
+	// check exists for -- the entire shard vanishing from the result at 200 --
+	// and the version that skipped every zero as "the peer did not say" let
+	// exactly that through.
+	if hw == 0 {
+		for _, m := range members {
+			if m == peer {
+				continue
+			}
+			if mk, ok := h.marks[m]; ok && mk.hw > 0 {
+				return true, mk.hw, true
+			}
+		}
+		return false, 0, gen != ""
+	}
+
+	// BELOW A SIBLING. Reported, never refused: see the doc comment.
+	for _, m := range members {
+		if m == peer {
+			continue
+		}
+		if mk, ok := h.marks[m]; ok && mk.hw > hw {
+			return true, mk.hw, false
+		}
+	}
+	return false, 0, gen != ""
 }
 
 // mergeDecode unmarshals one shard's answer into v, refusing rather than
@@ -1998,6 +2094,12 @@ const (
 	HdrShardsTotal    = "X-Simdlogs-Shards-Total"
 	HdrShardsAnswered = "X-Simdlogs-Shards-Answered"
 	HdrShardsMissing  = "X-Simdlogs-Shards-Missing"
+	// HdrShardsLagging names shards served by a replica whose watermark is
+	// below a sibling's. Separate from HdrShardsMissing because it does NOT
+	// refuse: a replica microseconds behind under ordinary ingest is
+	// indistinguishable from one that lost a day, so the answer is served and
+	// the shortfall is said out loud instead of only being logged.
+	HdrShardsLagging = "X-Simdlogs-Shards-Lagging"
 )
 
 // fanOutChecked fans out, then enforces the completeness rule.
@@ -2090,7 +2192,11 @@ func (s *Server) fanOutChecked(
 
 	var missing []string
 	var incomplete []string
+	var lagging []string
 	for i, p := range peers {
+		if p.BehindSibling {
+			lagging = append(lagging, strconv.Itoa(i))
+		}
 		switch {
 		case !p.OK():
 			missing = append(missing, fmt.Sprintf("%d(%s)", i, p.Class))
@@ -2102,6 +2208,9 @@ func (s *Server) fanOutChecked(
 			incomplete = append(incomplete, strconv.Itoa(i))
 		}
 	}
+	if len(lagging) > 0 {
+		w.Header().Set(HdrShardsLagging, strings.Join(lagging, ","))
+	}
 	bad := append(append([]string(nil), missing...), incomplete...)
 	if len(bad) == 0 {
 		return answersOf(peers), w, true
@@ -2111,6 +2220,19 @@ func (s *Server) fanOutChecked(
 	w.Header().Set(HdrShardsTotal, strconv.Itoa(len(peers)))
 	w.Header().Set(HdrShardsAnswered, strconv.Itoa(answered))
 	w.Header().Set(HdrShardsMissing, strings.Join(bad, ","))
+	// AND THIS NODE'S OWN ENVELOPE STOPS SAYING THE ANSWER IS WHOLE.
+	//
+	// serveEnvelope stamps Complete from this node's degraded snapshot, before
+	// the handler runs, and nothing lowered it afterwards. A middle router that
+	// answered 206 with a shard missing still told its PARENT Complete: true,
+	// so the parent merged a knowingly-partial answer as a whole one and a
+	// shard missing two levels down was invisible at the top.
+	//
+	// Set here, before any byte of the body is written: a header set after the
+	// first write is dropped silently.
+	if w.Header().Get(HdrComplete) != "" {
+		w.Header().Set(HdrComplete, "false")
+	}
 
 	if r.FormValue(partialParam) != "1" {
 		obs.L().Error("cluster read refused: shards missing",

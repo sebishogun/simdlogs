@@ -51,7 +51,7 @@ var federatedEndpoints = []struct {
 func goodShard(t *testing.T) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, true, "gen-test", "")
 		switch {
 		case strings.Contains(r.URL.Path, "hits"):
 			w.Write([]byte(`{"hits":[]}`))
@@ -198,7 +198,7 @@ func TestPartialIsOptInAndMarked(t *testing.T) {
 func TestADegradedShardCountsAsIncomplete(t *testing.T) {
 	degraded := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// A valid answer, explicitly not complete.
-		writeEnvelope(w.Header(), 0, 0, false, 1, "gen-test", "")
+		writeEnvelope(w.Header(), 0, 0, false, 1, true, "gen-test", "")
 		w.Write([]byte(""))
 	}))
 	defer degraded.Close()

@@ -199,7 +199,7 @@ func (s *Server) healthDetailAllowed(r *http.Request) bool {
 	return p != nil && (p.Can(config.RoleMetrics) || p.Can(config.RoleAdmin))
 }
 
-// storagePressureConditions is storagePressure as typed conditions.
+// storagePressureConditions is storagePressureForTest as typed conditions.
 //
 // The text form stays for the compatibility routes; this one separates
 // "degraded but accepting" from "refusing writes", which the single string
