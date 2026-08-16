@@ -399,6 +399,8 @@ func TestABodyThatParsesButIsNotAStateIsRefused(t *testing.T) {
 		{"groups as a VALUE", `{"note":"groups"}`, true},
 		{"groups inside a longer value", `{"msg":"no groups here"}`, true},
 		{"groups as a nested key", `{"inner":{"groups":[]}}`, true},
+		{"groups is null", `{"groups":null}`, true},
+		{"groups is null with space", `{"groups": null }`, true},
 		{"an array", `[]`, true},
 		{"a bare string", `"groups"`, true},
 	} {
@@ -463,5 +465,106 @@ func TestASelfOverlappingReplicaCannotCertifyAPair(t *testing.T) {
 	// A single group can never overlap itself, however wide.
 	if got := selfOverlap(doubled[:1]); got != "" {
 		t.Errorf("one group reported as overlapping: %s", got)
+	}
+}
+
+// Two ordinary flushes touching at one timestamp DO NOT converge, and the
+// stall is reported rather than silent. Through the real handler.
+//
+// This test asserts a limitation, not a feature, and it is here so the
+// limitation cannot be lost by accident.
+//
+// The router decides whether two groups may hold the same rows from their
+// [TimeMin,TimeMax] spans alone, and those two shapes are indistinguishable
+// that way:
+//
+//	two adjacent flushes           [T0,T1] [T1,T2]   different rows
+//	a re-ingest of one instant     [T1,T1] [T1,T1]   the same rows twice
+//
+// Three variants were tried, each broken by a reviewer who broke the previous
+// one: no check at all duplicated a clean replica's every row at
+// complete: true; a half-open test did the same, because a single-instant
+// re-ingest shares exactly one endpoint like an ordinary adjacency; the closed
+// test here duplicates nothing and stalls on ordinary adjacency.
+//
+// Repair's promise is that it never makes a replica worse, so this is the
+// right one of the three. It is not the right answer: that needs the
+// DESTINATION to compare the rows at the overlapping instant, which is
+// evidence it has and the router does not.
+func TestTouchingFlushesStallLoudlyRatherThanDuplicate(t *testing.T) {
+	_, router, nodes := replicatedShard(t, 3)
+
+	postLines(t, nodes[0].URL,
+		line("2026-06-01T12:00:00Z", "a"), line("2026-06-01T12:00:10Z", "b"))
+	postLines(t, nodes[0].URL,
+		line("2026-06-01T12:00:10Z", "c"), line("2026-06-01T12:00:20Z", "d"))
+	if got := rowCount(t, nodes[0]); got != 4 {
+		t.Fatalf("replica 0 has %d rows, want 4", got)
+	}
+
+	rep := runRepair(t, router)
+
+	// The part that must never regress: nothing is duplicated.
+	if got := rowCount(t, nodes[0]); got != 4 {
+		t.Errorf("repair changed the SOURCE to %d rows; it must only ever add to "+
+			"a replica that is behind", got)
+	}
+	for i, n := range nodes[1:] {
+		if got := rowCount(t, n); got > 4 {
+			t.Errorf("replica %d has %d rows, more than the source's 4: repair "+
+				"duplicated rows, which is the outcome this whole guard exists "+
+				"to prevent", i+1, got)
+		}
+	}
+
+	// The part that is a limitation, asserted so it cannot vanish quietly.
+	if rep.SelfOverlapping == 0 {
+		t.Error("two touching flushes were not reported as an inconclusive span " +
+			"pair; if this now passes, the router has learned to tell an " +
+			"adjacency from a duplicate and this test should be replaced by the " +
+			"convergence one")
+	}
+	if rep.Complete {
+		t.Error("a pass that could not converge reported itself complete")
+	}
+	if rep.Blocked == 0 {
+		t.Error("nothing was reported blocked, so an operator reading the report " +
+			"cannot see that a replica is still short")
+	}
+	if len(rep.Errors) == 0 {
+		t.Error("no error names the replicas an operator has to look at")
+	}
+	// The message has to say what the operator must actually check.
+	joined := strings.Join(rep.Errors, " ")
+	if !strings.Contains(joined, "same rows") {
+		t.Errorf("the error does not say what to check: %q", joined)
+	}
+}
+
+// A replica that really does hold duplicate rows is reported and cannot
+// certify a pair -- through the real handler, and without stalling the others.
+func TestASelfOverlappingReplicaIsReportedThroughTheHandler(t *testing.T) {
+	_, router, nodes := replicatedShard(t, 2)
+
+	// Replica 0 ingests one range, then ingests an overlapping range again --
+	// a retried batch with no write id, which is what a client library does
+	// after a timeout.
+	postLines(t, nodes[0].URL,
+		line("2026-06-01T12:00:00Z", "a"), line("2026-06-01T12:00:09Z", "b"))
+	postLines(t, nodes[0].URL,
+		line("2026-06-01T12:00:01Z", "a2"), line("2026-06-01T12:00:09Z", "b2"))
+
+	rep := runRepair(t, router)
+	if rep.SelfOverlapping == 0 {
+		t.Errorf("a replica holding two groups over the same span was not "+
+			"reported; it must not be trusted to certify that two groups "+
+			"differ: %+v", rep)
+	}
+	if rep.Complete {
+		t.Errorf("a pass that found a self-overlapping replica reported itself "+
+			"complete: %+v", rep)
+	}
+	if len(rep.Errors) == 0 {
+		t.Error("nothing in Errors names the replica an operator has to look at")
 	}
 }

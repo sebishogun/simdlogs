@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -221,6 +222,10 @@ type RepairReport struct {
 	// declined and nothing else is counted would otherwise be indistinguishable
 	// from a shard that was already in step.
 	Declined int `json:"declined"`
+	// SelfOverlapping is replicas whose own inventory holds two groups over
+	// the same span. Such a store already holds duplicate rows; it is still a
+	// source and a destination and it cannot certify that two groups differ.
+	SelfOverlapping int `json:"selfOverlapping"`
 	// Complete is false when any replica could not be reached, or when the
 	// bounds cut the pass short. A caller that treats an incomplete pass as
 	// convergence has re-created the problem repair exists to solve.
@@ -295,6 +300,26 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			for _, g := range st.Groups {
+				// The WIDEST span any holder reports for this digest, not the
+				// last one seen.
+				//
+				// This was last-writer-wins, and the guard then compared a
+				// span the router took on one peer's word. A peer reporting a
+				// real digest with a fabricated far-future span made the
+				// overlap check miss, and a CLEAN replica was copied onto and
+				// had every row duplicated -- reported as complete, with
+				// selfOverlapping 0, because the fabricated spans were
+				// disjoint. Widening is fail-safe: a lie can now only cause
+				// MORE blocking, which is a reported stall rather than silent
+				// duplication.
+				if have, ok := union[g.Digest]; ok {
+					if have.TimeMin < g.TimeMin {
+						g.TimeMin = have.TimeMin
+					}
+					if have.TimeMax > g.TimeMax {
+						g.TimeMax = have.TimeMax
+					}
+				}
 				union[g.Digest] = g
 			}
 		}
@@ -319,10 +344,14 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 			}
 			if bad := selfOverlap(st.Groups); bad != "" {
 				sr.SelfOverlapping++
+				rep.SelfOverlapping++
 				rep.Errors = append(rep.Errors, fmt.Sprintf(
-					"shard %d replica %d holds overlapping groups of its own (%s): it "+
-						"is not trusted to certify that two groups differ, and its own "+
-						"duplication needs an operator",
+					"shard %d replica %d holds two groups whose spans touch or overlap "+
+						"(%s). From spans alone this router cannot tell an ordinary pair "+
+						"of adjacent flushes from a re-ingest that duplicated rows, so it "+
+						"will not use this replica to certify that two groups differ -- "+
+						"which means a replica behind it stays short until you check "+
+						"whether those two groups hold the same rows",
 					shardIdx, st.Replica, bad))
 				rep.Complete = false
 				continue
@@ -558,8 +587,18 @@ func (s *Server) askReplicaState(r *http.Request, shard, replica int, u string) 
 		st.Err = "the answer is not a JSON object: " + err.Error()
 		return st
 	}
-	if _, ok := keys["groups"]; !ok {
-		st.Err = "the answer parsed but is not a replica state (no groups key)"
+	// The key must be present AND non-null. `{"groups":null}` has the key and
+	// unmarshals to a nil Groups, which is indistinguishable from an empty
+	// replica -- and a real empty node emits `"groups":[]`, so rejecting null
+	// costs no false negatives.
+	//
+	// Recorded because the round-four commit message claimed this check was
+	// here and it was not, on the same function whose round-three commit
+	// message claimed the key check was here and it was not. Twice, on one
+	// function, in consecutive commits.
+	raw, ok := keys["groups"]
+	if !ok || string(bytes.TrimSpace(raw)) == "null" {
+		st.Err = "the answer parsed but is not a replica state (no usable groups key)"
 		return st
 	}
 	got.Shard, got.Replica, got.URL = shard, replica, u
@@ -730,8 +769,41 @@ func overlappingFrom(have []storage.GroupDigest, g storage.GroupDigest,
 	return overlapping(candidates, g)
 }
 
-// selfOverlap returns a description of the first overlapping pair within one
-// replica's own inventory, or "" when there is none.
+// selfOverlap returns a description of the first overlapping-or-touching pair
+// within one replica's own inventory, or "" when there is none.
+//
+// # This is deliberately conservative, and the conservatism costs convergence
+//
+// The test is CLOSED, so it fires on two groups that merely touch at one
+// instant -- which is what an ordinary pair of flushes produces on any
+// second-resolution source. That replica is then excluded from `holders`, the
+// exemption cannot fire, and a replica behind it stays short until an operator
+// intervenes. It is reported loudly (SelfOverlapping, Complete false, a named
+// error) rather than silently.
+//
+// That is a choice between two bad outcomes, and it is the right one. The
+// alternatives were measured, each by a reviewer who broke the previous one:
+//
+//	no check at all      a peer with duplicate groups makes every exemption
+//	                     fire, a CLEAN replica is copied onto, all its rows
+//	                     are duplicated, complete: true. Silent, destroys data.
+//	strict (half-open)   the same, because a re-ingest of ONE instant produces
+//	                     two groups with identical [T,T] spans -- structurally
+//	                     identical to a legitimate adjacency.
+//	closed (this)        no duplication; a permanent, reported stall on
+//	                     ordinary adjacency.
+//
+// Repair's promise is that it never makes a replica worse, so a loud stall
+// beats silent duplication.
+//
+// # Spans cannot decide this, and the fix is not here
+//
+// The two shapes are indistinguishable in [TimeMin,TimeMax] alone. Deciding
+// correctly needs evidence this router does not have and cannot be given by a
+// peer's own report: whether the ROWS in the overlapping instant are the same
+// rows. The destination has them -- AdoptGroup parses the group and holds the
+// store's index -- so that is where the decision belongs. Until it moves
+// there, this stalls rather than guesses.
 //
 // O(n^2) over one shard's groups, run once per replica per pass. A shard holds
 // tens to hundreds of groups, and this decides whether that replica may exempt
@@ -740,6 +812,7 @@ func selfOverlap(groups []storage.GroupDigest) string {
 	for i := range groups {
 		for j := i + 1; j < len(groups); j++ {
 			a, b := groups[i], groups[j]
+			// CLOSED, and it costs a stall. Read the note above the function.
 			if a.TimeMin <= b.TimeMax && b.TimeMin <= a.TimeMax {
 				return fmt.Sprintf("%s [%d,%d] and %s [%d,%d]",
 					shortDigest(a.Digest), a.TimeMin, a.TimeMax,

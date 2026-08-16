@@ -4686,3 +4686,86 @@ all, and the fix that WAS written rested on an invariant a retried ingest
 breaks. Four rounds, and every round's defects were found by running a cluster
 or by an adversary reading with intent — never by the person who wrote them
 reading them again.
+
+## 48. Three ways to decide one thing, each broken by the reviewer who broke the last
+
+Repair must not copy a group whose rows a destination already holds under
+different bytes. The router decides that from `[TimeMin,TimeMax]` alone, and
+two shapes are indistinguishable that way:
+
+    two adjacent flushes        [T0,T1] [T1,T2]   different rows
+    a re-ingest of one instant  [T1,T1] [T1,T1]   the same rows twice
+
+Three variants shipped in one session. Each was broken by the reviewer who had
+broken the previous one, and each break was a live reproduction:
+
+| | duplication | convergence |
+|---|---|---|
+| no self-check (entry 46) | **silent**, a clean replica's every row doubled at `complete: true` | fine |
+| closed self-check (entry 47) | none | **permanent stall** on ordinary adjacency |
+| half-open self-check | **silent**, same as the first | fine |
+
+The half-open attempt is the instructive one. It looked obviously right — a
+shared boundary instant is what a flush produces, a real overlap is what
+duplication produces — and it is wrong because a re-ingest of a SINGLE instant
+produces two groups with identical `[T,T]` spans, which share exactly one
+endpoint and are structurally identical to a legitimate adjacency. I checked
+that against the reviewer's three-group reproduction, found it still caught by
+a different pair, and shipped it. The two-group case defeats it and I had not
+constructed one.
+
+**Sufficiency, settled.** If two groups share a row at time *t* then *t* lies
+in both spans, so the CLOSED test always fires: it is sufficient, and it is not
+necessary. Every failure above is the unnecessary direction.
+
+What ships is the closed test: no duplication, and a permanent stall that is
+reported (`SelfOverlapping`, `complete: false`, an error naming the pair and
+saying what to check). Repair's stated promise is that it never makes a replica
+worse, so a loud stall beats silent duplication — but it is the least bad of
+three, not an answer. The answer needs evidence the router does not have and
+cannot be given by a peer's report: whether the rows AT the overlapping instant
+are the same rows. `AdoptGroup` at the destination parses the group and holds
+the store's index. Task 428.
+
+**A fourth break, in the same pass.** `union[g.Digest] = g` was
+last-writer-wins, so the guard compared a span taken on one peer's word. A peer
+reporting a real digest with a fabricated far-future span made the check miss,
+and a clean replica had every row duplicated — `selfOverlapping: 0`, complete,
+because the fabricated spans were disjoint. The union now keeps the WIDEST span
+any holder reports, which is fail-safe: a lie can only cause more blocking, and
+more blocking is a reported stall.
+
+**Two more measured this round.**
+
+`looksLikeJSONObject` was restricted to a shard body's last line on the
+reasoning that a response is truncated at its end. Both reviewers rejected it
+independently, with the same constructed input: it is a WELL-FORMEDNESS check,
+not a truncation check, and a middle line ending in a nested value's `}` passes
+the cheap check and reaches the client as a row. One of them also showed the
+restriction was defeated by a single trailing newline, since `last` was
+computed on byte position. Truncation is caught a layer above anyway — a cut
+response fails `io.ReadAll` and is classified `PeerUnavailable` — so the
+restriction dropped the only case that could reach the check. Full check on
+every line again, at a measured +188.5% instructions on a 60,000-row bare
+select.
+
+Two attempts to buy that back:
+
+| | narrow (~90 B) | wide (~980 B) |
+|---|---|---|
+| byte at a time | 51,744 ns | 425,872 ns |
+| `bytes.IndexAny` to jump between structural bytes | 171,182 ns | 478,139 ns |
+| shipped: byte at a time, string skip inlined | 53,184 ns | 434,764 ns |
+
+`IndexAny` is **3.9× slower** on the narrow shape — it decodes a rune and scans
+the cutset per byte, which is worse than a five-way switch. Measured, reverted,
+recorded. Inlining `skipStringRaw` into the walk (Go does not inline a function
+containing a loop) closed the remaining 1.26× to within the 8.3% noise floor.
+
+`max_values_per_field=0` meant "unlimited" to `facetKeep` and "1000" to
+`timeFacet` — so the coordinator sending shards `0` to get their whole
+distribution bounded each shard's `_time` scan to 1000 ROWS, not distinct
+values, and `_time` vanished from every cluster facet answer on any tenant with
+more than 1000 matching rows per shard. Fixing the parameter for one field
+exposed the same trap one layer down, in the function that reads the same
+value with the opposite convention.

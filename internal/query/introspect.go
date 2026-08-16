@@ -287,17 +287,28 @@ func facetKeep(distinct, maxPerField int, keepConst bool) bool {
 // timestamps themselves. Only worth materializing while the result is small
 // enough for the field to survive the cardinality rule anyway, so the scan is
 // bounded to maxPerField+1 rows and abandoned past it.
+//
+// maxPerField <= 0 is UNLIMITED here, as it is in facetKeep's own
+// `maxPerField > 0 &&` guard. It used to mean defaultFacetMaxValues, so `0`
+// meant two different things in the two functions that read it -- and a
+// coordinator sending the shards `max_values_per_field=0` to get their whole
+// distribution got _time bounded to 1000 ROWS (not distinct values) per shard
+// and dropped. Measured: 1100 rows per shard over two distinct timestamps, a
+// caller asking for 5000, and the cluster answered every field except _time
+// while a single node answered _time with 2 values.
+//
+// Unlimited here is a real scan of every matching row, which is why the
+// caller has to ask for it: it is the same bargain `limit=0` makes.
 func timeFacet(s Store, q *Query, limit, maxPerField int, keepConst bool) (FieldFacet, bool) {
 	bound := maxPerField
-	if bound <= 0 {
-		bound = defaultFacetMaxValues
-	}
 	sub := *q
-	sub.Limit = bound + 1
+	if bound > 0 {
+		sub.Limit = bound + 1
+	}
 	sub.MatAll = false
 	sub.Materialize = nil
 	rows := Run(s, &sub)
-	if len(rows) > bound {
+	if bound > 0 && len(rows) > bound {
 		return FieldFacet{}, false
 	}
 	// Counted as integers, and formatted only for the values that survive the

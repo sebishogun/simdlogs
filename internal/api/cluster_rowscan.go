@@ -457,11 +457,26 @@ func scanComposite(b []byte, i int) (int, bool) {
 	for i < len(b) {
 		switch b[i] {
 		case '"':
-			ni, ok := skipStringRaw(b, i)
-			if !ok {
-				return ni, false
+			// skipStringRaw, INLINED. Go does not inline a function containing
+			// a loop, and this is the inner loop of a check that runs on every
+			// line of every shard body: measured 1.26x on both a 90-byte and a
+			// 980-byte fixture, five runs each, minimum, which is outside this
+			// repository's 8.3% noise floor and consistent across shapes.
+			i++
+			for i < len(b) {
+				if b[i] == '\\' {
+					i += 2
+					continue
+				}
+				if b[i] == '"' {
+					break
+				}
+				i++
 			}
-			i = ni
+			if i >= len(b) {
+				return i, false
+			}
+			i++
 			continue
 		case '{', '[':
 			depth++
@@ -535,38 +550,30 @@ func bufStr(buf *[]byte, off int) string {
 // which is true only when a coordinator half exists; without one nothing
 // decodes. A shard emitting that is a protocol violation this router cannot
 // detect without paying for a parse on every row of every read.
+// It runs on EVERY line, not only the last one.
+//
+// An earlier version restricted the balancing half to a shard body's last
+// line, on the reasoning that a response is truncated at its end. That premise
+// is true and irrelevant: two reviewers pointed out independently that the
+// check is a WELL-FORMEDNESS check, not a truncation check, and malformation
+// is not end-only. Both constructed the same shape -- a middle line missing
+// its own closing brace but ending in one belonging to a nested value:
+//
+//	{"_time":"...","_msg":"ok","nested":{"a":1}
+//	{"_time":"...","_msg":"second row"}
+//
+// The cheap check reads the nested object's `}` as the row's and passes it,
+// and on the bare-select path that fragment goes to the client verbatim as a
+// row. Truncation is caught a layer above anyway -- a cut HTTP response fails
+// io.ReadAll and is classified PeerUnavailable before mergeRows sees it -- so
+// the last-line restriction protected against the one case that could not
+// reach here while dropping the one that could.
+//
+// The cost that motivated it is real and is paid instead by making the walk
+// fast: see scanComposite.
 func looksLikeJSONObject(line []byte) bool {
-	return plausibleRowLine(line, true)
-}
-
-// plausibleRowLine is looksLikeJSONObject with the expensive half optional.
-//
-// `full` walks the line balancing braces, string-aware, and requires nothing
-// after the close -- which is what separates a TRUNCATED row from a whole one,
-// because a response cut after an inner `}` ends in the right byte. Measured at
-// 19x on 90-byte lines and 232x on 980-byte ones against the shape check
-// alone, and +24.4% wall on a 60,000-row bare select, which is the path that
-// exists to avoid parsing.
-//
-// So it is paid on the LAST line of a shard body and nowhere else: a response
-// is truncated at its end, so no earlier line can be cut. Every line still
-// gets the O(1) check, which is what catches an HTML error page, a plain-text
-// error and an empty body -- the cases this was written for.
-func plausibleRowLine(line []byte, full bool) bool {
 	i := skipWS(line, 0)
 	if i >= len(line) || line[i] != '{' {
-		return false
-	}
-	if !full {
-		for j := len(line) - 1; j > i; j-- {
-			switch line[j] {
-			case ' ', '\t', '\r':
-				continue
-			case '}':
-				return true
-			}
-			return false
-		}
 		return false
 	}
 	end, ok := scanComposite(line, i)

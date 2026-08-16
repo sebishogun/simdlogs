@@ -389,6 +389,11 @@ func TestATruncatedShardLineIsRefused(t *testing.T) {
 		{"brace inside a string", `{"_msg":"a } b"}`, false},
 		{"nested and whole", `{"_msg":"a","ctx":{"a":1}}`, false},
 		{"trailing bytes", `{"_msg":"a"} extra`, true},
+		// The shape two reviewers constructed independently: a line missing
+		// its OWN closing brace but ending in one belonging to a nested value.
+		// A first-and-last-byte check reads that as a whole object.
+		{"nested brace as the last byte", `{"_time":"2026-01-01T00:00:00Z","ctx":{"a":1}`, true},
+		{"brace from a string as the last byte", `{"_msg":"a }`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			good := goodShard(t)
@@ -437,5 +442,84 @@ func TestAnEmptyStreamFieldDoesNotDuplicateTheKey(t *testing.T) {
 				t.Errorf("_stream_id appears %d times: %s", n, line)
 			}
 		})
+	}
+}
+
+// A malformed line in the MIDDLE of a shard body is refused, not only the last
+// one.
+//
+// The check was briefly restricted to the last line, on the reasoning that a
+// response is truncated at its end. Two reviewers pointed out independently
+// that it is a well-formedness check rather than a truncation check, and
+// malformation is not end-only -- and that truncation is caught a layer above
+// anyway, because a cut HTTP response fails io.ReadAll and is classified
+// PeerUnavailable before mergeRows sees it. So the restriction dropped the
+// only case that could reach here.
+func TestAMalformedMiddleLineIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"middle line ends in a nested brace",
+			`{"_time":"2026-01-01T00:00:00Z","_msg":"ok","ctx":{"a":1}` + "\n" +
+				`{"_time":"2026-01-01T00:00:01Z","_msg":"second"}` + "\n"},
+		{"two objects on one middle line",
+			`{"_msg":"a"}{"_msg":"b"}` + "\n" + `{"_msg":"c"}` + "\n"},
+		{"malformed line then a blank line",
+			`{"_time":"2026-01-01T00:00:00Z","ctx":{"a":1}` + "\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			good := goodShard(t)
+			bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writeEnvelope(w.Header(), 0, 0, true, 1, "")
+				w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(bad.Close)
+			ts := router(t, good.URL, bad.URL)
+
+			resp, body := callEndpoint(t, ts, struct{ name, path, method, body string }{
+				"", "/select/logsql/query?query=*", "GET", "",
+			})
+			if resp.StatusCode/100 == 2 {
+				t.Errorf("answered %d: a malformed line that is not the last one "+
+					"reached the client.\n  body: %s", resp.StatusCode, truncate(body, 200))
+			}
+		})
+	}
+}
+
+// `max_values_per_field=0` means unlimited to _time as well as to every other
+// field.
+//
+// timeFacet read `<= 0` as defaultFacetMaxValues while facetKeep's own guard
+// reads it as unlimited, so `0` meant two different things in the two
+// functions that consume it. The coordinator sends the shards `0` to get their
+// whole distribution -- and that bounded each shard's _time scan to 1000 ROWS,
+// not distinct values, so _time vanished from every cluster facet answer on
+// any tenant with more than 1000 matching rows per shard. The rest of the
+// answer being right made it more plausible, not less.
+func TestTheTimeFacetTreatsZeroAsUnlimited(t *testing.T) {
+	var saw string
+	// 1200 rows over two distinct timestamps: far past the old 1000-row bound,
+	// and only two values, so a distinct-value cap would keep it.
+	body := `{"facets":[{"field_name":"_time","values":[
+		{"field_value":"2026-06-01T12:00:00Z","hits":600},
+		{"field_value":"2026-06-01T12:00:01Z","hits":600}]},
+		{"field_name":"level","values":[{"field_value":"a","hits":700},{"field_value":"b","hits":500}]}]}`
+	a := facetShard(t, &saw, body)
+	ts := router(t, a.URL)
+
+	_, got, raw := getJSONFrom(t, ts,
+		"/select/logsql/facets?query=*&max_values_per_field=5000&limit=5000")
+	names := facetNames(got)
+	found := false
+	for _, n := range names {
+		if n == "_time" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("_time is missing from %v for a caller asking for 5000 values "+
+			"per field: %s", names, raw)
+	}
+	if saw != "0" {
+		t.Errorf("the shard was sent max_values_per_field=%q, want \"0\"", saw)
 	}
 }
