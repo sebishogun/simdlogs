@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // HashPipe is `hash(field) as result` -- a stable 64-bit FNV-1a hash of the
@@ -103,6 +104,26 @@ func (p *PackPipe) apply(rows []Row) []Row {
 }
 
 // packJSON renders the selected fields (or all, in row order) as a JSON object.
+//
+// A BARE pack packs the row AS IT WILL BE SERIALIZED, which means `_time`,
+// `_stream` and `_stream_id` as well.
+//
+// Those three are synthesized at serialization -- appendRowJSON does it -- and
+// pack_json runs in the query layer, so a bare pack could not see them and the
+// packed value was short:
+//
+//	VL  p keys  [_msg _stream _stream_id _time lvl svc]
+//	SL  p       {"_msg":"hello","_stream":"{svc=\"api\"}","lvl":"info","svc":"api"}
+//
+// The row beside it was right, which is the shape that makes this hard to see:
+// a client reading `p` and a client reading the row got different records from
+// one response.
+//
+// A PROJECTED pack (`| fields lvl | pack_json`) and a stats pack do NOT get
+// them, and this needs no special case: a projection that dropped `_time` sets
+// NoTime, and neither carries `_stream`, so the same rules that govern
+// serialization govern the pack. Measured on the reference binary, both shapes
+// pack exactly their own fields there too.
 func packJSON(r Row, keys []string) string {
 	var b strings.Builder
 	b.WriteByte('{')
@@ -119,8 +140,26 @@ func packJSON(r Row, keys []string) string {
 		b.Write(vb)
 	}
 	if len(keys) == 0 {
+		if !r.NoTime {
+			emit("_time", time.Unix(0, r.Time).UTC().Format(time.RFC3339Nano))
+		}
+		// The pair is skipped in the loop only when it will be emitted below.
+		// A row carrying `_stream: ""` has no stream to derive an id from, and
+		// dropping the field as well would lose something the row DOES carry --
+		// the pack's job is to pack the row, not to improve it.
+		stream, id, hasStream := rowStreamPair(r)
 		for _, f := range r.Fields {
+			if f.Key == "_time" {
+				continue // emitted from r.Time, above, as serialization does
+			}
+			if hasStream && (f.Key == "_stream" || f.Key == "_stream_id") {
+				continue
+			}
 			emit(f.Key, f.Value)
+		}
+		if hasStream {
+			emit("_stream", stream)
+			emit("_stream_id", id)
 		}
 	} else {
 		for _, k := range keys {
@@ -129,6 +168,45 @@ func packJSON(r Row, keys []string) string {
 	}
 	b.WriteByte('}')
 	return b.String()
+}
+
+// rowStreamPair is the row's stream and its id, and whether the row has one at
+// all.
+//
+// ok is false for a row that carries no `_stream` -- a projection that dropped
+// it, or a stats row. Synthesizing the EMPTY stream for those was the first
+// version of this and it was wrong in the mirror-image direction. Measured
+// against the reference binary:
+//
+//	VL   * | fields lvl | pack_json as p   ->  p {"lvl":"info"}
+//	mine                                       p {"lvl":"info","_stream":"{}",
+//	                                              "_stream_id":"0000...55b5"}
+//
+// Two fields those rows never carried, on the one pack shape entry 59 recorded
+// as already correct. Serialization synthesizes the empty stream because a full
+// record is always in SOME stream; a projection is not a record.
+//
+// A NON-EMPTY value counts as present, which is the rule appendRowJSON learned
+// the hard way -- the store materializes a column for the whole group, so a row
+// that never carried `_stream_id` comes back with "" once any row in its flush
+// did, and treating that as present blanked the field for every other row.
+func rowStreamPair(r Row) (string, string, bool) {
+	stream, id := "", ""
+	for _, f := range r.Fields {
+		if f.Key == "_stream" && f.Value != "" {
+			stream = f.Value
+		}
+		if f.Key == "_stream_id" && f.Value != "" {
+			id = f.Value
+		}
+	}
+	if stream == "" {
+		return "", "", false
+	}
+	if id == "" {
+		id = StreamID(stream)
+	}
+	return stream, id, true
 }
 
 // packLogfmt renders the selected fields (or all) as logfmt key=value pairs,
@@ -142,8 +220,28 @@ func packLogfmt(r Row, keys []string) string {
 		parts = append(parts, k+"="+v)
 	}
 	if len(keys) == 0 {
+		// The same three synthesized fields as packJSON, for the same reason:
+		// pack_logfmt's bare form is the row as it will be serialized.
+		if !r.NoTime {
+			emit("_time", time.Unix(0, r.Time).UTC().Format(time.RFC3339Nano))
+		}
+		// The pair is skipped in the loop only when it will be emitted below.
+		// A row carrying `_stream: ""` has no stream to derive an id from, and
+		// dropping the field as well would lose something the row DOES carry --
+		// the pack's job is to pack the row, not to improve it.
+		stream, id, hasStream := rowStreamPair(r)
 		for _, f := range r.Fields {
+			if f.Key == "_time" {
+				continue // emitted from r.Time, above, as serialization does
+			}
+			if hasStream && (f.Key == "_stream" || f.Key == "_stream_id") {
+				continue
+			}
 			emit(f.Key, f.Value)
+		}
+		if hasStream {
+			emit("_stream", stream)
+			emit("_stream_id", id)
 		}
 	} else {
 		for _, k := range keys {

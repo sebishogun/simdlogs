@@ -5810,3 +5810,58 @@ so "nothing red" is a statement about coverage that exists rather than coverage
 that does not. Both copies deleted: an inert guard reads as a load-bearing one,
 which is how three rounds' worth of dead code got in.
 
+## 73. The bare pack, fixed — and the first fix put the fields on rows that never had them
+
+Entry 59 measured a bare `pack_json`'s value as short: `_time`, `_stream` and
+`_stream_id` are synthesized at serialization (`appendRowJSON`) and `pack_json`
+runs in the query layer, so it could not see them. The row beside the packed
+value was right, which is what makes it hard to see — a client reading `p` and a
+client reading the row got different records out of one response.
+
+```
+VL  p keys  [_msg _stream _stream_id _time lvl svc]
+SL  p       {"_msg":"hello","_stream":"{svc=\"api\"}","lvl":"info","svc":"api"}
+```
+
+The rule is one sentence: **a bare pack packs the row as it will be
+serialized.** So `_time` comes from `r.Time` when the row has one, and the
+stream pair from the row's own values.
+
+**The first version of it was wrong in the mirror direction.** `rowStreamPair`
+synthesized the EMPTY stream when a row carried none — which is what
+serialization does, because a full record is always in some stream — and that
+put two fields onto every projected and stats row:
+
+```
+VL    * | fields lvl | pack_json as p   ->  p {"lvl":"info"}
+first fix                                   p {"lvl":"info","_stream":"{}",
+                                               "_stream_id":"0000…55b5"}
+```
+
+Those are the two shapes entry 59 had already measured as CORRECT, broken by
+the fix for the third. A projection is not a record: the pair is emitted only
+when the row carries a non-empty `_stream`.
+
+**And the second version dropped a field the row did carry.** A row whose
+`_stream` column is present but EMPTY — which happens because the store
+materializes the column for a whole flush — had `_stream` skipped from the loop
+(to be emitted once from the pair) and then no pair emitted, so the field
+vanished. The skip is now conditional on the pair being emitted: the pack's job
+is to pack the row, not to improve it.
+
+Measured on the built binary, all four shapes:
+
+```
+* | pack_json as p                        {_time,_msg,lvl,svc,_stream,_stream_id}
+* | fields lvl | pack_json as p           {"lvl":"info"}
+* | stats by (svc) count() n | pack_json   {"svc":"api","n":"1"}
+* | fields _time, _msg | pack_json as p    {"_time":…,"_msg":"hello"}
+```
+
+The three projected shapes are byte-identical to the reference. The bare one
+matches its key SET; the ORDER differs — VL emits
+`_time, _stream_id, _stream, _msg, …` and this server emits
+`_time, <row fields>, _stream, _stream_id`, because matching VL's order means
+matching its internal field ordering, which this server does not have. The test
+asserts the set for that reason and says so.
+
