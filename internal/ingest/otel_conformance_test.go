@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -870,7 +871,22 @@ func TestFieldsOfRowInventsAFieldWhenAValueCarriesTheSeparator(t *testing.T) {
 // The conformance fixture could not see it: its builder had no way to write
 // the field, so neither encoding was ever asked.
 func TestResourceDroppedAttributeCountSurvivesBothEncodings(t *testing.T) {
-	const dropped = 7
+	// EVERY COUNT, not one below 128.
+	//
+	// The first version of this used 7 and passed while the protobuf path
+	// decoded the varint a SECOND time, because eachField has already decoded
+	// it: below 128 a varint is its own byte, so the two agree exactly where
+	// the fixture looked. 200 stored as 72, 255 as 127, 1000 as 488, 65535 as
+	// 16383, and 128 vanished entirely.
+	for _, dropped := range []uint64{1, 7, 127, 128, 129, 200, 255, 300, 1000,
+		65535, 1 << 20, 1<<32 - 1} {
+		t.Run(fmt.Sprint(dropped), func(t *testing.T) {
+			checkDroppedCount(t, dropped)
+		})
+	}
+}
+
+func checkDroppedCount(t *testing.T, dropped uint64) {
 	const atNano = 1_700_000_000_000_000_000
 
 	// protobuf
@@ -904,8 +920,8 @@ func TestResourceDroppedAttributeCountSurvivesBothEncodings(t *testing.T) {
 	}
 	jf, pf := fieldsOfRow(jr[0]), fieldsOfRow(pr[0])
 	const key = "resource_dropped_attributes_count"
-	if jf[key] != "7" {
-		t.Fatalf("the JSON path did not store %s: %v", key, jf)
+	if want := strconv.FormatUint(dropped, 10); jf[key] != want {
+		t.Fatalf("the JSON path stored %s=%q, want %q: %v", key, jf[key], want, jf)
 	}
 	if pf[key] != jf[key] {
 		t.Errorf("protobuf stored %s=%q, JSON stored %q. The same logical "+

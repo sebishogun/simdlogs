@@ -7328,3 +7328,42 @@ And one guard came out. `allRejected := len(peers) > 0` looked like ordinary
 care and is unreachable: the code sits past the `len(bad) == 0` early return
 and `bad` is built from `peers`, so an empty list has already returned.
 Mutating it to `true` left the suite green, which is what said so.
+
+## 105. The fixture picked the one value where the bug is invisible
+
+Entry 99 fixed `Resource.dropped_attributes_count`: the protobuf path read only
+field 1 of Resource, so the JSON path wrote the field and protobuf never did.
+The fix decoded field 2 -- and decoded it **twice**.
+
+`eachField` has already decoded the varint by the time it calls back; it hands
+an 8-byte little-endian buffer, and every other wire-type-0 case in the file
+reads it with `binary.LittleEndian.Uint64`. The new case ran `binary.Uvarint`
+over that buffer.
+
+	export said   JSON stored   protobuf stored
+	          7             7                 7
+	        127           127               127
+	        128           128           (absent)
+	        200           200                72
+	        255           255               127
+	       1000          1000               488
+	      65535         65535             16383
+
+A varint below 128 is its own byte, so `Uvarint` over the decoded buffer
+returns the same number -- and the fixture that was written to catch exactly
+this used **`const dropped = 7`**. The commit whose subject is "two OTLP
+encodings of one export were storing different things" went on storing
+different things for every count of 128 or more, and now a wrong NUMBER rather
+than an absent field, which is worse: a missing column is visible and a wrong
+one is not.
+
+The fixture takes twelve values across the boundary now -- 1, 7, 127, 128, 129,
+200, 255, 300, 1000, 65535, 2^20, 2^32-1 -- and ten of them redden on the old
+code.
+
+**The lesson is about the fixture, not the decoder.** A single-value fixture
+tests a single value, and 7 is the kind of number that gets picked: small,
+readable, obviously non-zero. Every varint bug in this format hides above 127,
+which is precisely where a hand-picked small constant does not go. The same
+shape produced entry 43's writer suite, which asserted eleven things about a
+file and decoded none of its values.

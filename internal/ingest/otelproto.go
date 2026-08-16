@@ -78,7 +78,17 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 						// default. The conformance fixture could not see it:
 						// its builder had no way to write the field, so
 						// neither encoding was ever asked.
-						resDropped, _ = binary.Uvarint(p2)
+						// LittleEndian.Uint64, not Uvarint. eachField has
+						// ALREADY decoded the varint and hands the callback an
+						// 8-byte little-endian buffer -- every other
+						// wire-type-0 case in this file reads it that way.
+						// Decoding it a second time gave a wrong NUMBER for
+						// every count of 128 or more (200 -> 72, 255 -> 127,
+						// 1000 -> 488, 65535 -> 16383), which is worse than
+						// the absent field it replaced, and the fixture that
+						// was supposed to catch it used 7 -- inside the range
+						// where the two agree.
+						resDropped = binary.LittleEndian.Uint64(p2)
 					}
 				})
 			}
