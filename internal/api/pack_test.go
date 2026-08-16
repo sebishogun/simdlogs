@@ -94,3 +94,48 @@ func TestPackAllPacksTheRowUnderAProjectingPipe(t *testing.T) {
 		})
 	}
 }
+
+// A pack-all does not turn a pipeline into a full-record select.
+//
+// q.MatAll carries TWO meanings: "the scan reads every column" and "this is
+// full-record output", and the API layer reads the second as "synthesize the
+// _stream/_stream_id pair onto every row" (appendRowJSON's withStream). Setting
+// MatAll to feed a pack-all therefore put `_stream:"{}"` and a _stream_id onto
+// the output of
+//
+//   - | stats by (svc) count() n | pack_json as p
+//
+// two fields those rows had never carried, on a query that is not a record
+// select. The packed VALUE was correct throughout -- the leak was beside it.
+//
+// q.MatCols is the half that is only about what the scan reads.
+func TestAPackAllDoesNotSynthesiseStreamFields(t *testing.T) {
+	node := realShard(t, []string{
+		`{"_time":"2024-01-01T00:00:00Z","_msg":"one","svc":"api"}`,
+		`{"_time":"2024-01-01T00:00:01Z","_msg":"two","svc":"web"}`,
+	})
+	for _, q := range []string{
+		`* | stats by (svc) count() n | pack_json as p`,
+		`* | fields svc | pack_json as p`,
+		`* | pack_json as p | fields p`,
+	} {
+		t.Run(q, func(t *testing.T) {
+			rows := queryPacked(t, node, q)
+			if len(rows) == 0 {
+				t.Fatalf("%s returned no rows", q)
+			}
+			for i, r := range rows {
+				for _, leaked := range []string{"_stream", "_stream_id"} {
+					if _, ok := r[leaked]; ok {
+						t.Errorf("row %d carries %s, which this query never asked for: %v",
+							i, leaked, r)
+					}
+				}
+				if p, _ := r["p"].(string); p == "" || p == "{}" {
+					t.Errorf("row %d packed to %q -- the fix must not cost the pack its "+
+						"input (row %v)", i, p, r)
+				}
+			}
+		})
+	}
+}

@@ -60,6 +60,13 @@ type Query struct {
 	// parameter answers m19,m18,m17 where the pipe answers m0,m1,m2).
 	LastN  int
 	MatAll bool // materialize every column (full-record output: bare selects, live tail)
+	// MatCols asks the SCAN for every column without asking for full-record
+	// OUTPUT. MatAll means both, and the API layer reads it as "synthesize the
+	// _stream/_stream_id pair onto every row" (appendRowJSON's withStream) --
+	// so setting MatAll to feed a pack-all pipe put those two fields onto stats
+	// rows that had never carried them. Two meanings in one flag; this is the
+	// half that is only about what the scan reads.
+	MatCols bool
 
 	// Cancellation and the reason a scan stopped.
 	//
@@ -603,7 +610,7 @@ func appendMatches(out []Row, g *storage.Reader, q *Query) []Row {
 	for _, f := range q.Materialize { // fields the pipe chain needs
 		addField(f)
 	}
-	if q.MatAll { // full-record output: every column, not just the filtered ones
+	if q.MatAll || q.MatCols { // every column, not just the filtered ones
 		for _, f := range g.ColumnNames() {
 			if f != "_time" {
 				addField(f)

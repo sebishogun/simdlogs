@@ -397,11 +397,20 @@ func RunPipeline(s Store, q *Query) []Row {
 		// is a full-column scan for queries that contain a pack-all, which is the
 		// price of the answer being right.
 		if pipesPackAll(pipes) {
-			// SET, not merely "do not clear". MatAll is false by default for a
-			// query that has pipes at all -- it is turned on for a bare select --
-			// so guarding the clear would have left the pack-all with nothing on
-			// every path that reaches here.
-			q.MatAll = true
+			// MatCols, not MatAll.
+			//
+			// MatAll carries a SECOND meaning the scan does not: the API layer
+			// reads it as "this is full-record output" and synthesizes the
+			// _stream/_stream_id pair onto every row (appendRowJSON's
+			// withStream). Setting it here put `_stream:"{}"` and a
+			// _stream_id onto the output of `* | stats by (svc) count() n |
+			// pack_json as p` -- two fields those rows never carried, on a
+			// query that is not a record select.
+			//
+			// SET, not merely "do not clear": both flags are false by default
+			// for a query that has pipes at all, so guarding the clear would
+			// have left the pack-all with nothing on every path reaching here.
+			q.MatCols = true
 		} else if PipesProject(pipes) {
 			q.MatAll = false
 		}
