@@ -2,11 +2,8 @@ package bench
 
 import (
 	"bytes"
-	"io"
 	"math/rand"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -131,21 +128,18 @@ func TestRealistic(t *testing.T) {
 	}
 
 	// ---- VictoriaLogs ----
-	if _, err := os.Stat("victoria-logs"); err != nil {
+	vlDir, _ := os.MkdirTemp(dirBase, "real-vl-")
+	defer os.RemoveAll(vlDir)
+	vlp := newVLAt(t, "127.0.0.1:19430", vlDir)
+	if vlp == nil {
 		t.Log("VL binary not staged; simdlogs numbers recorded, VL half skipped")
 		return
 	}
-	vlDir, _ := os.MkdirTemp(dirBase, "real-vl-")
-	defer os.RemoveAll(vlDir)
-	abs, _ := filepath.Abs("victoria-logs")
-	cmd := exec.Command(abs, "-httpListenAddr=127.0.0.1:19430", "-storageDataPath="+vlDir, "-retentionPeriod=10y")
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
+	if err := vlp.start(); err != nil {
 		t.Fatalf("start VL: %v", err)
 	}
-	defer cmd.Process.Kill()
-	vl := "http://127.0.0.1:19430"
-	waitReady(t, vl+"/insert/ready", 30*time.Second)
+	defer vlp.stop() // kill by PID and REAP; Kill alone leaves a zombie
+	vl := vlp.url
 	vlIngest, err := timeIngest(
 		func() { stream(func(c []byte) { post(t, vl+"/insert/jsonline", c) }) },
 		readyAtLeast(vl, countFrom, countTo, N),

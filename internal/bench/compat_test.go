@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -34,20 +32,7 @@ func TestLogsQLCompat(t *testing.T) {
 	_ = sl
 	postNDJSON(t, slURL+"/insert/jsonline", body)
 
-	if _, err := os.Stat("victoria-logs"); err != nil {
-		skipNoVL(t, "the LogsQL compatibility differential")
-	}
-	vlDir, _ := os.MkdirTemp("", "compat-vl-")
-	defer os.RemoveAll(vlDir)
-	abs, _ := filepath.Abs("victoria-logs")
-	cmd := exec.Command(abs, "-httpListenAddr=127.0.0.1:19440", "-storageDataPath="+vlDir, "-retentionPeriod=10y")
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start VL: %v", err)
-	}
-	defer cmd.Process.Kill()
-	vlURL := "http://127.0.0.1:19440"
-	waitReadyCompat(t, vlURL+"/insert/ready", 30*time.Second)
+	vlURL := startVL(t, "127.0.0.1:19440", "the LogsQL compatibility differential").url
 	postNDJSON(t, vlURL+"/insert/jsonline", body)
 	waitFor(t, readyAtLeast(vlURL, compatFrom, compatTo, compatRows), time.Minute,
 		"victoria-logs never made the compatibility corpus queryable")

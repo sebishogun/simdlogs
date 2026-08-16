@@ -3,13 +3,11 @@ package bench
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -130,28 +128,24 @@ func TestScaleVsVL(t *testing.T) {
 		slNeedle, slSel, slAgg)
 
 	// ---- VictoriaLogs, HTTP, disk-backed ----
-	binPath := "victoria-logs"
-	if _, err := os.Stat(binPath); err != nil {
+	vlDir, _ := os.MkdirTemp(dirBase, "scalevl-vl-")
+	defer os.RemoveAll(vlDir)
+	// VL runs with its own defaults (memory included) -- the fair comparison.
+	// SIMDLOGS_VL_MEMPCT can still cap it on a constrained box.
+	var extra []string
+	if memPct := os.Getenv("SIMDLOGS_VL_MEMPCT"); memPct != "" {
+		extra = append(extra, "-memory.allowedPercent="+memPct)
+	}
+	vlp := newVLAt(t, "127.0.0.1:19429", vlDir, extra...)
+	if vlp == nil {
 		t.Log("VL binary not staged; simdlogs numbers recorded, VL half skipped")
 		return
 	}
-	vlDir, _ := os.MkdirTemp(dirBase, "scalevl-vl-")
-	defer os.RemoveAll(vlDir)
-	abs, _ := filepath.Abs(binPath)
-	// VL runs with its own defaults (memory included) -- the fair comparison.
-	// SIMDLOGS_VL_MEMPCT can still cap it on a constrained box.
-	args := []string{"-httpListenAddr=127.0.0.1:19429", "-storageDataPath=" + vlDir, "-retentionPeriod=10y"}
-	if memPct := os.Getenv("SIMDLOGS_VL_MEMPCT"); memPct != "" {
-		args = append(args, "-memory.allowedPercent="+memPct)
-	}
-	cmd := exec.Command(abs, args...)
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
+	if err := vlp.start(); err != nil {
 		t.Fatalf("start VL: %v", err)
 	}
-	defer cmd.Process.Kill()
-	vl := "http://127.0.0.1:19429"
-	waitReady(t, vl+"/insert/ready", 30*time.Second)
+	defer vlp.stop() // kill by PID and REAP; Kill alone leaves a zombie
+	vl := vlp.url
 
 	// Polled, not slept. The fixed five seconds this used to spend landed in
 	// vlIngest and so in every ingest ratio this harness printed; it was also

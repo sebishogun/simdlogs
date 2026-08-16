@@ -6,8 +6,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -127,25 +125,16 @@ func TestHeadToHead(t *testing.T) {
 		slIngest.queryable, float64(n)/slIngest.queryable.Seconds(), slQuery)
 
 	// VictoriaLogs subprocess, if the binary is here.
-	binPath := "victoria-logs"
-	if _, err := os.Stat(binPath); err != nil {
+	vlp := newVL(t, "127.0.0.1:19428")
+	if vlp == nil {
 		t.Log("VictoriaLogs binary not staged (internal/bench/victoria-logs); simdlogs number recorded, VL half skipped")
 		return
 	}
-	vlDir := t.TempDir()
-	abs, _ := filepath.Abs(binPath)
-	cmd := exec.Command(abs,
-		"-httpListenAddr=127.0.0.1:19428",
-		"-storageDataPath="+vlDir,
-		"-retentionPeriod=10y",
-	)
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
+	if err := vlp.start(); err != nil {
 		t.Fatalf("start VL: %v", err)
 	}
-	defer cmd.Process.Kill()
-	vl := "http://127.0.0.1:19428"
-	waitReady(t, vl+"/insert/ready", 30*time.Second)
+	defer vlp.stop() // kill by PID and REAP; Kill alone leaves a zombie
+	vl := vlp.url
 
 	// The same two stamps, polled rather than slept. Polling also removes the
 	// other half of the old defect: a fixed sleep is a floor as well as a
