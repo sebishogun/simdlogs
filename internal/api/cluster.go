@@ -1057,7 +1057,25 @@ func answersOf(rs []PeerResponse) []shardAnswer {
 
 // federatedESCount sums the ES _count across storage nodes.
 func (s *Server) federatedESCount(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
+	// A FORM body is parameters, not an Elasticsearch query body.
+	//
+	// This read the body unconditionally, so withFormInURL's ParseForm found it
+	// already drained, saw no form, and returned formBody == nil -- and
+	// fanOutChecked then forwarded the caller's raw `q=level%3Aerror` bytes
+	// with no content type, which clusterClient.do relabels as
+	// application/json. The shard's own ParseForm will not read a JSON body, so
+	// it was asked no filter at all. Measured, spy shard answering 3 when it
+	// sees `q` and 1000 when it does not:
+	//
+	//	POST /_count?q=level:error  form CT, empty body -> 200 {"count":3}
+	//	POST /_count                form CT, q in body  -> 200 {"count":1000}
+	//
+	// Leaving the body unread lets withFormInURL parse it and fold `q` into the
+	// shard URL, which is the path the large-form case already takes.
+	var body []byte
+	if !isFormPost(r) {
+		body, _ = io.ReadAll(r.Body)
+	}
 	total := 0
 	bodies, w, ok := s.fanOutChecked(w, r, "/_count", body)
 	if !ok {
@@ -1834,67 +1852,9 @@ const (
 // Content-Length is not the test: a chunked request declares -1, and a client
 // posting a form under the wrong header is exactly the client whose framing
 // cannot be assumed. One byte read answers the question for every framing.
-// refuseUnreadableBody answers the caller when the parameters are in a body no
-// form parser will read, and reports whether the caller should stop.
-//
-// Separate from fanOutChecked because federatedSQL parses r.FormValue("query")
-// BEFORE it fans out, so it reached its own "SQL must start with SELECT" on the
-// empty string and refused for a reason that is not the reason. Eleven routes
-// naming the header and one naming the caller's SQL is the same inconsistency
-// this exists to remove, one route wide.
-func (s *Server) refuseUnreadableBody(w http.ResponseWriter, r *http.Request) bool {
-	if !unreadableBody(r) {
-		return false
-	}
-	ct := r.Header.Get("Content-Type")
-	s.writeErr(w, r, readSpec(), http.StatusBadRequest,
-		fmt.Sprintf("simdlogs: this request's Content-Type (%q) is not a form, so "+
-			"the parameters in its body cannot be read, and the shards would be "+
-			"asked the URL query alone -- a different question, at HTTP 200. Send "+
-			"the parameters as application/x-www-form-urlencoded, or in the query "+
-			"string.", ct))
-	return true
-}
-
-func unreadableBody(r *http.Request) bool {
-	if r.Method != http.MethodPost && r.Method != http.MethodPut {
-		return false
-	}
-	if r.Body == nil || isFormPost(r) {
-		return false
-	}
-	var one [1]byte
-	n, _ := io.ReadFull(r.Body, one[:])
-	return n > 0
-}
-
 func (s *Server) fanOutChecked(
 	w http.ResponseWriter, r *http.Request, path string, body []byte,
 ) ([]shardAnswer, http.ResponseWriter, bool) {
-	// A body this route reads as a form, in a content type that is not one, is
-	// refused HERE -- where the fault is -- rather than downstream.
-	//
-	// body == nil is exactly the set of routes whose parameters come from the
-	// form and the URL; the Elasticsearch routes pass their own body and are
-	// untouched. For those form routes a non-form Content-Type means the
-	// parameters in the body are unreadable, so the shards would be asked the
-	// URL query alone -- which for `POST /select/logsql/field_values` with
-	// `Content-Type: text/plain; charset` and `query=level%3Aerror&field=user`
-	// in the body is no query at all.
-	//
-	// Before the content-type gate this answered 400 naming the header on the
-	// six routes that reach withoutLimits, and 200 on the other six. After it,
-	// all twelve forwarded and real shards answered
-	// `503 2 of 2 shards could not answer completely (0(rejected),1(rejected))`
-	// -- consistent, and it sends an operator to inspect the storage nodes for
-	// a fault in their own request's header. Twelve identical 400s naming the
-	// Content-Type is the answer that is both consistent and true.
-	//
-	// An EMPTY body is not this case: the parameters are then in the URL, there
-	// is nothing unreadable, and the request is answered.
-	if body == nil && s.refuseUnreadableBody(w, r) {
-		return nil, w, false
-	}
 	fr, formBody := withFormInURL(r)
 	if fr == nil {
 		s.writeErr(w, r, readSpec(), http.StatusBadRequest,

@@ -741,58 +741,167 @@ func TestAMalformedBodyIsStillRefusedUnderAMalformedMediaParameter(t *testing.T)
 	}
 }
 
-// A body the router cannot read is refused, on EVERY federated read, naming
-// the Content-Type.
+// A body the router cannot read gives the SAME answer a single node gives.
 //
-// `POST /select/logsql/field_values` with `Content-Type: text/plain; charset`
-// and `query=level%3Aerror&field=user&limit=5` in the body: the parameters are
-// in a body no form parser will touch, so the shards would be asked the URL
-// query -- which is empty. Against real storage nodes that came back as
+// Two wrong answers preceded this one. Before the content-type gate, parameters
+// in a `text/plain` body were a 400 naming the header on the six routes that
+// reach withoutLimits and a 200 on the other six. After it, all twelve
+// forwarded -- and on /select/logsql/query that was the ENTIRE STORE at HTTP
+// 200, because planQuery defaulted a missing query to `*`.
 //
-//	503 2 of 2 shards could not answer completely (0(rejected),1(rejected))
+// The refusal written next was worse: it treated any non-empty body under a
+// non-form content type as parameter-bearing, so
+// `POST /select/logsql/query?query=*` with a `{}` JSON body -- every parameter
+// already in the URL, answered 200 by a single node -- became a 400 from the
+// router. It also stayed order-dependent: a multipart body drained by an
+// earlier FormValue read as empty and passed, which is the same
+// argument-evaluation accident one content type over.
 //
-// which sends an operator to inspect the storage nodes for a fault in their own
-// request's header. Twelve identical 400s naming the Content-Type is the answer
-// that is both consistent across the routes and true about the cause.
-//
-// Asserted on the MESSAGE as well as the code, because 400 alone was already
-// the answer on six routes for the wrong reason.
-func TestAnUnreadableBodyIsRefusedByEveryFederatedReadNamingTheHeader(t *testing.T) {
-	const body = "query=level%3Aerror&field=user&limit=5"
-	tried := 0
-	for _, rt := range surfaceRoutes() {
-		if rt.kind != federated || rt.write || rt.body != "" {
-			continue
-		}
-		sh := newRecordingShard(t)
-		ts := wmRouter(t, sh.ts.URL)
-		req, err := http.NewRequest("POST", ts.URL+rt.path, strings.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Content-Type", "text/plain; charset")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		tried++
-		if resp.StatusCode != 400 {
-			t.Errorf("%s answered %d to parameters in a body under a non-form "+
-				"Content-Type; the shards were asked the empty URL query: %.200s",
-				rt.path, resp.StatusCode, b)
-			continue
-		}
-		if !strings.Contains(string(b), "Content-Type") {
-			t.Errorf("%s refused without naming the Content-Type, which is the half "+
-				"that is wrong: %.200s", rt.path, b)
-		}
-		if q, asked := sh.askedES(); asked {
-			t.Errorf("%s refused and still asked the shard %q", rt.path, q)
+// A single node IGNORES a body it will not parse as a form, and then refuses
+// for the reason that is actually true: there is no `query`. The router does
+// the same now, so the comparison below is against the node rather than against
+// a code someone chose.
+func TestAnUnreadableBodyAnswersTheSameAsASingleNode(t *testing.T) {
+	single := singleNode(t)
+	for _, ct := range []string{
+		"text/plain; charset",
+		"application/json",
+		"multipart/form-data",
+		"",
+	} {
+		for _, tc := range []struct{ name, path, body string }{
+			// Parameters only in the body: unreadable, so there is no query.
+			{"params in the body", "/select/logsql/query", "query=level%3Aerror&field=user"},
+			// Parameters in the URL and a body the router ignores: answerable.
+			{"params in the URL", "/select/logsql/query?query=%2A", "{}"},
+		} {
+			t.Run(tc.name+" ct="+ct, func(t *testing.T) {
+				sh := newRecordingShard(t)
+				ts := wmRouter(t, sh.ts.URL)
+				sCode, sBody := postRaw(t, single, tc.path, ct, tc.body)
+				rCode, rBody := postRaw(t, ts, tc.path, ct, tc.body)
+				if sCode != rCode {
+					t.Errorf("single node answered %d and the router %d\n  single %.200s\n  router %.200s",
+						sCode, rCode, sBody, rBody)
+				}
+			})
 		}
 	}
-	if tried < 10 {
-		t.Fatalf("only %d federated reads were tried", tried)
+}
+
+// singleNode is a server with no backends, so every read is answered locally.
+func singleNode(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func postRaw(t *testing.T, ts *httptest.Server, path, ct, body string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest("POST", ts.URL+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ct != "" {
+		req.Header.Set("Content-Type", ct)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode, string(b)
+}
+
+// A router does not answer a missing query with the whole store.
+//
+// planQuery defaulted a blank `query` to `*`, where parseRequest's own comment
+// says the reference requires one and "defaulting to match-all answered a
+// client's bug with the entire store". Measured, a three-row store, filter
+// matching one row:
+//
+//	GET /select/logsql/query           single 400   router 200, 3 of 3 rows
+//	GET /select/logsql/query?query=    single 400   router 200, 3 of 3 rows
+//	GET /select/logsql/query?query=%20 single 400   router 200, 3 of 3 rows
+//
+// This is the amplifier under every "the shards were asked the empty query"
+// defect on this route: not a smaller answer, the entire store at HTTP 200.
+func TestAMissingQueryIsRefusedByTheRouterToo(t *testing.T) {
+	single := singleNode(t)
+	for _, path := range []string{
+		"/select/logsql/query",
+		"/select/logsql/query?query=",
+		"/select/logsql/query?query=%20",
+	} {
+		sh := newRecordingShard(t)
+		ts := wmRouter(t, sh.ts.URL)
+		sCode, sBody := getRaw(t, single, path)
+		rCode, rBody := getRaw(t, ts, path)
+		if sCode != rCode {
+			t.Errorf("%s: single node answered %d and the router %d\n  single %.150s\n  router %.150s",
+				path, sCode, rCode, sBody, rBody)
+		}
+		if q, asked := sh.asked(); asked != "" || q != "" {
+			t.Errorf("%s: the shard was asked query=%q -- a missing query became a "+
+				"whole-store scan", path, q)
+		}
+	}
+}
+
+func getRaw(t *testing.T, ts *httptest.Server, path string) (int, string) {
+	t.Helper()
+	resp, err := http.Get(ts.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode, string(b)
+}
+
+// `q` in a FORM body reaches the shard on /_count.
+//
+// federatedESCount read the body unconditionally, so withFormInURL's ParseForm
+// found it drained and returned no form; fanOutChecked then forwarded the raw
+// `q=...` bytes with no content type, which the peer client relabels
+// application/json. A shard's ParseForm will not read a JSON body, so it was
+// asked no filter and counted its whole store. Measured against a spy shard
+// answering 3 when it sees `q` and 1000 when it does not:
+//
+//	POST /_count?q=level:error  form CT, empty body -> 200 {"count":3}
+//	POST /_count                form CT, q in body  -> 200 {"count":1000}
+//
+// Asserted on what the shard was ASKED, because both answers are HTTP 200 and
+// the bigger one is the wrong one.
+func TestAFormBodyReachesTheShardOnESCount(t *testing.T) {
+	const filter = "level:error"
+	for _, tc := range []struct{ name, path, body string }{
+		{"q in the URL", "/_count?q=" + url.QueryEscape(filter), ""},
+		{"q in the body", "/_count", "q=" + url.QueryEscape(filter)},
+		{"q in the body, another key in the URL", "/_count?pretty=1", "q=" + url.QueryEscape(filter)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sh := newRecordingShard(t)
+			ts := wmRouter(t, sh.ts.URL)
+			code, body := postRaw(t, ts, tc.path, "application/x-www-form-urlencoded", tc.body)
+			if code != 200 {
+				t.Fatalf("answered %d: %.200s", code, body)
+			}
+			got, asked := sh.askedES()
+			if !asked {
+				t.Fatalf("the shard was never asked anything")
+			}
+			if got != filter {
+				t.Errorf("the shard was asked q=%q, the caller sent %q -- a shard asked "+
+					"no filter counts its whole store, at HTTP 200", got, filter)
+			}
+		})
 	}
 }

@@ -5412,13 +5412,13 @@ The fixture, written down so the number means something:
 
   query=*          3,762,650 bytes   188.1 B/row out
   query=*&limit=5        944 bytes
-  ratio            ~3,990x
+  ratio            3,985.9x
   peerMaxBodyBytes 268,435,456 -> ~1.43M rows per shard before the read fails
 ```
 
 Every shard streamed its whole matching set to the router, on the exact path
 POST exists for. What is stable across all three measurements is the ratio —
-about four thousand — and the order of the per-row cost; the digits are not,
+3,985.9x — and the order of the per-row cost; the digits are not,
 and quoting them to seven figures without the fixture claimed a precision the
 measurement never had.
 
@@ -5634,3 +5634,78 @@ Each of the four tests replacing the old window test was probed by mutation:
 forcing the two-step path reddens the record-count test, deleting the
 `ErrDuplicateWrite` fallback reddens the racing-duplicate test, and forcing
 `rode` true reddens the nothing-left-to-flush test.
+
+## 69. The refusal written for a header fault refused what a single node answers
+
+Entry 67 added `unreadableBody`: a POST with a non-empty body under a non-form
+content type was refused with 400 naming the Content-Type, because the
+parameters in that body are unreadable and the shards would be asked the URL
+query alone.
+
+It refuses requests that have no problem. Every parameter can already be in the
+URL, and then the body is irrelevant — a single node ignores it:
+
+```
+POST /select/logsql/query?query=*   body {}   ct application/json
+  single node  200 (the rows)
+  router       400 this request's Content-Type ("application/json") is not a form…
+```
+
+Same for `null`, `" "`, `text/plain`, an empty `Content-Type` with a body,
+chunked framing and `Expect: 100-continue`. It also stayed **order-dependent**,
+which is the accident it was written to remove: the check asks whether bytes
+remain in the body, and `ParseMultipartForm` — reached through an earlier
+`FormValue` on four of the twelve routes — drains a multipart body first. So
+`multipart/form-data` split 4 answered / 8 refused, and three of the four
+answering routes produced entry 67's own `503 … (0(rejected))` against real
+storage nodes.
+
+**The refusal was papering over the real defect one level down.** `planQuery`
+defaulted a blank `query` to `*`, where `parseRequest`'s own comment says the
+reference requires one and *"defaulting to match-all answered a client's bug
+with the entire store"*. Measured, a three-row store and a filter matching one
+row:
+
+```
+GET /select/logsql/query            single 400   router 200, 3 of 3 rows
+GET /select/logsql/query?query=     single 400   router 200, 3 of 3 rows
+GET /select/logsql/query?query=%20  single 400   router 200, 3 of 3 rows
+POST form, body junk=1              single 400   router 200, shard asked `*`
+```
+
+That is the amplifier under every "the shards were asked the empty query"
+finding in entries 55-68: on this route a dropped filter was never a smaller
+answer, it was the **entire store at HTTP 200**.
+
+So the refusal is deleted and the default is gone. A body the router cannot
+parse as a form is ignored, exactly as a single node ignores it, and the request
+is then refused for the reason that is true — there is no `query`. Every case
+above now answers identically on a router and a single node, and the test
+asserts that equality rather than a status code someone chose.
+
+Also corrected: entry 63's derived ratio, published as `~3,990x`. 3,762,650 /
+944 = **3,985.9**.
+
+## 70. `q` in a form body, on `/_count`: the shard was asked nothing and counted everything
+
+`federatedESCount` read the body unconditionally. `withFormInURL`'s `ParseForm`
+then found it drained, saw no form, and returned `formBody == nil` — and
+`fanOutChecked` forwarded the caller's raw `q=level%3Aerror` bytes with no
+content type, which `clusterClient.do` relabels `application/json`. A shard's
+`ParseForm` will not read a JSON body, so it was asked no filter at all.
+
+Measured, spy shard answering 3 when it sees `q` and 1000 when it does not:
+
+```
+POST /_count?q=level:error   form CT, empty body  -> 200 {"count":3}     shard q="level:error"
+POST /_count                 form CT, q in body   -> 200 {"count":1000}  shard q=""
+POST /_count?pretty=1        form CT, q in body   -> 200 {"count":1000}  shard q=""
+```
+
+Wire-level the shard saw `ct="application/json" rawquery="" body="q=level%3Aerror"`.
+
+The body is left unread when the content type says it is a form, so
+`withFormInURL` parses it and folds `q` into the shard URL — the path the
+large-form case already takes. `/_search` under the same shape was loud
+(`400 invalid character 'q'`) and is unchanged.
+

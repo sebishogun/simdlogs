@@ -54,9 +54,25 @@ import (
 // plus the head -- refusing when they disagree. That is a weaker guarantee than
 // the comment promised and it is the one the code makes.
 func (s *Server) planQuery(w http.ResponseWriter, r *http.Request) (shardQuery string, coord []query.Pipe, ok bool) {
+	// A MISSING query is refused, exactly as a single node refuses it.
+	//
+	// This defaulted to `*`, and parseRequest's own comment says why that is
+	// wrong: "The reference requires `query` on every select endpoint and
+	// rejects a request without one. Defaulting to match-all answered a
+	// client's bug with the entire store." A router did the opposite of the
+	// node it fronts:
+	//
+	//	GET /select/logsql/query           single 400   router 200, whole store
+	//	GET /select/logsql/query?query=    single 400   router 200, whole store
+	//	POST form, body junk=1             single 400   router 200, shard asked `*`
+	//
+	// It is also the amplifier under every "the shards were asked the empty
+	// query" defect: on this route a dropped filter was not a smaller answer,
+	// it was the entire store returned at HTTP 200.
 	raw := r.FormValue("query")
 	if strings.TrimSpace(raw) == "" {
-		raw = "*"
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, errMissingQuery.Error())
+		return "", nil, false
 	}
 	q, err := query.ParseLogsQL(raw)
 	if err != nil {

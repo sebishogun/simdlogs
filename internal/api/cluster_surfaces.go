@@ -364,13 +364,6 @@ func (s *Server) rejectNonMergeableStats(w http.ResponseWriter, r *http.Request)
 // with the parser, or text surgery on a query language. Refusing names the
 // endpoint that does plan, which answers the same question.
 func (s *Server) federatedSQL(w http.ResponseWriter, r *http.Request) {
-	// Before FormValue, which reads only the URL query when the content type is
-	// not a form: the SQL then parses as "" and this refused with "SQL must
-	// start with SELECT", blaming a statement the caller did send for a header
-	// the router could not read.
-	if s.refuseUnreadableBody(w, r) {
-		return
-	}
 	q, err := query.ParseSQL(r.FormValue("query"))
 	if err != nil {
 		s.writeErr(w, r, readSpec(), http.StatusBadRequest, err.Error())
