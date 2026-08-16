@@ -5792,3 +5792,21 @@ does not have.
 Reverted. The replacement test compares the router to a single node across three
 content types, which is the only claim there was to make.
 
+**Two of the three `normalizeFormContentType` calls were inert, and that was
+measured rather than assumed.** `ParseForm` caches: the first call populates
+`r.Form` and returns the error, every later call sees `r.Form` non-nil and
+returns nil. So correcting the header only matters where an error from THAT
+first parse is treated as fatal — `withoutLimits`, and nowhere else.
+
+```
+delete it from withoutLimits    2 tests red
+delete it from withFormInURL    nothing red
+delete it from fanOutChecked    nothing red
+```
+
+The matrix that establishes the second and third rows covers
+`application/x-www-form-urlencoded; charset` across all twelve federated reads,
+so "nothing red" is a statement about coverage that exists rather than coverage
+that does not. Both copies deleted: an inert guard reads as a load-bearing one,
+which is how three rounds' worth of dead code got in.
+

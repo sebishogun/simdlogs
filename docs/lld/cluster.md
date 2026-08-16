@@ -439,6 +439,28 @@ HTTP 200.
 | `/_search` | `federatedESSearch`: hits merged, `hits.total` summed, `relation: "eq"`. | works |
 | `/_count` | `federatedESCount`: counts summed. | works |
 
+**What a federated read requires of the request**, and where it is checked:
+
+- **`query` is required**, on every route in the table above whose parameters
+  come from the form and the URL — the same rule a single node applies in
+  `parseRequest`. `fanOutChecked` refuses a blank one with the node's own
+  `missing \`query\` arg` before any shard is asked. Fanning out an empty
+  selector instead made every shard refuse and the caller saw
+  `503 … N of N shards could not answer completely`, which sends an operator to
+  inspect the storage nodes for a parameter their own request did not carry.
+- **Both form encodings are read.** `application/x-www-form-urlencoded` and
+  `multipart/form-data`, because a single node reads both — `FormValue` calls
+  `ParseMultipartForm`. A multipart body that will not parse is ignored rather
+  than fatal, again matching the node, and the URL query is then the whole
+  request.
+- **A body under any other content type is ignored**, as a node ignores it. The
+  request is then refused for the reason that is true (no `query`), not for the
+  header.
+- **The two Elasticsearch routes are different**: their body is a JSON document,
+  read unconditionally whatever the content type says — `curl -d` sends a form
+  content type by default, and treating that as parameters left a real query
+  document unread.
+
 Tenant headers (`AccountID`, `ProjectID`) propagate on every fan-out, so each
 backend answers for the same tenant.
 

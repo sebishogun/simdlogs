@@ -679,14 +679,24 @@ func TestAMalformedMediaParameterDoesNotChangeWhatTheShardIsAsked(t *testing.T) 
 		return resp.StatusCode, q, sh.bounds()
 	}
 
-	for _, path := range []string{
-		"/select/logsql/query",
-		"/select/logsql/field_values",
-		"/select/logsql/field_names",
-		"/select/logsql/facets",
-		"/select/logsql/streams",
-		"/select/logsql/stream_ids",
-	} {
+	// EVERY federated read, from the classification, not a hand-kept six.
+	//
+	// The first version listed six and they excluded `hits`, `stats_query` and
+	// `stats_query_range` -- so deleting normalizeFormContentType from
+	// withFormInURL left this test green while `hits` answered 400 against
+	// eleven 200s. A test named for the shard's parameter set that cannot see
+	// the route the fix was written for is the shape this repository keeps
+	// finding.
+	var paths []string
+	for _, rt := range surfaceRoutes() {
+		if rt.kind == federated && !rt.write && rt.body == "" {
+			paths = append(paths, rt.path)
+		}
+	}
+	if len(paths) < 10 {
+		t.Fatalf("only %d federated reads were classified: %v", len(paths), paths)
+	}
+	for _, path := range paths {
 		t.Run(path, func(t *testing.T) {
 			wantCode, wantQ, wantB := ask(t, path, form+"; charset=UTF-8")
 			for _, ct := range []string{form, form + "; charset", form + " ;charset"} {
@@ -929,6 +939,11 @@ func TestEveryFederatedReadAnswersWhatASingleNodeAnswers(t *testing.T) {
 	}
 	framings := []framing{
 		{name: "urlencoded body", ct: "application/x-www-form-urlencoded", body: "%s"},
+		// jQuery's default header with the value lost. mime.ParseMediaType
+		// returns the media type AND ErrInvalidMediaParameter, so ParseForm
+		// parses the body perfectly and returns an error anyway.
+		{name: "urlencoded body, bad charset", ct: "application/x-www-form-urlencoded; charset", body: "%s"},
+		{name: "urlencoded body, charset", ct: "application/x-www-form-urlencoded; charset=UTF-8", body: "%s"},
 		{name: "multipart body", ct: "multipart/form-data", body: "%s"},
 		{name: "text/plain body", ct: "text/plain; charset", body: "%s"},
 		{name: "no content type", ct: "", body: "%s"},

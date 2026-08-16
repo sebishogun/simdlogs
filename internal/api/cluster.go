@@ -815,7 +815,19 @@ func withFormInURL(r *http.Request) (*http.Request, []byte) {
 	if !isFormPost(r) {
 		return r, nil
 	}
-	normalizeFormContentType(r)
+	// No normalizeFormContentType here, MEASURED rather than assumed.
+	//
+	// ParseForm caches: the first call populates r.Form and returns the error;
+	// every later call sees r.Form non-nil and returns nil. So the header
+	// correction only matters where an error from THAT first parse is treated
+	// as fatal, which is withoutLimits and nowhere else -- deleting it there
+	// reddens two tests, deleting it here or in fanOutChecked reddens none,
+	// including a matrix that now covers `; charset` on the form content type
+	// across all twelve federated reads.
+	//
+	// So the copy is gone rather than kept "for safety". An inert guard reads
+	// as a load-bearing one, which is how three rounds' worth of dead code got
+	// in.
 	if err := parseFormBody(r); err != nil {
 		// A form the router cannot parse is not a request it can fan out. This
 		// used to `return r`, which sent the shards the EMPTY query at HTTP 200
