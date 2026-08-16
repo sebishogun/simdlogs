@@ -5113,8 +5113,10 @@ Measured, one router and one shard, `level:in(v,v,…)`:
 | 1,200,001 | — | **503 `0(unavailable)`** |
 | 1,200,001, **single node** | n/a | **200** |
 
-The sweep across all twelve fan-out endpoints found eleven delivering the whole
-query as a form body and one failing. The committed tests used
+The sweep found eleven delivering the whole query as a form body and one
+failing. It was described as "all twelve fan-out endpoints"; `surfaceRoutes()`
+classifies **fourteen** federated reads, and the sweep -- like the test written
+from it -- covered nine of them. The committed tests used
 `/select/logsql/hits` and `/select/logsql/facets`. The repository already
 recorded why that endpoint is different — `cluster_postform_test.go:19-20`:
 "that one survives because planQuery rebuilds the shard URL from the parsed form
@@ -5172,14 +5174,35 @@ fix.
 
 - **`buildExcluded` dropped three files that ARE compiled on linux.**
   `strings.Contains(line, plat) && !strings.Contains(line, "linux")` excludes
-  every `//go:build !windows` file. Three in `internal/storage`, taking 18
-  production names' readers with them — `dirLock` 15 down to 1, `errLockHeld` 3
-  to 0 — and hiding two documented declarations from the gate entirely. Its own
-  comment claimed "it errs towards INCLUDING a file, so a reader is never
-  wrongly discounted"; the negation form does the opposite. Replaced with a real
-  constraint evaluator (`!`, `&&`, `||`, parentheses) that treats an unmodelled
-  tag as satisfied, so the safe direction is the actual direction. 254 -> 256
-  documented declarations.
+  every `//go:build !windows` file. Three in `internal/storage`, and two
+  documented declarations became invisible to the gate. 254 -> 256 documented
+  declarations, which reproduces exactly.
+
+  **The other numbers in the first version of this entry do not.** "18
+  production names lost their readers, `dirLock` 15 down to 1, `errLockHeld` 3
+  to 0" was recomputed by running `countReads` over the tree under each rule:
+  **59** names gain readers, **15** cross the gate's threshold, `dirLock` goes
+  **1 -> 8** (the direction inverted) and `errLockHeld` **0 -> 2**. And the new
+  rule also EXCLUDES three files the old one wrongly included --
+  `diskfree_other.go`, `quota_other.go`, `mmap_other.go` -- costing fourteen
+  names their readers, `errNoStatfs` 2 -> 0. Harmless today and the opposite of
+  the one-directional story the entry told.
+
+  **The replacement was wrong too, in the other direction.** A small recursive
+  evaluator treated an unmodelled tag as SATISFIED, which is safe until the tag
+  appears under a NEGATION: `!purego` evaluated false and excluded a file the
+  compiler includes -- the exact failure its own comment said it avoided. Its
+  test asserted `{"!purego", false}` and `{"(linux || darwin) && !cgo", false}`,
+  both contradicted by `go/build/constraint`, the second under `CGO_ENABLED=0`,
+  which is this repository's stated posture. It also hardcoded linux/amd64, so a
+  test named "agrees with the compiler" was false on every cross-architecture
+  lane.
+
+  It calls `build.Default.MatchFile` now -- the compiler's own answer -- and
+  reads the LEADING comment block only. Scanning every comment made a
+  `//go:build windows` line quoted inside a doc comment the file's constraint;
+  `unwired_test.go` contains two such lines and they survived only by not
+  starting their line.
 
 - **The founding shape is no longer detected, and three places said otherwise.**
   Treating a composite-literal key as a read — necessary, because treating it as
@@ -5192,9 +5215,11 @@ fix.
   the code is rather than only in a commit message.
 
 Also corrected: `maxPeerQueryBytes` is 60 KiB of **encoded** parameters, and
-percent-encoding a LogsQL query roughly doubles it — measured switch point 30,001
-raw characters in the URL against 31,001 (62,001 encoded) in the body, so the
-raw budget is ~30 KB and the comment claimed 60. `PeerUnavailable`'s "remedy —
+percent-encoding a LogsQL query roughly doubles it — measured boundary 30,719 raw /
+61,439 encoded in the URL against 30,720 raw / 61,442 encoded in the body, so
+the raw budget is ~30 KB and the comment claimed 60. An earlier draft cited
+"30,001 against 31,001", which is a 1,000-wide bracket rather than the switch
+point -- both of its endpoints fall on the correct side of it. `PeerUnavailable`'s "remedy —
 another replica — is the one that can actually help" is false for the 431 that
 motivated the change: the refusal is deterministic and every replica gives the
 same answer; what the class buys is an accurate name. `docs/wrong.md` cited an
@@ -5220,15 +5245,26 @@ VL  * | fields lvl | pack_json as p             {"lvl":"info","p":"{\"lvl\":\"in
 VL  * | stats by (svc) count() n | pack_json as p  {"svc":"api","n":"1","p":"{\"svc\":…,\"n\":…}"}
 ```
 
-What differs is the packed VALUE on the bare shape: VL's `p` carries `_time`,
-`_stream_id` and `_stream`; this server's does not. `pack_json` runs in the
+What differs is the packed VALUE on the bare shape. Measured field by field
+rather than as a group -- the first version of this entry said VL's `p` carries
+"`_time`, `_stream_id` and `_stream`" and this server's carries none of them,
+and that is wrong about `_stream`:
+
+```
+VL  p keys  [_msg _stream _stream_id _time lvl svc]
+SL  p       {"_msg":"hello","_stream":"{svc=\"api\"}","lvl":"info","svc":"api"}
+```
+
+`_stream` is present on both. The gap is `_time` and `_stream_id`. `pack_json` runs in the
 query layer and those three are synthesized at serialization
 (`appendRowJSON`), so the pack cannot see them. The row is right and the packed
 value is short — the mirror image of the defect entry 58 fixed, and the reason
 that test's three rows all happened to carry a projecting pipe.
 
-Recorded rather than fixed: making them agree means putting the pair onto the
-record before the pipes run, which changes what every pipe sees. Task #437.
+Recorded rather than fixed: making them agree means putting `_time` and
+`_stream_id` onto the record before the pipes run, which changes what every pipe
+sees. Task #437. Not "the pair" -- naming `_stream`/`_stream_id` there would
+have added a field that is already present and still left `_time` missing.
 
 Two latent ones closed alongside it. `applyCoordinatorPipes` set `MatAll: true`
 into a `Query` that `ApplyPipes` never reads either flag from — inert, and
@@ -5239,3 +5275,77 @@ and not `MatCols`, so an inherited `MatCols` would make a timestamps-only scan
 read every column of every matching row, against a 256 MiB budget it shares with
 the parent request. Unreachable today, which is why it would have been found
 late.
+
+
+## 60. The fix reached eleven of fourteen, and the test written to prove it covered nine
+
+Entry 56 fixed the large-POST path and said "eleven fan-out endpoints", "all
+twelve". `surfaceRoutes()` classifies **fourteen** federated reads.
+`TestEveryFanOutEndpointCarriesALargeQuery` listed ten, one of which
+(`/select/logsql/hits_count`) is not a route at all and skipped forever on its
+404 — so it covered **nine of fourteen** and missed `/select/logsql/stats_query`
+and `stats_query_range`, the Grafana-dashboard shape the whole change is about.
+
+This repository had already learned that and written it down:
+`TestEveryFederatedReadIsInTheCompletenessSuite` exists because *"federatedEndpoints
+was a hand-kept list that had drifted to nine of the fourteen federated reads"*.
+A hand-kept list drifted to nine of fourteen again, in a test written to prove
+coverage.
+
+The set is derived from `surfaceRoutes()` now, with each route's own parameters
+and its own query language — `/select/sql` gets a large `SELECT ... OR ...`
+chain rather than LogsQL, and the two Elasticsearch routes are **skipped with
+the reason** (a JSON body never enters the form path) rather than fed LogsQL and
+counted. Twelve exercised, two skipped, and the count itself is asserted.
+
+## 61. A limit the plan DELETED came back over a POST form, on the endpoint the change was named after
+
+`shardQueryURL` removes `limit` from the shard request when the plan has a
+coordinator half: the shards must return everything and the bound is applied
+once over the merged rows. `withFormInURL` merges form keys "not already in the
+shard URL" — and a key the plan **deleted** is not in the URL. Measured, three
+shards of ten rows, `&limit=5`, HTTP 200 throughout:
+
+| | single node | cluster GET | cluster POST form |
+|---|---|---|---|
+| `* \| stats count() c` | 30 | 30 | **15** |
+| `* \| stats by (level) count() c` | 10/10/10 | 10/10/10 | **5/5/5** |
+
+It reproduces before entry 56 as well, so that commit did not introduce it — it
+rewrote the function around it and added a comment asserting the opposite:
+*"with RawQuery cleared there is one source and the plan wins because the plan
+is what was merged in"*. A union merge does not preserve a deletion.
+
+Fixed by recording **which parameters the plan owns**, set or deleted, rather
+than by deleting this one from `r.Form` as well — that would fix `limit` and
+leave the next deleted parameter to be found the same way. Two of the three
+pieces are load-bearing; `withoutLimits`'s marking is redundant with its own
+form deletion and says so.
+
+Found alongside it and left open: a cluster and a single node disagree on which
+rows `sort ... | limit` keeps. Both cluster methods agree with each other, so it
+is not this defect. Task #438, and the case stays in the test with the
+comparison switched off and a pointer, rather than dropped.
+
+## 62. Two subtests could not fail, and a 400 named the wrong half
+
+`TestALimitInAPostFormDoesNotReachTheShards`'s two `facets` rows pass with
+either half of the fix deleted: facets passes `limit` through `unlimited`
+(`vals.Set("limit","0")`), so the key is always already in the URL and never
+enters `extra`. They were immune before the fix. Kept for the
+`max_values_per_field` half, which is real, and labelled `limitImmune` so the
+pass is not read as coverage. The other seven rows fail on both mutations.
+
+And `withoutLimits`' new `ParseForm` fails on a malformed **Content-Type** too —
+`parsePostForm` runs `mime.ParseMediaType` first — while the refusal said "this
+request's query string could not be parsed". Measured: `Content-Type: text/plain;
+charset` on a request whose query string is perfectly correct, answered 200
+before and 400-blaming-the-query-string after. It names the half that is
+actually unreadable now.
+
+Also closed: `fanOutChecked` dropped `formBody` when the caller had built a body
+of its own. Impossible today — the two endpoints that build a body send JSON, so
+`withFormInURL` returns before it looks at anything — but that is a statement
+about what clients send, not a property of the code, and `RawQuery` is now
+cleared so a dropped `formBody` would hand the shard **neither**. It is refused
+with an explanation instead of reasoned away.

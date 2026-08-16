@@ -458,6 +458,14 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 	}
 	shardReq := r.Clone(r.Context())
 	shardReq.URL.RawQuery = shardQueryURL(r, shardQuery, coordPipes)
+	// shardQueryURL rewrites `query` and, when there is a coordinator half,
+	// DELETES `limit` -- the shards must return everything and the bound is
+	// applied once over the merged rows. A deleted key is not in the shard URL,
+	// so withFormInURL's "skip what the URL already has" rule would put the
+	// caller's limit back over a POST. Measured before this: three shards of
+	// ten rows and `&limit=5`, `* | stats count() c` answered 30 on a single
+	// node, 30 over a cluster GET and 15 over a cluster POST form.
+	shardReq = withPlanKeys(shardReq, "query", "limit")
 
 	// The completeness gate BEFORE the merge. A shard that did not answer used
 	// to contribute nothing and the merge proceeded, so a cluster read with one
@@ -813,7 +821,10 @@ func withFormInURL(r *http.Request) (*http.Request, []byte) {
 	q := r.URL.Query()
 	extra := make(url.Values, len(r.Form))
 	for k, vs := range r.Form {
-		if _, ok := q[k]; ok {
+		// Already in the shard URL, or OWNED by the plan -- which covers the
+		// key the plan deliberately deleted, the case "already in the URL"
+		// cannot see. See planKeysCtx.
+		if _, ok := q[k]; ok || planOwns(r, k) {
 			continue
 		}
 		extra[k] = vs
@@ -1798,12 +1809,26 @@ func (s *Server) fanOutChecked(
 		return nil, w, false
 	}
 	// The form overflow only applies where the caller sent no body of its own.
-	// The two cannot both occur -- withFormInURL returns early unless the
-	// content type is a form, and the endpoints that build their own body send
-	// JSON -- but a body silently replaced would be a wrong answer, not an
-	// error, so the precedence is written down rather than assumed.
+	//
+	// The two cannot both occur today: withFormInURL returns before it looks at
+	// anything unless the content type is a form, and the two endpoints that
+	// build their own body (/_count, /_search) send JSON. That is a statement
+	// about what CLIENTS send, not a property of this code -- so the impossible
+	// case is refused rather than reasoned away. Under the previous shape the
+	// query string survived a dropped formBody; now RawQuery has been cleared,
+	// so dropping it would hand the shard neither, and the answer would be a
+	// smaller one at HTTP 200.
 	ct := ""
-	if body == nil && formBody != nil {
+	switch {
+	case body != nil && formBody != nil:
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+			"simdlogs: this request carries both a body of its own and a form "+
+				"large enough to need one, and the router has one body to send. "+
+				"Refused rather than silently dropping either: sending the form "+
+				"would discard the request body, and sending the body would ask "+
+				"the shards a shorter question than you asked")
+		return nil, w, false
+	case body == nil && formBody != nil:
 		body, ct = formBody, "application/x-www-form-urlencoded"
 	}
 	peers := s.fanOutPeers(fr, path, body, ct)

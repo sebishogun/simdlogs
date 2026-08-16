@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -183,6 +184,9 @@ func TestALimitInAPostFormDoesNotReachTheShards(t *testing.T) {
 		// and removing it makes timeFacet materialize every matching row --
 		// measured at 640,000 rows / 54.9 MB / 482 ms / +496 MiB on one shard.
 		forwarded []string
+		// limitImmune marks a row whose `limit` half cannot fail, because this
+		// endpoint's plan SETS the key rather than deleting it.
+		limitImmune bool
 	}{
 		{path: "/select/logsql/field_values", params: "field=user&limit=2"},
 		{path: "/select/logsql/field_names", params: "limit=2"},
@@ -190,10 +194,16 @@ func TestALimitInAPostFormDoesNotReachTheShards(t *testing.T) {
 		{path: "/select/logsql/stream_ids", params: "limit=2"},
 		{path: "/select/logsql/stream_field_names", params: "limit=2"},
 		{path: "/select/logsql/stream_field_values", params: "field=app&limit=2"},
+		// facets sets `limit=0` through `unlimited` rather than deleting it, so
+		// `limit` is ALWAYS already a URL key and never enters `extra`. These
+		// two rows were immune to the defect before the fix and stay green
+		// through both mutations -- measured, not assumed. Kept for the
+		// max_values_per_field half, which is real, and labelled so the pass
+		// is not read as coverage of the limit half.
 		{path: "/select/logsql/facets", params: "limit=2",
-			forwarded: []string{"max_values_per_field"}},
+			forwarded: []string{"max_values_per_field"}, limitImmune: true},
 		{path: "/select/logsql/facets", params: "limit=2&max_values_per_field=2",
-			forwarded: []string{"max_values_per_field"}},
+			forwarded: []string{"max_values_per_field"}, limitImmune: true},
 		{path: "/select/logsql/field_values", params: "field=user&max_values_per_field=7"},
 	} {
 		t.Run(ep.path+"?"+ep.params, func(t *testing.T) {
@@ -236,6 +246,180 @@ func TestALimitInAPostFormDoesNotReachTheShards(t *testing.T) {
 					t.Errorf("the shard received the caller's %s=%s: shard-local top-N "+
 						"lists merged into a wrong total. shard saw %s", k, want, gotPost)
 				}
+			}
+		})
+	}
+}
+
+// A limit the PLAN DELETED does not come back over a POST form.
+//
+// shardQueryURL removes `limit` from the shard request when the plan has a
+// coordinator half: the shards must return everything that matches and the
+// bound is applied once, over the merged rows. withFormInURL then merged form
+// keys "not already in the shard URL" -- and a key the plan DELETED is not in
+// the URL, so the caller's limit went straight back. Measured, three shards of
+// ten rows, `&limit=5`, HTTP 200 on every one:
+//
+//   - | stats count() c            single 30   GET 30      POST 15
+//   - | stats by (level) count() c 10/10/10    10/10/10    5/5/5
+//
+// The endpoint is /select/logsql/query, which is the one the large-POST change
+// was named after, and the comment added with it asserted the opposite: "with
+// RawQuery cleared there is one source and the plan wins because the plan is
+// what was merged in". A union merge does not preserve a deletion.
+//
+// Fixed by recording which parameters the plan OWNS rather than by deleting
+// this one from r.Form as well -- that would fix `limit` and leave the next
+// deleted parameter to be found the same way.
+func TestALimitThePlanDeletedDoesNotComeBackOverAPostForm(t *testing.T) {
+	// DISTINCT timestamps across shards, so `sort by (_time) | limit 5` has one
+	// right answer. With all three shards using 00:00:00..09 the ties break
+	// arbitrarily and a single node and a cluster can both be correct while
+	// disagreeing -- which is a fixture that cannot tell the defect from the
+	// tie.
+	rows := func(level string, base int) []string {
+		var out []string
+		for i := 0; i < 10; i++ {
+			out = append(out, fmt.Sprintf(
+				`{"_time":"2024-01-01T00:%02d:%02dZ","_msg":"m","level":%q,"user":"u%d"}`,
+				base, i, level, i%7))
+		}
+		return out
+	}
+	a := realShard(t, rows("info", 0))
+	b := realShard(t, rows("warn", 1))
+	c := realShard(t, rows("error", 2))
+	ts := router(t, a.URL, b.URL, c.URL)
+	solo := realShard(t, append(append(rows("info", 0), rows("warn", 1)...), rows("error", 2)...))
+
+	for _, tc := range []struct {
+		q string
+		// vsSolo compares the cluster against a single node holding the same
+		// rows. Off for `sort ... | limit`, where the two genuinely disagree on
+		// WHICH rows survive -- both cluster methods agree with each other, so
+		// it is not this defect, and it is task #438 rather than a case
+		// quietly dropped from here.
+		vsSolo bool
+	}{
+		{`* | stats count() c`, true},
+		{`* | stats by (level) count() c`, true},
+		{`* | sort by (_time) | limit 5`, false},
+	} {
+		q := tc.q
+		t.Run(q, func(t *testing.T) {
+			form := url.Values{"query": {q}, "limit": {"5"}}
+
+			soloRaw := rawGet(t, solo, "/select/logsql/query?"+form.Encode())
+			getRaw := rawGet(t, ts, "/select/logsql/query?"+form.Encode())
+			resp, err := http.Post(ts.URL+"/select/logsql/query",
+				"application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			postBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			postRaw := strings.TrimSpace(string(postBody))
+
+			if strings.TrimSpace(soloRaw) == "" {
+				t.Fatalf("the single node answered nothing, so this comparison is "+
+					"three empty answers agreeing: %q", soloRaw)
+			}
+			if g := strings.TrimSpace(getRaw); g != postRaw {
+				t.Errorf("the same query answers differently by method, so the bound "+
+					"the plan deleted reached the shards over POST and each one "+
+					"truncated its own rows:\n  GET  %s\n  POST %s", g, postRaw)
+			}
+			// Against a single node holding the same rows, as a SET of lines.
+			//
+			// Not byte-for-byte: group order across a stats merge is a map
+			// iteration on both sides, so two correct answers can differ in
+			// order. What must not differ is which rows are in them.
+			if tc.vsSolo && !sameLineSet(soloRaw, postRaw) {
+				t.Errorf("the cluster POST returns a different SET of rows than a "+
+					"single node holding the same data:\n  single %s\n  POST   %s",
+					strings.TrimSpace(soloRaw), postRaw)
+			}
+		})
+	}
+}
+
+// rawGet returns the body of a GET as a string.
+func rawGet(t *testing.T, ts *httptest.Server, path string) string {
+	t.Helper()
+	resp, err := http.Get(ts.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b)
+}
+
+// sameLineSet reports whether two NDJSON bodies carry the same lines, in any
+// order.
+func sameLineSet(a, b string) bool {
+	norm := func(s string) []string {
+		var out []string
+		for _, l := range strings.Split(strings.TrimSpace(s), "\n") {
+			if l = strings.TrimSpace(l); l != "" {
+				out = append(out, l)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+	x, y := norm(a), norm(b)
+	if len(x) != len(y) {
+		return false
+	}
+	for i := range x {
+		if x[i] != y[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// The 400 names the half that is actually unreadable.
+//
+// withoutLimits calls r.ParseForm, which fails on a malformed Content-Type as
+// well as on a malformed body -- parsePostForm runs mime.ParseMediaType first.
+// The refusal said "this request's query string could not be parsed" for all of
+// them, so an operator with `Content-Type: text/plain; charset` was sent to
+// inspect a query string that was perfectly correct.
+func TestTheRefusalNamesTheHalfThatIsUnreadable(t *testing.T) {
+	sh := newRecordingShard(t)
+	ts := wmRouter(t, sh.ts.URL)
+
+	for _, tc := range []struct {
+		name, ct, body, path, want string
+	}{
+		{"a malformed Content-Type", "text/plain; charset", "query=*",
+			"/select/logsql/field_values?query=*&field=user", "Content-Type"},
+		{"a malformed form body", "application/x-www-form-urlencoded", "%zz=1",
+			"/select/logsql/field_values?query=*&field=user", "request body"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest("POST", ts.URL+tc.path, strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", tc.ct)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 400 {
+				t.Fatalf("answered %d, want 400: %.200s", resp.StatusCode, b)
+			}
+			if !strings.Contains(string(b), tc.want) {
+				t.Errorf("the refusal does not name %q, so the operator is sent to "+
+					"the wrong half: %s", tc.want, b)
+			}
+			if tc.want != "query string" && strings.Contains(string(b), "query string") {
+				t.Errorf("the refusal blames the query string, which parses: %s", b)
 			}
 		})
 	}

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"fmt"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -167,6 +169,46 @@ func pipeSegments(raw string) []string {
 	return append(out, strings.TrimSpace(raw[start:]))
 }
 
+// planKeysCtx marks the parameters the ROUTER'S PLAN has already resolved for
+// a shard request, so the caller's form cannot put them back.
+//
+// withFormInURL merges form keys that are not already in the shard URL. That
+// rule cannot tell "the caller never sent this" from "the plan DELETED this",
+// and a deleted key is exactly the case that matters: shardQueryURL removes
+// `limit` when there is a coordinator half, because the shards must return
+// everything and the bound is applied once over the merged rows. Over a POST
+// the caller's limit was not in the URL, so it was not skipped, and the merge
+// put it straight back. Measured, three shards of ten rows, `&limit=5`:
+//
+//   - | stats count() c    single node 30, cluster GET 30, cluster POST 15
+//   - | stats by (level)   10/10/10,       10/10/10,       5/5/5
+//
+// HTTP 200 on all of them. Deleting from r.Form as well would fix `limit` and
+// leave the next deleted parameter to be found the same way, so the plan
+// records WHICH keys it owns and withFormInURL skips those, set or deleted.
+type planKeysCtx struct{}
+
+// withPlanKeys returns r marked as having these parameters resolved by the plan.
+func withPlanKeys(r *http.Request, keys ...string) *http.Request {
+	owned := map[string]struct{}{}
+	if prev, ok := r.Context().Value(planKeysCtx{}).(map[string]struct{}); ok {
+		for k := range prev {
+			owned[k] = struct{}{}
+		}
+	}
+	for _, k := range keys {
+		owned[k] = struct{}{}
+	}
+	return r.WithContext(context.WithValue(r.Context(), planKeysCtx{}, owned))
+}
+
+// planOwns reports whether the plan has resolved this parameter already.
+func planOwns(r *http.Request, key string) bool {
+	owned, _ := r.Context().Value(planKeysCtx{}).(map[string]struct{})
+	_, ok := owned[key]
+	return ok
+}
+
 // shardQueryURL rewrites the request's query parameter for the shards.
 func shardQueryURL(r *http.Request, shardQuery string, coordPipes []query.Pipe) string {
 	vals, _ := url.ParseQuery(r.URL.RawQuery)
@@ -317,6 +359,15 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 	// answer withFormInURL gives for the same reason.
 	if r.Method == http.MethodPost || r.Method == http.MethodPut {
 		if err := r.ParseForm(); err != nil {
+			// A form this node cannot parse -- but NOT necessarily a bad query
+			// string. ParseForm also fails on a malformed Content-Type, because
+			// parsePostForm runs mime.ParseMediaType first, and the caller's
+			// 400 then told an operator their query string was unreadable when
+			// it was fine. Measured: `Content-Type: text/plain; charset` on
+			// /select/logsql/field_values, whose query string parses perfectly.
+			//
+			// The URL query is re-checked here so the answer names the half
+			// that is actually wrong.
 			return nil, false
 		}
 	}
@@ -348,6 +399,9 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 	// parsed values and they have to be removed from BOTH -- r.Form is the
 	// union the peer reads and r.PostForm is what re-parsing would rebuild it
 	// from.
+	// The plan OWNS these two from here on, whether it set them or deleted
+	// them, so withFormInURL cannot re-add them from the caller's form.
+	out = withPlanKeys(out, "limit", "max_values_per_field")
 	for _, f := range []url.Values{out.Form, out.PostForm} {
 		if f == nil {
 			continue
@@ -364,8 +418,23 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 // refuseUnparseableQuery answers the caller when withoutLimits could not read
 // the query string, and reports whether the caller should stop.
 func (s *Server) refuseUnparseableQuery(w http.ResponseWriter, r *http.Request) {
+	// WHICH half is unreadable, checked rather than assumed.
+	//
+	// This said "query string" flat. withoutLimits also fails on a malformed
+	// Content-Type, because parsePostForm runs mime.ParseMediaType first --
+	// measured, `Content-Type: text/plain; charset` on a request whose query
+	// string parses perfectly -- and the operator was sent to inspect the half
+	// that was correct.
+	what := "request body"
+	if _, err := url.ParseQuery(r.URL.RawQuery); err != nil {
+		what = "query string"
+	} else if ct := r.Header.Get("Content-Type"); ct != "" {
+		if _, _, err := mime.ParseMediaType(ct); err != nil {
+			what = fmt.Sprintf("Content-Type header (%q)", ct)
+		}
+	}
 	s.writeErr(w, r, readSpec(), http.StatusBadRequest,
-		"simdlogs: this request's query string could not be parsed, so the "+
+		"simdlogs: this request's "+what+" could not be parsed, so the "+
 			"router cannot strip the per-shard result limits from it. Forwarding "+
 			"it unchanged would build the cluster's top values out of each shard's "+
 			"own top values, which silently drops anything popular across the "+

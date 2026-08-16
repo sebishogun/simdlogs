@@ -2,11 +2,14 @@ package docs
 
 import (
 	"go/ast"
+	"go/build"
 	"go/parser"
 	gotoken "go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -81,7 +84,7 @@ func TestDocumentedMechanismsHaveCallers(t *testing.T) {
 		// caller sits in a //go:build plan9 file counted as wired on linux. This
 		// repository has twelve build-tagged production files, including
 		// windows-only and plan9-only ones.
-		if buildExcluded(f) {
+		if buildExcluded(path) {
 			return nil
 		}
 		isTest := strings.HasSuffix(path, "_test.go")
@@ -236,111 +239,39 @@ var exempt = map[string]string{
 // buildExcluded reports whether f is compiled for a DIFFERENT platform than
 // this one, so its declarations do not count as readers here.
 //
-// It evaluates the constraint rather than substring-matching it. The first
-// version asked `strings.Contains(line, plat) && !strings.Contains(line,
-// "linux")`, which excluded every `//go:build !windows` file -- three of them
-// in internal/storage, all compiled on linux -- and took 18 production names'
-// readers with them, `dirLock` from 15 down to 1. Its own comment claimed "it
-// errs towards INCLUDING a file, so a reader is never wrongly discounted";
-// the negation form does the opposite. That is a live missed detection and a
-// latent false positive: the day one of those names is read only from a
-// !windows file, the gate fails on correct code.
+// It asks go/build/constraint -- the COMPILER'S OWN parser -- rather than
+// evaluating the expression itself. Two hand-rolled versions were wrong in
+// opposite directions:
 //
-// Deliberately small: it understands !, &&, || and the GOOS/GOARCH/unix terms
-// this repository actually writes, and treats anything else -- a release tag, a
-// custom tag like purego -- as SATISFIED, so an unrecognised constraint
-// includes the file. Erring towards including is the safe direction and this
-// time the code does it.
-func buildExcluded(f *ast.File) bool {
-	for _, cg := range f.Comments {
-		for _, c := range cg.List {
-			line, ok := strings.CutPrefix(c.Text, "//go:build ")
-			if !ok {
-				continue
-			}
-			if !constraintHolds(strings.TrimSpace(line)) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// constraintHolds evaluates a //go:build expression for linux/amd64.
+//   - `strings.Contains(line, plat) && !strings.Contains(line, "linux")`
+//     excluded every `//go:build !windows` file, three of them in
+//     internal/storage and all compiled here.
+//   - a small recursive evaluator treated an unmodelled tag as SATISFIED,
+//     which is the safe direction UNTIL it appears under a negation:
+//     `!purego` then evaluated false and excluded a file the compiler
+//     includes. Its doc claimed the opposite, and the test asserted
+//     `{"!purego", false}` and `{"(linux || darwin) && !cgo", false}` -- both
+//     contradicted by go/build, the second under CGO_ENABLED=0, which is this
+//     repository's stated posture.
 //
-// || binds loosest, then &&, then ! and parentheses -- Go's own precedence.
-func constraintHolds(e string) bool {
-	e = strings.TrimSpace(e)
-	if e == "" {
-		return true
-	}
-	if d := splitTop(e, "||"); len(d) > 1 {
-		for _, part := range d {
-			if constraintHolds(part) {
-				return true
-			}
-		}
+// The evaluator also hardcoded linux/amd64, so a test named "agrees with the
+// compiler" was false on every cross-architecture lane. runtime.GOOS and
+// runtime.GOARCH now, and build.Default for everything else.
+//
+// And the constraint is read from the file's LEADING comment block only.
+// Scanning every comment meant a `//go:build windows` line quoted INSIDE a doc
+// comment -- which this very file contains, twice -- was evaluated as the
+// file's constraint. They survive only because they are not at the start of
+// their line.
+func buildExcluded(path string) bool {
+	ok, err := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
+	if err != nil {
+		// Unreadable or unparseable is not this gate's subject; INCLUDE, which
+		// is the direction that never discounts a real reader.
 		return false
 	}
-	if d := splitTop(e, "&&"); len(d) > 1 {
-		for _, part := range d {
-			if !constraintHolds(part) {
-				return false
-			}
-		}
-		return true
-	}
-	if strings.HasPrefix(e, "!") {
-		return !constraintHolds(e[1:])
-	}
-	if strings.HasPrefix(e, "(") && strings.HasSuffix(e, ")") {
-		return constraintHolds(e[1 : len(e)-1])
-	}
-	switch e {
-	case "linux", "amd64", "unix", "gc", "cgo":
-		return true
-	}
-	// Any other GOOS or GOARCH this build is not.
-	for _, t := range []string{
-		"windows", "plan9", "darwin", "js", "wasip1", "aix", "solaris",
-		"freebsd", "openbsd", "netbsd", "dragonfly", "ios", "android", "illumos",
-		"386", "arm", "arm64", "riscv64", "s390x", "ppc64", "ppc64le",
-		"loong64", "mips", "mips64", "mips64le", "mipsle", "wasm",
-	} {
-		if e == t {
-			return false
-		}
-	}
-	// A tag this function does not model -- a release tag, purego, a custom
-	// one. Treated as satisfied so the file is INCLUDED and no reader is lost.
-	return true
+	return !ok
 }
-
-// splitTop splits e on sep at parenthesis depth zero.
-func splitTop(e, sep string) []string {
-	var out []string
-	depth, last := 0, 0
-	for i := 0; i+len(sep) <= len(e); i++ {
-		switch e[i] {
-		case '(':
-			depth++
-		case ')':
-			depth--
-		}
-		if depth == 0 && e[i:i+len(sep)] == sep {
-			out = append(out, e[last:i])
-			last = i + len(sep)
-			i += len(sep) - 1
-		}
-	}
-	return append(out, e[last:])
-}
-
-// The founding shape is only half-detected, and this is the disclosure.
-//
-// PeerResponse.HighWatermark is named at the top of this file as founding
-// example #1. Written inside a composite literal, it is now MISSED. Written by
-// assignment, it is still found. Nothing here recovers the other half.
 
 // countReads adds every READ of an identifier in f to uses.
 //
@@ -419,51 +350,6 @@ func countReads(f *ast.File, uses map[string]int) {
 	})
 }
 
-// The build-constraint evaluator, on the shapes this repository writes.
-//
-// The substring version excluded three internal/storage files that ARE compiled
-// on linux -- atomicfile_unix.go, lock_unix.go and flock_unix.go, all
-// `!windows` -- because the line contains "windows" and does not contain
-// "linux". 18 production names lost their readers (dirLock 15 -> 1,
-// errLockHeld 3 -> 0), and two documented declarations became invisible to the
-// gate entirely.
-func TestTheBuildConstraintEvaluatorAgreesWithTheCompiler(t *testing.T) {
-	for _, tc := range []struct {
-		expr string
-		want bool // compiled on linux/amd64?
-	}{
-		// The three that were wrongly excluded.
-		{"!windows", true},
-		{"!windows && !plan9", true},
-		{"!windows && !plan9 && !js && !wasip1", true},
-		// Genuinely other platforms.
-		{"windows", false},
-		{"plan9", false},
-		{"darwin || windows", false},
-		{"js && wasm", false},
-		{"!linux", false},
-		{"!unix", false},
-		// This one.
-		{"linux", true},
-		{"unix", true},
-		{"linux || darwin", true},
-		{"linux && amd64", true},
-		{"linux && arm64", false},
-		{"(linux || darwin) && !cgo", false},
-		{"(linux || darwin) && amd64", true},
-		// A tag the evaluator does not model is SATISFIED, so the file is
-		// included and no reader is discounted.
-		{"purego", true},
-		{"!purego", false},
-		{"go1.21", true},
-		{"", true},
-	} {
-		if got := constraintHolds(tc.expr); got != tc.want {
-			t.Errorf("constraintHolds(%q) = %v, want %v", tc.expr, got, tc.want)
-		}
-	}
-}
-
 // The three files the substring version dropped are counted again.
 //
 // Named explicitly rather than left to the aggregate count: the aggregate went
@@ -478,13 +364,69 @@ func TestTheUnixOnlyStorageFilesCountAsReaders(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Skipf("%s is gone; if it moved, move this list with it", rel)
 		}
-		f, err := parser.ParseFile(gotoken.NewFileSet(), path, nil, parser.ParseComments)
-		if err != nil {
-			t.Fatalf("%s: %v", rel, err)
-		}
-		if buildExcluded(f) {
+		if buildExcluded(path) {
 			t.Errorf("%s is excluded, and it is compiled on linux: every name read "+
 				"only from here looks unwired", rel)
 		}
+	}
+}
+
+// buildExcluded agrees with the compiler on every file in the tree.
+//
+// Trivially true now that it asks go/build, and kept because the two hand-rolled
+// versions it replaced were each wrong on real files here -- one excluding every
+// `!windows` file, the other excluding anything under `!<unmodelled tag>`. If a
+// future change reintroduces a local evaluator "for speed", this is the check it
+// has to pass.
+func TestBuildExcludedAgreesWithTheCompiler(t *testing.T) {
+	checked, excluded := 0, 0
+	err := filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		checked++
+		want, merr := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
+		if merr != nil {
+			return nil
+		}
+		got := buildExcluded(path)
+		if got == want { // buildExcluded is the NEGATION of MatchFile
+			t.Errorf("%s: buildExcluded=%v and the compiler's MatchFile=%v",
+				path, got, want)
+		}
+		if got {
+			excluded++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checked < 100 {
+		t.Errorf("only %d .go files walked; the tree has hundreds, so this "+
+			"comparison ran on almost nothing", checked)
+	}
+	t.Logf("%d files, %d excluded on %s/%s", checked, excluded, runtime.GOOS, runtime.GOARCH)
+}
+
+// A `//go:build` line quoted inside a doc comment is not the file's constraint.
+//
+// Scanning every comment in the file made one -- and this file contains two --
+// the constraint for the whole file, discounting every reader in it. go/build
+// reads the leading block only, which is what the compiler does.
+func TestAQuotedBuildLineIsNotAConstraint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sample.go")
+	body := "package sample\n\n" +
+		"// Files that are windows-only carry\n" +
+		"//go:build windows\n" +
+		"// at the top; this comment is NOT a constraint.\n" +
+		"func F() {}\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if buildExcluded(path) {
+		t.Error("a //go:build line inside a doc comment was read as the file's " +
+			"constraint, so every declaration read from that file looks unwired")
 	}
 }

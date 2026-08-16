@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -104,55 +105,88 @@ func postForm(t *testing.T, ts *httptest.Server, path string, form url.Values) (
 	return resp.StatusCode, string(buf[:n])
 }
 
-// EVERY fan-out endpoint, not the two that happened to work.
+// EVERY federated read, DERIVED from surfaceRoutes rather than hand-kept.
 //
-// The first version of this tested /select/logsql/hits and /select/logsql/facets
-// and passed while /select/logsql/query -- the endpoint the change was written
-// for -- was still capped. federatedSelect writes the PLANNED query into the
-// shard URL before the overflow check runs, so `query` was already a URL key and
-// could not move to the body; with nothing else in the form there was no body at
-// all. Measured then: 520 KB answered 200, 560 KB answered 503 `0(unavailable)`
-// with the shard never reached, and the same query on a non-router node
-// answered 200.
-func TestEveryFanOutEndpointCarriesALargeQuery(t *testing.T) {
+// The first version listed two endpoints and passed while /select/logsql/query
+// -- the endpoint the change was written for -- was still capped. The second
+// listed ten, one of which (/select/logsql/hits_count) is not a route at all
+// and skipped forever on its 404, so it covered nine of the FOURTEEN federated
+// reads and missed /select/logsql/stats_query and stats_query_range: the
+// Grafana-dashboard shape this whole change is about.
+//
+// This repository had already learned that lesson and written it down:
+// TestEveryFederatedReadIsInTheCompletenessSuite exists because
+// "federatedEndpoints was a hand-kept list that had drifted to nine of the
+// fourteen federated reads". A hand-kept list drifted to nine of fourteen
+// again, in a test written to prove coverage.
+//
+// So the set comes from surfaceRoutes(), which TestEverySurfaceRouteIsClassified
+// proves is every path the mux registers. A new federated endpoint is covered
+// the day it is classified, and one that disappears takes its case with it.
+func TestEveryFederatedReadCarriesALargeQuery(t *testing.T) {
 	q := bigQuery(1_200_000)
-	for _, ep := range []struct{ path, extra string }{
-		{"/select/logsql/query", ""},
-		{"/select/logsql/hits", "step=1h"},
-		{"/select/logsql/facets", ""},
-		{"/select/logsql/field_names", ""},
-		{"/select/logsql/field_values", "field=level"},
-		{"/select/logsql/streams", ""},
-		{"/select/logsql/stream_ids", ""},
-		{"/select/logsql/stream_field_names", ""},
-		{"/select/logsql/stream_field_values", "field=app"},
-		{"/select/logsql/hits_count", ""},
-	} {
-		t.Run(ep.path, func(t *testing.T) {
+	n := 0
+	for _, rt := range surfaceRoutes() {
+		if rt.kind != federated || rt.write {
+			continue
+		}
+		n++
+		t.Run(rt.path, func(t *testing.T) {
 			sh := newRecordingShard(t)
 			ts := wmRouter(t, sh.ts.URL)
-			form := url.Values{"query": {q}}
-			if ep.extra != "" {
-				k, v, _ := strings.Cut(ep.extra, "=")
-				form.Set(k, v)
+
+			// The route's own parameters, with `query` replaced by the large
+			// one. Taken from the classification so a route that needs
+			// `field=` or a time window is exercised as it is really called.
+			form, err := url.ParseQuery(rt.query)
+			if err != nil {
+				t.Fatalf("route query %q does not parse: %v", rt.query, err)
 			}
-			code, body := postForm(t, ts, ep.path, form)
+
+			// The large input in the route's OWN query language.
+			//
+			// A route with a JSON body does not take a form at all, so
+			// withFormInURL returns before it looks at anything -- those are
+			// out of scope for this change and skipped with the reason, not
+			// fed LogsQL and counted as covered.
+			switch {
+			case rt.body != "":
+				t.Skipf("%s carries a JSON body, so the form path this test covers "+
+					"is never entered: withFormInURL returns at the content type",
+					rt.path)
+			case strings.HasPrefix(form.Get("query"), "SELECT"):
+				form.Set("query", bigSQL(1_200_000))
+			default:
+				form.Set("query", q)
+			}
+			want := form.Get("query")
+
+			code, body := postForm(t, ts, rt.path, form)
 			if code == 503 {
 				t.Fatalf("%s refused a %d-byte POST query (%d): the request line is "+
-					"still carrying it. %s", ep.path, len(q), code, body)
+					"still carrying it. %s", rt.path, len(q), code, body)
 			}
-			if code != 200 && code != 404 {
-				t.Fatalf("%s answered %d: %s", ep.path, code, body)
+			if code != 200 {
+				t.Fatalf("%s answered %d: %.300s", rt.path, code, body)
 			}
-			if code == 404 {
-				t.Skipf("%s is not a fan-out endpoint on this build", ep.path)
+			got, _ := sh.asked()
+			if got == "" {
+				t.Fatalf("%s answered 200 without asking the shard anything", rt.path)
 			}
-			if got, _ := sh.asked(); got != q {
+			if got != want {
 				t.Errorf("the shard was asked %d bytes, the caller sent %d",
-					len(got), len(q))
+					len(got), len(want))
 			}
 		})
 	}
+	// The count is part of the assertion: a classification change that empties
+	// this loop would otherwise pass in silence.
+	if n < 12 {
+		t.Errorf("only %d federated reads were exercised; surfaceRoutes classifies "+
+			"fourteen, two of which carry a JSON body and are skipped with the "+
+			"reason. A hand-kept list drifting to nine is what this test replaced", n)
+	}
+	t.Logf("%d federated reads carried a %d-byte query", n, len(q))
 }
 
 func TestALargePostQueryReachesTheShardsWhole(t *testing.T) {
@@ -268,4 +302,15 @@ func TestAPeerRefusingBeforeItsHandlerIsNotReportedAsAVersionMismatch(t *testing
 	if !strings.Contains(body, string(PeerUnavailable)) {
 		t.Errorf("want the answer to name %s: %s", PeerUnavailable, body)
 	}
+}
+
+// bigSQL is a SELECT whose IN list is about n bytes -- /select/sql's own query
+// language, so that route is exercised rather than fed LogsQL and skipped.
+func bigSQL(n int) string {
+	var b strings.Builder
+	b.WriteString(`SELECT * FROM logs WHERE level='v0'`)
+	for i := 1; b.Len() < n; i++ {
+		fmt.Fprintf(&b, " OR level='v%d'", i)
+	}
+	return b.String()
 }
