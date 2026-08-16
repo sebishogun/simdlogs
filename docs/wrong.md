@@ -4806,3 +4806,53 @@ could not fail. This one could — it simply never ran, and announced that fact
 in a line nobody reads, in the one status (`SKIP`) that looks like success in
 every summary view. A gate that skips is worth less than no gate, because it
 occupies the place where somebody would otherwise notice one is missing.
+
+## 50. Three ways to make the line check faster, all slower than the byte loop
+
+`looksLikeJSONObject` runs on every line of every shard body on the
+bare-select path — the one structural walk a clustered read cannot skip, and
+the path whose whole design is to avoid parsing. It was measured at +188.5%
+instructions against the O(1) shape check it replaced, so the question is
+whether that can be bought back.
+
+**The disassembly first.** `go tool objdump -s 'api\.scanComposite'`: the hot
+loop is `MOVZX 0(AX)(DI*1), DX` with the length compared once at the top — no
+bounds check inside, no spills, the switch compiled to a compare tree, five to
+seven instructions per byte. There is nothing to reclaim in the scalar shape;
+it is already at ~2.1 GB/s, which for a per-byte compare tree is close to what
+the loads cost.
+
+So the question becomes bulk, which is what this family is for. Three
+candidates, measured interleaved in one session, minimum of four runs of 500,
+1000 lines per operation:
+
+| | narrow (~90 B) | wide (~980 B) | B/op |
+|---|---|---|---|
+| **byte loop, string skip inlined (shipped)** | **56,891 ns** | **469,180 ns** | **0** |
+| `bytes.IndexAny` to jump between structural bytes | 171,182 ns | 478,139 ns | 0 |
+| `simd.IndexAllAny` structural index, then walk positions | 77,200 ns | 572,165 ns | 0 |
+| `simdjson.Valid` (whole-line validity) | 176,315 ns | 451,244 ns | 13 |
+
+Every one loses on the narrow shape, which is the common one: 3.0×, 1.36× and
+3.1× respectively. On the wide shape `simdjson.Valid` is 4% faster — inside the
+8.3% floor, so not a difference — and it allocates 13 bytes per line, on a
+per-line path, which the tenets rule out on its own.
+
+**Why the SIMD kernels lose here.** They are not being used wrongly; the work
+is wrong for them. A structural index has to WRITE every structural position to
+memory, and the walk that follows still has to read them back; the byte loop
+writes nothing and branches on a value already in a register. The lines are
+also short — a per-call kernel entry has a floor (this family measured ~1.4 ns
+for a non-inlinable call), and at 90 bytes that floor is a meaningful share of
+the whole check. `simdjson.Valid` does strictly more than is needed: full
+validity where balance-and-terminate is the question.
+
+**What would change the answer.** Amortising the kernel over a whole shard
+BODY rather than a line — one structural index for 60,000 rows, then a walk
+that never re-reads the bytes — is the shape that would win, because it pays
+the entry once and the write once. That is a different function with a
+different interface, and it is not written.
+
+Recorded rather than left as folklore: "we should use the SIMD kernels here" is
+the obvious suggestion for this code, and on this shape, at this granularity,
+it is measurably wrong three ways.
