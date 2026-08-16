@@ -6556,3 +6556,48 @@ decision. The rows are the assertion.
 The router's latch stays. It stops one router doing the whole pass twice, which
 wastes a round of fetches even when nothing duplicates — the cheap half, and no
 longer the only half.
+
+## 91. A cluster archive presented as an old node archive, and named the one flag that cannot help
+
+Task #431, first entry off the unwired baseline. `ValidateClusterBackup`'s doc
+says it is *"called BEFORE anything is unpacked"* because *"a restore that
+discovers the mismatch halfway has already written some of it"* — and nothing
+called it. It is the example the unwired-mechanism gate's own header cites.
+
+It had no caller because **there is no cluster restore**. `simdlogs restore`
+restores one node's archive; a cluster backup is `cluster.json` plus one tar per
+shard, and nothing reads it back. So the question is not "where should the
+validation run" but "what happens to the operator who has a cluster backup and
+the restore command they were given".
+
+Measured, a real two-shard cluster archive (14848 bytes: `cluster.json` 619,
+`shard-0.tar` 6656, `shard-1.tar` 4608):
+
+```
+simdlogs restore -src cluster.tar -dst DIR                storage: the backup archive carries no manifest
+simdlogs restore -src cluster.tar -dry-run                storage: the backup archive carries no manifest
+simdlogs restore -src cluster.tar -dst DIR -allow-unverified   the same, and one empty LOCK file written
+```
+
+Nothing corrupt landed — the tar's entries are not group names, so they are
+refused one at a time — and that is the whole of the good news. The message
+names `-allow-unverified`, whose help text is *"restore a pre-format-1 archive,
+which carries no manifest"*, and that flag fails identically. An operator was
+told their archive was unverifiable and pointed at the one option that cannot
+help.
+
+`ErrClusterArchive` and `ClusterArchiveError` are raised at the tar entry, not
+after the scan: the entries that follow are per-shard tars, and rejected one by
+one they produce a limit or a name error whose text says nothing about what the
+archive is. The error carries the manifest bytes out, and the restore command
+decodes them, **validates them with `ValidateClusterBackup`**, and prints the
+shard count, each shard's archive and rows, and the procedure — including that
+the shard count must match, because rows are placed by a function of it.
+
+Validated before quoted, which is the point of running it here: two archives
+claiming shard 0 would otherwise be printed as a shard list an operator could
+act on. Four malformed manifests are refused by name.
+
+The gate's baseline is a ratchet in both directions, and this is the first entry
+it has given back: an exemption that gains a production reader fails the gate,
+so it cannot outlive its reason.

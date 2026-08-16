@@ -215,24 +215,29 @@ var exempt = map[string]string{
 	// the failure it prevents, and never connected -- which is what this gate
 	// was written to surface. Listed so the gate can run today rather than
 	// staying off until every one is fixed.
+	//
+	// ValidateClusterBackup is NOT here any more. It has a production caller:
+	// cmd/simdlogs/restore.go runs it when the archive it was handed turns out
+	// to be a cluster one, before quoting what the manifest claims. That was
+	// the example this gate's own header cites, and it is the first entry the
+	// ratchet has removed.
 	// ReplicasConsulted is NOT here any more, and the reason is worth keeping.
 	// Its entry said "read by nothing", which was false under the rule this gate
 	// now applies: encoding/json reads it by reflection at cluster_backup.go:196
 	// and it ships in cluster.json. Accurately: no Go code BRANCHES on it. The
 	// gate cannot see reflection and does not pretend to.
-	"ValidateClusterBackup": "no production caller. Its doc says it is 'called BEFORE anything is unpacked' because 'a restore that discovers the mismatch halfway has already written some of it' -- and the restore path does not call it. The example this gate's own header cites, which the first two versions of the gate could not see",
-	"routeCount":            "the audit DOES call it -- route_audit_test.go:38, route_count_test.go:23, contracts_test.go:333 -- and the audit is a test, which is the actual reason. The doc block at server.go:602 describes registeredPaths and is attached to routeCount, which is why the gate sees this name at all",
-	"ExecuteCount":          "an Executor method with no PRODUCTION caller -- executor_test.go:221, :231 and :329 do call it, and an earlier version of this note said \"no caller\" flat",
-	"QuarantinedGroups":     "the COUNT reaches production (countQuarantined -> the simdlogs_storage_quarantined_groups gauge); only the LISTING -- which group, why, how many bytes, when -- has no reader, so an operator can alert on the number and cannot ask what it is",
-	"SnapshotAll":           "superseded by SnapshotAllWithSeq, which is what callers use",
-	"RestoreTar":            "the older unstaged restore path; protocols.go:27 says the staged one replaced it",
-	"SetMaxRows":            "a dead exported setter: -search.maxRows reaches the server through config (server.go:300), so the LIMIT works and this way of setting it has no caller",
-	"SetDirRereadInterval":  "the same, one flag over: -readiness-reread-interval arrives via config.DirRereadInterval (server.go:244) and this setter is unused",
-	"readiness":             "server.go:2045 is a SUPERSEDED readiness handler; /-/ready goes to s.healthHandler(healthReady) at server.go:716. The earlier reason blamed 'a name shared with unrelated prose', which describes a mechanism this gate does not have -- comments never contribute to uses",
-	"FieldRequestID":        "a log field constant no log line uses",
-	"FieldStatus":           "same",
-	"FieldDurationMS":       "same",
-	"FieldRows":             "same",
+	"routeCount":           "the audit DOES call it -- route_audit_test.go:38, route_count_test.go:23, contracts_test.go:333 -- and the audit is a test, which is the actual reason. The doc block at server.go:602 describes registeredPaths and is attached to routeCount, which is why the gate sees this name at all",
+	"ExecuteCount":         "an Executor method with no PRODUCTION caller -- executor_test.go:221, :231 and :329 do call it, and an earlier version of this note said \"no caller\" flat",
+	"QuarantinedGroups":    "the COUNT reaches production (countQuarantined -> the simdlogs_storage_quarantined_groups gauge); only the LISTING -- which group, why, how many bytes, when -- has no reader, so an operator can alert on the number and cannot ask what it is",
+	"SnapshotAll":          "superseded by SnapshotAllWithSeq, which is what callers use",
+	"RestoreTar":           "the older unstaged restore path; protocols.go:27 says the staged one replaced it",
+	"SetMaxRows":           "a dead exported setter: -search.maxRows reaches the server through config (server.go:300), so the LIMIT works and this way of setting it has no caller",
+	"SetDirRereadInterval": "the same, one flag over: -readiness-reread-interval arrives via config.DirRereadInterval (server.go:244) and this setter is unused",
+	"readiness":            "server.go:2045 is a SUPERSEDED readiness handler; /-/ready goes to s.healthHandler(healthReady) at server.go:716. The earlier reason blamed 'a name shared with unrelated prose', which describes a mechanism this gate does not have -- comments never contribute to uses",
+	"FieldRequestID":       "a log field constant no log line uses",
+	"FieldStatus":          "same",
+	"FieldDurationMS":      "same",
+	"FieldRows":            "same",
 }
 
 // buildExcluded reports whether f is compiled for a DIFFERENT platform than

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"errors"
 	"os"
@@ -197,4 +198,122 @@ func TestRestoreCommand(t *testing.T) {
 			t.Fatalf("stderr %q", errOut)
 		}
 	})
+}
+
+// A CLUSTER archive is named as one, not called unverifiable.
+//
+// It carries cluster.json and one tar per shard, and no BACKUP-MANIFEST -- so
+// the node restore reported "the backup archive carries no manifest", which
+// names -allow-unverified. That flag is for a pre-format-1 NODE archive and
+// fails identically, so an operator holding a cluster backup was told their
+// archive was unverifiable and pointed at the one option that cannot help.
+//
+// This is also ValidateClusterBackup's first production caller. Its doc says it
+// is "called BEFORE anything is unpacked" because "a restore that discovers the
+// mismatch halfway has already written some of it", and no shipped path called
+// it -- the example the unwired-mechanism gate's own header cites.
+func TestAClusterArchiveIsNamedRatherThanCalledUnverifiable(t *testing.T) {
+	// A cluster archive by hand, in the shape clusterBackup writes: the
+	// manifest first, then one tar per shard.
+	man := `{"format":1,"createdUnix":1700000000,"protocol":1,` +
+		`"shards":[{"shard":0,"archive":"shard-0.tar","rows":7},` +
+		`{"shard":1,"archive":"shard-1.tar","rows":5}]}`
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	write := func(name string, body []byte) {
+		t.Helper()
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o600, Size: int64(len(body)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("cluster.json", []byte(man))
+	write("shard-0.tar", bytes.Repeat([]byte{0}, 1024))
+	write("shard-1.tar", bytes.Repeat([]byte{0}, 1024))
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "cluster.tar")
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every way an operator would reach for it, including the flag the old
+	// message sent them to.
+	for _, args := range [][]string{
+		{"-src", path, "-dst", filepath.Join(t.TempDir(), "into")},
+		{"-src", path, "-dry-run"},
+		{"-src", path, "-dst", filepath.Join(t.TempDir(), "into2"), "-allow-unverified"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			code, _, errOut := run(t, "", args...)
+			if code == 0 {
+				t.Fatalf("restoring a cluster archive into a node succeeded: %s", errOut)
+			}
+			if !strings.Contains(errOut, "cluster archive") {
+				t.Errorf("the refusal does not say what the archive IS:\n%s", errOut)
+			}
+			if strings.Contains(errOut, "carries no manifest") {
+				t.Errorf("the refusal still calls a cluster archive unmanifested, "+
+					"which points at -allow-unverified and that cannot help:\n%s", errOut)
+			}
+			// The manifest's own facts, so the operator knows what they hold.
+			for _, want := range []string{"2 shards", "shard-0.tar", "shard-1.tar", "7 rows"} {
+				if !strings.Contains(errOut, want) {
+					t.Errorf("the refusal does not mention %q:\n%s", want, errOut)
+				}
+			}
+			if !strings.Contains(errOut, "one shard at a time") {
+				t.Errorf("the refusal does not say what to do instead:\n%s", errOut)
+			}
+		})
+	}
+}
+
+// A cluster archive whose manifest does not validate is reported as that.
+//
+// ValidateClusterBackup runs before the manifest's contents are quoted, so a
+// malformed one is named rather than read out as fact -- two shards claiming
+// the same index would otherwise be printed as a shard list an operator could
+// act on.
+func TestAMalformedClusterManifestIsNotQuotedAsFact(t *testing.T) {
+	for _, tc := range []struct{ name, man, want string }{
+		{"two archives claim one shard",
+			`{"format":1,"protocol":1,"shards":[{"shard":0,"archive":"a.tar"},{"shard":0,"archive":"b.tar"}]}`,
+			"appears twice"},
+		{"a shard names no archive",
+			`{"format":1,"protocol":1,"shards":[{"shard":0,"archive":""}]}`,
+			"names no archive"},
+		{"no shards at all",
+			`{"format":1,"protocol":1,"shards":[]}`,
+			"records no shards"},
+		{"not JSON", `{`, "does not parse"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			tw := tar.NewWriter(&buf)
+			if err := tw.WriteHeader(&tar.Header{
+				Name: "cluster.json", Mode: 0o600, Size: int64(len(tc.man)),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			tw.Write([]byte(tc.man))
+			tw.Close()
+			path := filepath.Join(t.TempDir(), "cluster.tar")
+			if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			code, _, errOut := run(t, "", "-src", path, "-dry-run")
+			if code == 0 {
+				t.Fatalf("a malformed cluster archive succeeded: %s", errOut)
+			}
+			if !strings.Contains(errOut, tc.want) {
+				t.Errorf("the refusal does not say %q:\n%s", tc.want, errOut)
+			}
+		})
+	}
 }

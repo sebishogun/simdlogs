@@ -30,6 +30,11 @@ import (
 const (
 	backupManifestName = "BACKUP-MANIFEST"
 	backupCompleteName = "BACKUP-COMPLETE"
+	// clusterManifestName is the entry a CLUSTER archive carries. This package
+	// never writes one and cannot restore one; it is here so a cluster archive
+	// can be told apart from a node archive with no manifest, which is what it
+	// otherwise looks like. See ErrClusterArchive.
+	clusterManifestName = "cluster.json"
 )
 
 // BackupFormat is the archive format this build writes.

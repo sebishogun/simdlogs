@@ -1,12 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"time"
 
+	"github.com/sebishogun/simdlogs/internal/api"
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
@@ -129,6 +132,45 @@ func runRestore(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "the store IS in place at %s; do not retry. It may not survive a power\n", *dst)
 		fmt.Fprintf(stderr, "loss until the directory is synced, so sync the filesystem now.\n")
 		printManifest(stdout, "restored", man)
+		return 1
+	}
+	// A CLUSTER archive, named as one.
+	//
+	// It carries no BACKUP-MANIFEST, so it used to present as "the backup
+	// archive carries no manifest" -- which names -allow-unverified, the flag
+	// for a pre-format-1 NODE archive, and that flag fails the same way. An
+	// operator holding a cluster backup was told their archive was
+	// unverifiable and pointed at the one option that cannot help.
+	//
+	// This is also where ValidateClusterBackup gets its first production
+	// caller. Its own doc says it is "called BEFORE anything is unpacked"
+	// because "a restore that discovers the mismatch halfway has already
+	// written some of it", and no shipped path called it. Here the manifest is
+	// checked before its contents are quoted, so a malformed one is reported as
+	// malformed rather than read out as fact.
+	var clusterErr *storage.ClusterArchiveError
+	if errors.As(err, &clusterErr) {
+		fmt.Fprintf(stderr, "simdlogs restore: %v\n", err)
+		var cm api.ClusterManifest
+		if jerr := json.Unmarshal(clusterErr.Manifest, &cm); jerr != nil {
+			fmt.Fprintf(stderr, "its cluster.json does not parse (%v), so what it holds is unknown.\n", jerr)
+			return 1
+		}
+		if verr := api.ValidateClusterBackup(cm, 0); verr != nil {
+			fmt.Fprintf(stderr, "its cluster.json does not validate: %v\n", verr)
+			return 1
+		}
+		fmt.Fprintf(stderr, "it holds %d shards, taken %s.\n",
+			len(cm.Shards), time.Unix(cm.CreatedUnix, 0).UTC().Format(time.RFC3339))
+		for _, sb := range cm.Shards {
+			fmt.Fprintf(stderr, "  shard %d  %s  %d rows\n", sb.Shard, sb.Archive, sb.Rows)
+		}
+		fmt.Fprintf(stderr, "Restore it one shard at a time: extract each %s from this tar and\n",
+			"shard-N.tar")
+		fmt.Fprintf(stderr, "run this command once per storage node, into that node's own directory.\n")
+		fmt.Fprintf(stderr, "The shard COUNT must match: rows are placed by a function of it, so a\n")
+		fmt.Fprintf(stderr, "%d-shard archive restored into a cluster of any other size puts rows\n", len(cm.Shards))
+		fmt.Fprintf(stderr, "where no query looks for them.\n")
 		return 1
 	}
 	if errors.Is(err, storage.ErrBackupUnverified) && *allowUnverified && !*dryRun {

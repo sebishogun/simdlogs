@@ -142,6 +142,32 @@ func writeTarFile(tw *tar.Writer, name string, data []byte, mod time.Time) error
 // not finish, not a corrupt one -- and a distinct remedy.
 var ErrBackupTruncated = errors.New("storage: the backup archive is truncated")
 
+// ErrClusterArchive reports an archive taken by a ROUTER, holding one tar per
+// shard, handed to the single-node restore.
+//
+// It is a distinct error because the two are indistinguishable by the only
+// thing the node path looks for: a cluster archive carries no BACKUP-MANIFEST,
+// so it presented as "carries no manifest" -- which names the flag
+// (-allow-unverified) for a pre-format-1 NODE archive, and that flag then fails
+// the same way. An operator holding a cluster backup was told the archive was
+// unverifiable and pointed at the one option that cannot help.
+//
+// Nothing is written either way; this is a message, and the message is the
+// difference between "your archive is old" and "your archive is a different
+// shape and needs a different procedure".
+var ErrClusterArchive = errors.New(
+	"storage: this is a cluster archive (it carries cluster.json and one tar per shard), " +
+		"not a single node's backup")
+
+// ClusterArchiveError carries the cluster manifest's bytes out with the
+// refusal, so a caller that can read them -- the restore command -- reports the
+// shard count and what to do instead, and one that cannot still gets a message
+// that names the shape.
+type ClusterArchiveError struct{ Manifest []byte }
+
+func (e *ClusterArchiveError) Error() string { return ErrClusterArchive.Error() }
+func (e *ClusterArchiveError) Unwrap() error { return ErrClusterArchive }
+
 // ErrBackupUnverified reports an archive with no manifest. Restoring it is
 // possible and nothing about it was checked.
 var ErrBackupUnverified = errors.New("storage: the backup archive carries no manifest")
@@ -288,6 +314,16 @@ func readBackup(r io.Reader, lim backupReadLimits, onManifest func(*BackupManife
 			}
 			complete = true
 			continue
+		case clusterManifestName:
+			// Refused HERE rather than after the scan, because the entries that
+			// follow are per-shard tars: bounded and rejected one by one, they
+			// would produce a limit or a name error whose text says nothing
+			// about what the archive is.
+			b, err := io.ReadAll(io.LimitReader(tr, lim.manifestBytes()+1))
+			if err != nil {
+				return man, restored, ErrClusterArchive
+			}
+			return man, restored, &ClusterArchiveError{Manifest: b}
 		}
 
 		// The terminator is documented as the LAST entry and only its presence
