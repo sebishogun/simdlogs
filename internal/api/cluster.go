@@ -618,12 +618,39 @@ func (s *Server) mergeRows(
 		// The order the pipes see must be the order a single storage node would
 		// have given them, or a pipe that reads POSITION -- offset, limit
 		// without a sort, tail -- answers a different question on a cluster than
-		// on one node. A node scans oldest-first, so the coordinator half sorts
-		// ascending; the bare-select path below keeps newest-first, because
-		// there `limit` means "the newest N" and that is the endpoint's
-		// documented meaning.
+		// on one node.
+		//
+		// AND SO MUST THE ROW SET. `limit` is LastN, and on a node LastN bounds
+		// the SCAN: `Run` returns the newest n rows newest-first and every pipe
+		// then runs on those n. Applying it after the pipes instead -- taking
+		// the last n of an ascending result and reversing -- is a different
+		// answer, not a different order. Measured, three shards of ten rows,
+		// `&limit=5`:
+		//
+		//	query                          node            this path before
+		//	* | limit 5                    02:09..02:05    00:04..00:00
+		//	* | sort by (_time)            02:05..02:09    02:09..02:05
+		//	* | sort by (_time) | limit 5  02:05..02:09    00:04..00:00
+		//	* | offset 2 | limit 3         02:07..02:05    00:04..00:02
+		//
+		// So the bound is applied HERE, to the merged rows, before the pipes --
+		// which is where the node applies it -- and the order flips to
+		// newest-first with it, because that is what a bounded scan returns.
+		// Unbounded, a node scans oldest-first and this stays ascending.
+		//
+		// limitBoundsOutput is the same set as before and still names the pipe
+		// heads a node lets BYPASS the scan bound: runStats and runUniqFast run
+		// their own scan, which is why `* | stats count() c` answers 30 on a
+		// node with `&limit=5` and not 5.
+		bounded := 0
+		if n := endpointLimit(r); n > 0 && limitBoundsOutput(coordPipes) {
+			bounded = n
+		}
 		sort.Slice(all, func(i, j int) bool {
 			if all[i].t != all[j].t {
+				if bounded > 0 {
+					return all[i].t > all[j].t
+				}
 				return all[i].t < all[j].t
 			}
 			if all[i].shard != all[j].shard {
@@ -631,6 +658,9 @@ func (s *Server) mergeRows(
 			}
 			return all[i].seq < all[j].seq
 		})
+		if bounded > 0 && len(all) > bounded {
+			all = all[:bounded]
+		}
 
 		// The rows are parsed into fields ONLY here.
 		//
@@ -648,22 +678,10 @@ func (s *Server) mergeRows(
 			return
 		}
 
-		// The endpoint's `limit`, applied once, here -- and only where a single
-		// node would apply it. See limitBoundsOutput.
-		//
-		// `limit` means the NEWEST n, returned newest-first. Measured against a
-		// single node: `*` unlimited answers line 00 first and `*&limit=3`
-		// answers line 29 first, on the same data. Taking the first n of the
-		// ascending merge gave the OLDEST n -- the opposite rows, not merely
-		// the opposite order.
-		if n := endpointLimit(r); n > 0 && limitBoundsOutput(coordPipes) {
-			if len(merged) > n {
-				merged = merged[len(merged)-n:]
-			}
-			for i, j := 0, len(merged)-1; i < j; i, j = i+1, j-1 {
-				merged[i], merged[j] = merged[j], merged[i]
-			}
-		}
+		// NO post-pipeline limit. The bound was applied to the rows entering the
+		// pipes, above, because that is where a node applies it. Applying it
+		// again here would truncate a result the pipes already shaped -- and
+		// truncate it from the wrong end, which is the defect this replaced.
 		w.Header().Set("Content-Type", ndjsonContentType)
 		w.WriteHeader(http.StatusOK)
 		bw := bufio.NewWriter(w)

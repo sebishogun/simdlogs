@@ -150,8 +150,44 @@ func (s *Server) planQuery(w http.ResponseWriter, r *http.Request) (shardQuery s
 	}
 
 	shardQuery = segs[0]
-	for i := 1; i <= len(plan.ShardPipes) && i < len(segs); i++ {
+	// NOTHING is pushed down when the endpoint's `limit` bounds the output.
+	//
+	// `limit` is LastN, and a node applies it to the SCAN -- before any pipe,
+	// row-local ones included. A shard that ran a filtering row-local pipe
+	// first has already thrown away rows the bound would have kept, and the
+	// router cannot put them back. Measured, three shards of ten rows,
+	// `&limit=5`, where the newest five all have level=error:
+	//
+	//	* | filter level:info | sort by (_time)
+	//	  node     nothing -- the newest five are all `error`
+	//	  cluster  five `info` rows, at 200
+	//
+	// The head filter is not affected: it is part of the scan on both sides,
+	// which is why `level:info | sort by (_time)` already agreed.
+	//
+	// The cost is that shards return their whole match set for a bounded
+	// query with pipes, which is the same trade withoutLimits already makes
+	// for `limit` and `max_values_per_field` -- and the alternative here is
+	// not a slower answer but a different one.
+	push := len(plan.ShardPipes)
+	if n := endpointLimit(r); n > 0 && limitBoundsOutput(q.Pipes) {
+		// Up to the FIRST pipe that can change the row count, not zero: a
+		// one-to-one pipe is safe under the bound, and each shard's newest n
+		// contains the cluster's newest n, so pushing it down is both correct
+		// and cheaper. `* | fields _time, _msg` stays on the shards; `* |
+		// filter level:info | ...` does not.
+		for i, pp := range plan.ShardPipes {
+			if query.ChangesRowCount(pp) {
+				push = i
+				break
+			}
+		}
+	}
+	for i := 1; i <= push && i < len(segs); i++ {
 		shardQuery += " | " + segs[i]
+	}
+	if push < len(plan.ShardPipes) {
+		return shardQuery, q.Pipes, true
 	}
 	return shardQuery, plan.CoordinatorPipes, true
 }

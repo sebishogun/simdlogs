@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -1102,4 +1103,154 @@ func countTempMultipart(t *testing.T) int {
 		}
 	}
 	return n
+}
+
+// A cluster and a single node keep the same rows under `?limit`, in the same
+// order.
+//
+// `limit` is LastN, and a node applies it to the SCAN -- before every pipe,
+// row-local ones included. The router applied it AFTER the coordinator pipes,
+// taking the last n of an ascending result and reversing, which is a different
+// answer and not merely a different order. Measured, three shards of ten rows
+// each with distinct timestamps, `&limit=5`:
+//
+//	query                          node            router
+//	* | limit 5                    02:09..02:05    00:04..00:00
+//	* | sort by (_time)            02:05..02:09    02:09..02:05
+//	* | sort by (_time) | limit 5  02:05..02:09    00:04..00:00
+//	* | offset 2 | limit 3         02:07..02:05    00:04..00:02
+//	* | filter level:info | sort   nothing         five info rows
+//
+// The last one is a second defect and needs a second fix: a shard that ran a
+// filtering row-local pipe first has already discarded rows the bound would
+// have kept, so under a bounding `limit` the push-down stops at the first pipe
+// that can change the row count. `* | fields _time, _msg` still pushes down --
+// one row in, one row out means each shard's newest n contains the cluster's
+// newest n.
+//
+// THE NODE IS THE SPECIFICATION, and every row is compared in order. The two
+// stats/uniq rows compare as SETS: group order is a map iteration on both
+// sides, so two correct answers can differ there and only there.
+func TestAClusterAndANodeKeepTheSameRowsUnderALimit(t *testing.T) {
+	rows := func(level string, base int) []string {
+		var out []string
+		for i := 0; i < 10; i++ {
+			out = append(out, fmt.Sprintf(
+				`{"_time":"2024-01-01T00:%02d:%02dZ","_msg":"m","level":%q,"user":"u%d"}`,
+				base, i, level, i%7))
+		}
+		return out
+	}
+	a := realShard(t, rows("info", 0))
+	b := realShard(t, rows("warn", 1))
+	c := realShard(t, rows("error", 2))
+	ts := router(t, a.URL, b.URL, c.URL)
+	solo := realShard(t, append(append(rows("info", 0), rows("warn", 1)...), rows("error", 2)...))
+
+	for _, tc := range []struct {
+		q string
+		// asSet is for the two whose group order is a map iteration on both
+		// sides. Everything else is compared line by line, in order.
+		asSet bool
+	}{
+		{`*`, false},
+		{`* | limit 5`, false},
+		{`* | sort by (_time)`, false},
+		{`* | sort by (_time) | limit 5`, false},
+		{`* | sort by (_time) desc | limit 3`, false},
+		{`* | offset 2 | limit 3`, false},
+		{`* | fields _time, level | sort by (_time)`, false},
+		{`level:info | sort by (_time)`, false},
+		// The filtering row-local pipe: the newest five are all level=error,
+		// so a node answers nothing and a router that let its shards filter
+		// first answered five info rows at 200.
+		{`* | filter level:info | sort by (_time)`, false},
+		{`* | filter level:error | sort by (_time)`, false},
+		{`* | stats count() c`, true},
+		{`* | stats by (level) count() c`, true},
+		{`* | uniq by (level)`, true},
+	} {
+		t.Run(tc.q, func(t *testing.T) {
+			form := url.Values{"query": {tc.q}, "limit": {"5"}}
+			want := strings.TrimSpace(rawGet(t, solo, "/select/logsql/query?"+form.Encode()))
+			got := strings.TrimSpace(rawGet(t, ts, "/select/logsql/query?"+form.Encode()))
+			if tc.asSet {
+				if !sameLineSet(want, got) {
+					t.Errorf("cluster and node disagree as sets:\n  node    %s\n  cluster %s", want, got)
+				}
+				return
+			}
+			// Line by line, IN ORDER, each line as an object.
+			//
+			// Not byte-for-byte: a node emits a field the pipeline named --
+			// `filter level:error`, `sort by (level, _time)` -- in second
+			// position, and the coordinator rebuilds rows from each shard's
+			// JSON in ingest order. Measured, same rows and same values:
+			//
+			//	node    {"_time":"…05Z","level":"error","_msg":"m","user":"u5",…}
+			//	cluster {"_time":"…05Z","_msg":"m","level":"error","user":"u5",…}
+			//
+			// That is a real divergence for a byte-comparing consumer and it
+			// is recorded as open; it is NOT this defect, and comparing bytes
+			// here would hide the row-level question behind it. Row count,
+			// row order and every key and value are still exact.
+			if !sameRowsInOrder(want, got) {
+				t.Errorf("cluster and node disagree on which rows `%s` keeps, or "+
+					"on their order:\n  node    %s\n  cluster %s\nRAW node    %.200s\nRAW cluster %.200s",
+					tc.q, timesOf(want), timesOf(got), want, got)
+			}
+		})
+	}
+	// The comparison is not three empty answers agreeing.
+	form := url.Values{"query": {`*`}, "limit": {"5"}}
+	if n := len(strings.Split(strings.TrimSpace(
+		rawGet(t, solo, "/select/logsql/query?"+form.Encode())), "\n")); n != 5 {
+		t.Fatalf("the node answered %d lines for `*&limit=5`, so the fixture is "+
+			"not what this test compares against", n)
+	}
+}
+
+// sameRowsInOrder compares two NDJSON bodies row by row, each row as an object.
+func sameRowsInOrder(a, b string) bool {
+	al, bl := strings.Split(a, "\n"), strings.Split(b, "\n")
+	if len(al) != len(bl) {
+		return false
+	}
+	for i := range al {
+		var x, y map[string]any
+		if json.Unmarshal([]byte(al[i]), &x) != nil || json.Unmarshal([]byte(bl[i]), &y) != nil {
+			if al[i] != bl[i] {
+				return false
+			}
+			continue
+		}
+		if len(x) != len(y) {
+			return false
+		}
+		for k, v := range x {
+			if w, ok := y[k]; !ok || fmt.Sprint(v) != fmt.Sprint(w) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// timesOf renders each line's _time, so a failure names the rows rather than
+// printing six hundred bytes of identical JSON.
+func timesOf(s string) string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		i := strings.Index(l, `"_time":"`)
+		if i < 0 {
+			out = append(out, l)
+			continue
+		}
+		v := l[i+9:]
+		if j := strings.IndexByte(v, '"'); j >= 0 {
+			v = v[:j]
+		}
+		out = append(out, strings.TrimSuffix(strings.TrimPrefix(v, "2024-01-01T00:"), "Z"))
+	}
+	return strings.Join(out, " ")
 }

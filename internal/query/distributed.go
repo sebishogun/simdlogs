@@ -311,6 +311,44 @@ func stripsTime(p Pipe) bool {
 	return false
 }
 
+// ChangesRowCount reports that a pipe's output can hold a different number of
+// rows than its input.
+//
+// It exists for ONE question: whether a pipe may run on a shard when the
+// endpoint's `limit` is set. `limit` is LastN, and a node applies it to the
+// scan -- before every pipe. A shard that filtered first has already discarded
+// rows the bound would have kept, and the router cannot put them back:
+//
+//   - | filter level:info | sort by (_time)   with &limit=5
+//     node     nothing, when the newest five are all level=error
+//     cluster  five info rows, at HTTP 200
+//
+// A pipe that maps rows one-to-one is safe: each shard's newest n contains the
+// cluster's newest n, so pushing it down with the bound is both correct and
+// cheaper.
+//
+// THE DEFAULT IS TRUE. A pipe this switch does not name is treated as unsafe to
+// push down, which costs a shard's full match set and never an answer. The
+// opposite default would make a pipe added to the language silently eligible,
+// and the failure would be a short answer at 200.
+func ChangesRowCount(p Pipe) bool {
+	switch p.(type) {
+	case *FieldsPipe, *RenamePipe, *DeletePipe, *CopyPipe, *FormatPipe,
+		*ExtractPipe, *ExtractRegexpPipe, *MathPipe, *LenPipe,
+		*UnpackJSONPipe, *UnpackLogfmtPipe, *UnpackSyslogPipe, *UnpackWordsPipe,
+		*ReplacePipe, *HashPipe, *DecolorizePipe, *PackPipe,
+		*JSONArrayLenPipe, *CollapseNumsPipe:
+		// One row in, one row out: fields are added, renamed, rewritten or
+		// dropped, and no row is.
+		return false
+	}
+	// Named for the reader rather than left to the default, because these are
+	// the row-local pipes it is actually about: `filter` and `drop_empty`
+	// remove rows, `unroll` replaces one row with as many as its array holds
+	// (zero, for an empty one).
+	return true
+}
+
 // MergeOp is how a coordinator combines one aggregate's per-shard values.
 type MergeOp uint8
 

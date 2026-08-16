@@ -6414,3 +6414,74 @@ Two more from the same round:
   `pack_logfmt` emitted `_time=… c=1 _time=…`. Two logfmt cases now run through
   the same comparison, with a logfmt parser that keeps the key ORDER, since a
   map would collapse the duplicate exactly as the JSON half once did.
+
+## 88. `limit` bounds the scan on a node and the output on a router — two different answers
+
+Task #438, left open by entry 61 as "a cluster and a single node disagree on
+which rows `sort ... | limit` keeps". It is not about `sort`. It is the
+endpoint's `limit`, and it breaks four query shapes.
+
+`limit` is `LastN`, and a node applies it to the **scan**: `Run` returns the
+newest n rows newest-first and every pipe then runs on those n
+(`internal/query/engine.go:425`). The router applied it after the coordinator
+pipes — taking the last n of an ascending result and reversing it. Measured,
+three shards of ten rows with distinct timestamps, `&limit=5`, where the newest
+five all have `level=error`:
+
+| query | node | router |
+|---|---|---|
+| `* \| limit 5` | 02:09..02:05 | **00:04..00:00** |
+| `* \| sort by (_time)` | 02:05..02:09 | **02:09..02:05** |
+| `* \| sort by (_time) \| limit 5` | 02:05..02:09 | **00:04..00:00** |
+| `* \| offset 2 \| limit 3` | 02:07..02:05 | **00:04..00:02** |
+| `* \| filter level:info \| sort by (_time)` | nothing | **five `info` rows** |
+| `*` | 02:09..02:05 | 02:09..02:05 |
+| `* \| stats count() c` | 30 | 30 |
+
+Three of these are the **opposite rows**, not the opposite order. All at 200.
+
+**Two defects, two fixes.** The bound moves to where a node applies it: the
+merged rows are sorted newest-first and truncated to n *before* the coordinator
+pipes, and the post-pipeline truncation is gone. That fixes the first four rows.
+
+The fifth needs the plan to change. A shard that ran a filtering row-local pipe
+first has already discarded rows the bound would have kept, and the router
+cannot put them back — so under a bounding `limit` the push-down now stops at
+the first pipe that can change the row count. `query.ChangesRowCount` names the
+one-to-one pipes explicitly and **defaults to true**: a pipe added to the
+language is treated as unsafe to push down, which costs a shard's full match set
+and never an answer. The opposite default would make it silently eligible and
+the failure would be a short answer at 200.
+
+`* | fields _time, _msg` still pushes down with its shard `limit`, and that is
+not an exception: one row in, one row out means each shard's newest n contains
+the cluster's newest n. A first version forced the whole chain to the
+coordinator and reddened
+`TestAShardLimitThePlanKeepsIsNotSuppressedByAPostForm`, which is exactly the
+row that says so.
+
+**Why `stats` is unaffected**: `runStats` runs its own scan and never sees the
+bound, which is why `* | stats count() c` answers 30 on a node with `&limit=5`
+and not 5. `limitBoundsOutput` already named that set and is unchanged — only
+the place it is consulted moved.
+
+**Still open, and measured rather than assumed gone.** The node emits a field
+the pipeline named in second position; the coordinator rebuilds rows from each
+shard's JSON in ingest order:
+
+```
+node    {"_time":"…02:05Z","level":"error","_msg":"m","user":"u5",…}
+cluster {"_time":"…02:05Z","_msg":"m","level":"error","user":"u5",…}
+```
+
+Same rows, same values, same order, different key order — for
+`| filter level:error` and for `sort by (level, _time)`. It matters to a
+byte-comparing consumer and not to a JSON one. The parity test therefore
+compares each line as an **object**, in row order, so the row question is not
+hidden behind the key question; row count, row order, and every key and value
+are exact.
+
+Thirteen query shapes are compared against a single node holding the same rows.
+Four mutations redden it: removing the pre-pipeline bound (6 subtests), keeping
+the merge ascending (9), pushing filtering pipes down anyway (1), and making
+`ChangesRowCount` always false (1).
