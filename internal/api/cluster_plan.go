@@ -357,7 +357,20 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 	// A body that will not parse is not a request that can be planned. The
 	// caller turns false into a 400 (refuseUnparseableQuery), which is the same
 	// answer withFormInURL gives for the same reason.
-	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+	// Only for a FORM body. ParseForm reads the body for any POST/PUT and runs
+	// mime.ParseMediaType first, so a malformed Content-Type failed here on a
+	// body this function was never going to read -- and only on the six routes
+	// that reach withoutLimits. The same request answered 200 on the other six:
+	//
+	//	POST <route>?query=*   Content-Type: text/plain; charset
+	//	  query, hits, facets, stats_query, stats_query_range, sql   -> 200
+	//	  field_names, field_values, streams, stream_ids,
+	//	  stream_field_names, stream_field_values                    -> 400
+	//
+	// facets escaped only by argument-evaluation order: maxValuesParam(r) primes
+	// ParseForm and swallows the error before this runs. Gating on the content
+	// type makes all twelve agree, and agree with a single node.
+	if isFormPost(r) {
 		if err := r.ParseForm(); err != nil {
 			// A form this node cannot parse -- but NOT necessarily a bad query
 			// string. ParseForm also fails on a malformed Content-Type, because
@@ -399,9 +412,14 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 	// parsed values and they have to be removed from BOTH -- r.Form is the
 	// union the peer reads and r.PostForm is what re-parsing would rebuild it
 	// from.
-	// The plan OWNS these two from here on, whether it set them or deleted
-	// them, so withFormInURL cannot re-add them from the caller's form.
-	out = withPlanKeys(out, "limit", "max_values_per_field")
+	// NOT marked plan-owned here.
+	//
+	// A marking would be inert: this function DELETES both keys from out.Form
+	// and out.PostForm below, so they never reach `extra` in the first place --
+	// removing the marking fails no test, and a comment claiming it stops
+	// withFormInURL re-adding them would be describing the deletion's work.
+	// The marking that IS load-bearing is federatedSelect's, where the plan
+	// deletes from the URL and cannot reach the form.
 	for _, f := range []url.Values{out.Form, out.PostForm} {
 		if f == nil {
 			continue
@@ -415,16 +433,28 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 	return out, true
 }
 
+// isFormPost reports whether r carries a form body this router will read.
+func isFormPost(r *http.Request) bool {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		return false
+	}
+	ct := r.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.TrimSpace(ct) == "application/x-www-form-urlencoded"
+}
+
 // refuseUnparseableQuery answers the caller when withoutLimits could not read
 // the query string, and reports whether the caller should stop.
 func (s *Server) refuseUnparseableQuery(w http.ResponseWriter, r *http.Request) {
 	// WHICH half is unreadable, checked rather than assumed.
 	//
-	// This said "query string" flat. withoutLimits also fails on a malformed
-	// Content-Type, because parsePostForm runs mime.ParseMediaType first --
-	// measured, `Content-Type: text/plain; charset` on a request whose query
-	// string parses perfectly -- and the operator was sent to inspect the half
-	// that was correct.
+	// This said "query string" flat, and a malformed FORM BODY is the common
+	// case. The Content-Type branch below is kept as a bound rather than as the
+	// case it was written for: withoutLimits no longer calls ParseForm unless
+	// the content type IS a form, so a malformed one is not an error here at
+	// all -- it just means there is no form to read.
 	what := "request body"
 	if _, err := url.ParseQuery(r.URL.RawQuery); err != nil {
 		what = "query string"

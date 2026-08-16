@@ -5215,11 +5215,17 @@ fix.
   the code is rather than only in a commit message.
 
 Also corrected: `maxPeerQueryBytes` is 60 KiB of **encoded** parameters, and
-percent-encoding a LogsQL query roughly doubles it — measured boundary 30,719 raw /
-61,439 encoded in the URL against 30,720 raw / 61,442 encoded in the body, so
-the raw budget is ~30 KB and the comment claimed 60. An earlier draft cited
-"30,001 against 31,001", which is a 1,000-wide bracket rather than the switch
-point -- both of its endpoints fall on the correct side of it. `PeerUnavailable`'s "remedy —
+percent-encoding a LogsQL query roughly doubles it — measured boundary 30,720 raw /
+61,440 encoded still in the URL against 30,721 raw / 61,443 in the body, so the
+raw budget is exactly 30 KiB and the comment claimed 60.
+
+Two drafts of this number were wrong before that one. "30,001 against 31,001" is
+a 1,000-wide bracket, not a switch point. "30,719 / 61,439 in the URL against
+30,720 / 61,442 in the body" is one raw byte and two encoded bytes off, in the
+direction that mislabels the boundary case: the comparison is
+`len(enc) > maxPeerQueryBytes`, strict, so 61,440 stays in the URL, and 61,442
+is not an attainable length in this shape's sequence at all
+(…61,439, 61,440, 61,443…). `PeerUnavailable`'s "remedy —
 another replica — is the one that can actually help" is false for the 431 that
 motivated the change: the refusal is deterministic and every replica gives the
 same answer; what the class buys is an accurate name. `docs/wrong.md` cited an
@@ -5349,3 +5355,67 @@ of its own. Impossible today — the two endpoints that build a body send JSON, 
 about what clients send, not a property of the code, and `RawQuery` is now
 cleared so a dropped `formBody` would hand the shard **neither**. It is refused
 with an explanation instead of reasoned away.
+
+## 63. The fix that suppressed a shard limit the plan deliberately keeps
+
+Entry 61 recorded which parameters the plan owns so a POST form could not
+re-add a deleted one. It marked `limit` **unconditionally**, and
+`shardQueryURL` deletes it only when there is a coordinator half — its own
+comment says *"with no coordinator half the shard limit is exactly right and
+stays"*. Over a POST it stopped staying. Measured, one shard,
+`POST query=*&limit=5`:
+
+```
+before   shard received  limit=5&query=%2A
+after    shard received  query=%2A
+GET      shard received  limit=5&query=%2A     (unchanged)
+```
+
+The answer stayed correct — `mergeRows` applies the bound from the original
+request — so this is blast radius, not a wrong number. One storage node, 20,000
+rows: `query=*` is **3,808,890 bytes** against **955** with `limit=5`, at
+190.4 B/row. Every shard streamed its whole matching set to the router, on the
+exact path POST exists for. The router buffers each shard body against a 256 MiB
+cap, so ~1.41M rows per shard before the read fails outright.
+
+Marked only when the plan deletes it now. `query` is not marked at all:
+`shardQueryURL` always `Set`s it, so it is always a URL key and the existing
+rule covers it — that marking was inert, and an inert marking reads as a
+load-bearing one.
+
+**And the both-bodies refusal fired on a request with no body.** The guard read
+`body != nil`, and both Elasticsearch handlers pass `io.ReadAll(r.Body)`, which
+never returns nil — an empty body is an empty non-nil slice. Measured,
+`POST /_count?q=<70 KiB>` with a form content type and no body: **200 before,
+400 after**, with a message saying the request carried two bodies when it
+carried none.
+
+## 64. Three labels that labelled nothing, and a 400 on half the routes
+
+- **`limitImmune` was a struct field with no reader.** Entry 62 said the immune
+  rows were "labelled rather than left to read as coverage"; the label was a
+  field nothing consulted, and the repo's unwired gate skips `_test.go` so
+  nothing could catch it. It gates the `limit` assertion now.
+- **The coverage count could not fire.** `n++` ran *before* the JSON-body skip,
+  so `n` was always 14 and `if n < 12` was unreachable — two more routes could
+  start skipping in silence. Worse, the log line then said *"14 federated reads
+  carried a 1200001-byte query"* immediately after two SKIP lines. Twelve
+  carried it.
+- **The same malformed request was 400 on six routes and 200 on six.**
+  `withoutLimits` called `ParseForm` for any POST/PUT regardless of content
+  type, and `ParseForm` runs `mime.ParseMediaType` first — so a malformed
+  `Content-Type` failed on a body the router was never going to read, and only
+  on the six routes that reach it. `facets` escaped by argument-evaluation
+  order alone: `maxValuesParam` primes `ParseForm` and swallows the error first.
+  It parses only a form content type now and all twelve answer 200.
+
+  Which retires entry 62's own fix: naming the Content-Type in the refusal was
+  the right answer to the wrong defect — the refusal should not have happened.
+
+Two stale claims corrected. `pack_test.go` still carried *"VL's `p` CONTAINS
+`_time`, `_stream_id` and `_stream`, and this server's does not"* — the sentence
+entry 59 was corrected to remove; `_stream` is on both and the gap is `_time`
+and `_stream_id`. And the switch point is **30,720 raw / 61,440 encoded still in
+the URL** against 30,721 / 61,443 in the body: the comparison is strict, so
+61,440 stays, and the previously-published 61,442 is not an attainable length in
+this shape's sequence at all.

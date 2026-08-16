@@ -126,11 +126,19 @@ func TestPackAllPacksTheRowUnderAProjectingPipe(t *testing.T) {
 //	                                      ->  {"svc":"api","n":"1","p":"{\"svc\":…,\"n\":…}"}
 //
 // The two projected shapes match this server exactly. The bare one does not,
-// and not in the direction this test is about: VL's `p` CONTAINS `_time`,
-// `_stream_id` and `_stream`, and this server's does not, because the pack runs
-// in the query layer while those fields are synthesized at serialization
-// (appendRowJSON). So the row is right and the packed value is short -- the
-// mirror image of the defect fixed here. Making them agree means synthesizing
+// and not in the direction this test is about. Measured field by field against
+// the staged binary:
+//
+//	VL  p keys  _time _stream_id _stream _msg lvl svc
+//	SL  p       {"_msg":…,"_stream":"{svc=\"api\"}","lvl":…,"svc":…}
+//
+// `_stream` is on BOTH. The gap is `_time` and `_stream_id`. An earlier version
+// of this comment said VL's `p` carries all three and this server's carries
+// none -- docs/wrong.md entry 59 was corrected and this comment, which the
+// entry is about, was left holding the false version.
+//
+// So the row is right and the packed value is short -- the mirror image of the
+// defect fixed here. Making them agree means synthesizing
 // the pair before the pipes run, which changes what every pipe sees; task #437.
 func TestAPackAllDoesNotSynthesiseStreamFields(t *testing.T) {
 	node := realShard(t, []string{

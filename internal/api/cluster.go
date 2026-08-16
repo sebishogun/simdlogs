@@ -465,7 +465,28 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 	// caller's limit back over a POST. Measured before this: three shards of
 	// ten rows and `&limit=5`, `* | stats count() c` answered 30 on a single
 	// node, 30 over a cluster GET and 15 over a cluster POST form.
-	shardReq = withPlanKeys(shardReq, "query", "limit")
+	// `limit` only when the plan DELETES it, which is only when there is a
+	// coordinator half.
+	//
+	// Marking it unconditionally suppressed a shard limit the plan
+	// deliberately KEEPS -- shardQueryURL's own comment says "with no
+	// coordinator half the shard limit is exactly right and stays". Over a POST
+	// form it stopped staying. Measured, one shard, `POST query=*&limit=5`:
+	// the shard received `limit=5&query=%2A` before and `query=%2A` after, and
+	// the same request over GET still carried it.
+	//
+	// The answer stayed correct -- mergeRows applies the bound from the
+	// original request -- so this was blast radius, not a wrong number: one
+	// storage node, 20,000 rows, `query=*` is 3,808,890 bytes against 955 with
+	// `limit=5`. Every shard streamed its whole matching set to the router on
+	// the exact path POST exists for.
+	//
+	// `query` is NOT marked: shardQueryURL always Sets it, so it is always a
+	// URL key and the "already in the query" rule covers it. Marking it was
+	// inert, and an inert marking reads as a load-bearing one.
+	if len(coordPipes) > 0 {
+		shardReq = withPlanKeys(shardReq, "limit")
+	}
 
 	// The completeness gate BEFORE the merge. A shard that did not answer used
 	// to contribute nothing and the merge proceeded, so a cluster read with one
@@ -1810,17 +1831,21 @@ func (s *Server) fanOutChecked(
 	}
 	// The form overflow only applies where the caller sent no body of its own.
 	//
-	// The two cannot both occur today: withFormInURL returns before it looks at
-	// anything unless the content type is a form, and the two endpoints that
-	// build their own body (/_count, /_search) send JSON. That is a statement
-	// about what CLIENTS send, not a property of this code -- so the impossible
-	// case is refused rather than reasoned away. Under the previous shape the
+	// len(body), not body != nil. The two ES handlers pass io.ReadAll(r.Body),
+	// which NEVER returns nil -- an empty body is an empty non-nil slice -- so
+	// the guard fired on `POST /_count?q=<70 KiB>` with a form content type and
+	// no body at all, answering 400 with a message saying the request carried
+	// two bodies when it carried none. Measured: 200 before, 400 after.
+	//
+	// The remaining case really is a client that sends both. That is a
+	// statement about what CLIENTS send, not a property of this code -- so it
+	// is refused rather than reasoned away. Under the previous shape the
 	// query string survived a dropped formBody; now RawQuery has been cleared,
 	// so dropping it would hand the shard neither, and the answer would be a
 	// smaller one at HTTP 200.
 	ct := ""
 	switch {
-	case body != nil && formBody != nil:
+	case len(body) > 0 && formBody != nil:
 		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
 			"simdlogs: this request carries both a body of its own and a form "+
 				"large enough to need one, and the router has one body to send. "+

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -125,12 +126,11 @@ func postForm(t *testing.T, ts *httptest.Server, path string, form url.Values) (
 // the day it is classified, and one that disappears takes its case with it.
 func TestEveryFederatedReadCarriesALargeQuery(t *testing.T) {
 	q := bigQuery(1_200_000)
-	n := 0
+	var carried atomic.Int64
 	for _, rt := range surfaceRoutes() {
 		if rt.kind != federated || rt.write {
 			continue
 		}
-		n++
 		t.Run(rt.path, func(t *testing.T) {
 			sh := newRecordingShard(t)
 			ts := wmRouter(t, sh.ts.URL)
@@ -177,16 +177,25 @@ func TestEveryFederatedReadCarriesALargeQuery(t *testing.T) {
 				t.Errorf("the shard was asked %d bytes, the caller sent %d",
 					len(got), len(want))
 			}
+			// Counted only on the routes that actually carried it. `n++`
+			// before the skip made n == 14 always, so the guard below could
+			// never fire and the log line said fourteen carried a query that
+			// twelve carried.
+			carried.Add(1)
 		})
 	}
 	// The count is part of the assertion: a classification change that empties
 	// this loop would otherwise pass in silence.
-	if n < 12 {
-		t.Errorf("only %d federated reads were exercised; surfaceRoutes classifies "+
-			"fourteen, two of which carry a JSON body and are skipped with the "+
-			"reason. A hand-kept list drifting to nine is what this test replaced", n)
+	if n := carried.Load(); n < 12 {
+		t.Errorf("only %d federated reads carried the query; surfaceRoutes "+
+			"classifies fourteen, two of which have a JSON body and are skipped "+
+			"with the reason. A hand-kept list drifting to nine is what this test "+
+			"replaced, and a count that includes the skips cannot see that happen "+
+			"again", n)
+	} else {
+		t.Logf("%d of %d federated reads carried a %d-byte query; the rest have a "+
+			"JSON body", n, len(surfaceRoutes()), len(q))
 	}
-	t.Logf("%d federated reads carried a %d-byte query", n, len(q))
 }
 
 func TestALargePostQueryReachesTheShardsWhole(t *testing.T) {

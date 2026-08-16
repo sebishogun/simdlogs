@@ -237,9 +237,19 @@ func TestALimitInAPostFormDoesNotReachTheShards(t *testing.T) {
 			}
 			// And a bound the plan STRIPS is not passed through. Equality alone
 			// would be satisfied by both methods being wrong together.
+			//
+			// limitImmune skips the `limit` half where the plan SETS the key
+			// rather than deleting it, so it was never in `extra` and the row
+			// measures nothing about this defect. It was a struct field with no
+			// reader before -- "labelled rather than left to read as coverage"
+			// where the label was a field nothing consulted, which the repo's
+			// own unwired gate cannot see because it skips _test.go.
 			for _, k := range []string{"limit", "max_values_per_field"} {
 				want := form.Get(k)
 				if want == "" || want == "0" || slices.Contains(ep.forwarded, k) {
+					continue
+				}
+				if k == "limit" && ep.limitImmune {
 					continue
 				}
 				if strings.Contains(gotPost, k+"="+want) {
@@ -394,8 +404,15 @@ func TestTheRefusalNamesTheHalfThatIsUnreadable(t *testing.T) {
 	for _, tc := range []struct {
 		name, ct, body, path, want string
 	}{
-		{"a malformed Content-Type", "text/plain; charset", "query=*",
-			"/select/logsql/field_values?query=*&field=user", "Content-Type"},
+		// The malformed-Content-Type row is GONE, and its absence is the point.
+		//
+		// It used to answer 400 here and 200 on the six federated reads that do
+		// not call withoutLimits, because ParseForm ran on a body the router
+		// was never going to read. withoutLimits only parses a form content
+		// type now, so this request answers 200 everywhere -- see
+		// TestAMalformedContentTypeAnswersTheSameOnEveryFederatedRead. Naming
+		// the Content-Type in the refusal was the right fix for the wrong
+		// defect: the refusal should not have happened.
 		{"a malformed form body", "application/x-www-form-urlencoded", "%zz=1",
 			"/select/logsql/field_values?query=*&field=user", "request body"},
 	} {
@@ -423,4 +440,153 @@ func TestTheRefusalNamesTheHalfThatIsUnreadable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A shard limit the plan KEEPS is not suppressed by a POST form.
+//
+// shardQueryURL deletes `limit` only when the plan has a coordinator half; its
+// own comment says "with no coordinator half the shard limit is exactly right
+// and stays". Marking the key plan-owned unconditionally stopped it staying,
+// and only over a POST. Measured, one shard, `POST query=*&limit=5`:
+//
+//	before  shard received  limit=5&query=%2A
+//	after   shard received  query=%2A
+//	the same request over GET still carried it
+//
+// The answer stayed correct -- mergeRows applies the bound from the original
+// request -- so this was blast radius, not a wrong number: one storage node,
+// 20,000 rows, `query=*` is 3,808,890 bytes against 955 with `limit=5`, at
+// 190.4 B/row. Every shard streamed its whole matching set to the router, on
+// the exact path POST exists for.
+func TestAShardLimitThePlanKeepsIsNotSuppressedByAPostForm(t *testing.T) {
+	for _, tc := range []struct {
+		name, query string
+		// wantOnShard is what the shard's `limit` must be. Empty means the
+		// plan deleted it, which it does only with a coordinator half.
+		wantOnShard string
+	}{
+		// No coordinator half: the shard limit is right and stays.
+		{"a bare filter", "*", "5"},
+		// KEEPS _time: a projection that strips it forces a merge, because the
+		// coordinator orders the rows by _time and cannot without it. So
+		// "| fields _msg" is a coordinator case and "| fields _time, _msg" is
+		// not -- the first version of this row had that backwards and the code
+		// was right.
+		{"a row-local projection that keeps _time", "* | fields _time, _msg", "5"},
+		{"a projection that strips _time needs a merge", "* | fields _msg", ""},
+		// A coordinator half: the shards must return everything.
+		{"stats needs a merge", "* | stats count() c", ""},
+		{"sort needs a merge", "* | sort by (_time)", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			form := url.Values{"query": {tc.query}, "limit": {"5"}}
+
+			viaGet := newRecordingShard(t)
+			gts := wmRouter(t, viaGet.ts.URL)
+			if code, _, raw := getJSONFrom(t, gts, "/select/logsql/query?"+form.Encode()); code != 200 {
+				t.Skipf("GET answered %d: %s", code, raw)
+			}
+			_, gotGet := viaGet.asked()
+
+			viaPost := newRecordingShard(t)
+			pts := wmRouter(t, viaPost.ts.URL)
+			if code, body := postForm(t, pts, "/select/logsql/query", form); code != 200 {
+				t.Skipf("POST answered %d: %s", code, body)
+			}
+			_, gotPost := viaPost.asked()
+
+			if gotGet != gotPost {
+				t.Errorf("the shard is asked for a different limit depending on the "+
+					"caller's method:\n  via GET  limit=%q\n  via POST limit=%q",
+					gotGet, gotPost)
+			}
+			if gotPost != tc.wantOnShard {
+				t.Errorf("the shard received limit=%q, want %q -- the plan %s it here",
+					gotPost, tc.wantOnShard,
+					map[bool]string{true: "deletes", false: "keeps"}[tc.wantOnShard == ""])
+			}
+		})
+	}
+}
+
+// A request with NO body of its own is not refused for carrying two.
+//
+// The guard read `body != nil`, and both Elasticsearch handlers pass
+// io.ReadAll(r.Body) -- which never returns nil, because an empty body is an
+// empty non-nil slice. Measured, `POST /_count?q=<70 KiB>` with a form content
+// type and no body at all: 200 before, 400 after, with a message saying the
+// request carried both a body of its own and a form.
+func TestAnEmptyBodyIsNotTwoBodies(t *testing.T) {
+	sh := newRecordingShard(t)
+	ts := wmRouter(t, sh.ts.URL)
+
+	// A URL query large enough to need the body path, and no body.
+	q := bigQuery(70 << 10)
+	req, err := http.NewRequest("POST",
+		ts.URL+"/_count?q="+url.QueryEscape(q), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if strings.Contains(string(b), "both a body of its own") {
+		t.Errorf("a request with no body was refused for carrying two: %d %s",
+			resp.StatusCode, b)
+	}
+	if resp.StatusCode == 400 {
+		t.Errorf("answered 400: %s", b)
+	}
+}
+
+// All twelve federated reads answer a malformed Content-Type the same way.
+//
+// withoutLimits called r.ParseForm for any POST/PUT regardless of content type,
+// and ParseForm runs mime.ParseMediaType first -- so a malformed Content-Type
+// failed on a body the router was never going to read, and only on the six
+// routes that reach withoutLimits. Measured, `POST <route>?query=*` with
+// `Content-Type: text/plain; charset` and a perfectly good query string:
+//
+//	query, hits, facets, stats_query, stats_query_range, sql   -> 200
+//	field_names, field_values, streams, stream_ids,
+//	stream_field_names, stream_field_values                    -> 400
+//
+// facets escaped only by argument-evaluation order -- maxValuesParam primes
+// ParseForm and swallows the error before withoutLimits runs -- which is not a
+// property anyone chose.
+func TestAMalformedContentTypeAnswersTheSameOnEveryFederatedRead(t *testing.T) {
+	var codes []string
+	for _, rt := range surfaceRoutes() {
+		if rt.kind != federated || rt.write || rt.body != "" {
+			continue
+		}
+		sh := newRecordingShard(t)
+		ts := wmRouter(t, sh.ts.URL)
+
+		req, err := http.NewRequest("POST", ts.URL+rt.path+"?"+rt.query, strings.NewReader(""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "text/plain; charset")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		codes = append(codes, fmt.Sprintf("%s=%d", rt.path, resp.StatusCode))
+		if resp.StatusCode == 400 {
+			t.Errorf("%s answers 400 to a malformed Content-Type whose query string "+
+				"parses; six other federated reads answer 200 to the same request",
+				rt.path)
+		}
+	}
+	if len(codes) < 10 {
+		t.Fatalf("only %d federated reads were tried: %v", len(codes), codes)
+	}
+	t.Logf("%d routes: %v", len(codes), codes)
 }
