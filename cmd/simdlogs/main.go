@@ -51,7 +51,7 @@ func main() {
 	dir := flag.String("storage", "./simdlogs-data", "storage directory")
 	retention := flag.Duration("retention", 0, "drop data older than this (e.g. 720h); 0 disables")
 	tierDropPost := flag.Bool("recompact-drop-postings", false, "when recompacting, also drop the per-column inverted index (35% smaller total vs 8% for flate alone, but cold equality queries fall back to a scan -- what VictoriaLogs does for every query)")
-	tierAfter := flag.Duration("recompact-after", 0, "re-encode groups older than this with flate dictionaries (~17% smaller, slower value reads on cold data); 0 disables")
+	tierAfter := flag.Duration("recompact-after", 0, "re-encode groups older than this with flate dictionaries (~8% smaller, slower value reads on cold data); 0 disables")
 	compactMin := flag.Int("compact-min-groups", 0,
 		"merge runs of at least this many small adjacent groups into one; 0 disables. "+
 			"A client sending one row per request writes one group per row, and every query "+

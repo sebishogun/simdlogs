@@ -143,10 +143,11 @@ session):
 - `internal/bench/scale_test.go`: the header comment says "there is no mmap
   yet" — mmap shipped long ago; the test builds readers in RAM, but the
   comment is stale.
-- `cmd/simdlogs/main.go`: the `-recompact-after` help claims ~17% smaller
-  for flate-only recompaction, disagreeing with the 8% in the
+- ~~`cmd/simdlogs/main.go`: the `-recompact-after` help claims ~17% smaller
+  for flate-only recompaction~~ — FIXED. It says ~8%, matching the
   `-recompact-drop-postings` help and the measured -8.1%
-  (`docs/wrong.md` tiering entry).
+  (`docs/wrong.md` tiering entry), and
+  `TestTheRecompactionFlagsAgreeOnTheMeasuredFigure` holds the pair together.
 - `docs/wrong.md` entry 37 is likewise implementation-side work queued from
   a documentation session. The gofmt blocker that sat beside it here is gone:
   `gofmt -l .` is clean.
