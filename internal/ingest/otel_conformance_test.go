@@ -833,3 +833,300 @@ func TestOTLPCompositeRenderingIsBounded(t *testing.T) {
 	t.Logf("body %d bytes -> attribute %d bytes (%.1fx), bound %d",
 		len(payload), len(got), float64(len(got))/float64(len(payload)), maxCompositeBytes)
 }
+
+// ---- the identity violations the differential could not see ----
+
+// fieldsOfRow is why storeRows refuses a separator in a value, demonstrated.
+//
+// It splits on `|`, so a row whose _msg is `x|severity=ERROR` parses as TWO
+// fields: `_msg=x`, and a `severity` field that IS NOT IN THE ROW. An assertion
+// that the record carries severity=ERROR then passes on a record with no
+// severity at all -- and every value assertion in these files goes through this
+// function.
+//
+// No separator can be reserved: a log value holds arbitrary bytes. So the
+// renderer refuses instead, and this is the behaviour it is refusing to
+// produce.
+func TestFieldsOfRowInventsAFieldWhenAValueCarriesTheSeparator(t *testing.T) {
+	got := fieldsOfRow("TS|_msg=x|severity=ERROR")
+	if got["severity"] != "ERROR" {
+		t.Fatalf("the demonstration no longer demonstrates: severity=%q. If "+
+			"fieldsOfRow became unambiguous, storeRows no longer needs to "+
+			"refuse and this test should go with it", got["severity"])
+	}
+	if got["_msg"] != "x" {
+		t.Errorf("_msg=%q, want the truncated %q", got["_msg"], "x")
+	}
+}
+
+// Resource.dropped_attributes_count is field 2, and the protobuf path read
+// only field 1.
+//
+// The JSON path writes `resource_dropped_attributes_count` and the protobuf
+// path never decoded it, so the SAME logical export stored a different set of
+// fields depending on which encoding the collector was configured for. A
+// collector's otlphttp exporter sends protobuf by default and JSON on request.
+//
+// The conformance fixture could not see it: its builder had no way to write
+// the field, so neither encoding was ever asked.
+func TestResourceDroppedAttributeCountSurvivesBothEncodings(t *testing.T) {
+	const dropped = 7
+	const atNano = 1_700_000_000_000_000_000
+
+	// protobuf
+	var resource []byte
+	resource = pbytes(resource, 1, kv("service.name", anyString("api")))
+	resource = pvarint(resource, 2, dropped) // Resource.dropped_attributes_count
+	var rec []byte
+	rec = pfixed64(rec, 1, atNano)
+	rec = pbytes(rec, 5, anyString("m"))
+	var scope []byte
+	scope = pbytes(scope, 2, rec)
+	var rl []byte
+	rl = pbytes(rl, 1, resource)
+	rl = pbytes(rl, 2, scope)
+	protoBody := pbytes(nil, 1, rl)
+
+	jsonBody := fmt.Sprintf(`{"resourceLogs":[{"resource":{
+		"attributes":[{"key":"service.name","value":{"stringValue":"api"}}],
+		"droppedAttributesCount":%d},
+		"scopeLogs":[{"logRecords":[
+			{"timeUnixNano":"%d","body":{"stringValue":"m"}}]}]}]}`, dropped, atNano)
+
+	jr, _ := rowsOf(t, func(w *Writer) (Result, error) {
+		return IngestOTLPLogs(w, []byte(jsonBody), func() int64 { return 0 })
+	})
+	pr, _ := rowsOf(t, func(w *Writer) (Result, error) {
+		return IngestOTLPLogsProto(w, protoBody, func() int64 { return 0 }, nil)
+	})
+	if len(jr) != 1 || len(pr) != 1 {
+		t.Fatalf("json %d rows, proto %d rows", len(jr), len(pr))
+	}
+	jf, pf := fieldsOfRow(jr[0]), fieldsOfRow(pr[0])
+	const key = "resource_dropped_attributes_count"
+	if jf[key] != "7" {
+		t.Fatalf("the JSON path did not store %s: %v", key, jf)
+	}
+	if pf[key] != jf[key] {
+		t.Errorf("protobuf stored %s=%q, JSON stored %q. The same logical "+
+			"export stores different fields depending on which encoding the "+
+			"collector was configured for, and protobuf is the default",
+			key, pf[key], jf[key])
+	}
+}
+
+// An OTLP/JSON trace_id is hex, and hex is case-insensitive, so the same ID
+// arrives uppercase or lowercase depending on the exporter.
+//
+// The protobuf path carries raw bytes and renders them lowercase. The JSON path
+// stored whatever string it was given, so the identical trace stored two
+// different values and a query for one found neither half of the other's
+// records. Nothing validated it either: `not-hex-at-all!!` went in verbatim.
+func TestATraceIDIsNormalizedTheSameWayInBothEncodings(t *testing.T) {
+	const atNano = 1_700_000_000_000_000_000
+	raw := []byte{0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
+		0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89}
+	span := []byte{0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10}
+
+	var rec []byte
+	rec = pfixed64(rec, 1, atNano)
+	rec = pbytes(rec, 5, anyString("m"))
+	rec = pbytes(rec, 9, raw)   // trace_id
+	rec = pbytes(rec, 10, span) // span_id
+	var scope []byte
+	scope = pbytes(scope, 2, rec)
+	var rl []byte
+	rl = pbytes(rl, 1, pbytes(nil, 1, kv("service.name", anyString("api"))))
+	rl = pbytes(rl, 2, scope)
+	protoBody := pbytes(nil, 1, rl)
+
+	pr, _ := rowsOf(t, func(w *Writer) (Result, error) {
+		return IngestOTLPLogsProto(w, protoBody, func() int64 { return 0 }, nil)
+	})
+	if len(pr) != 1 {
+		t.Fatalf("proto stored %d rows", len(pr))
+	}
+	want := fieldsOfRow(pr[0])
+
+	// The same IDs, spelled in UPPER case, which is what an exporter using
+	// Go's %X or Java's toHexString produces.
+	for _, spelling := range []struct{ name, trace, span string }{
+		{"upper", strings.ToUpper(hex.EncodeToString(raw)), strings.ToUpper(hex.EncodeToString(span))},
+		{"lower", hex.EncodeToString(raw), hex.EncodeToString(span)},
+		{"mixed", "AbCdEf0123456789aBcDeF0123456789", "FeDcBa9876543210"},
+	} {
+		t.Run(spelling.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"resourceLogs":[{"resource":{
+				"attributes":[{"key":"service.name","value":{"stringValue":"api"}}]},
+				"scopeLogs":[{"logRecords":[{"timeUnixNano":"%d",
+					"body":{"stringValue":"m"},"traceId":%q,"spanId":%q}]}]}]}`,
+				atNano, spelling.trace, spelling.span)
+			jr, _ := rowsOf(t, func(w *Writer) (Result, error) {
+				return IngestOTLPLogs(w, []byte(body), func() int64 { return 0 })
+			})
+			if len(jr) != 1 {
+				t.Fatalf("json stored %d rows", len(jr))
+			}
+			got := fieldsOfRow(jr[0])
+			if got["trace_id"] != want["trace_id"] {
+				t.Errorf("trace_id: JSON %q, protobuf %q. The same trace stored "+
+					"under two spellings means a query for one finds neither "+
+					"half of the other's records", got["trace_id"], want["trace_id"])
+			}
+			if got["span_id"] != want["span_id"] {
+				t.Errorf("span_id: JSON %q, protobuf %q", got["span_id"], want["span_id"])
+			}
+		})
+	}
+}
+
+// A traceId that is not hex at all is not stored as if it were one.
+//
+// OTLP/JSON says trace_id is hex. A value that is not gets stored verbatim,
+// so a field a query treats as an identifier holds arbitrary text -- including
+// text that came from outside the cluster.
+func TestATraceIDThatIsNotHexIsNotStoredAsOne(t *testing.T) {
+	const atNano = 1_700_000_000_000_000_000
+	for _, bad := range []string{
+		"not-hex-at-all!!",
+		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+		"0123",                             // hex, but not 16 bytes
+		strings.Repeat("ab", 64),           // hex, far too long
+		"0123456789abcdef0123456789abcdeg", // one bad nibble
+	} {
+		t.Run(bad, func(t *testing.T) {
+			body := fmt.Sprintf(`{"resourceLogs":[{"resource":{
+				"attributes":[{"key":"service.name","value":{"stringValue":"api"}}]},
+				"scopeLogs":[{"logRecords":[{"timeUnixNano":"%d",
+					"body":{"stringValue":"m"},"traceId":%q}]}]}]}`, atNano, bad)
+			rows, _ := rowsOf(t, func(w *Writer) (Result, error) {
+				return IngestOTLPLogs(w, []byte(body), func() int64 { return 0 })
+			})
+			if len(rows) != 1 {
+				t.Fatalf("stored %d rows", len(rows))
+			}
+			if got := fieldsOfRow(rows[0])["trace_id"]; got == bad {
+				t.Errorf("stored trace_id=%q verbatim. OTLP/JSON says this "+
+					"field is hex; storing whatever arrived puts arbitrary "+
+					"external text in a column queries treat as an identifier", got)
+			}
+			// The record itself is kept: one bad field is not a reason to drop
+			// a log line.
+			if got := fieldsOfRow(rows[0])["_msg"]; got != "m" {
+				t.Errorf("the record was lost over a bad trace_id: _msg=%q", got)
+			}
+		})
+	}
+}
+
+// Past the nesting bound the two encodings still agree, and the value says it
+// was cut.
+//
+// This started as a check that the DEPTH bound marks its truncation the way
+// maxCompositeBytes marks its own. It does not -- and it turns out it cannot be
+// seen to, which is the finding.
+//
+// A nested array renders by stringifying each level and then escaping it as a
+// string value at the next, so the escaping roughly doubles the output per
+// level: by about level 13 the value is past the 64 KiB budget, and the byte
+// bound therefore ALWAYS fires before the 16-level depth bound can. Measured at
+// 22 levels: 512 KB of escaped brackets, marked `"...truncated"` by the byte
+// budget. The depth bound is a STACK guard during decode, not an output guard,
+// and its cut is not separately observable through any array or kvlist fixture.
+//
+// The first version of this test asserted `strings.Contains(value,
+// "truncated")` and passed -- on the byte budget's marker, not the depth
+// bound's, which does not exist. That is the shape of a test that agrees with
+// whatever the code does.
+//
+// So it pins what is true and checkable: both encodings produce the SAME value
+// past the bound, the value is marked, and the record survives. An operator
+// switching their collector's encoding must not see the attribute change.
+func TestNestingPastTheBoundIsTheSameInBothEncodings(t *testing.T) {
+	const depth = maxAnyValueDepth + 6
+	const atNano = 1_700_000_000_000_000_000
+
+	inner := anyString("leaf")
+	for i := 0; i < depth; i++ {
+		inner = anyArray(inner)
+	}
+	var rec []byte
+	rec = pfixed64(rec, 1, atNano)
+	rec = pbytes(rec, 5, anyString("m"))
+	rec = pbytes(rec, 6, kv("deep", inner))
+	var scope []byte
+	scope = pbytes(scope, 2, rec)
+	var rl []byte
+	rl = pbytes(rl, 1, pbytes(nil, 1, kv("service.name", anyString("api"))))
+	rl = pbytes(rl, 2, scope)
+	protoBody := pbytes(nil, 1, rl)
+
+	jsonInner := `{"stringValue":"leaf"}`
+	for i := 0; i < depth; i++ {
+		jsonInner = `{"arrayValue":{"values":[` + jsonInner + `]}}`
+	}
+	jsonBody := fmt.Sprintf(`{"resourceLogs":[{"resource":{
+		"attributes":[{"key":"service.name","value":{"stringValue":"api"}}]},
+		"scopeLogs":[{"logRecords":[{"timeUnixNano":"%d",
+			"body":{"stringValue":"m"},
+			"attributes":[{"key":"deep","value":%s}]}]}]}]}`, atNano, jsonInner)
+
+	pr, pres := rowsOf(t, func(w *Writer) (Result, error) {
+		return IngestOTLPLogsProto(w, protoBody, func() int64 { return 0 }, nil)
+	})
+	jr, jres := rowsOf(t, func(w *Writer) (Result, error) {
+		return IngestOTLPLogs(w, []byte(jsonBody), func() int64 { return 0 })
+	})
+	if len(pr) != 1 || len(jr) != 1 {
+		t.Fatalf("proto %d rows, json %d rows", len(pr), len(jr))
+	}
+	if pres.Accepted != 1 || jres.Accepted != 1 {
+		t.Fatalf("accepted proto=%d json=%d, want 1 each", pres.Accepted, jres.Accepted)
+	}
+	pv, jv := fieldsOfRow(pr[0])["deep"], fieldsOfRow(jr[0])["deep"]
+	if pv == "" || jv == "" {
+		t.Fatalf("the over-nested attribute vanished entirely: proto %d bytes, "+
+			"json %d bytes. It is meant to be truncated, not dropped", len(pv), len(jv))
+	}
+	if pv != jv {
+		t.Errorf("the two encodings disagree past the nesting bound: proto %d "+
+			"bytes, json %d bytes. An operator switching their collector's "+
+			"encoding sees the attribute change", len(pv), len(jv))
+	}
+	// The byte budget is what fires, and it is what marks. Bounded by it too:
+	// the 64 KiB budget is on the value, and this asserts the row did not
+	// somehow carry the full 512 KB.
+	if !strings.Contains(pv, "truncated") {
+		t.Errorf("the cut value carries no marker: %.120q", pv)
+	}
+	if len(pv) > 4*maxCompositeBytes {
+		t.Errorf("the value is %d bytes against a %d-byte budget; the escaping "+
+			"blowup is not being bounded", len(pv), maxCompositeBytes)
+	}
+}
+
+// The renderer's refusal, exercised. Nothing in any fixture carries a `|`
+// today, so deleting the check left the whole package green -- which is the
+// state a tripwire is in right up until the day it matters.
+func TestTheRowRendererRefusesAnAmbiguousField(t *testing.T) {
+	for _, c := range []struct {
+		key, value string
+		bad        bool
+	}{
+		{"_msg", "x|severity=ERROR", true}, // the phantom-field case
+		{"we|ird", "v", true},              // the key side
+		{"_msg", "a plain message", false}, // and the control: ordinary data
+		{"_msg", "an = sign is fine", false},
+		{"_msg", "", false},
+	} {
+		err := rowRenderable(c.key, c.value)
+		if c.bad && err == nil {
+			t.Errorf("%q=%q was accepted; rendering it produces a row that "+
+				"parses into fields nobody stored", c.key, c.value)
+		}
+		if !c.bad && err != nil {
+			t.Errorf("%q=%q was refused: %v. Ordinary data must render",
+				c.key, c.value, err)
+		}
+	}
+}

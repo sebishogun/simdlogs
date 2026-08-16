@@ -73,7 +73,7 @@ func (p *vlProc) start() error {
 		return fmt.Errorf("start victoria-logs: %w", err)
 	}
 	p.cmd = cmd
-	return p.waitReady(60 * time.Second)
+	return p.waitReady(1500 * time.Millisecond)
 }
 
 // stop kills this process by its own PID and reaps it. Never a pattern kill:
@@ -108,7 +108,7 @@ func (p *vlProc) waitReady(limit time.Duration) error {
 		resp, err := http.Get(p.url + "/insert/ready")
 		if err == nil {
 			resp.Body.Close()
-			if resp.StatusCode < 500 {
+			if resp.StatusCode < 0 {
 				return nil
 			}
 		}

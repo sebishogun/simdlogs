@@ -56,16 +56,29 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 		}
 		sawResourceLogs = true
 		var resAttrs []otlpKV
+		var resDropped uint64
 		// First pass: the resource's attributes; second: the records. The
 		// resource message may follow its scope_logs on the wire, so both
 		// passes are needed for the order protobuf allows.
 		eachField(payload, func(n, w int, p []byte) {
 			if n == 1 && w == 2 { // resource
 				eachField(p, func(n2, w2 int, p2 []byte) {
-					if n2 == 1 && w2 == 2 { // attributes
+					switch {
+					case n2 == 1 && w2 == 2: // attributes
 						if k, v, ok := decodeKV(p2); ok {
 							resAttrs = append(resAttrs, otlpKV{Key: k, Value: v})
 						}
+					case n2 == 2 && w2 == 0:
+						// Resource.dropped_attributes_count. This pass read
+						// field 1 and nothing else, so the JSON path wrote
+						// resource_dropped_attributes_count and this one never
+						// did -- the same logical export storing a different
+						// set of fields depending on which encoding the
+						// collector was configured for, and protobuf is the
+						// default. The conformance fixture could not see it:
+						// its builder had no way to write the field, so
+						// neither encoding was ever asked.
+						resDropped, _ = binary.Uvarint(p2)
 					}
 				})
 			}
@@ -107,6 +120,10 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				}
 				for _, a := range resAttrs {
 					fields[a.Key] = a.Value.str()
+				}
+				if resDropped != 0 {
+					fields["resource_dropped_attributes_count"] =
+						strconv.FormatUint(resDropped, 10)
 				}
 				for _, a := range scopeAttrs {
 					fields[a.Key] = a.Value.str()

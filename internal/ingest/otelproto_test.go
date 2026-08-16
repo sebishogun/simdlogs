@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"encoding/binary"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -23,6 +24,19 @@ const jsonExport = `{"resourceLogs":[{"resource":{"attributes":[
  ]}]}]}`
 
 // storeRows renders every stored record as "time|k=v;k=v" lines, sorted.
+// storeRows renders every stored row as `<time>|k=v|k=v...`, sorted.
+//
+// It REFUSES a key or value containing the separator, which is the whole
+// reason this note exists. fieldsOfRow reverses the rendering by splitting on
+// `|`, so a value like `x|severity=ERROR` did not merely truncate the field it
+// belonged to -- it INVENTED a `severity` field, and an assertion that the row
+// carries severity=ERROR then passed on a row that has no severity at all.
+//
+// Splitting cannot be made safe: a log value can hold any byte, so no
+// separator is reserved. What can be made safe is the fixture. A test that
+// genuinely needs a `|` in a value has to compare structured fields instead,
+// and this failure is where it finds that out -- loudly, rather than by
+// quietly agreeing with it.
 func storeRows(t *testing.T, st *storage.Store) []string {
 	t.Helper()
 	q, err := query.ParseLogsQL("*")
@@ -34,6 +48,9 @@ func storeRows(t *testing.T, st *storage.Store) []string {
 	for _, r := range query.RunPipeline(st, q) {
 		fs := make([]string, 0, len(r.Fields))
 		for _, f := range r.Fields {
+			if err := rowRenderable(f.Key, f.Value); err != nil {
+				t.Fatal(err)
+			}
 			fs = append(fs, f.Key+"="+f.Value)
 		}
 		sort.Strings(fs)
@@ -243,4 +260,18 @@ func TestOTLPProtoRejectsMetricsAndTraces(t *testing.T) {
 			}
 		})
 	}
+}
+
+// rowRenderable rejects a key or value that would make the rendered row
+// ambiguous. Separate from storeRows so it can be tested directly: inside a
+// t.Fatal nothing can reach it, and a refusal nothing exercises is one nobody
+// knows still works.
+func rowRenderable(key, value string) error {
+	if strings.ContainsRune(key, '|') || strings.ContainsRune(value, '|') {
+		return fmt.Errorf("field %q=%q contains the row separator. fieldsOfRow "+
+			"splits on it, so this row would parse into fields that are not in "+
+			"it -- including a whole field nobody stored. Compare the "+
+			"structured fields for this fixture instead", key, value)
+	}
+	return nil
 }

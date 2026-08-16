@@ -294,11 +294,29 @@ func otlpRecordFields(fields map[string]string, sevNum int, sevText, traceID, sp
 	if sevText != "" {
 		fields["severity"] = sevText
 	}
-	if traceID != "" {
-		fields["trace_id"] = traceID
+	// NORMALIZED, and only if they are what they claim to be.
+	//
+	// OTLP/JSON carries these as hex and hex is case-insensitive, so the same
+	// trace arrives upper, lower or mixed depending on whose exporter wrote it.
+	// The protobuf path carries raw bytes and renders them lowercase; the JSON
+	// path stored the string it was handed. The identical trace was therefore
+	// stored under two spellings, and a query for one found neither half of the
+	// other's records.
+	//
+	// Nothing validated it either: `not-hex-at-all!!` went in verbatim, so a
+	// column queries treat as an identifier held arbitrary text that arrived
+	// from outside the cluster. A value that is not a trace ID is dropped
+	// rather than stored as one -- and the RECORD is kept, because one bad
+	// field is not a reason to lose a log line.
+	//
+	// Doing it here rather than in the JSON decoder is what makes the two
+	// encodings agree by construction: the protobuf path hands in lowercase
+	// hex of exactly the right length, so it normalises to itself.
+	if id, ok := normalizeIDHex(traceID, 16); ok {
+		fields["trace_id"] = id
 	}
-	if spanID != "" {
-		fields["span_id"] = spanID
+	if id, ok := normalizeIDHex(spanID, 8); ok {
+		fields["span_id"] = id
 	}
 	if eventName != "" {
 		fields["event_name"] = eventName
@@ -309,6 +327,38 @@ func otlpRecordFields(fields map[string]string, sevNum int, sevText, traceID, sp
 	if dropped != 0 {
 		fields["dropped_attributes_count"] = strconv.FormatUint(uint64(dropped), 10)
 	}
+}
+
+// normalizeIDHex lowercases a hex ID of exactly wantBytes bytes, and reports
+// false for anything else -- wrong length, a non-hex character, or empty.
+//
+// No allocation when the input is already lowercase and the right length, which
+// is every record on the protobuf path and most on the JSON one.
+func normalizeIDHex(s string, wantBytes int) (string, bool) {
+	if len(s) != wantBytes*2 {
+		return "", false
+	}
+	upper := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'F':
+			upper = true
+		default:
+			return "", false
+		}
+	}
+	if !upper {
+		return s, true
+	}
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'F' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b), true
 }
 
 var errNoResourceLogs = errors.New("no resourceLogs field: not an OTLP logs payload")

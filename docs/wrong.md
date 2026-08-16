@@ -6963,3 +6963,76 @@ them — `TestAPeerWithNoGenerationIsReportedNotRefused` and the restart
 subtests — were written for the blocking findings and cover these by
 construction, which is worth recording as the reason they are green rather than
 leaving them looking like guards nobody checked.
+
+## 99. Two OTLP encodings of one export, storing different things
+
+Task #410's OTLP round. Three of its findings were real, one was real and not
+reachable, and the test helper every value assertion in this package goes
+through was inventing fields.
+
+**`Resource.dropped_attributes_count` is field 2, and the protobuf path read
+only field 1.** The JSON path wrote `resource_dropped_attributes_count` and the
+protobuf path never did, so the same logical export stored a different set of
+fields depending on which encoding the collector was configured for — and a
+collector's otlphttp exporter sends protobuf by default. The conformance
+fixture could not see it: its builder had no way to write the field, so neither
+encoding was ever asked.
+
+**A trace ID was stored in whatever case it arrived in.** OTLP/JSON carries
+trace_id and span_id as hex, and hex is case-insensitive; the protobuf path
+carries raw bytes and renders them lowercase. Measured on the identical IDs:
+
+	proto  abcdef0123456789abcdef0123456789
+	json   ABCDEF0123456789ABCDEF0123456789
+
+The same trace under two spellings, so a query for one finds neither half of
+the other's records. Nothing validated it either: `not-hex-at-all!!`,
+`zzzz...`, a 4-character `0123` and a 128-character one all went in verbatim,
+putting arbitrary text that arrived from outside the cluster into a column
+queries treat as an identifier.
+
+Normalised in `otlpRecordFields`, which both encodings already share, so they
+agree by construction: the protobuf path hands in lowercase hex of exactly the
+right length and normalises to itself. A value that is not a trace ID is
+dropped and the RECORD is kept — one bad field is not a reason to lose a log
+line.
+
+**The depth bound's silent cut is real and cannot be observed.** The report was
+that past 16 levels the innermost value is dropped with no marker, at `{}`
+full-success — unlike `maxCompositeBytes`, which marks with `"...truncated"`.
+The first half is true. The second is not reachable: a nested array renders by
+stringifying each level and escaping it as a string at the next, so the output
+roughly doubles per level and the 64 KiB budget fires by about level 13, before
+the depth bound ever can. Measured at 22 levels: 512 KB of escaped brackets,
+marked by the byte budget.
+
+So the depth bound is a stack guard during decode, not an output guard, and no
+array or kvlist fixture can separate the two cuts. The first version of the
+test asserted `strings.Contains(value, "truncated")` and **passed on the byte
+budget's marker** — a test agreeing with whatever the code does. It pins what
+is checkable instead: both encodings produce the same value past the bound, it
+is marked, it is bounded, and the record survives.
+
+**And `fieldsOfRow` invented fields.** It reverses the row rendering by
+splitting on `|`, so a record whose `_msg` is `x|severity=ERROR` parses as
+`_msg=x` plus a `severity` field **that is not in the row**. An assertion that
+the record carries `severity=ERROR` then passed on a record with no severity at
+all — and all 27 value assertions across the OTLP, Datadog, Loki and journald
+conformance files go through this function.
+
+No separator can be reserved, because a log value holds arbitrary bytes. What
+can be fixed is the fixture, so the renderer refuses instead: a key or value
+containing the separator is a loud failure at render time, and a test that
+genuinely needs one has to compare structured fields. The refusal lives in
+`rowRenderable` rather than inline in a `t.Fatal`, because nothing could reach
+it inside one — no current fixture carries a `|`, so deleting the check left
+the whole package green, which is the state a tripwire is in right up until the
+day it matters.
+
+| mutation | failing tests |
+|---|---|
+| the resource dropped count is ignored | 1 |
+| IDs are not lowercased | 3 |
+| any length of ID is accepted | 3 |
+| non-hex characters are accepted | 3 |
+| the row separator is not refused | 1 |
