@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,7 +70,7 @@ func (s *Server) shards() [][]string {
 // ROUTER's credential being refused, so every replica refuses it identically
 // and retrying turns one 401 into N while delaying the report by the timeout.
 func (s *Server) askShard(
-	r *http.Request, shardID int, shard []string, path string, post []byte,
+	r *http.Request, shardID int, shard []string, path string, post []byte, ct string,
 ) PeerResponse {
 	method := http.MethodGet
 	if post != nil {
@@ -77,7 +78,7 @@ func (s *Server) askShard(
 	}
 	var last PeerResponse
 	for i, b := range shard {
-		last = s.peers.do(r, shardID, i, b, method, path, post)
+		last = s.peers.do(r, shardID, i, b, method, path, post, ct)
 		if last.OK() {
 			return last
 		}
@@ -699,7 +700,7 @@ func (s *Server) mergeRows(
 // The failures are what the old [][]byte could not carry: a nil entry meant
 // "no data", "every replica down" and "refused" alike, so a merge could not
 // report an incomplete answer because it could not see one.
-func (s *Server) fanOutPeers(r *http.Request, path string, body []byte) []PeerResponse {
+func (s *Server) fanOutPeers(r *http.Request, path string, body []byte, ct string) []PeerResponse {
 	shards := s.shards()
 	out := make([]PeerResponse, len(shards))
 	var wg sync.WaitGroup
@@ -707,7 +708,7 @@ func (s *Server) fanOutPeers(r *http.Request, path string, body []byte) []PeerRe
 		wg.Add(1)
 		go func(i int, sh []string) {
 			defer wg.Done()
-			out[i] = s.askShard(r, i, sh, path, body)
+			out[i] = s.askShard(r, i, sh, path, body, ct)
 			s.checkWatermark(&out[i], i)
 		}(i, sh)
 	}
@@ -735,26 +736,50 @@ func (s *Server) fanOutPeers(r *http.Request, path string, body []byte) []PeerRe
 // r.Form is the union of the URL query and the parsed body, so re-encoding it
 // preserves both. Only for a form content type: ParseForm does not touch a JSON
 // body, and the two ES endpoints that DO send a body build their own.
-func withFormInURL(r *http.Request) *http.Request {
+// maxPeerQueryBytes is how much of a peer request may travel in the request
+// LINE before the rest is moved into a form body.
+//
+// A request line and its headers together are bounded by net/http's
+// MaxHeaderBytes, 1 MiB by default, and a peer that exceeds it answers 431 from
+// the server itself -- before the handler, so with no protocol-version header
+// and no error class. Measured: a 1.2 MB `level:in(...)` query, the shape a
+// dashboard templating variable expands to, POSTed to a ONE-NODE cluster
+// running one build, came back
+//
+//	503 ... 1 of 1 shards could not answer completely (0(version_mismatch))
+//
+// on a cluster with no version mismatch in it. The same query on a non-router
+// node is answered. POST exists so a query can be larger than a URL, and
+// folding the form into the URL took that away in clustered mode only.
+//
+// 60 KiB rather than something near the 1 MiB ceiling: the point is to leave
+// the ordinary GET path untouched -- no dashboard emits 60 KB of parameters --
+// while the oversized case, which cannot work in a URL at all, takes the body.
+const maxPeerQueryBytes = 60 << 10
+
+// withFormInURL folds a POST form into the peer request. It returns the request
+// and, when the parameters are too large for a request line, the form body the
+// peer request must carry instead.
+func withFormInURL(r *http.Request) (*http.Request, []byte) {
 	if r.Method != http.MethodPost && r.Method != http.MethodPut {
-		return r
+		return r, nil
 	}
 	ct := r.Header.Get("Content-Type")
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
 		ct = ct[:i]
 	}
 	if strings.TrimSpace(ct) != "application/x-www-form-urlencoded" {
-		return r
+		return r, nil
 	}
 	if err := r.ParseForm(); err != nil {
 		// A form the router cannot parse is not a request it can fan out. This
 		// used to `return r`, which sent the shards the EMPTY query at HTTP 200
 		// -- the exact behaviour this function's own doc comment names as the
 		// reason it exists, left in place for the error path.
-		return nil
+		return nil, nil
 	}
 	if len(r.Form) == 0 {
-		return r
+		return r, nil
 	}
 	// MERGED UNDER the query string, never over it.
 	//
@@ -775,20 +800,34 @@ func withFormInURL(r *http.Request) *http.Request {
 	// commit that added this, and the commit message said so. A key already in
 	// the query string wins; the form only supplies what the URL does not have.
 	q := r.URL.Query()
-	added := false
+	extra := make(url.Values, len(r.Form))
 	for k, vs := range r.Form {
 		if _, ok := q[k]; ok {
 			continue
 		}
-		q[k] = vs
-		added = true
+		extra[k] = vs
 	}
-	if !added {
-		return r
+	if len(extra) == 0 {
+		return r, nil
 	}
 	out := r.Clone(r.Context())
+
+	// Over the request-line budget, the form's contribution travels as a BODY.
+	//
+	// The two sets are disjoint by construction -- a key already in the query
+	// was skipped above -- so Go's precedence between r.PostForm and the URL
+	// query never comes up, and the router's plan keeps winning exactly as it
+	// does on the small path. That matters: r.Form copies PostForm FIRST, so a
+	// body value would otherwise beat the query value the router just wrote.
+	enc := extra.Encode()
+	if len(r.URL.RawQuery)+1+len(enc) > maxPeerQueryBytes {
+		return out, []byte(enc)
+	}
+	for k, vs := range extra {
+		q[k] = vs
+	}
 	out.URL.RawQuery = q.Encode()
-	return out
+	return out, nil
 }
 
 // checkWatermark demotes an answer served by a replica that has fallen behind.
@@ -1718,7 +1757,7 @@ const (
 func (s *Server) fanOutChecked(
 	w http.ResponseWriter, r *http.Request, path string, body []byte,
 ) ([]shardAnswer, http.ResponseWriter, bool) {
-	fr := withFormInURL(r)
+	fr, formBody := withFormInURL(r)
 	if fr == nil {
 		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
 			"simdlogs: the request body is not a readable form, so the query it "+
@@ -1726,7 +1765,16 @@ func (s *Server) fanOutChecked(
 				"instead would answer a question you did not ask.")
 		return nil, w, false
 	}
-	peers := s.fanOutPeers(fr, path, body)
+	// The form overflow only applies where the caller sent no body of its own.
+	// The two cannot both occur -- withFormInURL returns early unless the
+	// content type is a form, and the endpoints that build their own body send
+	// JSON -- but a body silently replaced would be a wrong answer, not an
+	// error, so the precedence is written down rather than assumed.
+	ct := ""
+	if body == nil && formBody != nil {
+		body, ct = formBody, "application/x-www-form-urlencoded"
+	}
+	peers := s.fanOutPeers(fr, path, body, ct)
 
 	var missing []string
 	var incomplete []string

@@ -5043,3 +5043,51 @@ more. This is the most expensive one so far: not an unused helper, but the
 correct implementation of a guarantee, sitting beside the incorrect one that
 production calls, with a doc comment on the correct one describing the defect in
 the other.
+
+## 55. A one-node cluster reported `version_mismatch`, and POST had stopped being bigger than a URL
+
+Two defects on one request, found by asking what a 1.2 MB query does.
+
+`withFormInURL` folds a POST form into the peer's URL, which is right for the
+ordinary case and, past a point, takes away the reason POST exists. A request
+line and its headers are bounded together by net/http's `MaxHeaderBytes`, 1 MiB
+by default, and a peer over it answers **431 from the server** — before the
+handler, so with no protocol-version header and no error class.
+
+The client checks the version FIRST, deliberately: a peer on an unknown version
+may have produced a body that parses and means something else. That reasoning is
+about a body a *handler* produced. Against a 431 it read the silence as a version
+statement. Measured, one router, one shard, one build, one binary:
+
+```
+POST /select/logsql/hits   query=_stream:{app="x"} AND level:in(v,v,…)   1,200,031 bytes
+
+503 simdlogs: 1 of 1 shards could not answer completely (0(version_mismatch)).
+```
+
+There is no version mismatch in a one-node cluster. The remedy that message
+asks for — check node versions, upgrade the odd one out — has nothing to act on.
+The same query against a **non-router** node is answered, so clustered mode had
+quietly lost a capability single-node has, and said something false about why.
+
+At 120 KB it answers 200. The transition is at net/http's limit, which is why
+this was never seen: every query anyone had tried fit in a URL.
+
+**Both halves are load-bearing, and each was probed alone.** Reverting the
+overflow path alone: 503 again, now `0(unavailable)` — correctly classified and
+still refused. Reverting the classification alone: `version_mismatch` returns.
+Neither fix covers for the other.
+
+**The precedence test guards less than it looked like it guarded.** The overflow
+travels as a form body, and Go's `ParseForm` copies `PostForm` *first* — so on
+the peer a body value beats a query value, the opposite of the ordering the
+small path relies on (entry 108: `stats count()` answering 10 by GET and 2 by
+POST). What actually holds is that the two sets are **disjoint**: a key already
+in the query is never put in the body. Sending the body unconditionally at every
+size leaves `TestTheRouterPlanStillWinsOverALargeForm` **green**; only removing
+the skip turns it red. The test is a guard on the disjointness and on nothing
+else, and its comment says so now rather than claiming the threshold.
+
+The threshold is 60 KiB rather than something near the 1 MiB ceiling, so the
+ordinary GET path is untouched — no dashboard emits 60 KB of parameters — and
+only the case that cannot work in a URL at all changes shape.

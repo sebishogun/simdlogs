@@ -61,6 +61,32 @@ const (
 
 // newClusterClient builds the peer client. tlsCfg is nil for plaintext peer
 // traffic; when set it carries the client certificate for mTLS.
+// preHandlerStatus reports whether a status is one a peer's HTTP SERVER emits
+// on its own, before any handler runs -- so before the protocol-version header
+// and the error class are set.
+//
+// The version check runs first, deliberately: a peer on an unknown version may
+// have produced a body that parses and means something else. That reasoning is
+// about a body a HANDLER produced. These statuses come with no handler and no
+// body worth mistrusting, and reading their missing version header as a version
+// mismatch pointed an operator at the wrong fault entirely -- a 1.2 MB query
+// against a ONE-NODE cluster reported "version_mismatch", and upgrading nodes,
+// the action that message asks for, does nothing.
+//
+// 431 and 413 are net/http's own (MaxHeaderBytes, MaxBytesReader); 400, 414 and
+// 505 it emits on a request it cannot parse; 502/503/504 come from a proxy
+// between the two nodes, which is likewise not a version statement.
+func preHandlerStatus(code int) bool {
+	switch code {
+	case http.StatusRequestHeaderFieldsTooLarge, http.StatusRequestEntityTooLarge,
+		http.StatusBadRequest, http.StatusRequestURITooLong,
+		http.StatusHTTPVersionNotSupported,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
 func newClusterClient(tlsCfg *tls.Config) *clusterClient {
 	return &clusterClient{
 		http: &http.Client{
@@ -117,7 +143,7 @@ var forwardedHeaders = []string{
 // class, because the caller's job is to decide what to do about it and "error
 // was nil-checked away" is how a failed peer became a silently missing shard.
 func (c *clusterClient) do(
-	r *http.Request, shard, replica int, url, method, path string, body []byte,
+	r *http.Request, shard, replica int, url, method, path string, body []byte, ct string,
 ) PeerResponse {
 	out := PeerResponse{Shard: shard, Replica: replica, URL: url}
 
@@ -142,7 +168,10 @@ func (c *clusterClient) do(
 		return out
 	}
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		if ct == "" {
+			ct = "application/json"
+		}
+		req.Header.Set("Content-Type", ct)
 	}
 	for _, h := range forwardedHeaders {
 		if v := r.Header.Get(h); v != "" {
@@ -172,6 +201,16 @@ func (c *clusterClient) do(
 	// The version FIRST, before anything in the body is trusted. A peer on an
 	// unknown version may have produced a body that parses and means something
 	// else, which is worse than one that does not parse.
+	if resp.Header.Get(HdrProtocolVersion) == "" && preHandlerStatus(resp.StatusCode) {
+		// Not a version statement: nothing on the peer that knows the version
+		// ran. Reported as unavailable, which is the class whose remedy --
+		// another replica -- is the one that can actually help.
+		out.Class = PeerUnavailable
+		out.Err = fmt.Errorf("peer's HTTP server refused the request before any "+
+			"handler ran (HTTP %d), so it sent no protocol version; this is not a "+
+			"version mismatch", resp.StatusCode)
+		return out
+	}
 	switch v := resp.Header.Get(HdrProtocolVersion); v {
 	case "":
 		// No version header at all: either a node from before this protocol
@@ -320,6 +359,13 @@ func (c *clusterClient) spool(
 	defer hr.Body.Close()
 	out.Status = hr.StatusCode
 
+	if hr.Header.Get(HdrProtocolVersion) == "" && preHandlerStatus(hr.StatusCode) {
+		out.Class = PeerUnavailable
+		out.Err = fmt.Errorf("peer's HTTP server refused the request before any "+
+			"handler ran (HTTP %d), so it sent no protocol version; this is not a "+
+			"version mismatch", hr.StatusCode)
+		return nil, 0, out, cleanup
+	}
 	if v := hr.Header.Get(HdrProtocolVersion); v == "" {
 		out.Class = PeerVersionMismatch
 		out.Err = errors.New("peer sent no protocol version")

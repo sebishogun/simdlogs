@@ -47,7 +47,7 @@ func FuzzPeerEnvelope(f *testing.F) {
 
 		req := httptest.NewRequest("GET", "http://router/select/logsql/query?query=*", nil)
 		cl := newClusterClient(nil)
-		resp := cl.do(req, 0, 0, peer.URL, http.MethodGet, "/select/logsql/query", nil)
+		resp := cl.do(req, 0, 0, peer.URL, http.MethodGet, "/select/logsql/query", nil, "")
 
 		// Only the exact protocol version may be trusted. Anything else --
 		// absent, unparseable, a different number -- is a peer this router

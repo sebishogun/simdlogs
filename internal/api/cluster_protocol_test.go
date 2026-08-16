@@ -41,7 +41,7 @@ func envelopePeer(t *testing.T, body string) *httptest.Server {
 func askPeer(t *testing.T, c *clusterClient, url string) PeerResponse {
 	t.Helper()
 	r := httptest.NewRequest(http.MethodGet, "/select/logsql/query?query=*", nil)
-	return c.do(r, 0, 0, url, http.MethodGet, "/select/logsql/query", nil)
+	return c.do(r, 0, 0, url, http.MethodGet, "/select/logsql/query", nil, "")
 }
 
 // A well-behaved peer is accepted, and its envelope is read.
@@ -226,7 +226,7 @@ func TestThePeerClientForwardsOnlyWhatItNames(t *testing.T) {
 	r.Header.Set("AccountID", "7")
 	r.Header.Set("ProjectID", "3")
 	r.Header.Set("X-Request-Id", "trace-123")
-	newClusterClient(nil).do(r, 0, 0, peer.URL, http.MethodGet, "/select/logsql/query", nil)
+	newClusterClient(nil).do(r, 0, 0, peer.URL, http.MethodGet, "/select/logsql/query", nil, "")
 
 	h := <-seen
 	if h.Get("Authorization") != "" {

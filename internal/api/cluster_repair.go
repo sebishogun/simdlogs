@@ -586,7 +586,7 @@ func pickSource(states []ReplicaState, digest, notThis string) string {
 // askReplicaState reads one replica's inventory.
 func (s *Server) askReplicaState(r *http.Request, shard, replica int, u string) ReplicaState {
 	st := ReplicaState{Shard: shard, Replica: replica, URL: u}
-	resp := s.peers.do(r, shard, replica, u, http.MethodGet, pathReplicaState, nil)
+	resp := s.peers.do(r, shard, replica, u, http.MethodGet, pathReplicaState, nil, "")
 	if !resp.OK() {
 		st.Err = fmt.Sprintf("%s: %v", resp.Class, resp.Err)
 		return st
@@ -651,11 +651,11 @@ func (s *Server) copyGroup(r *http.Request, src, dst, digest string) (int64, err
 	fetch := r.Clone(ctx)
 	fetch.URL.RawQuery = url.Values{"digest": {digest}}.Encode()
 
-	got := s.peers.do(fetch, 0, 0, src, http.MethodGet, pathReplicaGroup, nil)
+	got := s.peers.do(fetch, 0, 0, src, http.MethodGet, pathReplicaGroup, nil, "")
 	if !got.OK() {
 		return 0, fmt.Errorf("fetching from %s: %s: %v", src, got.Class, got.Err)
 	}
-	put := s.peers.do(fetch, 0, 0, dst, http.MethodPost, pathReplicaGroup, got.Body)
+	put := s.peers.do(fetch, 0, 0, dst, http.MethodPost, pathReplicaGroup, got.Body, "")
 	if !put.OK() {
 		return 0, fmt.Errorf("adopting at %s: %s: %v", dst, put.Class, put.Err)
 	}
