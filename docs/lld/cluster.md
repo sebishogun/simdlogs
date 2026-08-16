@@ -484,17 +484,26 @@ where the handler calls `FormValue` leaks one multipart temp file per request,
 because the handler parses on a request copy the server never sees and
 `finishRequest` cleans up the original. Neither failure is visible in an
 ordinary response, so the list is not maintained by inspection:
-`TestNoRouteLeavesAMultipartTempFileBehind` posts a spilling multipart body to
-every path `Handler()` registered and fails on any file left behind. The plain
-one carries a positive control -- a handler wired like a route whose spec forgot
-`form: true`, which must leave a file -- because its check is an absence and an
-absence has two causes. The authenticated one has no control; what establishes
-that it can see a leak is the mutation, reverting `format` to `r.FormValue`,
-which reddens it naming all three health routes. There are **two** of them, one against a plain server and one against an
-authenticated server: the leak needs a middleware that replaced the
-request, and with authentication off `withTenant` makes no copy for the health
-routes, so the one configuration in which `/health`, `/-/healthy` and `/-/ready`
-leaked was the one the first version of the gate never built. It found `/internal/replica/group`,
+there are **two** gates, one against a plain server and one against an
+authenticated server. Each posts a spilling multipart body to every path
+`Handler()` registered and fails on any file left behind.
+
+Both are needed because the leak needs a middleware that replaced the request,
+and with authentication off `withTenant` makes no copy for the health routes --
+so the one configuration in which `/health`, `/-/healthy` and `/-/ready` leaked
+was the one the first version of the gate never built.
+
+The plain gate, `TestNoRouteLeavesAMultipartTempFileBehind`, carries a positive
+control: a handler wired like a route whose spec forgot `form: true`, which must
+leave a file. Its check is an absence and an absence has two causes, so without
+the control a spill threshold too high to spill would pass.
+
+`TestNoRouteLeavesATempFileBehindOnAnAuthenticatedServer` has no control. What
+establishes that it can see a leak is the mutation: reverting `format` to
+`r.FormValue` reddens it naming all three health routes, and leaves the plain
+gate green.
+
+The plain gate found `/internal/replica/group`,
 whose handler read `digest` with `r.FormValue` before `io.ReadAll`-ing the body
 it was about to adopt — the URL is where the client already sends it.
 

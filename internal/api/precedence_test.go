@@ -462,6 +462,13 @@ func TestARowAndItsPackAgree(t *testing.T) {
 		// overwrites an existing key, so this is how a duplicate reaches the
 		// serializer. It emitted {"_time":"…","c":"1","_time":"…"}.
 		`* | stats by (_time) count() c | copy _time as t2 | rename t2 as _time | pack_json as p`,
+		// pack_LOGFMT, which is the third copy of the rule and the one no
+		// subtest reached: every case above packs JSON, so `hasDuplicate`
+		// never saw a logfmt pack and reverting packLogfmt's guard left the
+		// whole suite green. Its duplicate spells itself
+		// `_time=… c=1 _time=…`.
+		`* | stats by (_time) count() c | pack_logfmt as p`,
+		`* | stats by (_time) count() c | copy _time as t2 | rename t2 as _time | pack_logfmt as p`,
 	} {
 		t.Run(q, func(t *testing.T) {
 			code, body := postRaw(t, node, "/select/logsql/query?query="+url.QueryEscape(q), "", "")
@@ -490,12 +497,32 @@ func TestARowAndItsPackAgree(t *testing.T) {
 				if !ok {
 					t.Fatalf("the row carries no pack: %s", ln)
 				}
-				if k := jsonKeySequence(t, packed); hasDuplicate(k) {
-					t.Errorf("the pack repeats a key: %v in %s", k, packed)
-				}
 				var pack map[string]string
-				if err := json.Unmarshal([]byte(packed), &pack); err != nil {
-					t.Fatalf("the pack is not JSON: %v: %s", err, packed)
+				if strings.HasPrefix(strings.TrimSpace(packed), "{") {
+					if k := jsonKeySequence(t, packed); hasDuplicate(k) {
+						t.Errorf("the pack repeats a key: %v in %s", k, packed)
+					}
+					if err := json.Unmarshal([]byte(packed), &pack); err != nil {
+						t.Fatalf("the pack is not JSON: %v: %s", err, packed)
+					}
+				} else {
+					// logfmt: `k=v` pairs, space separated. Parsed by the same
+					// rule the packer writes so a repeated key is visible --
+					// a map alone would collapse it, which is the mistake the
+					// JSON half already made once.
+					pack = map[string]string{}
+					var keys []string
+					for _, kv := range strings.Fields(packed) {
+						k, v, ok := strings.Cut(kv, "=")
+						if !ok {
+							continue
+						}
+						keys = append(keys, k)
+						pack[k] = v
+					}
+					if hasDuplicate(keys) {
+						t.Errorf("the logfmt pack repeats a key: %v in %s", keys, packed)
+					}
 				}
 				delete(row, "p")
 				for k, v := range row {
@@ -616,14 +643,40 @@ func sortedLines(body string) string {
 // VL's; the value COUNT and the hit counts are.
 func TestAMixedStoreReportsTheEmptyStream(t *testing.T) {
 	node := singleNode(t)
+	// ONE REQUEST, both kinds of row.
+	//
+	// Six separate requests land in six flush groups, so the streamless rows
+	// have no `_stream` column at all and the store only ever exercises one of
+	// the two ways a row reaches the empty stream. In one request they share a
+	// group, the column is materialized to "" for the rows that lack the
+	// field, and both paths run -- which is where the remainder was counting
+	// those rows twice, reporting nine hits over six rows.
+	var sb strings.Builder
 	for i := 0; i < 3; i++ {
-		postRaw(t, node, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson",
+		fmt.Fprintf(&sb, `{"_time":"2026-08-16T03:00:0%dZ","_msg":"row %d","svc":"s0"}`+"\n", i, i)
+	}
+	for i := 3; i < 6; i++ {
+		fmt.Fprintf(&sb, `{"_time":"2026-08-16T03:00:0%dZ","_msg":"row %d"}`+"\n", i, i)
+	}
+	postRaw(t, node, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson", sb.String())
+	// And the separate-request shape too, on its own store, since that is the
+	// other way to reach the empty stream and the two took different branches.
+	sep := singleNode(t)
+	for i := 0; i < 3; i++ {
+		postRaw(t, sep, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson",
 			fmt.Sprintf(`{"_time":"2026-08-16T03:00:0%dZ","_msg":"row %d","svc":"s0"}`+"\n", i, i))
 	}
 	for i := 3; i < 6; i++ {
-		postRaw(t, node, "/insert/jsonline", "application/x-ndjson",
+		postRaw(t, sep, "/insert/jsonline", "application/x-ndjson",
 			fmt.Sprintf(`{"_time":"2026-08-16T03:00:0%dZ","_msg":"row %d"}`+"\n", i, i))
 	}
+	for _, srv := range []*httptest.Server{node, sep} {
+		checkMixedStreamStore(t, srv)
+	}
+}
+
+func checkMixedStreamStore(t *testing.T, node *httptest.Server) {
+	t.Helper()
 
 	var streams struct {
 		Values []struct {
@@ -669,9 +722,20 @@ func TestAMixedStoreReportsTheEmptyStream(t *testing.T) {
 	if err := json.Unmarshal([]byte(idBody), &ids); err != nil {
 		t.Fatalf("stream_ids is not JSON: %v: %s", err, idBody)
 	}
-	if len(ids.Values) != len(streams.Values) {
-		t.Errorf("/stream_ids lists %d ids for %d streams: %s",
-			len(ids.Values), len(streams.Values), idBody)
+	// The HITS, not the count. StreamIDs builds one entry per Streams entry,
+	// so comparing the lengths is structural -- it cannot fail whatever
+	// Streams returns, and reverting the fix left it green while three other
+	// assertions went red.
+	idTotal := 0
+	for _, v := range ids.Values {
+		idTotal += v.Hits
+	}
+	if idTotal != 6 {
+		t.Errorf("/stream_ids hits total %d over six rows: %s", idTotal, idBody)
+	}
+	if len(ids.Values) != 2 {
+		t.Errorf("/stream_ids lists %d ids where the store has two streams "+
+			"(one named, one empty): %s", len(ids.Values), idBody)
 	}
 
 	// And the `_stream` facet, over the same store, must agree with /streams.

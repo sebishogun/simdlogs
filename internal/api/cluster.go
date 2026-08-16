@@ -826,7 +826,7 @@ func withFormInURL(r *http.Request) (*http.Request, []byte) {
 	//
 	// It was deleted once on the measurement that nothing reddened. The measure
 	// was blind: the parity matrix filters `rt.body != ""`, which excludes
-	// exactly the two Elasticsearch routes -- and those pass a non-nil body to
+	// exactly the routes whose body is a document -- and those pass a non-nil body to
 	// fanOutChecked, so its missing-query guard (whose FormValue is what primes
 	// r.Form for every other route) is skipped and THIS becomes the first parse
 	// of the request. With `; charset` that parse returns
@@ -837,7 +837,7 @@ func withFormInURL(r *http.Request) (*http.Request, []byte) {
 	//	  router      400 the request body is not a readable form
 	//	POST /_search  same content type             200 / 400 the same way
 	//
-	// jQuery's spelling, on the two routes whose body IS a document. The test
+	// jQuery's spelling, on the routes whose body IS a document. The test
 	// the deletion cited as its coverage is the one that could not see them.
 	normalizeFormContentType(r)
 	if err := parseFormBody(r); err != nil {

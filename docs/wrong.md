@@ -6318,12 +6318,18 @@ A 4 MiB multipart POST, server-side `TotalAlloc` delta:
 
 | route | `form: true` | `form: false` |
 |---|---|---|
-| `/flags` | 16.96 MB | < 2 MB |
-| `/admin/backup` | 16.97 MB | < 2 MB |
-| `/admin/acknowledge-degraded` | 16.96 MB | < 2 MB |
+| `/flags` | 16.96 MB | 0.16 MB |
+| `/admin/backup` | **8.56 MB** | 0.14 MB |
+| `/admin/acknowledge-degraded` | 16.95 MB | 0.15 MB |
 
 Asserted with a wide margin rather than an exact number — half the body size
 separates them by an order of magnitude, so it is a check and not a benchmark.
+
+**Correction (entry 87).** This table first published `/admin/backup` at 16.97
+MB, which is the other two rows' number copied across; re-measured over five
+runs it is 8.56 MB. The test's own comment gave a third figure, "~13 MiB", which
+matches none of them and is now the measured range. All three answer 200 in both
+configurations, so the difference is the buffering and nothing else.
 
 **Prose that stayed behind the code.** Four places still said "the two
 Elasticsearch routes" after the set became three; and the LLD said the leak gate
@@ -6359,3 +6365,52 @@ store, replacing the special case that only handled the first.
 Mixed ingestion is not exotic — it is what a store looks like while
 `_stream_fields` is being rolled out, and what any second shipper that does not
 set it produces.
+
+## 87. The empty-stream fix replaced an under-count with an over-count
+
+Entry 86 made the empty stream the REMAINDER: `Count(q)` minus the rows in a
+named stream. It added that to the count already read off the `_stream` column,
+so every row whose column is `""` was counted twice.
+
+Both ways a row reaches the empty stream have to be handled, and entry 86 only
+noticed one of them:
+
+- **no `_stream` column at all** — ingested without `_stream_fields`, so absent
+  from `StatsByField`. This is what the remainder is for.
+- **a column materialized to `""`** — the store materializes the column for a
+  whole flush group, so a row that never carried the field comes back with `""`
+  once any row in its group did. `streamValues` already returns these.
+
+Measured on ONE ingest request of six rows, three carrying `svc`:
+
+| | simdlogs after entry 86 | victoria-logs |
+|---|---|---|
+| `/streams` | `{}`:6 and `{svc="s0"}`:3 — **nine hits over six rows** | `{svc="s0"}`:3 and `{}`:3 |
+| `/stream_ids` | 6 and 3 | 3 and 3 |
+| `field_names` `_stream` | 6 | 6 |
+
+so `field_names` and `/query` said six while `/streams` said nine — the same
+one-store-two-answers shape entry 86 set out to remove, with the sign flipped.
+A missing number is not improved by a wrong one.
+
+The empty stream holds exactly the rows the named ones do not, so it is an
+ASSIGNMENT — `Count(q) - named` — and both paths fall out of it.
+
+**The fixture is the finding.** Entry 86's test posted its six rows as six
+separate requests, which land in six flush groups, so the streamless rows had no
+column at all and the `""` branch never ran. One request puts them in one group.
+The test now runs both shapes against separate stores, and its own
+"hits total 6" assertion — right all along — reddens on either.
+
+Two more from the same round:
+
+- **`/stream_ids`'s assertion could not fail.** `StreamIDs` builds one entry per
+  `Streams` entry, so comparing the two lengths is structural. Reverting the
+  fix reddened three assertions and left that one green. It compares the HITS
+  now.
+- **`packLogfmt`'s guard was pinned by nothing.** All four subtests of the
+  row-and-pack agreement test packed JSON, so `hasDuplicate` never saw a logfmt
+  pack and reverting that copy left the whole suite green — while
+  `pack_logfmt` emitted `_time=… c=1 _time=…`. Two logfmt cases now run through
+  the same comparison, with a logfmt parser that keeps the key ORDER, since a
+  map would collapse the duplicate exactly as the JSON half once did.

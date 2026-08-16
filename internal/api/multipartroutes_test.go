@@ -17,7 +17,7 @@ import (
 // request, so the deferred RemoveAll reaches the form the handler used. That
 // parse is now opt-in per route (routeSpec.form), because doing it everywhere
 // read and buffered the body of routes that never look at one and CONSUMED the
-// body of the two that read it themselves.
+// body of the three that read it themselves.
 //
 // An opt-in list is only as good as the knowledge that went into it, and
 // getting one entry wrong is silent: a route whose handler parses a form while
@@ -153,7 +153,7 @@ func TestNoRouteLeavesAMultipartTempFileBehind(t *testing.T) {
 //	          router             200                503
 //	/_search  node               200                400
 //
-// docs/lld/cluster.md states the rule these two break: "their body is a JSON
+// docs/lld/cluster.md states the rule these three break: "their body is a JSON
 // document, read unconditionally whatever the content type says."
 func TestADocumentBodyIsReadUnderEveryFraming(t *testing.T) {
 	srv, err := NewServer(t.TempDir())
@@ -383,8 +383,9 @@ func TestADocumentRouteReadsNoFormFromTheBodyTail(t *testing.T) {
 // guard's pre-parse reads and buffers the whole body first.
 //
 // Asserted with a wide margin rather than an exact number: a 4 MiB body costs
-// ~13 MiB of TotalAlloc with the pre-parse on and well under 1 MiB with it off,
-// so a limit of half the body size separates them without being a benchmark.
+// 8.5 to 17 MiB of TotalAlloc with the pre-parse on -- the spread is the
+// route's own work, not noise -- and about 0.15 MiB with it off, so a limit of
+// half the body size separates them without being a benchmark.
 func TestAnAdminRouteDoesNotBufferABodyItNeverReads(t *testing.T) {
 	srv, err := NewServer(t.TempDir())
 	if err != nil {

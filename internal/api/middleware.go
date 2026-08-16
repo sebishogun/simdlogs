@@ -52,9 +52,9 @@ type routeSpec struct {
 	// delta -- /metrics 0 -> 128 MiB, / 0 -> 128 MiB, /alerts 0 -> 128 MiB,
 	// plus a temp file written and deleted per request, on three routes that
 	// discard the body. And on the routes that read the body themselves --
-	// /_search, /_count and /select/vector -- the parse CONSUMED it: /_count with a JSON document
-	// under multipart/form-data went from 200 to 400 ("simdlogs: EOF") on a
-	// node and to 503 on a router.
+	// /_search, /_count and /select/vector -- the parse CONSUMED it: /_count
+	// with a JSON document under multipart/form-data went from 200 to 400
+	// ("simdlogs: EOF") on a node and to 503 on a router.
 	//
 	// A route whose handler parses a form while this is false leaks a temp
 	// file per request, which is the defect this whole mechanism exists to

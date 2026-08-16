@@ -61,12 +61,18 @@ import (
 //
 // # _time and its absence
 //
-// _time is lifted back out of the fields, because the engine carries it
-// separately and a pipe that sorts by time reads Row.Time rather than a field
-// named _time. A line with NO _time is a row that genuinely has none -- a stats
-// result, or a projection that dropped it -- and it is marked NoTime so the
-// re-encode does not invent a 1970 timestamp for it. An UNPARSEABLE _time stays
-// a field: it is data the row carries, and dropping it would lose it silently.
+// _time is lifted into Row.Time, because the engine carries it separately and a
+// pipe that sorts by time reads Row.Time rather than a field named _time. It is
+// KEPT as a field as well: for `stats by (_time)` that field is the group key,
+// and consuming it made the merge group every row together -- a router
+// answering {"c":"4"} where a node answers two rows of "2". It costs nothing on
+// the way out, because the serializer emits that key at most once.
+//
+// A line with NO _time is a row that genuinely has none -- a stats result, or a
+// projection that dropped it -- and it is marked NoTime so the re-encode does
+// not invent a 1970 timestamp for it. An UNPARSEABLE _time stays a field and is
+// not lifted: it is data the row carries, and dropping it would lose it
+// silently.
 //
 // # Anything that is not a flat JSON object is the whole line as _msg
 //
@@ -122,10 +128,11 @@ func jsonLineToRow(line []byte) query.Row {
 	row := query.Row{NoTime: true}
 
 	// first distinguishes the opening `{` from a `,`. It is NOT len(row.Fields)
-	// > 0: a lifted _time adds no field, so a row starting with _time would
-	// then look like its first pair and the comma before the second key would
-	// be read as the start of a key. That is what the differential against the
-	// decoder caught -- every ordinary row, whose first field is _time, fell
+	// > 0 -- a scanner that derived its position from the field count would
+	// have to agree with every rule about which keys become fields, and it did
+	// not: when a lifted _time added no field, a row starting with _time looked
+	// like its first pair and the comma before the second key was read as the
+	// start of a key. That is what the differential against the
 	// back to rawRow.
 	first := true
 	for {
@@ -197,9 +204,9 @@ func jsonLineToRow(line []byte) query.Row {
 	}
 }
 
-// countFields is the number of top-level pairs in a JSON object: an upper
-// bound on the fields a row will carry, since a lifted _time removes one. It
-// is a size hint, so a wrong answer on a malformed line costs nothing.
+// countFields is the number of top-level pairs in a JSON object, which is
+// exactly the fields a row will carry now that a lifted _time is kept as one
+// too. It is a size hint, so a wrong answer on a malformed line costs nothing.
 func countFields(line []byte) int {
 	depth, n := 0, 0
 	for i := 0; i < len(line); {

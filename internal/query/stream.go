@@ -33,20 +33,32 @@ const EmptyStream = "{}"
 // hit counts.
 func Streams(s Store, q *Query) []ValueCount {
 	out, empty := streamValues(s, q)
-	// THE REMAINDER is the empty stream.
+	// THE REMAINDER is the empty stream, and it is an assignment.
 	//
-	// Rows ingested without `_stream_fields` have no `_stream` column at all
-	// -- they are absent from StatsByField rather than present with "" --  so
-	// the empty stream cannot be read off that column. Every row is in exactly
-	// one stream, so whatever the named ones do not account for is in the
-	// empty one, and that arithmetic covers the all-empty store and the mixed
-	// store with one expression instead of a special case for each.
+	// Every row is in exactly one stream, so the empty one holds precisely
+	// what the named ones do not: Count(q) minus their hits. That covers both
+	// ways a row reaches it -- no `_stream` column at all (ingested without
+	// `_stream_fields`, so absent from StatsByField) and a column materialized
+	// to "" (one flush group where some row did have the field) -- with one
+	// expression instead of a case for each.
+	//
+	// It was `empty += n - named`, which counted the ""-column rows TWICE:
+	// once from the column, once in the remainder. Measured on one ingest
+	// request of six rows, three carrying `svc`:
+	//
+	//	streams   {}:6 and {svc="s0"}:3   -- nine hits over six rows
+	//	VL        {svc="s0"}:3 and {}:3
+	//
+	// so field_names and /query said six while /streams said nine, which is
+	// the same one-store-two-answers shape the under-reporting version had.
+	// A missing number is not improved by a wrong one.
 	named := 0
 	for _, vc := range out {
 		named += vc.Count
 	}
+	empty = 0
 	if n := Count(s, q); n > named {
-		empty += n - named
+		empty = n - named
 	}
 	if len(out) == 0 && empty == 0 {
 		return nil
