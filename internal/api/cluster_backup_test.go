@@ -239,3 +239,67 @@ func TestTheManifestReportsHowFarApartTheShardsWere(t *testing.T) {
 		t.Fatalf("an empty manifest has spread %d", got)
 	}
 }
+
+// The spread the runbook tells an operator to read is IN the archive.
+//
+// docs/runbooks/backup-restore.md computes cluster RPO from the skew between
+// shard archives. It used to name `ClusterManifest.Spread()` -- a method on an
+// internal/ type, reachable from no endpoint and no command, so the runbook
+// asked for a number an operator had no way to obtain, and the method itself
+// had no production caller at all.
+//
+// Asserted through the MANIFEST'S JSON rather than by calling Spread(), because
+// calling the method is exactly the thing an operator cannot do: the test has
+// to fail if the field stops being marshalled, not merely if the arithmetic
+// changes.
+func TestTheClusterBackupCarriesItsOwnSpread(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hw   []int64
+		want int64
+	}{
+		{"one shard has no spread", []int64{5000}, 0},
+		{"earliest to latest", []int64{5000, 1000, 3000}, 4000},
+		{"already in order", []int64{1000, 9000}, 8000},
+		{"a shard with no watermark widens it", []int64{0, 7000}, 7000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			man := ClusterManifest{Format: 1}
+			for i, hw := range tc.hw {
+				man.Shards = append(man.Shards, ShardBackup{Shard: i, HighWatermark: hw})
+			}
+			man.SpreadNanos = man.Spread()
+
+			blob, err := json.Marshal(man)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(blob, &got); err != nil {
+				t.Fatal(err)
+			}
+			v, ok := got["spreadNanos"]
+			if !ok {
+				t.Fatalf("cluster.json has no spreadNanos: the runbook tells an "+
+					"operator to read it from this file. Keys: %v", got)
+			}
+			f, ok := v.(float64)
+			if !ok {
+				t.Fatalf("spreadNanos is %T, not a number", v)
+			}
+			if int64(f) != tc.want {
+				t.Errorf("spreadNanos=%d, want %d (watermarks %v)", int64(f), tc.want, tc.hw)
+			}
+		})
+	}
+
+	// An empty manifest still carries the field, at zero. `omitempty` here would
+	// make "no shards" and "no spread" the same absent key.
+	blob, err := json.Marshal(ClusterManifest{Format: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(blob, []byte(`"spreadNanos"`)) {
+		t.Errorf("an empty manifest omits spreadNanos entirely: %s", blob)
+	}
+}

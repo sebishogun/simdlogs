@@ -40,7 +40,15 @@ func TestDocumentedMechanismsHaveCallers(t *testing.T) {
 		`\bwould otherwise\b|\botherwise would\b|\bso a caller can tell\b|` +
 		`\bso an operator can tell\b|\bguards? against\b|\bstops? a\b|` +
 		`\bis what lets a caller tell\b|\brather than\b|\bsilently\b|` +
-		`\bwithout (?:anyone|a caller|an operator) (?:noticing|being told)\b)`)
+		`\bwithout (?:anyone|a caller|an operator) (?:noticing|being told)\b|` +
+		// ValidateClusterBackup's doc -- "a restore that discovers the mismatch
+		// halfway has already written some of it" -- named a failure it prevents
+		// in none of the words above, so the gate never considered the very
+		// declaration its own header cites as one of the four it exists to
+		// catch. Chasing phrases is whack-a-mole; these are the shapes this
+		// repository actually writes.
+		`\bhas already\b|\bwould have\b|\bcalled BEFORE\b|\bbefore anything\b|` +
+		`\btoo late\b|\bhalfway\b|\bunrecoverable\b|\bcannot be undone\b)`)
 
 	fset := gotoken.NewFileSet()
 	type decl struct {
@@ -66,6 +74,15 @@ func TestDocumentedMechanismsHaveCallers(t *testing.T) {
 		f, perr := parser.ParseFile(fset, path, nil, parser.ParseComments)
 		if perr != nil {
 			return nil // a file that does not parse is not this gate's subject
+		}
+		// A file this build EXCLUDES is not a reader.
+		//
+		// parser.ParseFile ignores build constraints, so a mechanism whose only
+		// caller sits in a //go:build plan9 file counted as wired on linux. This
+		// repository has twelve build-tagged production files, including
+		// windows-only and plan9-only ones.
+		if buildExcluded(f) {
+			return nil
 		}
 		isTest := strings.HasSuffix(path, "_test.go")
 
@@ -191,21 +208,47 @@ var exempt = map[string]string{
 	// the failure it prevents, and never connected -- which is what this gate
 	// was written to surface. Listed so the gate can run today rather than
 	// staying off until every one is fixed.
-	"ReplicasConsulted":     "written into the manifest at cluster_backup.go:172 and read by nothing -- the same written-never-read shape as HighWatermark",
-	"Spread":                "a ClusterManifest method with no caller at all",
-	"routeCount":            "documented as feeding the audit; the audit does not call it",
+	// ReplicasConsulted is NOT here any more, and the reason is worth keeping.
+	// Its entry said "read by nothing", which was false under the rule this gate
+	// now applies: encoding/json reads it by reflection at cluster_backup.go:196
+	// and it ships in cluster.json. Accurately: no Go code BRANCHES on it. The
+	// gate cannot see reflection and does not pretend to.
+	"ValidateClusterBackup": "no production caller. Its doc says it is 'called BEFORE anything is unpacked' because 'a restore that discovers the mismatch halfway has already written some of it' -- and the restore path does not call it. The example this gate's own header cites, which the first two versions of the gate could not see",
+	"routeCount":            "the audit DOES call it -- route_audit_test.go:38, route_count_test.go:23, contracts_test.go:333 -- and the audit is a test, which is the actual reason. The doc block at server.go:602 describes registeredPaths and is attached to routeCount, which is why the gate sees this name at all",
 	"ExecuteCount":          "an Executor method with no caller",
-	"AppendGroupIdempotent": "the idempotent-write entry point, called only by tests",
-	"QuarantinedGroups":     "lists a store's quarantine; nothing production-side asks",
+	"AppendGroupIdempotent": "one of TWO idempotent-write entry points, not the only one: production deliberately takes CommittedWrite + FlushWithReceipt -> Store.CommitReceipt (writer.go:678), and receipts.go:192-201 says the split is intentional. It is still the one that commits the receipt in the SAME record as the group, which is the guarantee production does not get -- docs/wrong.md entry 54, task #433",
+	"QuarantinedGroups":     "the COUNT reaches production (countQuarantined -> the simdlogs_storage_quarantined_groups gauge); only the LISTING -- which group, why, how many bytes, when -- has no reader, so an operator can alert on the number and cannot ask what it is",
 	"SnapshotAll":           "superseded by SnapshotAllWithSeq, which is what callers use",
 	"RestoreTar":            "the older unstaged restore path; protocols.go:27 says the staged one replaced it",
 	"SetMaxRows":            "a dead exported setter: -search.maxRows reaches the server through config (server.go:300), so the LIMIT works and this way of setting it has no caller",
 	"SetDirRereadInterval":  "the same, one flag over: -readiness-reread-interval arrives via config.DirRereadInterval (server.go:244) and this setter is unused",
-	"readiness":             "a name shared with unrelated prose; the declaration this flags has no reader",
+	"readiness":             "server.go:2045 is a SUPERSEDED readiness handler; /-/ready goes to s.healthHandler(healthReady) at server.go:716. The earlier reason blamed 'a name shared with unrelated prose', which describes a mechanism this gate does not have -- comments never contribute to uses",
 	"FieldRequestID":        "a log field constant no log line uses",
 	"FieldStatus":           "same",
 	"FieldDurationMS":       "same",
 	"FieldRows":             "same",
+}
+
+// buildExcluded reports whether f carries a //go:build line naming a GOOS or
+// GOARCH other than this one. Deliberately crude: it is a filter on "this file
+// is compiled for a different platform", not a constraint evaluator, and it
+// errs towards INCLUDING a file, so a reader is never wrongly discounted.
+func buildExcluded(f *ast.File) bool {
+	for _, cg := range f.Comments {
+		for _, c := range cg.List {
+			line, ok := strings.CutPrefix(c.Text, "//go:build ")
+			if !ok {
+				continue
+			}
+			for _, plat := range []string{"windows", "plan9", "darwin", "js", "wasip1",
+				"aix", "solaris", "freebsd", "openbsd", "netbsd", "ios", "android"} {
+				if strings.Contains(line, plat) && !strings.Contains(line, "linux") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // countReads adds every READ of an identifier in f to uses.
@@ -230,8 +273,17 @@ func countReads(f *ast.File, uses map[string]int) {
 			for _, lhs := range x.Lhs {
 				writes[lhs] = true
 			}
-		case *ast.KeyValueExpr:
-			writes[x.Key] = true
+			// A KeyValueExpr key is NOT reliably a write.
+			//
+			// In a STRUCT literal it names a field and is one. In a MAP literal
+			// -- and an indexed array or slice literal -- the key is a value
+			// expression and is a READ, so a documented constant used only as a
+			// map key was reported as unwired while a production function read
+			// it. Telling the two apart needs the literal's type, which this
+			// gate does not resolve, so it takes the conservative branch: keys
+			// count as reads, and a field that is only ever assigned inside a
+			// struct literal is no longer detected. A missed detection beats a
+			// gate that fails on correct code.
 		}
 		return true
 	})

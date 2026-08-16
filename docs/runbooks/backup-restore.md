@@ -113,7 +113,7 @@ are: the format and protocol must match this build, the shard count must match
 the target, no shard may appear twice, and every shard must name an archive.
 
 `highWatermark` is each shard's NEWEST ROW TIMESTAMP at the moment its source
-was chosen — not when its archive was written. `Spread()` is therefore the skew
+was chosen — not when its archive was written. `spreadNanos` is therefore the skew
 between shards' newest data, not the wall-clock interval between captures: a
 shard that stopped ingesting an hour ago reports an hour of spread even if
 every archive was taken in the same second. It is computed from `cluster.json`
@@ -131,10 +131,10 @@ validated here and the unpacking is the operator's, per shard.
 | | Value | Why |
 |---|---|---|
 | RPO, single node | the age of the backup | there is no continuous shipping |
-| RPO, cluster | the age of the backup, plus the spread between shard archives (`ClusterManifest.Spread()`) | the shard archives are taken sequentially |
+| RPO, cluster | the age of the backup, plus the spread between shard archives (`spreadNanos` in the archive's `cluster.json`) | the shard archives are taken sequentially |
 | RTO | restore time, dominated by untarring the archive | no replay step |
 
 **Unresolved:** there is no incremental backup, so RPO is bounded by how often
-a full capture is affordable. `Spread()` is reported and not bounded — no
+a full capture is affordable. `spreadNanos` is reported and not bounded — no
 threshold is right for every deployment, and one invented here would either
 refuse good backups or bless bad ones.

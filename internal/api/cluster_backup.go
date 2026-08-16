@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -63,6 +62,16 @@ type ClusterManifest struct {
 	Protocol int `json:"protocol"`
 	// Shards is one entry per shard, in shard order.
 	Shards []ShardBackup `json:"shards"`
+	// SpreadNanos is Spread() at the moment the manifest was written: how far
+	// apart the shard archives were taken.
+	//
+	// It is in the manifest because docs/runbooks/backup-restore.md tells an
+	// operator to compute their cluster RPO from `ClusterManifest.Spread()` --
+	// a method in an internal/ package, reachable from no endpoint and no
+	// command, so the runbook named a number nobody could obtain. Recording it
+	// is the whole fix: the archive now carries it and `jq .spreadNanos
+	// cluster.json` answers the question the runbook asks.
+	SpreadNanos int64 `json:"spreadNanos"`
 }
 
 // ShardBackup is one shard's part of a cluster backup.
@@ -192,6 +201,8 @@ func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
 	// the first byte aborts the connection instead, which is what the
 	// single-node handler already does.
 	tw := tar.NewWriter(w)
+
+	man.SpreadNanos = man.Spread()
 
 	blob, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -430,8 +441,8 @@ func ValidateClusterBackup(man ClusterManifest, intoShards int) error {
 	return nil
 }
 
-// ClusterBackupSpread is how far apart the shard archives were taken, in
-// nanoseconds between the earliest and latest high watermark.
+// Spread is how far apart the shard archives were taken, in nanoseconds
+// between the earliest and latest high watermark.
 //
 // Reported rather than enforced. There is no bound that is right for every
 // deployment, and a threshold this code invented would either refuse good
@@ -441,10 +452,14 @@ func (m ClusterManifest) Spread() int64 {
 	if len(m.Shards) == 0 {
 		return 0
 	}
-	hw := make([]int64, 0, len(m.Shards))
-	for _, sb := range m.Shards {
-		hw = append(hw, sb.HighWatermark)
+	lo, hi := m.Shards[0].HighWatermark, m.Shards[0].HighWatermark
+	for _, sb := range m.Shards[1:] {
+		if sb.HighWatermark < lo {
+			lo = sb.HighWatermark
+		}
+		if sb.HighWatermark > hi {
+			hi = sb.HighWatermark
+		}
 	}
-	sort.Slice(hw, func(i, j int) bool { return hw[i] < hw[j] })
-	return hw[len(hw)-1] - hw[0]
+	return hi - lo
 }
