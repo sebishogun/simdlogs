@@ -5412,13 +5412,13 @@ The fixture, written down so the number means something:
 
   query=*          3,762,650 bytes   188.1 B/row out
   query=*&limit=5        944 bytes
-  ratio            3,985.9x
+  ratio            3,985.9x  (the other two runs: 3,988.4 and 3,983.3)
   peerMaxBodyBytes 268,435,456 -> ~1.43M rows per shard before the read fails
 ```
 
 Every shard streamed its whole matching set to the router, on the exact path
 POST exists for. What is stable across all three measurements is the ratio —
-3,985.9x — and the order of the per-row cost; the digits are not,
+about four thousand — and the order of the per-row cost; the digits are not,
 and quoting them to seven figures without the fixture claimed a precision the
 measurement never had.
 
@@ -5708,4 +5708,87 @@ The body is left unread when the content type says it is a form, so
 `withFormInURL` parses it and folds `q` into the shard URL — the path the
 large-form case already takes. `/_search` under the same shape was loud
 (`400 invalid character 'q'`) and is unchanged.
+
+## 71. The fix for a 503 traded 16 cells for 31, and the test could not see it
+
+Entry 69 deleted `unreadableBody` and stopped `planQuery` defaulting a blank
+query to `*`. Measured across twelve federated reads × thirteen framings,
+router against a real storage node, that commit **fixed 16 cells and regressed
+31**: nine to eleven routes moved from a 400 naming the caller's own header to
+`503 … 2 of 2 shards could not answer completely (0(rejected),1(rejected))` —
+verbatim the answer entry 67 exists to remove, and one a client retries forever
+because a retry re-fans-out and can never succeed.
+
+```
+curl -F 'query=*'             node 200:12    router 200:1  502:1  503:10
+text/plain, params in body    node 400:11    router 400:2  502:1  503:9
+```
+
+**Three causes, all "the router does not read what the node reads".**
+
+`isFormPost` matched only `application/x-www-form-urlencoded`. A single node
+parses multipart — `FormValue` calls `ParseMultipartForm` — so the router never
+folded a multipart form into the shard URL and the shards were asked nothing. It
+matches both encodings now, through a `parseFormBody` that calls the right
+parser. A multipart body that will not PARSE is ignored rather than fatal, which
+is also what a node does: `FormValue` discards that error and reads the URL
+query.
+
+The router fanned out an empty selector where a node refuses. `parseRequest`
+refuses a blank `query` on every select endpoint; `fanOutChecked` now applies
+the same rule before any shard is asked, so the caller gets the node's own 400
+instead of a 5xx pointing at the storage nodes.
+
+And `/select/logsql/stats_query_range` on a NODE answered 200 to a request with
+no parameters at all, fabricating a matrix:
+
+```
+GET /select/logsql/stats_query_range
+  200 {"resultType":"matrix","result":[{"metric":{},
+       "values":[[1690951540,""],[1690951540,""],[1690951540,""]]}]}
+```
+
+A constant garbage epoch and empty-string values. `docs/lld/api.md` says `query`
+is required on every select endpoint; this was the route where that was false,
+and it was the only pair of cells where the router's refusal was RIGHT and the
+node's answer was wrong.
+
+**The test could not see any of it.** It used a recording shard — a spy that
+answers 200 to anything — and one route. Against that spy, 11 of 12 federated
+reads answered 200 with the shard asked `query=""` for the multipart,
+`text/plain` and no-Content-Type framings: the defect class entries 55-70 exist
+to remove, hidden by the fixture. The matrix now runs every federated read
+against a REAL storage node and compares to that same node. Removing multipart
+support reddens 11 cells, removing the missing-query guard reddens 20, and
+accepting a blank query on `stats_query_range` reddens 2.
+
+## 72. A parameter no storage node reads, bought with a working capability
+
+Entry 70 stopped `federatedESCount` reading the body when the content type is a
+form, so `withFormInURL` could fold `q` into the shard URL.
+
+`curl -d` sends `Content-Type: application/x-www-form-urlencoded` **by
+default**, so a real Elasticsearch document took that path: `ParseForm` turned
+the JSON into one URL key and the shard got an empty body.
+
+```
+curl -d '{"query":{"term":{"level":"error"}}}' <router>/_count
+  before  200 {"count":1}          after  503
+  shard   url ".../_count?%7B%22query%22...%7D=" ct="" body=""
+  and with ?allow_partial_response=1: 206 {"count":0}
+```
+
+A silently wrong number on the partial path, and `/_search` — which still read
+its body unconditionally — answered 200 to the identical request, so the two ES
+endpoints disagreed with each other.
+
+**And `q` is not a parameter any storage node reads.** `esCount` decodes the
+JSON body; there is no `q` handling in `es.go` at all, so
+`/_count?q=level:error` with a valid body answers about the whole store on a
+single node too. The test that passed was passing against a recording shard
+that called `FormValue("q")` itself — a spy asserting a contract the real thing
+does not have.
+
+Reverted. The replacement test compares the router to a single node across three
+content types, which is the only claim there was to make.
 

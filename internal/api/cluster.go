@@ -816,7 +816,7 @@ func withFormInURL(r *http.Request) (*http.Request, []byte) {
 		return r, nil
 	}
 	normalizeFormContentType(r)
-	if err := r.ParseForm(); err != nil {
+	if err := parseFormBody(r); err != nil {
 		// A form the router cannot parse is not a request it can fan out. This
 		// used to `return r`, which sent the shards the EMPTY query at HTTP 200
 		// -- the exact behaviour this function's own doc comment names as the
@@ -1057,25 +1057,27 @@ func answersOf(rs []PeerResponse) []shardAnswer {
 
 // federatedESCount sums the ES _count across storage nodes.
 func (s *Server) federatedESCount(w http.ResponseWriter, r *http.Request) {
-	// A FORM body is parameters, not an Elasticsearch query body.
+	// The body is read UNCONDITIONALLY, including under a form content type.
 	//
-	// This read the body unconditionally, so withFormInURL's ParseForm found it
-	// already drained, saw no form, and returned formBody == nil -- and
-	// fanOutChecked then forwarded the caller's raw `q=level%3Aerror` bytes
-	// with no content type, which clusterClient.do relabels as
-	// application/json. The shard's own ParseForm will not read a JSON body, so
-	// it was asked no filter at all. Measured, spy shard answering 3 when it
-	// sees `q` and 1000 when it does not:
+	// A previous version skipped the read when isFormPost(r) said the content
+	// type was a form, so withFormInURL could fold `q` into the shard URL. Two
+	// things were wrong with it. `curl -d` sends
+	// `Content-Type: application/x-www-form-urlencoded` BY DEFAULT, so a real
+	// Elasticsearch document took that path: ParseForm turned the JSON into one
+	// URL key and the shard got an empty body.
 	//
-	//	POST /_count?q=level:error  form CT, empty body -> 200 {"count":3}
-	//	POST /_count                form CT, q in body  -> 200 {"count":1000}
+	//	curl -d '{"query":{"term":{"level":"error"}}}' <router>/_count
+	//	  before  200 {"count":1}          after  503
+	//	  shard url ".../_count?%7B%22query%22...%7D=" ct="" body=""
 	//
-	// Leaving the body unread lets withFormInURL parse it and fold `q` into the
-	// shard URL, which is the path the large-form case already takes.
-	var body []byte
-	if !isFormPost(r) {
-		body, _ = io.ReadAll(r.Body)
-	}
+	// And the parameter it was folding is one NO storage node reads: esCount
+	// decodes the JSON body and there is no `q` handling anywhere in es.go, so
+	// `/_count?q=level:error` with a valid body answers about the whole store
+	// on a single node too. The test that passed was passing against a
+	// recording shard that called FormValue("q") itself.
+	//
+	// So it traded a working capability for a parameter that does nothing.
+	body, _ := io.ReadAll(r.Body)
 	total := 0
 	bodies, w, ok := s.fanOutChecked(w, r, "/_count", body)
 	if !ok {
@@ -1841,20 +1843,27 @@ const (
 // this function would be overtaken by the handler's first Write, which sends
 // 200. Returning the writer makes the substitution visible at the call site
 // rather than hidden in a wrapper the handler does not know about.
-// unreadableBody reports whether r carries a body this router cannot read as a
-// form -- a non-empty body under a content type that is not
-// application/x-www-form-urlencoded.
-//
-// It consumes at most one byte, which is safe only for the routes that do not
-// forward the caller's body. fanOutChecked calls it exactly there, under
-// body == nil.
-//
-// Content-Length is not the test: a chunked request declares -1, and a client
-// posting a form under the wrong header is exactly the client whose framing
-// cannot be assumed. One byte read answers the question for every framing.
 func (s *Server) fanOutChecked(
 	w http.ResponseWriter, r *http.Request, path string, body []byte,
 ) ([]shardAnswer, http.ResponseWriter, bool) {
+	// A MISSING query is refused HERE, before any shard is asked.
+	//
+	// body == nil is the set of routes whose parameters come from the form and
+	// the URL; a single node refuses each of them with errMissingQuery when
+	// `query` is blank (parseRequest). The router instead fanned out an empty
+	// selector, every shard refused it, and the caller got
+	//
+	//	503 2 of 2 shards could not answer completely (0(rejected),1(rejected))
+	//
+	// -- an operator sent to inspect the storage nodes for a parameter their
+	// own request did not carry. Measured across the twelve federated reads
+	// with the parameters in a body no form parser reads (`text/plain`, no
+	// Content-Type, a malformed multipart): the router answered 400 on two and
+	// 5xx on ten, against a single node's 400.
+	if body == nil && strings.TrimSpace(r.FormValue("query")) == "" {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, errMissingQuery.Error())
+		return nil, w, false
+	}
 	fr, formBody := withFormInURL(r)
 	if fr == nil {
 		s.writeErr(w, r, readSpec(), http.StatusBadRequest,

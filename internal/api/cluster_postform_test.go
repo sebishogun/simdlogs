@@ -866,42 +866,112 @@ func getRaw(t *testing.T, ts *httptest.Server, path string) (int, string) {
 	return resp.StatusCode, string(b)
 }
 
-// `q` in a FORM body reaches the shard on /_count.
+// `/_count` reads its BODY, whatever the content type says.
 //
-// federatedESCount read the body unconditionally, so withFormInURL's ParseForm
-// found it drained and returned no form; fanOutChecked then forwarded the raw
-// `q=...` bytes with no content type, which the peer client relabels
-// application/json. A shard's ParseForm will not read a JSON body, so it was
-// asked no filter and counted its whole store. Measured against a spy shard
-// answering 3 when it sees `q` and 1000 when it does not:
+// `curl -d` sends `Content-Type: application/x-www-form-urlencoded` by default,
+// so a gate that treated a form content type as "parameters, not a document"
+// left a real Elasticsearch body unread:
 //
-//	POST /_count?q=level:error  form CT, empty body -> 200 {"count":3}
-//	POST /_count                form CT, q in body  -> 200 {"count":1000}
+//	curl -d '{"query":{"term":{"level":"error"}}}' <router>/_count
+//	  single node 200 {"count":1}   router 503
+//	  shard url ".../_count?%7B%22query%22...%7D=" ct="" body=""
 //
-// Asserted on what the shard was ASKED, because both answers are HTTP 200 and
-// the bigger one is the wrong one.
-func TestAFormBodyReachesTheShardOnESCount(t *testing.T) {
-	const filter = "level:error"
-	for _, tc := range []struct{ name, path, body string }{
-		{"q in the URL", "/_count?q=" + url.QueryEscape(filter), ""},
-		{"q in the body", "/_count", "q=" + url.QueryEscape(filter)},
-		{"q in the body, another key in the URL", "/_count?pretty=1", "q=" + url.QueryEscape(filter)},
+// And the parameter that gate existed to fold into the shard URL is one NO
+// storage node reads: esCount decodes the JSON body, and there is no `q`
+// handling in es.go at all. The test that passed did so against a recording
+// shard that called FormValue("q") itself -- a spy asserting a contract the
+// real thing does not have.
+//
+// So this asserts the ROUTER matches a SINGLE NODE, which is the only claim
+// worth making here.
+func TestAnESCountBodyIsReadWhateverTheContentTypeSays(t *testing.T) {
+	single := singleNode(t)
+	const esBody = `{"query":{"term":{"level":"error"}}}`
+	for _, ct := range []string{
+		"application/x-www-form-urlencoded", // curl -d's default
+		"application/json",
+		"",
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			sh := newRecordingShard(t)
-			ts := wmRouter(t, sh.ts.URL)
-			code, body := postRaw(t, ts, tc.path, "application/x-www-form-urlencoded", tc.body)
-			if code != 200 {
-				t.Fatalf("answered %d: %.200s", code, body)
-			}
-			got, asked := sh.askedES()
-			if !asked {
-				t.Fatalf("the shard was never asked anything")
-			}
-			if got != filter {
-				t.Errorf("the shard was asked q=%q, the caller sent %q -- a shard asked "+
-					"no filter counts its whole store, at HTTP 200", got, filter)
-			}
-		})
+		sh := newRecordingShard(t)
+		ts := wmRouter(t, sh.ts.URL)
+		sCode, sBody := postRaw(t, single, "/_count", ct, esBody)
+		rCode, rBody := postRaw(t, ts, "/_count", ct, esBody)
+		if sCode != rCode {
+			t.Errorf("Content-Type %q: single node answered %d and the router %d\n"+
+				"  single %.200s\n  router %.200s", ct, sCode, rCode, sBody, rBody)
+		}
+	}
+}
+
+// EVERY federated read answers what a single node answers, over every framing.
+//
+// The earlier version of this used a recording shard -- a spy that answers 200
+// to anything -- and one route. Against that spy 11 of 12 federated reads
+// answered 200 with the shard asked `query=""` for the multipart, text/plain
+// and no-Content-Type framings: the exact defect class entries 55-70 exist to
+// remove, invisible because the fixture could not refuse.
+//
+// So the shard here is a REAL storage node, and it is the same node the answer
+// is compared against. Measured before this was made to pass, twelve routes:
+//
+//	curl -F 'query=*'        node 200:12    router 200:1  502:1  503:10
+//	text/plain, params in body  node 400:11   router 400:2  502:1  503:9
+//
+// Nine routes moved from a 400 naming the caller's own header to a 503 sending
+// an operator to inspect the storage nodes.
+func TestEveryFederatedReadAnswersWhatASingleNodeAnswers(t *testing.T) {
+	node := singleNode(t)
+	ts := wmRouter(t, node.URL)
+
+	type framing struct {
+		name, ct, body string
+		inURL          bool
+	}
+	framings := []framing{
+		{name: "urlencoded body", ct: "application/x-www-form-urlencoded", body: "%s"},
+		{name: "multipart body", ct: "multipart/form-data", body: "%s"},
+		{name: "text/plain body", ct: "text/plain; charset", body: "%s"},
+		{name: "no content type", ct: "", body: "%s"},
+		{name: "json body, params in URL", ct: "application/json", body: "{}", inURL: true},
+		{name: "no body, params in URL", ct: "", body: "", inURL: true},
+	}
+
+	for _, rt := range surfaceRoutes() {
+		if rt.kind != federated || rt.write || rt.body != "" {
+			continue
+		}
+		for _, f := range framings {
+			t.Run(rt.path+" "+f.name, func(t *testing.T) {
+				path, body := rt.path, ""
+				switch {
+				case f.inURL:
+					path += "?" + rt.query
+					body = f.body
+				case f.ct == "multipart/form-data":
+					// A real multipart document, so this framing exercises the
+					// parser rather than a malformed body.
+					var b strings.Builder
+					for _, kv := range strings.Split(rt.query, "&") {
+						k, v, _ := strings.Cut(kv, "=")
+						dec, _ := url.QueryUnescape(v)
+						fmt.Fprintf(&b, "--B\r\nContent-Disposition: form-data; name=%q\r\n\r\n%s\r\n", k, dec)
+					}
+					b.WriteString("--B--\r\n")
+					body = b.String()
+				default:
+					body = rt.query
+				}
+				ct := f.ct
+				if f.ct == "multipart/form-data" {
+					ct = `multipart/form-data; boundary=B`
+				}
+				nCode, nBody := postRaw(t, node, path, ct, body)
+				rCode, rBody := postRaw(t, ts, path, ct, body)
+				if nCode != rCode {
+					t.Errorf("single node %d, router %d\n  single %.200s\n  router %.200s",
+						nCode, rCode, nBody, rBody)
+				}
+			})
+		}
 	}
 }

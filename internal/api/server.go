@@ -1935,6 +1935,24 @@ func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
 		s.federatedMatrix(w, r)
 		return
 	}
+	// A MISSING query is refused, as it is on every other select endpoint.
+	//
+	// The raw string went through unchecked, so this route answered 200 with a
+	// fabricated matrix:
+	//
+	//	GET /select/logsql/stats_query_range          (no parameters at all)
+	//	  200 {"resultType":"matrix","result":[{"metric":{},
+	//	       "values":[[1690951540,""],[1690951540,""],[1690951540,""]]}]}
+	//
+	// A constant garbage epoch and empty-string values, from a request that
+	// asked nothing. docs/lld/api.md says `query` is required on every select
+	// endpoint and a request without one is a 400; this was the route where
+	// that was false, and it made a router (which does refuse) disagree with
+	// the node it fronts.
+	if strings.TrimSpace(r.FormValue("query")) == "" {
+		http.Error(w, errMissingQuery.Error(), 400)
+		return
+	}
 	from, to := timeWindow(r)
 	step := parseStepNs(r.FormValue("step"), from, to)
 	rq := &query.Query{From: from, To: to}

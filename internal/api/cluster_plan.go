@@ -388,7 +388,7 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 	// type makes all twelve agree, and agree with a single node.
 	if isFormPost(r) {
 		normalizeFormContentType(r)
-		if err := r.ParseForm(); err != nil {
+		if err := parseFormBody(r); err != nil {
 			// A form this node cannot parse -- but NOT necessarily a bad query
 			// string. ParseForm also fails on a malformed Content-Type, because
 			// parsePostForm runs mime.ParseMediaType first, and the caller's
@@ -451,15 +451,65 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 }
 
 // isFormPost reports whether r carries a form body this router will read.
+//
+// MULTIPART COUNTS. A single node reads it -- r.FormValue calls
+// ParseMultipartForm -- and this returned false for it, so the router never
+// folded a multipart form into the shard URL and the shards were asked nothing:
+//
+//	curl -F 'query=*' <node>    200 on all twelve federated reads
+//	curl -F 'query=*' <router>  200 on one, 5xx on eleven
+//
+// Reading what the node reads is the whole contract of a router.
 func isFormPost(r *http.Request) bool {
+	return formKind(r) != formNone
+}
+
+type formEncoding int
+
+const (
+	formNone formEncoding = iota
+	formURLEncoded
+	formMultipart
+)
+
+func formKind(r *http.Request) formEncoding {
 	if r.Method != http.MethodPost && r.Method != http.MethodPut {
-		return false
+		return formNone
 	}
 	ct := r.Header.Get("Content-Type")
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
 		ct = ct[:i]
 	}
-	return strings.TrimSpace(ct) == "application/x-www-form-urlencoded"
+	switch strings.TrimSpace(ct) {
+	case "application/x-www-form-urlencoded":
+		return formURLEncoded
+	case "multipart/form-data":
+		return formMultipart
+	}
+	return formNone
+}
+
+// parseFormBody parses r's form, whichever of the two encodings it is.
+//
+// ParseForm does NOT parse a multipart body -- it returns nil having populated
+// r.Form from the query string alone, which is indistinguishable from success
+// and is why a multipart request reached the shards with no parameters.
+func parseFormBody(r *http.Request) error {
+	if formKind(r) == formMultipart {
+		// 32 MiB, net/http's own default for FormValue. Anything larger spills
+		// to a temp file, which this path does not want; the parameters a
+		// select endpoint takes are query strings, not uploads.
+		if err := r.ParseMultipartForm(32 << 20); err == nil {
+			return nil
+		}
+		// A multipart body that will not parse is IGNORED, not fatal -- which
+		// is what a single node does, because FormValue discards
+		// ParseMultipartForm's error and reads r.Form. The URL query is then
+		// the whole request, and if it carries no `query` the request is
+		// refused for THAT, which is the reason a node gives.
+		return r.ParseForm()
+	}
+	return r.ParseForm()
 }
 
 // normalizeFormContentType drops unparseable parameters from a form request's
