@@ -4856,3 +4856,40 @@ different interface, and it is not written.
 Recorded rather than left as folklore: "we should use the SIMD kernels here" is
 the obvious suggestion for this code, and on this shape, at this granularity,
 it is measurably wrong three ways.
+
+## 51. Five store-aware pipes answering cluster queries from the wrong set
+
+`ApplyPipes` refuses `join`, `union` and `stream_context` at a coordinator,
+with the reasoning that skipping a store-aware pipe "would answer the query as
+if the pipe were not there, which is the silent-wrong-answer shape this whole
+area is about". Five more pipes are store-aware and were not in that list.
+
+On a storage node each is answered by a LEADING fast path over the store's own
+footers and index — `runBlocksCount` and its siblings. `apply` is the fallback
+for the non-leading case, and at a coordinator it is what runs, over the merged
+WIRE rows. Measured against a single node holding the same twelve rows:
+
+| query | node | router |
+|---|---|---|
+| `* \| blocks_count` | `{"blocks_count":"2"}` | `{"blocks_count":"12"}` |
+| `level:error \| blocks_count` | `{"blocks_count":"1"}` | `{"blocks_count":"3"}` |
+| `* \| block_stats` | two block-stat rows | all twelve log rows |
+| `* \| field_names` | 7 names | 8, including `_stream_id` |
+
+`BlocksCountPipe.apply` is `len(rows)` — a ROW count wearing a block count's
+name, and a number a reader has no way to question. `BlockStatsPipe.apply` is
+`return rows`: a silent no-op that answers the query as if the pipe were not
+there, which is the sentence four lines above the refusal it was missing from.
+`field_names` counts `_stream_id`, which the SHARD synthesized on the wire and
+no store holds.
+
+All five refused now, naming the endpoint that does federate — the
+`/select/logsql/` forms of `field_names`, `field_values` and `facets` fan out
+and merge correctly, and have done throughout.
+
+**Why five rounds of review did not find them.** Every round concentrated on
+the functions the previous round's findings named. These sit one call away from
+all of it, behind a type switch that already had the right shape and the wrong
+membership, and the first reviewer to enumerate cluster reads BY PIPE rather
+than by endpoint found all five in one pass. Attention follows the last defect,
+which is exactly where the next one is not.

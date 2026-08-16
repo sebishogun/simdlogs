@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -521,5 +522,54 @@ func TestTheTimeFacetTreatsZeroAsUnlimited(t *testing.T) {
 	}
 	if saw != "0" {
 		t.Errorf("the shard was sent max_values_per_field=%q, want \"0\"", saw)
+	}
+}
+
+// The store-aware pipes are refused at a coordinator, not answered from the
+// merged rows.
+//
+// Each of these reads a storage node's own layout or index. A coordinator has
+// no store, so `apply` -- the fallback for the non-leading case -- ran over the
+// merged WIRE rows and produced a plausible number:
+//
+//   - | blocks_count   node {"blocks_count":"2"}   router {"blocks_count":"12"}
+//     len(rows), which is a ROW count
+//   - | block_stats    node two block-stat rows    router all 12 log rows
+//     apply returns its input unchanged, a silent no-op
+//   - | field_names    node 7 names                router 8, including
+//     _stream_id, which the SHARD synthesized on the wire
+//
+// ApplyPipes already refused join, union and stream_context with the reasoning
+// that skipping a store-aware pipe "would answer the query as if the pipe were
+// not there, which is the silent-wrong-answer shape this whole area is about".
+// These five were not in that list and did exactly that.
+func TestStoreAwarePipesAreRefusedAtACoordinator(t *testing.T) {
+	good := goodShard(t)
+	ts := router(t, good.URL, goodShard(t).URL)
+
+	for _, tc := range []struct{ name, pipe, wantIn string }{
+		{"blocks_count", "blocks_count", "no store"},
+		{"block_stats", "block_stats", "no store"},
+		{"field_names", "field_names", "endpoint"},
+		{"field_values", "field_values level", "endpoint"},
+		{"facets", "facets", "endpoint"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A leading filter forces a coordinator half: the pipe is not the
+			// first stage, so the node's own fast path is not what answers.
+			q := url.QueryEscape("* | " + tc.pipe)
+			resp, body := callEndpoint(t, ts, struct{ name, path, method, body string }{
+				"", "/select/logsql/query?query=" + q, "GET", "",
+			})
+			if resp.StatusCode/100 == 2 {
+				t.Fatalf("answered %d with %q: a coordinator has no store, so this "+
+					"was computed from the merged wire rows",
+					resp.StatusCode, truncate(body, 200))
+			}
+			if !strings.Contains(body, tc.wantIn) {
+				t.Errorf("the refusal does not say why (%q missing): %q",
+					tc.wantIn, truncate(body, 250))
+			}
+		})
 	}
 }

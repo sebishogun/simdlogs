@@ -1488,6 +1488,45 @@ func ApplyPipes(q *Query, rows []Row) []Row {
 			q.stop(fmt.Errorf("%w: %T cannot run at a cluster coordinator, which has no "+
 				"store to run its subquery against", ErrRejected, p))
 			return nil
+
+		// The STORE-AWARE source pipes, refused for the same reason and with
+		// the same words the comment above uses: skipping a store-aware pipe
+		// "would answer the query as if the pipe were not there, which is the
+		// silent-wrong-answer shape this whole area is about". They were not
+		// in this list and they did exactly that.
+		//
+		// On a storage node each of these is answered by a leading fast path
+		// over the store's own footers and index (runBlocksCount and friends),
+		// and `apply` is the fallback for the non-leading case. At a
+		// coordinator there is no store, so `apply` is what runs -- over the
+		// merged WIRE rows, which is a different set from the stored ones.
+		// Measured against a single node holding the same data:
+		//
+		//	* | blocks_count   node {"blocks_count":"2"}   router {"blocks_count":"12"}
+		//	                   -- len(rows), which is a ROW count
+		//	* | block_stats    node two block-stat rows    router all 12 log rows
+		//	                   -- apply returns its input unchanged, a no-op
+		//	* | field_names    node 7 names                router 8, including
+		//	                   _stream_id, which the SHARD synthesized on the
+		//	                   wire and no store holds
+		//
+		// Every one of those is a plausible number at HTTP 200. The endpoints
+		// (/select/logsql/field_names and the rest) DO federate correctly, by
+		// fanning out and merging, so the refusal names them.
+		case *BlocksCountPipe, *BlockStatsPipe:
+			q.stop(fmt.Errorf("%w: %T reads this node's own storage layout, and a "+
+				"cluster coordinator has no store -- it holds the merged rows, which "+
+				"are not blocks. Run this against a storage node directly",
+				ErrRejected, p))
+			return nil
+		case *FieldNamesPipe, *FieldValuesPipe, *FacetsPipe:
+			q.stop(fmt.Errorf("%w: %T answers from a store's index on a storage node, "+
+				"and a cluster coordinator has none -- computing it from the merged "+
+				"rows counts fields the shards synthesized on the wire and misses "+
+				"fields no matching row happens to carry. Use the matching "+
+				"/select/logsql/ endpoint, which fans out and merges",
+				ErrRejected, p))
+			return nil
 		}
 		rows = p.apply(rows)
 		if measure {
