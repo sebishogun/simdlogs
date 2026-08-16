@@ -488,6 +488,15 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 	// `query` is NOT marked: shardQueryURL always Sets it, so it is always a
 	// URL key and the "already in the query" rule covers it. Marking it was
 	// inert, and an inert marking reads as a load-bearing one.
+	// `query` is marked ALWAYS, and that marking is load-bearing now.
+	//
+	// Entry 63 removed it as inert: shardQueryURL always Sets it, so it was
+	// always a URL key and withFormInURL's "already in the query" rule covered
+	// it. That rule is gone -- it made the URL win over the body, where a node
+	// lets the BODY win for a urlencoded form -- so what stops the caller's
+	// form from overwriting the plan's rewritten query is this mark and
+	// nothing else.
+	shardReq = withPlanKeys(shardReq, "query")
 	if len(coordPipes) > 0 {
 		shardReq = withPlanKeys(shardReq, "limit")
 	}
@@ -862,13 +871,33 @@ func withFormInURL(r *http.Request) (*http.Request, []byte) {
 	// Worst of it: /select/logsql/query over a POST form was CORRECT before the
 	// commit that added this, and the commit message said so. A key already in
 	// the query string wins; the form only supplies what the URL does not have.
+	// The PLAN's keys win; every other key takes the precedence a NODE gives
+	// it.
+	//
+	// This used to skip any key already in the shard URL, which made the URL
+	// win over the body -- and a node does the opposite for a urlencoded form,
+	// because ParseForm puts PostForm before the URL query and FormValue reads
+	// the first. So a parameter sent in both places asked the cluster a
+	// different question than it asked a node, at HTTP 200 on both:
+	//
+	//	POST /select/logsql/stats_query?query=level:error | stats count() c
+	//	     ct urlencoded, body query=* | stats count() c
+	//	  node   "30"      router  "10"
+	//	same shape with limit=1 in the URL and limit=3 in the body:
+	//	  node   3 rows    router  1 row
+	//
+	// r.Form ALREADY encodes that precedence -- Go builds it body-first for a
+	// urlencoded form and URL-first for multipart -- so forwarding r.Form's
+	// values verbatim gives the shard the node's answer for both encodings,
+	// multi-valued parameters included.
+	//
+	// What the URL must still win is the plan's own rewrite, and that is now
+	// marked rather than inferred from "it is in the URL": shardQueryURL's
+	// `query`, the `limit` it deletes, and withoutLimits' bounds.
 	q := r.URL.Query()
 	extra := make(url.Values, len(r.Form))
 	for k, vs := range r.Form {
-		// Already in the shard URL, or OWNED by the plan -- which covers the
-		// key the plan deliberately deleted, the case "already in the URL"
-		// cannot see. See planKeysCtx.
-		if _, ok := q[k]; ok || planOwns(r, k) {
+		if planOwns(r, k) {
 			continue
 		}
 		extra[k] = vs
@@ -1452,9 +1481,23 @@ func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
 		out = append(out, matrixSeries{Metric: a.metric, Values: pts})
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"status": "success",
-		"data":   map[string]any{"resultType": "matrix", "result": out},
+	// A STRUCT, not a map: encoding/json sorts a map's keys, so the router
+	// answered {"data":{"result":…,"resultType":…},"status":…} where a node
+	// answers {"status":…,"data":{"resultType":…,"result":…}}. Identical to any
+	// JSON client, and a difference a byte-for-byte comparison against a node
+	// reports as a disagreement.
+	json.NewEncoder(w).Encode(struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string         `json:"resultType"`
+			Result     []matrixSeries `json:"result"`
+		} `json:"data"`
+	}{
+		Status: "success",
+		Data: struct {
+			ResultType string         `json:"resultType"`
+			Result     []matrixSeries `json:"result"`
+		}{ResultType: "matrix", Result: out},
 	})
 }
 

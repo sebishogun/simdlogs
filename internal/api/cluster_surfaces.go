@@ -313,9 +313,25 @@ func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"status": "success",
-		"data":   map[string]any{"resultType": "vector", "result": res},
+	// promResponse, the SAME struct a single node writes.
+	//
+	// encoding/json sorts a MAP's keys, so the router answered
+	// {"data":{"result":…,"resultType":…},"status":…} where a node answers
+	// {"status":…,"data":{"resultType":…,"result":…}} -- identical to any JSON
+	// client, and a difference a byte-for-byte comparison against a node
+	// reports, which is how the cluster surfaces are tested.
+	json.NewEncoder(w).Encode(struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string         `json:"resultType"`
+			Result     []vectorSeries `json:"result"`
+		} `json:"data"`
+	}{
+		Status: "success",
+		Data: struct {
+			ResultType string         `json:"resultType"`
+			Result     []vectorSeries `json:"result"`
+		}{ResultType: "vector", Result: res},
 	})
 }
 

@@ -5938,3 +5938,53 @@ The second still created no files, because the padding part had no `filename`.
 `filename="pad.bin"` the fix removed leaves three files behind for three
 requests, and the fix leaves none.
 
+## 76. A parameter sent twice asked the cluster a different question than it asked a node
+
+`withFormInURL` merged the caller's form UNDER the query string, so a key
+present in both took the URL's value. A node does the opposite for a urlencoded
+form: `ParseForm` puts `PostForm` before the URL query and `FormValue` reads the
+first, so the BODY wins. Both answered 200:
+
+```
+POST /select/logsql/stats_query?query=level:error | stats count() c
+     ct urlencoded, body query=* | stats count() c
+  node   "30"      router  "10"
+same shape, limit=1 in the URL and limit=3 in the body:
+  node   3 rows    router  1 row
+```
+
+Under MULTIPART the two already agreed — Go appends multipart values AFTER the
+URL query — so the router was implementing multipart precedence for both
+encodings.
+
+`r.Form` already encodes the right precedence for each encoding, so the merge
+forwards its values verbatim and the shard gets the node's answer either way,
+multi-valued parameters included.
+
+**What the URL must still win is the plan's own rewrite**, and that is now
+MARKED rather than inferred from "it is in the URL". `federatedSelect` marks
+`query` — a mark entry 63 removed as inert, which it was under the old rule and
+is not under this one: removing it now reddens
+`TestAPostFormDoesNotOverwriteTheRoutersOwnQuery` and
+`TestALimitThePlanDeletedDoesNotComeBackOverAPostForm`.
+
+**And the obvious companion marking is inert.** Marking `withoutLimits`' bounds
+the same way reddens nothing, because that function deletes them from the
+clone's `Form` and `PostForm` too — and a key absent from `r.Form` cannot be
+re-added by the merge. Not kept: third time this session that "mark it too, for
+safety" turned out to be inert.
+
+Two envelopes were maps where a node writes a struct, so `encoding/json` sorted
+their keys and the router answered `{"data":…,"status":…}` against a node's
+`{"status":…,"data":…}`. Structs now, which is what makes a byte comparison
+possible at all.
+
+**The fixture had to be repaired twice before it could measure anything.** The
+first `loadedPair` built the router with `wmRouter`, which calls
+`SetReplicas(len(backends))` — three REPLICAS of one shard, not three shards —
+so the router answered from one node holding a third of the data: 10 against the
+node's 30, which looks exactly like the defect and is a fixture that cannot see
+it. And the assertion compared line counts and a substring until both sides
+agreed on the number, at which point it still passed on two different
+envelopes; it compares bodies byte for byte now.
+

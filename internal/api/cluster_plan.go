@@ -408,6 +408,16 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 	}
 	out := r.Clone(r.Context())
 	out.URL.RawQuery = vals.Encode()
+	// NOT marked with withPlanKeys, measured rather than assumed.
+	//
+	// withFormInURL no longer skips a key merely because it is in the shard
+	// URL, so the obvious move is to mark these the way federatedSelect marks
+	// `query`. Adding that marking reddens nothing: the deletion from the
+	// clone's Form and PostForm below is what protects them, because a key
+	// absent from r.Form cannot be re-added by the merge.
+	//
+	// Third time this session that "mark it too, for safety" turned out to be
+	// inert. An inert guard reads as a load-bearing one.
 
 	// The PARSED FORM as well, not only the query string.
 	//
