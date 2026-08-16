@@ -5037,6 +5037,12 @@ process's microsecond gap per request — and it is real, and it is now measured
 by a test that FAILS if it ever closes, rather than asserting the current
 behaviour forever. Task #433 holds the design decision.
 
+**Closed for the common case, at no cost. See entry 68.** The fourth variant
+above — "align the flush boundary with the request" — was priced as giving up
+cross-request batching, and it does not have to: the id can ride the group the
+flush ALREADY enqueues, without changing when the flush happens or what it
+contains.
+
 **The shape, again.** Round six's closing note was "the mechanism was built and
 never wired to a reader", and named four. The gate written for it found sixteen
 more. This is the most expensive one so far: not an unused helper, but the
@@ -5569,3 +5575,62 @@ held from the ones that did not is not care taken: it is whether the assertion
 names what the SHARD RECEIVED. Every test that asserted a status code passed
 through its own defect; every test that asserted the shard's parameter set
 caught it.
+
+## 68. The idempotency window closed by moving the id, not the flush
+
+Entry 54 measured a window between a flush and its receipt, listed four
+variants, rejected three as strictly worse, and priced the fourth — align the
+flush boundary with the request — as *"correct, and it gives up the
+cross-request batching that the ingest throughput numbers are built on. That is
+a real design decision with a measurable cost, not an edit."*
+
+That priced the wrong thing. `FlushWithReceipt` was ALREADY `Flush()` per
+replicated write, so the batching a request-aligned boundary would give up is
+only the batching among *concurrent* replicated writes — and none of it has to
+be given up, because the question is not WHEN the flush happens or WHAT it
+contains. It is which manifest record the id goes in.
+
+`flushLocked` enqueues exactly one job, and one job is one group. So when
+
+- there are rows buffered (there is a group for the id to ride), and
+- `len(w.live) == 0` (nothing else in flight, so every group this writer has
+  already handed out is committed, and manifest records are appended in order —
+  "this record is durable" implies "every earlier one is"),
+
+the id goes to that job and the worker commits it through
+`AppendGroupIdempotent`: **one record, one transaction, no window**. The group
+is still whatever was buffered, from however many requests. Neither condition
+can be relaxed: dropping the second is entry 54's rejected "stamp the id on
+every group", which commits a receipt for rows a partial flush never wrote.
+
+Measured as the manifest sequence delta across one `FlushWithReceipt` of ten
+rows under a write id:
+
+```
+before   seq +2   group record, then receipt record   -- two fsyncs, one window
+after    seq +1   one record carrying both            -- one fsync, no window
+```
+
+The delta is the measurement, not a reopen: both designs have the same end
+state when no crash happens, and the record count is what "one transaction"
+means. It is also one `Sync()` less per replicated write, because `man.commit`
+syncs once per record.
+
+Under concurrency the conditions fail and `CommitReceipt` runs as before, so
+the window narrows rather than moving. `AppendGroupIdempotent` returning
+`ErrDuplicateWrite` — two retries of one id racing past the middleware's check
+— falls back to a plain `AppendGroup`: the group holds every row buffered on
+the tenant, and dropping it would lose other callers' rows to a duplicate that
+is not theirs.
+
+**The gate found its own stale exemption.** `AppendGroupIdempotent` was on
+`TestDocumentedMechanismsHaveCallers`' exempt list with a note explaining that
+production deliberately took the other path. Wiring it reddened the gate, which
+is what an exemption list is for when the reason behind it stops being true —
+*"an exemption nobody removes is how the next unwired mechanism gets in under
+it"*, and this one removed itself.
+
+Each of the four tests replacing the old window test was probed by mutation:
+forcing the two-step path reddens the record-count test, deleting the
+`ErrDuplicateWrite` fallback reddens the racing-duplicate test, and forcing
+`rode` true reddens the nothing-left-to-flush test.

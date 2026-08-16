@@ -187,18 +187,25 @@ func (s *Store) CommittedWrite(id WriteID) bool { return s.receipts.has(id) }
 // ReceiptCount is how many write ids this store remembers.
 func (s *Store) ReceiptCount() int { return s.receipts.count() }
 
-// CommitReceipt records a write id as committed, durably.
+// CommitReceipt records a write id as committed, durably, in its own manifest
+// record.
 //
-// Separate from AppendGroupIdempotent because a batching writer's groups do
-// not map one-to-one onto requests: a flush contains rows from many requests,
-// and one request's rows may span groups. So the receipt is committed AFTER
-// the rows it covers are durable, in its own manifest record.
+// This is the FALLBACK. A batching writer's groups do not map one-to-one onto
+// requests -- a flush contains rows from many, and one request's rows may span
+// groups -- so a receipt cannot always ride the group that makes it true. When
+// it cannot, it is committed here, after those rows are durable.
 //
-// That leaves a window: a crash between the group commit and this one loses
-// the receipt while keeping the rows, so a retry stores them again. The
-// alternative -- recording the receipt first -- loses the rows while claiming
-// they are stored, and refuses the retry that would have saved them. Given a
-// choice between a duplicate and a loss, this takes the duplicate.
+// That leaves a window: a crash between the group commit and this one loses the
+// receipt while keeping the rows, so a retry stores them again. The alternative
+// -- recording the receipt first -- loses the rows while claiming they are
+// stored, and refuses the retry that would have saved them. Given a choice
+// between a duplicate and a loss, this takes the duplicate.
+//
+// Writer.flushCarrying avoids the choice where it can: when the flush enqueues
+// exactly one group and nothing else is in flight, that group's commit implies
+// the whole write is durable, so the id goes into ITS record through
+// AppendGroupIdempotent and there is no window at all. The conditions fail
+// under concurrency, which is what this function is for.
 func (s *Store) CommitReceipt(id WriteID) error {
 	if id == "" {
 		return nil

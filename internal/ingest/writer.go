@@ -87,6 +87,10 @@ type Writer struct {
 	// caller is told success for rows that failed.
 	hist    []*flushBatch
 	nextSeq uint64
+	// nextReceipt is handed to the next job flushLocked enqueues, and cleared
+	// when it is. Guarded by mu, which is held across the set and the flush,
+	// so it cannot reach another caller's job.
+	nextReceipt storage.WriteID
 	// outcomes is what batches retired from hist left behind, oldest first,
 	// so a FlushMark arriving after its batch aged out still gets an answer.
 	// oldestAnswerable is the lowest mark that answer can cover; below it the
@@ -160,6 +164,10 @@ type flushJob struct {
 	vecFlds  VectorFields
 	compact  bool
 	batch    *flushBatch // the Flush waiting for this job, never nil
+	// receipt is a write id to commit in the SAME manifest record as this
+	// job's group, or "" for the ordinary case. Set only when that record's
+	// commit implies the whole write is durable -- see flushCarrying.
+	receipt storage.WriteID
 }
 
 // NewWriter makes a writer over the store and starts its flush pool.
@@ -189,6 +197,27 @@ func NewWriterWorkers(s *storage.Store, workers int) *Writer {
 }
 
 var nowFn = time.Now // overridable in tests
+
+// appendGroup commits one group, with a write id in the same manifest record
+// when the job carries one.
+//
+// ErrDuplicateWrite means the id was committed by someone else between the
+// middleware's check and this append -- two retries of the same write racing.
+// The GROUP still has to land: it holds every row buffered on this tenant, not
+// only the racing request's, and dropping it would lose other callers' rows to
+// a duplicate that is not theirs. So the rows are committed without the id,
+// which is exactly the state the id already describes.
+func (w *Writer) appendGroup(g *storage.Group, receipt storage.WriteID) error {
+	if receipt == "" {
+		_, err := w.store.AppendGroup(g)
+		return err
+	}
+	_, err := w.store.AppendGroupIdempotent(g, receipt)
+	if errors.Is(err, storage.ErrDuplicateWrite) {
+		_, err = w.store.AppendGroup(g)
+	}
+	return err
+}
 
 // worker builds and stores one group per job: dictionary build and marshal
 // (the expensive, parallelizable half) run here, off the parse goroutine.
@@ -227,7 +256,7 @@ func (w *Writer) worker() {
 			})
 		}
 		g := &storage.Group{Rows: len(j.ts), Columns: cols, Compact: j.compact}
-		if _, err := w.store.AppendGroup(g); err != nil {
+		if err := w.appendGroup(g, j.receipt); err != nil {
 			e := err
 			j.batch.err.CompareAndSwap(nil, &e)
 			// Counted whether or not this was the first error. The first one
@@ -663,20 +692,101 @@ var ErrWriterClosed = errors.New("ingest: writer is closed")
 // duplicate. The whole point of the receipt is to make a retry safe, and that
 // version would make it unsafe in the one case where it matters.
 //
+// "In the same commit" is literal where it can be. flushCarrying hands the id
+// to the group the flush enqueues, and Store.AppendGroupIdempotent puts both in
+// one manifest record -- one record is one transaction, so there is no instant
+// at which the rows are queryable and the id is not. Where it cannot (rows
+// already carried away by another caller's flush, or another batch still in
+// flight) the id is committed in its own record afterwards, with the window
+// docs/wrong.md entry 54 measured. The window narrowed; it did not move, and no
+// batching was given up to narrow it.
+//
 // A flush per replicated write is a real cost, and it is the cost of the
 // guarantee: the writer batches rows from many requests, so "this request's
 // rows are stored" is not a question the batch can answer without one.
 // Ordinary client writes do not pay it -- they carry no write id.
 func (w *Writer) FlushWithReceipt(id storage.WriteID) error {
-	if err := w.Flush(); err != nil {
+	if id == "" {
+		return w.Flush()
+	}
+	rode, err := w.flushCarrying(id)
+	if err != nil {
 		return err
 	}
-	if id == "" {
+	if rode {
+		// The id went into the same manifest record as the group. One record
+		// is one transaction, so there is no instant at which the rows are
+		// visible and the receipt is not.
 		return nil
 	}
 	// After the flush: the rows this request contributed are in a committed
-	// group, so the receipt is now true.
+	// group, so the receipt is now true -- with the window this function's
+	// doc describes, which flushCarrying closes only when it can.
 	return w.store.CommitReceipt(id)
+}
+
+// flushCarrying is Flush, handing the write id to the group it enqueues when
+// that group's commit implies the whole write is durable. rode reports whether
+// it did; a false rode leaves the receipt for the caller to commit separately.
+//
+// The rule is two conditions, both checked under the writer's lock before the
+// flush:
+//
+//   - There are rows buffered. flushLocked enqueues exactly one job per call,
+//     so "rows buffered" and "one group" are the same statement -- and with no
+//     rows there is no group for the id to ride.
+//   - Nothing else is in flight (len(w.live) == 0). Every group this writer has
+//     already handed out is therefore committed, so any rows of this write that
+//     an earlier auto-flush carried away are durable BEFORE this record lands.
+//     Manifest records are appended in order, so "this record is durable"
+//     implies "every earlier one is".
+//
+// Neither condition can be relaxed. Stamping the id on every group a flush
+// writes leaves a PARTIAL flush with the receipt committed and some groups
+// missing, which refuses the retry that would have saved them -- strictly worse
+// than a duplicate, and the reason that variant was rejected when the window
+// was first measured (docs/wrong.md entry 54).
+//
+// What this does NOT do is give up the cross-request batching the ingest
+// numbers are built on: the group is whatever was buffered, from however many
+// requests. It changes which manifest record the id goes in, not when the flush
+// happens or what it contains. Under concurrency the conditions simply fail and
+// the previous two-step path runs, so the window narrows rather than moving.
+func (w *Writer) flushCarrying(id storage.WriteID) (bool, error) {
+	w.mu.Lock()
+	closed := w.closed.Load()
+	var wait []*flushBatch
+	rode := false
+	if !closed {
+		// Before flushLocked: it appends w.batch to w.live itself, so asking
+		// after would always see one.
+		if len(w.ts) > 0 && len(w.live) == 0 {
+			w.nextReceipt = id
+			rode = true
+		}
+		w.flushLocked()
+		// flushLocked clears nextReceipt when it enqueues. If it did not --
+		// which this cannot reach today, since len(w.ts) > 0 is the condition
+		// it returns early on -- the id did not ride and must not be treated
+		// as though it had.
+		if w.nextReceipt != "" {
+			w.nextReceipt = ""
+			rode = false
+		}
+		wait = append(wait, w.live...)
+		w.batch = w.newBatchLocked()
+	}
+	w.mu.Unlock()
+	if closed {
+		return false, &WriteError{Err: ErrWriterClosed, Class: RetrySoon, Partial: true}
+	}
+	if err := w.awaitBatches(wait, nil); err != nil {
+		// The group did not land, so neither did the id: AppendGroupIdempotent
+		// commits both in one record or neither. Reported as the write failure
+		// it is, with no receipt committed by either path.
+		return false, err
+	}
+	return rode, nil
 }
 
 func (w *Writer) Flush() error {
@@ -820,7 +930,9 @@ func (w *Writer) flushLocked() {
 		}
 	}
 	w.jobs <- flushJob{ts: w.ts, colOrder: w.colOrder, vals: vals, vecs: w.vecs,
-		vecFlds: w.vecFlds, compact: w.compact, batch: w.batch}
+		vecFlds: w.vecFlds, compact: w.compact, batch: w.batch,
+		receipt: w.nextReceipt}
+	w.nextReceipt = ""
 
 	// Fresh buffers; the job owns the handed-off ones.
 	w.ts = make([]int64, 0, FlushRows)
