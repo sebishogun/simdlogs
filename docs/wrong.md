@@ -7036,3 +7036,46 @@ day it matters.
 | any length of ID is accepted | 3 |
 | non-hex characters are accepted | 3 |
 | the row separator is not refused | 1 |
+
+## 100. `git add internal/` during a review committed the reviewer's mutations
+
+Entry 99's commit, `a92b638`, contains two lines nobody wrote on purpose:
+
+	-	return p.waitReady(60 * time.Second)
+	+	return p.waitReady(1500 * time.Millisecond)
+	-			if resp.StatusCode < 500 {
+	+			if resp.StatusCode < 0 {
+
+`resp.StatusCode < 0` is never true, so `waitReady` could only time out: every
+VictoriaLogs start in `internal/bench` failed, 1.5 seconds later, in HEAD. It
+also carried a reviewer's scratch test file into the repository.
+
+They are a review agent's mutation probes, applied to the working tree while it
+was checking whether that guard can redden. The agent restores from its own
+scratchpad copy when it finishes; the commit landed in the window between the
+edit and the restore. `git add -A docs/wrong.md internal/` staged a directory,
+and `internal/bench` was in it.
+
+Nothing about the change being committed was wrong — the suite that ran before
+it was green, and it was green because it ran before the mutation. The full
+suite was run at 15:12 and the commit was made at 15:15.
+
+Three things follow, and only the first is about git:
+
+- **Stage explicit paths.** `git add internal/` is a request to commit whatever
+  is in that tree right now, which during a review is not what the author
+  wrote.
+- **A green suite is only evidence about the tree that ran.** The gap between
+  a test run and a commit is a window, and a review agent is a writer inside
+  it. This is the same shape as the `tail`-swallowed exit status: a check that
+  is true about something other than what shipped.
+- **The scratch files are `.gitignore`d now** — `zz_*_test.go` and
+  `zzz_*_test.go`, which is the convention the agents already use. That makes
+  the accident one step harder rather than impossible; the first point is the
+  one that matters.
+
+Found by reading a file-modification notice, not by any test: the bench package
+still compiled, and its own suite passes without the VictoriaLogs binary
+because every test there skips loudly when it is not staged. With the binary
+staged the differentials fail — which is to say the gate for this existed and
+was not run between the mutation and the commit.

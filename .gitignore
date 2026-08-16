@@ -11,3 +11,11 @@ internal/bench/victoria-logs
 
 # locality analysis artifacts: a per-checkout cache keyed by git SHA, not source
 .locality/
+
+# Review-agent scratch files. A reviewer probes the tree in place, so a
+# `git add <dir>` during a review sweeps its mutations and its scratch tests
+# into a commit -- which is how a mutated waitReady() and a `StatusCode < 0`
+# that is never true reached HEAD in a92b638. Stage explicit paths, and keep
+# these untracked so the accident is one step harder.
+zz_*_test.go
+zzz_*_test.go
