@@ -378,7 +378,27 @@ func RunPipeline(s Store, q *Query) []Row {
 		// Only a projecting pipe chain skips the full-record materialize. A chain
 		// that rewrites or slices rows (delete/rename/limit/...) still returns whole
 		// records, and clearing MatAll for those was dropping every field but _time.
-		if PipesProject(pipes) {
+		//
+		// A pack-all pipe overrides that. `pack_json` with no explicit field list
+		// packs whatever the row carries, and the field-collection walk adds
+		// nothing for it (there is no list to add) -- so under ANY projecting pipe
+		// in the same chain the scan materialized nothing for it and every row
+		// packed to `{}`, at HTTP 200. It cannot be satisfied from a projected
+		// column set, because the set it needs is "all of them".
+		//
+		// Forcing the full materialize is safe in the other direction too: a
+		// projecting pipe BEFORE the pack still narrows the rows first, so
+		// `fields a, b | pack_json` packs a and b. MatAll governs what the scan
+		// reads from storage, not what a pipe has already thrown away. The cost
+		// is a full-column scan for queries that contain a pack-all, which is the
+		// price of the answer being right.
+		if pipesPackAll(pipes) {
+			// SET, not merely "do not clear". MatAll is false by default for a
+			// query that has pipes at all -- it is turned on for a bare select --
+			// so guarding the clear would have left the pack-all with nothing on
+			// every path that reaches here.
+			q.MatAll = true
+		} else if PipesProject(pipes) {
 			q.MatAll = false
 		}
 		switch p0 := pipes[0].(type) {
@@ -1484,6 +1504,18 @@ func (p *DeletePipe) apply(rows []Row) []Row {
 // whole records, so the engine must materialize every column for it -- matching
 // VictoriaLogs, where `* | limit 5` returns five full records, not five
 // timestamps.
+// pipesPackAll reports whether the chain contains a pack pipe with no explicit
+// field list -- the one pipe whose input is "every field this row has", which no
+// projection can supply. See the MatAll decision in RunPipeline.
+func pipesPackAll(pipes []Pipe) bool {
+	for _, p := range pipes {
+		if pk, ok := p.(*PackPipe); ok && len(pk.Fields) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func PipesProject(pipes []Pipe) bool {
 	for _, p := range pipes {
 		switch p.(type) {
