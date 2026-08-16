@@ -594,3 +594,89 @@ func sortedLines(body string) string {
 	sort.Strings(lines)
 	return strings.Join(lines, "\n")
 }
+
+// A store where SOME rows have a stream reports the empty stream too.
+//
+// The empty-stream fallback was all-or-nothing: it fired only when nothing was
+// in a named stream, so a store ingested partly with `_stream_fields` and
+// partly without reported only the named half. The rows with no stream vanished
+// from /streams, /stream_ids and the `_stream` facet, while /query returned
+// them and field_names counted them — one store, two answers about how many
+// rows exist.
+//
+// Measured against the staged victoria-logs binary on the same six rows, three
+// named:
+//
+//	                 simdlogs before          victoria-logs
+//	/streams         [{svc="s0"}:3]           [{svc="s0"}:3, {}:3]
+//	/stream_ids      one value                two values
+//	/field_names     _stream:6                _stream:6      (already agreed)
+//
+// The stream IDS are this server's own hashes and are not expected to equal
+// VL's; the value COUNT and the hit counts are.
+func TestAMixedStoreReportsTheEmptyStream(t *testing.T) {
+	node := singleNode(t)
+	for i := 0; i < 3; i++ {
+		postRaw(t, node, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson",
+			fmt.Sprintf(`{"_time":"2026-08-16T03:00:0%dZ","_msg":"row %d","svc":"s0"}`+"\n", i, i))
+	}
+	for i := 3; i < 6; i++ {
+		postRaw(t, node, "/insert/jsonline", "application/x-ndjson",
+			fmt.Sprintf(`{"_time":"2026-08-16T03:00:0%dZ","_msg":"row %d"}`+"\n", i, i))
+	}
+
+	var streams struct {
+		Values []struct {
+			Value string `json:"value"`
+			Hits  int    `json:"hits"`
+		} `json:"values"`
+	}
+	_, body := postRaw(t, node, "/select/logsql/streams?query=%2A", "", "")
+	if err := json.Unmarshal([]byte(body), &streams); err != nil {
+		t.Fatalf("streams is not JSON: %v: %s", err, body)
+	}
+	got := map[string]int{}
+	for _, v := range streams.Values {
+		got[v.Value] = v.Hits
+	}
+	for _, want := range []struct {
+		value string
+		hits  int
+	}{{`{svc="s0"}`, 3}, {"{}", 3}} {
+		if got[want.value] != want.hits {
+			t.Errorf("/streams reports %s at %d hits, want %d: %s",
+				want.value, got[want.value], want.hits, body)
+		}
+	}
+	// The hits must add up to the rows that exist, or a stream is being
+	// counted twice or not at all.
+	total := 0
+	for _, v := range streams.Values {
+		total += v.Hits
+	}
+	if total != 6 {
+		t.Errorf("/streams hits total %d over six rows: %s", total, body)
+	}
+
+	// /stream_ids derives from /streams, so it must have the same cardinality.
+	var ids struct {
+		Values []struct {
+			Value string `json:"value"`
+			Hits  int    `json:"hits"`
+		} `json:"values"`
+	}
+	_, idBody := postRaw(t, node, "/select/logsql/stream_ids?query=%2A", "", "")
+	if err := json.Unmarshal([]byte(idBody), &ids); err != nil {
+		t.Fatalf("stream_ids is not JSON: %v: %s", err, idBody)
+	}
+	if len(ids.Values) != len(streams.Values) {
+		t.Errorf("/stream_ids lists %d ids for %d streams: %s",
+			len(ids.Values), len(streams.Values), idBody)
+	}
+
+	// And the `_stream` facet, over the same store, must agree with /streams.
+	_, fBody := postRaw(t, node, "/select/logsql/facets?query=%2A&keep_const_fields=1", "", "")
+	if n := facetHits(t, fBody, "_stream"); n != 6 {
+		t.Errorf("the _stream facet totals %d hits where /streams totals 6: %.400s", n, fBody)
+	}
+}

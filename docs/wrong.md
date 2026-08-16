@@ -6331,3 +6331,31 @@ Elasticsearch routes" after the set became three; and the LLD said the leak gate
 and only the plain one has a control. What establishes the authenticated one is
 the mutation — reverting `format` to `r.FormValue` reddens it naming all three
 health routes — and the LLD says that now instead.
+
+## 86. The empty stream was reported only when it was the ONLY stream
+
+`Streams` fell back to "every row is in the empty stream" when nothing was in a
+named one. A store ingested partly with `_stream_fields` and partly without has
+both, and the empty half was dropped. Measured against the staged
+victoria-logs binary, six rows, three named:
+
+| | simdlogs | victoria-logs |
+|---|---|---|
+| `/select/logsql/streams` | `[{svc="s0"}:3]` | `[{svc="s0"}:3, {}:3]` |
+| `/select/logsql/stream_ids` | one value | two values |
+| `/select/logsql/field_names` | `_stream`:6 | `_stream`:6 |
+
+so one store gave two answers about how many rows exist: `field_names` and
+`/query` counted six, `/streams` and the `_stream` facet counted three.
+
+**The empty stream cannot be read off the `_stream` column.** A row ingested
+without `_stream_fields` has no such column at all — it is absent from
+`StatsByField`, not present with `""` — so the first attempt, mapping `""` to
+`{}`, changed nothing and the measurement said so. Every row is in exactly one
+stream, so the empty stream is the **remainder**: `Count(q)` minus the rows in
+a named stream. That one expression covers the all-empty store and the mixed
+store, replacing the special case that only handled the first.
+
+Mixed ingestion is not exotic — it is what a store looks like while
+`_stream_fields` is being rolled out, and what any second shipper that does not
+set it produces.

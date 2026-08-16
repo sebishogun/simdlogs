@@ -32,33 +32,66 @@ const EmptyStream = "{}"
 // Streams lists the distinct _stream label sets among the rows matching q, with
 // hit counts.
 func Streams(s Store, q *Query) []ValueCount {
-	out, named := streamValues(s, q)
-	if !named {
-		// No _stream column: the rows are not streamless, they are all in the
-		// empty stream. Reporting nothing here made /streams and /stream_ids
-		// answer [] against a store a client could plainly query.
-		if n := Count(s, q); n > 0 {
-			return []ValueCount{{Value: EmptyStream, Count: n}}
-		}
+	out, empty := streamValues(s, q)
+	// THE REMAINDER is the empty stream.
+	//
+	// Rows ingested without `_stream_fields` have no `_stream` column at all
+	// -- they are absent from StatsByField rather than present with "" --  so
+	// the empty stream cannot be read off that column. Every row is in exactly
+	// one stream, so whatever the named ones do not account for is in the
+	// empty one, and that arithmetic covers the all-empty store and the mixed
+	// store with one expression instead of a special case for each.
+	named := 0
+	for _, vc := range out {
+		named += vc.Count
+	}
+	if n := Count(s, q); n > named {
+		empty += n - named
+	}
+	if len(out) == 0 && empty == 0 {
 		return nil
+	}
+	// A MIXED store has both, and the empty half was dropped.
+	//
+	// The fallback above only fires when NOTHING is in a named stream, so a
+	// store where some rows were ingested with `_stream_fields` and some
+	// without reported only the named ones -- and the rows with no stream
+	// vanished from /streams, /stream_ids and the `_stream` facet, while
+	// /select/logsql/query returned them and field_names counted them. Six
+	// rows, three named:
+	//
+	//	           simdlogs                      victoria-logs
+	//	streams    [{svc="s0"}:3]                [{svc="s0"}:3, {}:3]
+	//	stream_ids [one]                         [two]
+	//
+	// The empty stream is a stream -- it is what EmptyStream exists to say --
+	// so it is reported whenever any row is in it, not only when every row is.
+	if empty > 0 {
+		out = append(out, ValueCount{Value: EmptyStream, Count: empty})
 	}
 	sortValueCounts(out)
 	return out
 }
 
-// streamValues returns the named streams, and whether there were any. The two
-// answers are separate because only the endpoints that report a stream's HITS
-// need the row count behind the empty-stream fallback -- the ones that report
-// its LABELS do not, and the empty stream has none.
-func streamValues(s Store, q *Query) (out []ValueCount, named bool) {
+// streamValues returns the NAMED streams and how many rows are in the empty
+// one. The two are separate because the endpoints that report a stream's
+// LABELS want only the named ones -- the empty stream has none -- while the
+// ones that report its HITS want both.
+//
+// A row whose `_stream` column is the empty string is IN the empty stream, not
+// missing a stream: the store materializes the column for a whole group, so a
+// row that never carried one comes back with "" once any row in its flush did.
+func streamValues(s Store, q *Query) (named []ValueCount, empty int) {
 	all := StatsByField(s, q, "_stream")
-	out = all[:0]
+	named = all[:0]
 	for _, vc := range all {
-		if vc.Value != "" {
-			out = append(out, vc)
+		if vc.Value == "" {
+			empty += vc.Count
+			continue
 		}
+		named = append(named, vc)
 	}
-	return out, len(out) > 0
+	return named, empty
 }
 
 // StreamIDs lists the distinct stream ids among the rows matching q.
@@ -74,8 +107,8 @@ func StreamIDs(s Store, q *Query) []ValueCount {
 // StreamFieldNames lists the distinct label names across matching streams, with
 // the number of rows each label covers.
 func StreamFieldNames(s Store, q *Query) []ValueCount {
-	streams, named := streamValues(s, q)
-	if !named {
+	streams, _ := streamValues(s, q)
+	if len(streams) == 0 {
 		// Every row is in the empty stream, which has no labels. Falling through
 		// to Streams here counted every matching row to learn a total that the
 		// answer -- an empty list -- never uses.
@@ -97,8 +130,8 @@ func StreamFieldNames(s Store, q *Query) []ValueCount {
 
 // StreamFieldValues lists the distinct values of one stream label, with hits.
 func StreamFieldValues(s Store, q *Query, field string) []ValueCount {
-	streams, named := streamValues(s, q)
-	if !named {
+	streams, _ := streamValues(s, q)
+	if len(streams) == 0 {
 		return nil // the empty stream carries no labels, so no label has values
 	}
 	counts := map[string]int{}
