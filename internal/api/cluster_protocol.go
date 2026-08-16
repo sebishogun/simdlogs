@@ -160,6 +160,16 @@ type PeerResponse struct {
 	// has ingested nothing since yesterday reports yesterday, and a merge that
 	// hid that would look identical to a shard that is up to date and empty.
 	HighWatermark int64
+	// IncompleteReason says WHY this answer is not whole, when the reader is
+	// the one that decided it.
+	//
+	// The `missing` bucket names a class -- `0(unavailable)` -- and the
+	// `incomplete` bucket was a bare index. Watermark refusals are the main
+	// producer of that bucket now, so an operator reading
+	// "1 of 1 shards could not answer completely (0)" cannot tell a store with
+	// quarantined groups from a replica whose watermark went backwards, which
+	// are different problems with different fixes.
+	IncompleteReason string
 	// BehindSibling is set by the reader when this peer's watermark is below
 	// one a live sibling reported. It never refuses -- see checkWatermark --
 	// but it is named in the response so the shortfall is not silent.
@@ -285,7 +295,7 @@ func (s *Server) serveEnvelope(next http.Handler) http.Handler {
 		// node's own stores, and a node with backends did not answer this read
 		// from them -- its own store is empty and its watermark is zero, which
 		// says nothing about the shards that actually answered.
-		hw, hasHW := int64(0), len(s.backends) == 0
+		hw, hasHW := int64(0), len(s.backendList()) == 0
 		if hasHW {
 			hw = s.highWatermark()
 		}

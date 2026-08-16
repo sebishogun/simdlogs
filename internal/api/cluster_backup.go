@@ -107,7 +107,7 @@ func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
 	if !s.clusterTenant(w, r) {
 		return
 	}
-	if len(s.backends) == 0 {
+	if len(s.backendList()) == 0 {
 		s.writeErr(w, r, adminSpec(), http.StatusNotImplemented,
 			"simdlogs: a cluster backup captures every shard, and this node has no "+
 				"backends configured, so it is not a router. /admin/backup takes this "+

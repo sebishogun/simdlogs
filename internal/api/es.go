@@ -79,7 +79,7 @@ type esPrefix struct {
 var errESUnsupported = errors.New("simdlogs: unsupported Elasticsearch query clause")
 
 func (s *Server) esSearch(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedESSearch(w, r)
 		return
 	}
@@ -150,7 +150,7 @@ func (s *Server) esSearch(w http.ResponseWriter, r *http.Request) {
 const esDefaultSize = 10
 
 func (s *Server) esCount(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedESCount(w, r)
 		return
 	}

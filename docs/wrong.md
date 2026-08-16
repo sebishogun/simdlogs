@@ -6914,3 +6914,52 @@ code. Entry 96's claim that "a genuinely lagging replica is refused" is true
 only of a replica that fell below its own floor, and this entry is the
 correction; entry 96 stays as it was written, because it is a record of what
 was believed at the time.
+
+## 98. The other three from the same review: a bare index, a race under the guard's own premise, and two guards the rewrite closed by accident
+
+Entry 97 landed the three blocking findings. These are the rest.
+
+**The refusal did not say what kind it was.** The `missing` bucket names a
+class — `0(unavailable)` — and the `incomplete` bucket was a bare index, so
+
+	503 ... 1 of 1 shards could not answer completely (0)
+
+read identically whether the shard's store had quarantined groups or its
+watermark had gone backwards. Those are different problems with different
+fixes, and after entry 97 this bucket produces mostly the second. It carries a
+reason now, `0(watermark)` or `0(degraded)`, and both are asserted — a test for
+only the watermark case would pass on a version that labelled everything
+"watermark", which is a worse answer than the bare index it replaced.
+
+**`SetBackends` was a plain assignment against readers in per-shard
+goroutines.** Nothing raced in practice: only `main.go` calls it, before
+serving. But the watermark check's peer-identity guard exists specifically for
+"SetBackends repointing an index at a different machine", and that is an
+operation the field's own type said could not be performed at runtime without
+racing. A guard whose premise the code cannot safely carry out has a hole under
+it.
+
+`atomic.Pointer[[]string]` with a `backendList()` accessor, one atomic load per
+read. Two things the first version got wrong and the tests now hold:
+
+- `shards()` called the accessor four times — the bound check and the slice
+  could see two different lists, which is the exact tear the atomic was for.
+  Moving a race from a field to its accessor is not a fix. One load, hoisted.
+- `SetBackends` stored the caller's slice. It copies: a caller appending to a
+  slice they still hold was rewriting this server's topology under the
+  goroutines reading it. `TestSetBackendsCopiesTheCallersSlice` uses spare
+  capacity so the append writes in place, which is the case aliasing loses.
+
+Reverting the field to a plain slice reddens under `-race`; aliasing the
+caller's slice reddens without it.
+
+**And two guards the reviewer found untestable are now dead, closed by entry
+97's rewrite rather than by anything aimed at them.** The restart branch's
+`gen != "" && h.gen != ""` and the unreachable `certain` computation in the
+`hw >= h.hw` arm both belonged to the old single-floor `observe`. Re-probed
+against the rewrite: making an empty generation count as the same process
+reddens 1, dropping the no-generation case reddens 2. The fixtures that closed
+them — `TestAPeerWithNoGenerationIsReportedNotRefused` and the restart
+subtests — were written for the blocking findings and cover these by
+construction, which is worth recording as the reason they are green rather than
+leaving them looking like guards nobody checked.

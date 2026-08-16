@@ -22,7 +22,7 @@ import (
 // Found by TestNoRouterReadSilentlyReadsTheEmptyLocalStore, which sends the
 // same request to a router and to a storage node holding the data and fails
 // when the storage node answers with something and the router answers with
-// nothing. Counting `len(s.backends) > 0` branches would have listed the
+// nothing. Counting `len(s.backendList()) > 0` branches would have listed the
 // handlers that DO federate; it cannot list the ones nobody remembered.
 
 // federatedFacets merges per-field value counts across shards.
@@ -417,7 +417,7 @@ func (s *Server) federatedSQL(w http.ResponseWriter, r *http.Request) {
 // help; 501 says the endpoint is not implemented on the node it reached, and a
 // caller can act on that by asking a storage node directly.
 func (s *Server) refuseInRouterMode(w http.ResponseWriter, r *http.Request, what, why string) bool {
-	if len(s.backends) == 0 {
+	if len(s.backendList()) == 0 {
 		return false
 	}
 	s.writeErr(w, r, readSpec(), http.StatusNotImplemented, fmt.Sprintf(

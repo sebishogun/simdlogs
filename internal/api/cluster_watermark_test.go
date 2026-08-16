@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -192,6 +193,16 @@ func TestAPeerThatWentBackwardsInOneProcessIsRefused(t *testing.T) {
 	}
 	if code != http.StatusServiceUnavailable {
 		t.Errorf("answered %d, want 503: %s", code, raw)
+	}
+	// AND THE REFUSAL SAYS WHICH KIND IT IS.
+	//
+	// The missing bucket names a class -- `0(unavailable)` -- and this one used
+	// to be a bare index, so "1 of 1 shards could not answer completely (0)"
+	// read the same whether the shard's store was degraded or its watermark had
+	// gone backwards. Those are different problems with different fixes, and
+	// this bucket now produces mostly the second.
+	if !strings.Contains(raw, "0(watermark)") {
+		t.Errorf("the refusal does not say the watermark is why: %s", raw)
 	}
 	// The escape hatch is what makes the refusal recoverable rather than an
 	// outage: a caller that would rather have the short answer can ask.
@@ -671,4 +682,110 @@ func getWithHeaders(t *testing.T, ts *httptest.Server, path string) *http.Respon
 		t.Fatal(err)
 	}
 	return resp
+}
+
+// A shard whose own store is degraded says "degraded", not "watermark".
+//
+// The two land in the same bucket and had the same rendering. Asserting only
+// the watermark case would pass on a version that labelled everything
+// "watermark", which is a worse answer than the bare index it replaced.
+func TestADegradedShardIsNamedAsDegradedNotAsLagging(t *testing.T) {
+	sh := newWMShard(t, 7, 5000)
+	// This peer reports its OWN store as incomplete, with a healthy watermark.
+	sh.ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(w.Header(), 0, 0, false, 5000, true, sh.gen.Load().(string), "")
+		fmt.Fprintf(w, `{"hits":[{"timestamp":"1970-01-01T00:00:00Z","total":%d}]}`, sh.hits.Load())
+	})
+	ts := wmRouter(t, sh.ts.URL)
+
+	code, _, raw := hitsTotal(t, ts, "*")
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("a shard reporting its own store incomplete answered %d, want 503: %s", code, raw)
+	}
+	if !strings.Contains(raw, "0(degraded)") {
+		t.Errorf("a degraded store is not named as such: %s", raw)
+	}
+	if strings.Contains(raw, "watermark") {
+		t.Errorf("a degraded store was reported as a watermark problem, which "+
+			"sends the operator to the wrong place: %s", raw)
+	}
+}
+
+// SetBackends is safe against the readers it repoints.
+//
+// It was `s.backends = urls`: a plain assignment against per-shard goroutines
+// reading the same field. Only main.go calls it, before serving, so nothing
+// raced in practice -- but the watermark check's own peer-identity guard exists
+// for "SetBackends repointing an index at a different machine", which is an
+// operation the field's type said could not be done at runtime without racing.
+// A guard whose premise the code cannot safely perform has a hole under it.
+//
+// Run with -race, which is where this fails if the atomic goes away.
+func TestSetBackendsIsSafeAgainstTheReadersItRepoints(t *testing.T) {
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	srv.SetReplicas(1)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// shards() reads the list and slices it; a torn read shows up
+				// here as a panic or as a shard of the wrong width.
+				for _, sh := range srv.shards() {
+					if len(sh) != 1 {
+						t.Errorf("a shard of %d replicas at replication 1", len(sh))
+						return
+					}
+				}
+			}
+		}()
+	}
+	for i := 0; i < 200; i++ {
+		n := 1 + i%4
+		urls := make([]string, n)
+		for j := range urls {
+			urls[j] = "http://node" + strconv.Itoa(j)
+		}
+		srv.SetBackends(urls)
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// And the caller's slice is the caller's: appending to it afterwards must not
+// rewrite this server's topology under the goroutines reading it.
+func TestSetBackendsCopiesTheCallersSlice(t *testing.T) {
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	srv.SetReplicas(1)
+
+	urls := make([]string, 2, 8) // spare capacity: append writes in place
+	urls[0], urls[1] = "http://a", "http://b"
+	srv.SetBackends(urls)
+	urls[0] = "http://HIJACKED"
+	urls = append(urls, "http://c")
+
+	got := srv.shards()
+	if len(got) != 2 {
+		t.Fatalf("%d shards after the caller appended, want 2", len(got))
+	}
+	if got[0][0] != "http://a" {
+		t.Errorf("shard 0 is %q; the caller rewrote it through the slice they "+
+			"still held", got[0][0])
+	}
 }

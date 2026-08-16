@@ -147,7 +147,7 @@ func (s *Server) health() HealthReport {
 		rep.add(p)
 	}
 
-	if n := len(s.backends); n > 0 {
+	if n := len(s.backendList()); n > 0 {
 		if missing := s.unreachablePeers(); len(missing) > 0 {
 			sort.Strings(missing)
 			rep.add(HealthCondition{State: StateClusterIncomplete,
@@ -336,7 +336,7 @@ func (s *Server) healthHandler(kind healthKind) http.HandlerFunc {
 // peers at a one-second timeout is a five-second probe, and an orchestrator
 // whose probe times out kills the process.
 func (s *Server) unreachablePeers() []string {
-	peers := s.backends
+	peers := s.backendList()
 	if len(peers) == 0 {
 		return nil
 	}

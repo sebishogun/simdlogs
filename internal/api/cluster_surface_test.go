@@ -20,7 +20,7 @@ import (
 // empty answer is indistinguishable from a cluster that genuinely holds no
 // matching data, so nothing anywhere reports a problem.
 //
-// Counting `len(s.backends) > 0` branches gives 14 of 46 routes. This test does
+// Counting `len(s.backendList()) > 0` branches gives 14 of 46 routes. This test does
 // not take that list on trust: it sends the same request to a router and to a
 // storage node that HAS the data, and fails when the storage node answers with
 // something and the router answers with nothing.

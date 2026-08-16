@@ -110,18 +110,28 @@ type Server struct {
 	// itself separately -- a test that sleeps out a window is measuring the
 	// clock, and one that cannot set the window has to.
 	dirRereadEvery time.Duration
-	backends       []string // peer node base URLs; when set, selects fan out and merge (vmselect role)
-	replicas       int      // replication factor: backends group into shards of this many replicas
-	maxRows        int      // cap on a bare (no-pipe) select's rows. Errors, never truncates.
-	limits         config.Limits
-	started        time.Time
-	nIngestReq     int64 // ingest requests (atomic)
-	nQueryReq      int64 // query requests (atomic)
-	nRowsIn        int64 // log entries ingested (atomic)
-	nBytesIn       int64 // bytes of log data ingested (atomic)
-	nRowsDrop      int64 // entries rejected as malformed (atomic)
-	nHTTPErrs      int64 // responses with a 4xx/5xx status (atomic)
-	nTails         int64 // live tail requests currently open (atomic)
+	// backendsAt holds the peer node base URLs; when set, selects fan out and
+	// merge (the vmselect role). Read through backendList().
+	//
+	// ATOMIC, not a plain slice. SetBackends is a plain assignment against
+	// readers in per-shard goroutines, and the whole reason the watermark
+	// check records which PEER set a floor is "SetBackends repointing an index
+	// at a different machine" -- an operation the field's own type said could
+	// not be done at runtime without racing. Only main.go calls it today, and
+	// before serving, so the race is latent; a guard whose premise is an
+	// operation the code cannot safely perform is a guard with a hole under it.
+	backendsAt atomic.Pointer[[]string]
+	replicas   int // replication factor: backends group into shards of this many replicas
+	maxRows    int // cap on a bare (no-pipe) select's rows. Errors, never truncates.
+	limits     config.Limits
+	started    time.Time
+	nIngestReq int64 // ingest requests (atomic)
+	nQueryReq  int64 // query requests (atomic)
+	nRowsIn    int64 // log entries ingested (atomic)
+	nBytesIn   int64 // bytes of log data ingested (atomic)
+	nRowsDrop  int64 // entries rejected as malformed (atomic)
+	nHTTPErrs  int64 // responses with a 4xx/5xx status (atomic)
+	nTails     int64 // live tail requests currently open (atomic)
 
 	szMu    sync.Mutex // guards the cached store footprint
 	szBytes int64
@@ -1054,7 +1064,7 @@ func (s *Server) pagedSelect(w http.ResponseWriter, r *http.Request, q *query.Qu
 }
 
 func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 { // select-router: fan out to the storage nodes and merge
+	if len(s.backendList()) > 0 { // select-router: fan out to the storage nodes and merge
 		s.federatedSelect(w, r)
 		return
 	}
@@ -1413,7 +1423,7 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 // interface VictoriaLogs does not have. Results stream as NDJSON like the
 // LogsQL select.
 func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 { // select-router: federate the row-local case, refuse the rest
+	if len(s.backendList()) > 0 { // select-router: federate the row-local case, refuse the rest
 		s.federatedSQL(w, r)
 		return
 	}
@@ -1526,7 +1536,7 @@ const maxHitsBuckets = 10_000
 const defaultHitsBuckets = 240
 
 func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedHits(w, r)
 		return
 	}
@@ -1713,7 +1723,7 @@ func selectQueryOf(r *http.Request) (*query.Query, error) { return parseRequest(
 var errMissingQuery = errors.New("simdlogs: missing `query` arg")
 
 func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedValueCounts(w, r, "/select/logsql/field_names")
 		return
 	}
@@ -1731,7 +1741,7 @@ func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedValueCounts(w, r, "/select/logsql/field_values")
 		return
 	}
@@ -1753,7 +1763,7 @@ func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 { // select-router: a facet over the router's own store is empty
+	if len(s.backendList()) > 0 { // select-router: a facet over the router's own store is empty
 		s.federatedFacets(w, r)
 		return
 	}
@@ -1780,7 +1790,7 @@ func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
 // statsQuery answers a stats query at a single instant: the Prometheus vector
 // envelope, so the same dashboard panel that graphs a range can read a value.
 func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedStatsQuery(w, r)
 		return
 	}
@@ -1911,7 +1921,7 @@ func intParam(r *http.Request, name string, def int) int {
 
 // streamsHandler lists the distinct _stream label sets in the window.
 func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedValueCounts(w, r, "/select/logsql/streams")
 		return
 	}
@@ -1930,7 +1940,7 @@ func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
 
 // streamIDsHandler lists the distinct stream ids in the window.
 func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedValueCounts(w, r, "/select/logsql/stream_ids")
 		return
 	}
@@ -1949,7 +1959,7 @@ func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
 
 // streamFieldNamesHandler lists the distinct stream label names.
 func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedValueCounts(w, r, "/select/logsql/stream_field_names")
 		return
 	}
@@ -1968,7 +1978,7 @@ func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request)
 
 // streamFieldValuesHandler lists the distinct values of one stream label.
 func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedValueCounts(w, r, "/select/logsql/stream_field_values")
 		return
 	}
@@ -1988,7 +1998,7 @@ func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request
 // statsQueryRange buckets a stats query over the time range and returns a
 // Prometheus-style matrix: one series per group-by tuple, a point per step.
 func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedMatrix(w, r)
 		return
 	}

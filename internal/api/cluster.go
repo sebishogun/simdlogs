@@ -28,7 +28,22 @@ import (
 // out to these peer base URLs and merges their rows, the way VictoriaLogs'
 // vmselect queries a set of vmstorage nodes. With no backends the node serves
 // its own store.
-func (s *Server) SetBackends(urls []string) { s.backends = urls }
+func (s *Server) SetBackends(urls []string) {
+	// A COPY. The caller's slice is the caller's, and storing it means a later
+	// append on their side rewrites this server's topology underneath the
+	// goroutines reading it.
+	cp := append([]string(nil), urls...)
+	s.backendsAt.Store(&cp)
+}
+
+// backendList is the current peer list. One atomic load; nil when this node is
+// not a router.
+func (s *Server) backendList() []string {
+	if p := s.backendsAt.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
 
 // SetReplicas sets the replication factor: the backends partition into shards
 // of r replicas each. A write goes to every replica of its shard; a read takes
@@ -52,12 +67,16 @@ func (s *Server) shards() [][]string {
 		r = 1
 	}
 	var out [][]string
-	for i := 0; i < len(s.backends); i += r {
+	// ONE load. Four separate ones could see two different lists across the
+	// bound check and the slice, which is the exact tear the atomic exists to
+	// remove -- moving a race from the field to its accessor is no fix.
+	b := s.backendList()
+	for i := 0; i < len(b); i += r {
 		hi := i + r
-		if hi > len(s.backends) {
-			hi = len(s.backends)
+		if hi > len(b) {
+			hi = len(b)
 		}
-		out = append(out, s.backends[i:hi])
+		out = append(out, b[i:hi])
 	}
 	return out
 }
@@ -121,7 +140,7 @@ func isWritePath(p string) bool {
 // (federatedSelect), so only writes are intercepted here.
 func (s *Server) routeWrites(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.backends) > 0 && isWritePath(r.URL.Path) {
+		if len(s.backendList()) > 0 && isWritePath(r.URL.Path) {
 			// Forwarding returns before the mux, so none of the per-route
 			// wrappers run: the role check, method, media type and body limit
 			// all live in there. Unguarded, a router was an unauthenticated,
@@ -1058,6 +1077,7 @@ func (s *Server) checkWatermark(p *PeerResponse, shard int) {
 		// the answer is refused and the client retries.
 		if certain {
 			p.Complete = false
+			p.IncompleteReason = "watermark"
 			return
 		}
 		// NOT certain, so not refused -- and not silent either. The shard is
@@ -2201,11 +2221,21 @@ func (s *Server) fanOutChecked(
 		case !p.OK():
 			missing = append(missing, fmt.Sprintf("%d(%s)", i, p.Class))
 		case !p.Complete:
-			// Answered, but from an incomplete store. Counted as missing for
+			// Answered, but not from its whole dataset. Counted as missing for
 			// the completeness rule: a shard serving from a degraded store is
 			// missing data just as surely as one that did not answer, and the
 			// only difference is that this one looks fine.
-			incomplete = append(incomplete, strconv.Itoa(i))
+			//
+			// WITH A REASON, the way the missing bucket carries a class. A bare
+			// index cannot tell an operator whether the shard's store is
+			// degraded or its watermark went backwards -- different problems
+			// with different fixes, and this bucket now produces mostly the
+			// second.
+			reason := p.IncompleteReason
+			if reason == "" {
+				reason = "degraded" // the peer's own report on its own store
+			}
+			incomplete = append(incomplete, fmt.Sprintf("%d(%s)", i, reason))
 		}
 	}
 	if len(lagging) > 0 {
