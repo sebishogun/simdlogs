@@ -86,12 +86,52 @@ func TestAProjectedPackCarriesOnlyItsOwnFields(t *testing.T) {
 			want: []string{"n", "svc"},
 		},
 		{
+			// The field's value MATCHES r.Time here, because for a row that
+			// has a time the pack emits it from r.Time -- that is what
+			// serialization does, and "packs the row as it will be serialized"
+			// is the rule. The fixture used to disagree with itself
+			// (r.Time 2026-08-06, the field 2026-08-16) and the value went
+			// unchecked, so it did not matter which one won.
 			name: "projection that KEPT _time",
 			row: Row{Time: 1786000000000000000, Fields: []Field{
-				{Key: "_time", Value: "2026-08-16T03:00:00Z"},
+				{Key: "_time", Value: "2026-08-06T07:06:40Z"},
 				{Key: "_msg", Value: "hello"},
 			}},
 			want: []string{"_msg", "_time"},
+		},
+		{
+			// The MIRROR of the empty-stream case, on `_time`.
+			//
+			// The skip above it is conditional on the pair being emitted; the
+			// `_time` skip was not, so a NoTime row carrying a `_time` FIELD
+			// lost it from both halves -- nothing emitted it from r.Time and
+			// the loop dropped it. `stats by (_time)`, `rename x as _time`,
+			// `copy x as _time` and the router's jsonLineToRow all produce
+			// exactly this row. Measured, four rows:
+			//
+			//	* | stats by (_time) count() c | pack_json as p
+			//	  VL      p {"_time":"2026-08-16T03:00:00Z","c":"1"}
+			//	  before  p {"c":"1"}
+			//
+			// The case above ("projection that KEPT _time") does not cover it:
+			// its NoTime is false, so `_time` is emitted from r.Time and the
+			// key set is right either way.
+			name: "stats row grouped BY _time",
+			row: Row{NoTime: true, Fields: []Field{
+				{Key: "_time", Value: "2026-08-16T03:00:00Z"}, {Key: "c", Value: "1"},
+			}},
+			want: []string{"_time", "c"},
+		},
+		{
+			// The same shape after `rename lvl as _time`: the value is not a
+			// timestamp at all, which is what makes a key-only assertion
+			// insufficient -- emitting r.Time (zero) would give the key back
+			// with "1970-01-01T00:00:00Z" in it.
+			name: "a _time that is not a timestamp",
+			row: Row{NoTime: true, Fields: []Field{
+				{Key: "_time", Value: "error"}, {Key: "c", Value: "2"},
+			}},
+			want: []string{"_time", "c"},
 		},
 		{
 			// An empty `_stream` value is NOT a stream: the store materializes
@@ -105,9 +145,31 @@ func TestAProjectedPackCarriesOnlyItsOwnFields(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := packKeys(t, packJSON(tc.row, nil))
+			packed := packJSON(tc.row, nil)
+			got := packKeys(t, packed)
 			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
 				t.Errorf("packed %v, want %v", got, tc.want)
+			}
+			// The VALUES too, for every field the row carried. A key set alone
+			// cannot tell a field that survived from a field re-synthesized
+			// with a different value -- `_time` from a zero r.Time is
+			// "1970-01-01T00:00:00Z" and has the right key.
+			var m map[string]string
+			if err := json.Unmarshal([]byte(packed), &m); err != nil {
+				t.Fatalf("pack_json is not an object: %v: %s", err, packed)
+			}
+			for _, f := range tc.row.Fields {
+				if v, ok := m[f.Key]; ok && v != f.Value {
+					t.Errorf("%s packed as %q, want the row's own %q: %s",
+						f.Key, v, f.Value, packed)
+				}
+			}
+			// pack_logfmt follows the same rule, on the same rows.
+			lf := packLogfmt(tc.row, nil)
+			for _, k := range tc.want {
+				if !strings.Contains(lf, k+"=") {
+					t.Errorf("pack_logfmt dropped %s: %s", k, lf)
+				}
 			}
 		})
 	}

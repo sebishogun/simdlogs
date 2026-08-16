@@ -44,6 +44,24 @@ type routeSpec struct {
 	// operational surface uses it: a scraper that gets 429 under load takes
 	// away the telemetry that explains the load.
 	nosem bool
+	// form says this route reads its parameters out of r.Form, so guard
+	// parses a multipart body before the middleware chain copies the request.
+	//
+	// Not every route: guard read and buffered the body of routes that never
+	// look at one. Measured, a 40 MiB multipart POST, server-side TotalAlloc
+	// delta -- /metrics 0 -> 128 MiB, / 0 -> 128 MiB, /alerts 0 -> 128 MiB,
+	// plus a temp file written and deleted per request, on three routes that
+	// discard the body. And on the two Elasticsearch routes, which read the
+	// body themselves, the parse CONSUMED it: /_count with a JSON document
+	// under multipart/form-data went from 200 to 400 ("simdlogs: EOF") on a
+	// node and to 503 on a router.
+	//
+	// A route whose handler parses a form while this is false leaks a temp
+	// file per request, which is the defect this whole mechanism exists to
+	// stop -- so it is not a matter of getting the list right by inspection:
+	// TestNoRouteLeavesAMultipartTempFileBehind posts a spilling body to every
+	// registered route and fails on any file left behind.
+	form bool
 	// stream selects the tail budget. A live tail is an idle connection, not
 	// a running query -- charging it the query budget meant a handful of open
 	// tails returned 429 for every other read, /metrics included. It still
@@ -275,7 +293,7 @@ func (s *Server) guard(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
 		// ParseMultipartForm downstream returns nil immediately, so the
 		// handlers are unchanged; a parse that FAILS leaves MultipartForm nil
 		// and the error surfaces where it did before.
-		if formKind(r) == formMultipart {
+		if spec.form && formKind(r) == formMultipart {
 			normalizeFormContentType(r)
 			_ = r.ParseMultipartForm(multipartMemory)
 			if r.MultipartForm != nil {
@@ -289,6 +307,11 @@ func (s *Server) guard(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
 // multipartMemory is how much of a multipart body is held in memory before it
 // spills to a temp file -- net/http's own FormValue default. The spill is what
 // the deferred RemoveAll above cleans up; this bounds how often it happens.
+//
+// It cannot usefully be lowered for a test: a handler's own r.FormValue calls
+// ParseMultipartForm with net/http's defaultMaxMemory, also 32 MiB, and a
+// handler-side parse is exactly what the leak gate has to provoke. So the gate
+// pays for a body past this size rather than shrinking it.
 const multipartMemory = 32 << 20
 
 func allowedMethod(allowed []string, m string) bool {
@@ -441,7 +464,30 @@ func otlpSpec() routeSpec {
 // readSpec is the query surface: GET or POST, any type, plain-text errors as
 // the existing clients expect.
 func readSpec() routeSpec {
-	return routeSpec{methods: []string{http.MethodGet, http.MethodPost}, format: errText, deadline: true}
+	return routeSpec{
+		methods:  []string{http.MethodGet, http.MethodPost},
+		format:   errText,
+		deadline: true,
+		form:     true, // query, start, end, limit and the rest come from r.Form
+	}
+}
+
+// rawBodySpec is a read route whose handler reads r.Body ITSELF: the two
+// Elasticsearch routes, whose body is a JSON document rather than a form.
+// Parsing a form for them consumes the body they are about to decode.
+func rawBodySpec() routeSpec {
+	sp := readSpec()
+	sp.form = false
+	return sp
+}
+
+// staticSpec is a read route that reads neither a form nor a body -- the UI
+// and the alerts page. They answer from server state, so buffering an uploaded
+// body for them is pure cost.
+func staticSpec() routeSpec {
+	sp := readSpec()
+	sp.form = false
+	return sp
 }
 
 // tailSpec is the live tail: a read route with no deadline, since it is meant
@@ -497,12 +543,14 @@ func specForPath(p string) routeSpec {
 func opsSpec() routeSpec {
 	sp := readSpec()
 	sp.nosem = true
+	sp.form = false // /metrics answers from server state; it reads no parameters
 	return sp
 }
 
 // adminSpec is the administrative surface.
 func adminSpec() routeSpec {
-	return routeSpec{methods: []string{http.MethodGet, http.MethodPost}, format: errText}
+	// form: serveReplicaState reads `digest` through r.FormValue.
+	return routeSpec{methods: []string{http.MethodGet, http.MethodPost}, format: errText, form: true}
 }
 
 // replicaGroupSpec is adminSpec with the ANTI-ENTROPY body limit.
@@ -520,6 +568,7 @@ func adminSpec() routeSpec {
 func replicaGroupSpec() routeSpec {
 	sp := adminSpec()
 	sp.limit = func() int64 { return maxRepairBytes }
+	sp.form = false // the adopt POST's body IS the group, read with io.ReadAll
 	return sp
 }
 

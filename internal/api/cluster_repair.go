@@ -135,7 +135,21 @@ func (s *Server) serveReplicaState(w http.ResponseWriter, r *http.Request) {
 
 // serveReplicaGroup serves one group's bytes (GET) or adopts one (POST).
 func (s *Server) serveReplicaGroup(w http.ResponseWriter, r *http.Request) {
-	digest := r.FormValue("digest")
+	// FROM THE URL, never r.FormValue.
+	//
+	// FormValue parses the BODY for a form-encoded content type, and this
+	// handler's POST branch reads that same body with io.ReadAll -- so the
+	// digest lookup ate the group it was about to adopt. protocols.go states
+	// the rule for the ingest routes ("Read from the URL, never r.FormValue")
+	// after a line-protocol write stored nothing while answering 204; this is
+	// the same defect on the anti-entropy path, where the consequence is a
+	// shard that can never converge.
+	//
+	// Found by the all-routes temp-file gate: a multipart POST here answered
+	// 400 and left a temp file behind, because FormValue parsed a multipart
+	// form on the request copy and nothing removed it. cluster_client sends
+	// the digest as `?digest=`, so the URL is where it already is.
+	digest := r.URL.Query().Get("digest")
 	if digest == "" {
 		s.writeErr(w, r, adminSpec(), http.StatusBadRequest,
 			"simdlogs: a group is addressed by digest, not by id: an id means only "+

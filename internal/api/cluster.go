@@ -485,9 +485,6 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 	// gave three different seven-figure numbers. Every shard streamed its whole
 	// matching set to the router on the exact path POST exists for.
 	//
-	// `query` is NOT marked: shardQueryURL always Sets it, so it is always a
-	// URL key and the "already in the query" rule covers it. Marking it was
-	// inert, and an inert marking reads as a load-bearing one.
 	// `query` is marked ALWAYS, and that marking is load-bearing now.
 	//
 	// Entry 63 removed it as inert: shardQueryURL always Sets it, so it was

@@ -126,11 +126,28 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 	// _stream and _stream_id are synthesized onto every returned record, so they
 	// are fields the client can see and filter on -- listing only the stored
 	// columns hid two fields that queries plainly work against.
-	hasStream := false
+	// BOTH names, not just `_stream`.
+	//
+	// `_stream_id` was appended unconditionally while `_stream` was guarded,
+	// so a store whose rows carry a client-supplied `_stream_id` column listed
+	// it TWICE on a node -- and a router, which sums the shards' counts by
+	// name, answered twice the number of rows there are. Measured, six rows
+	// each carrying `_stream_id`, one shard:
+	//
+	//	node   [… {"value":"_stream_id","hits":6},{"value":"_stream_id","hits":6} …]
+	//	router [{"value":"_stream_id","hits":12}, …]
+	//
+	// Both at HTTP 200, and the facets endpoint over the same store was
+	// already correct -- this is the same defect one endpoint over, which is
+	// why the guard now covers both names in one pass instead of one name in
+	// a loop that can be copied wrong again.
+	hasStream, hasStreamID := false, false
 	for _, vc := range out {
-		if vc.Value == "_stream" {
+		switch vc.Value {
+		case "_stream":
 			hasStream = true
-			break
+		case "_stream_id":
+			hasStreamID = true
 		}
 	}
 	// `total` is the matching row count, already summed above -- calling Count
@@ -140,7 +157,9 @@ func FieldNameCounts(s Store, q *Query) []ValueCount {
 		if !hasStream {
 			out = append(out, ValueCount{Value: "_stream", Count: n})
 		}
-		out = append(out, ValueCount{Value: "_stream_id", Count: n})
+		if !hasStreamID {
+			out = append(out, ValueCount{Value: "_stream_id", Count: n})
+		}
 	}
 	sortValueCounts(out)
 	return out

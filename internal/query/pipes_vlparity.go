@@ -149,7 +149,15 @@ func packJSON(r Row, keys []string) string {
 		// the pack's job is to pack the row, not to improve it.
 		stream, id, hasStream := rowStreamPair(r)
 		for _, f := range r.Fields {
-			if f.Key == "_time" {
+			// Conditional on the emit above, exactly as the stream pair is.
+			// A NoTime row emits no `_time` from r.Time, so skipping the field
+			// as well loses a value the row DOES carry: `stats by (_time)`,
+			// `rename x as _time` and the router's jsonLineToRow all produce
+			// one. Measured, `* | stats by (_time) count() c | pack_json as p`
+			// over four rows: p was {"c":"1"} where the reference and this
+			// server's own previous build both give
+			// {"_time":"2026-08-16T03:00:00Z","c":"1"}.
+			if f.Key == "_time" && !r.NoTime {
 				continue // emitted from r.Time, above, as serialization does
 			}
 			if hasStream && (f.Key == "_stream" || f.Key == "_stream_id") {
@@ -231,7 +239,15 @@ func packLogfmt(r Row, keys []string) string {
 		// the pack's job is to pack the row, not to improve it.
 		stream, id, hasStream := rowStreamPair(r)
 		for _, f := range r.Fields {
-			if f.Key == "_time" {
+			// Conditional on the emit above, exactly as the stream pair is.
+			// A NoTime row emits no `_time` from r.Time, so skipping the field
+			// as well loses a value the row DOES carry: `stats by (_time)`,
+			// `rename x as _time` and the router's jsonLineToRow all produce
+			// one. Measured, `* | stats by (_time) count() c | pack_json as p`
+			// over four rows: p was {"c":"1"} where the reference and this
+			// server's own previous build both give
+			// {"_time":"2026-08-16T03:00:00Z","c":"1"}.
+			if f.Key == "_time" && !r.NoTime {
 				continue // emitted from r.Time, above, as serialization does
 			}
 			if hasStream && (f.Key == "_stream" || f.Key == "_stream_id") {

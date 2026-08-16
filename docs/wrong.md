@@ -5949,9 +5949,19 @@ first, so the BODY wins. Both answered 200:
 POST /select/logsql/stats_query?query=level:error | stats count() c
      ct urlencoded, body query=* | stats count() c
   node   "30"      router  "10"
-same shape, limit=1 in the URL and limit=3 in the body:
-  node   3 rows    router  1 row
+same shape, limit=1 in the URL and limit=5 in the body:
+  node   5 rows    router  3 rows
 ```
+
+**Correction (entry 79).** This entry originally read "limit=1 in the URL and
+limit=3 in the body: node 3 rows, router 1 row". That is not what a three-shard
+router does, and the test shipped with the same numbers. Re-measured on this
+entry's own base commit: `url=1 body=3` gives node 3 rows and router 3 rows,
+**equal**, because the router applies the URL's limit=1 per shard and there are
+three shards. "router 1 row" is the ONE-shard result -- it came from the
+one-shard fixture this entry elsewhere says cannot see the defect, and was
+carried into both the prose and the test unchanged. `url=1 body=5` is the
+version that discriminates: node 5, router 3.
 
 Under MULTIPART the two already agreed — Go appends multipart values AFTER the
 URL query — so the router was implementing multipart precedence for both
@@ -6014,3 +6024,128 @@ grew out of compares status codes over an empty store, which is "returns the
 same three digits over no data" — both sides answered 200 here, and the
 difference is entirely in the body.
 
+
+## 78. Three fixes, three new defects: a lost field, a consumed body, and a buffered one
+
+Reviewer round on `9b5bcf4..3bd502f` — the range that fixed entries 73–77.
+
+**`pack_json` and `pack_logfmt` dropped a `_time` the row carried.** Entry 73
+records getting exactly this right for `_stream`: "the skip is conditional on
+the pair being emitted now". The same conditional was not applied to `_time`,
+so a `NoTime` row carrying a `_time` FIELD lost it from both halves — nothing
+emitted it from `r.Time` and the loop skipped the field. Measured, four rows:
+
+| query | before 39e5716 | after | victoria-logs |
+|---|---|---|---|
+| `… \| stats by (_time) count() c \| pack_json as p` | `{"_time":"…00Z","c":"1"}` | `{"c":"1"}` | `{"_time":"2026-08-16T03:00:00Z","c":"1"}` |
+| `… \| rename level as _time \| pack_json as p` | `{"_time":"error",…}` | `{"c":"2"}` for both rows | — |
+
+Reachable through `stats by (_time)`, `rename … as _time`, `copy … as _time`
+and the router's `jsonLineToRow`. Uncovered: the existing table's
+"projection that KEPT `_time`" case has `NoTime` false, so `_time` comes from
+`r.Time` and its key set is right either way. That fixture also disagreed with
+itself — `r.Time` said 2026-08-06 and its `_time` field said 2026-08-16 — and
+nothing checked the value, so it did not matter which won. The table now
+asserts values as well as keys, and carries the two rows that reach the defect.
+
+**`guard`'s multipart parse consumed the body of the two routes that read it
+themselves.** Entry 75 claimed "a second `ParseMultipartForm` downstream returns
+nil immediately, so no handler changes" — true of handlers that parse a form,
+false of handlers that read `r.Body`:
+
+| | before entry 75 | after |
+|---|---|---|
+| `/_count`, multipart, body `{"query":{"match_all":{}}}` | node 200 `{"count":12}` | node **400** `simdlogs: EOF`, router **503** |
+| `/_search`, same | 200 | **400** |
+
+And it buffered the body of routes that read nothing at all. 40 MiB multipart
+POST, server-side `TotalAlloc` delta: `/metrics` 0 → **128 MiB**, `/` 0 → 128
+MiB, `/alerts` 0 → 128 MiB, plus a temp file written and removed per request.
+`/metrics` is deliberately exempt from the query semaphore, so this is 3.2× the
+body in heap churn on the one route that must answer under load.
+
+The parse is now per route (`routeSpec.form`). An opt-in list gets one entry
+wrong silently, so it is not trusted: `TestNoRouteLeavesAMultipartTempFileBehind`
+posts a spilling multipart body to **every** path `Handler()` registered and
+fails on any file left behind.
+
+Two things had to be got right for that gate to mean anything:
+
+- **A positive control.** The check is an absence, and an absence has two
+  causes. The first version lowered the spill threshold to 1 KiB to make the
+  sweep cheap — but a handler's own `r.FormValue` calls `ParseMultipartForm`
+  with net/http's `defaultMaxMemory`, also 32 MiB and not ours, so nothing
+  spilled and the gate would have passed on a leaking server. A deliberately
+  leaking handler now runs first and the test fails outright if it leaves no
+  file.
+- **Two phases.** A file that exists *while* a request is in flight is the
+  mechanism working. `/select/logsql/tail` is meant to stay open, and checking
+  right after the request reported its in-flight file as a leak. Files are
+  attributed per route in phase one and judged after `ts.Close()`, which waits
+  for every handler.
+
+**It found one.** `/internal/replica/group` answered 400 and left a temp file:
+`serveReplicaGroup` reads `digest` with `r.FormValue` *before* the method
+switch, and its POST branch then `io.ReadAll`s the same body to adopt the group.
+`protocols.go` already states the rule — "Read from the URL, never
+`r.FormValue`: FormValue parses the BODY" — recorded after a line-protocol write
+stored nothing while answering 204. Same defect on the anti-entropy path, where
+the consequence is a shard that can never converge. `cluster_client` sends
+`?digest=`, so the URL is where it already was.
+
+**`_stream_id` was still doubled in `FieldNameCounts`.** Entry 77 fixed
+`FacetList` and not the endpoint beside it: `_stream` guarded against the stored
+column, `_stream_id` appended unconditionally. Six rows each carrying a
+client-supplied `_stream_id`, one shard:
+
+```
+node   [… {"value":"_stream_id","hits":6},{"value":"_stream_id","hits":6} …]
+router [{"value":"_stream_id","hits":12}, …]
+```
+
+Word for word entry 77's shape, both at HTTP 200. The new test supplies the
+field, which `loadedPair`'s rows do not — without it the stored column never
+exists and the test passes on the broken code.
+
+## 79. Four tests that could not fail, one of which put a wrong number in the record
+
+Same review round. None of these is a code defect; each is a check that was
+green for a reason other than the one claimed.
+
+**The limit subtest was a coincidence.** `limit=1` in the URL and `limit=3` in
+the body, over the three-shard fixture: a router applying the URL's limit=1 per
+shard returns 3 rows, which is what the body's limit=3 asks for. Measured on
+entry 76's own base commit:
+
+```
+url=1 body=3   node 3 rows, router 3 rows, EQUAL
+url=1 body=4   node 4 rows, router 3 rows, DIFFER
+url=1 body=5   node 5 rows, router 3 rows, DIFFER
+```
+
+**And entry 76 published the wrong number.** It read "node 3 rows, router 1
+row". That is the ONE-shard result — it came from the one-shard fixture the same
+entry says cannot see the defect, and was carried into the prose and the test
+unchanged. Corrected in place, in entry 76.
+
+**The matrix envelope was never compared.** `federatedVector` and
+`federatedMatrix` were both changed from a map to a struct so the router's key
+order matches a node's; only the vector one was exercised. Reverting the matrix
+envelope to a map left the whole suite green while the router answered
+`{"data":{"result":…,"resultType":…},"status":…}` against a node's
+`{"status":…,"data":{"resultType":…,"result":…}}`. A `stats_query_range` case
+now goes through the same byte comparison.
+
+**The facets test could not tell the synthesis from the column.** "Appears
+once" is satisfied both by emitting `_stream`/`_stream_id` from `Streams`/
+`StreamIDs` and skipping the stored columns — what `FacetList` does — and by
+keeping the columns and deleting the tail. Deleting the tail left every package
+green, while `_stream_id` vanished from facets entirely and `_stream` reported
+the raw column value `""` where the row serializes `{svc="s0"}`. The contract is
+click-through: the new test pastes each faceted value back into a filter and
+requires it to select rows.
+
+**A contradictory comment shipped.** Two adjacent paragraphs on the same line of
+code, one saying `query` is not marked because marking it was inert, the next
+saying it is marked always and load-bearing. The first was true before the rule
+it depended on was removed in the same range. Deleted.

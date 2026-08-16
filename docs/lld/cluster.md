@@ -459,7 +459,32 @@ HTTP 200.
 - **The two Elasticsearch routes are different**: their body is a JSON document,
   read unconditionally whatever the content type says — `curl -d` sends a form
   content type by default, and treating that as parameters left a real query
-  document unread.
+  document unread. They carry `routeSpec.form = false` for the same reason: the
+  request-shape guard parses a multipart body up front so its temp file can be
+  removed, and doing that on these two routes **consumed the document** —
+  measured, `/_count` with a JSON body under `multipart/form-data` answered
+  `400 simdlogs: EOF` on a node and `503` on a router, where every other
+  framing of the same document answers `200`.
+- **A parameter sent in both the URL and the body resolves as a node resolves
+  it.** `r.Form` already encodes Go's own precedence — body-first for a
+  urlencoded form, URL-first for multipart — so `withFormInURL` forwards
+  `r.Form`'s values verbatim rather than re-deciding, and the plan's own keys
+  (`query`, and `limit` when the router runs coordinator pipes) are marked so a
+  caller's form cannot overwrite the planned query. Before this, the same
+  request answered `30` on a node and `10` on a router, both at HTTP 200.
+
+**Which routes parse a form at all** is per route, not global. `routeSpec.form`
+selects it, and it is wrong in both directions: parsing where the handler reads
+the raw body consumes it (the Elasticsearch routes above), and *not* parsing
+where the handler calls `FormValue` leaks one multipart temp file per request,
+because the handler parses on a request copy the server never sees and
+`finishRequest` cleans up the original. Neither failure is visible in an
+ordinary response, so the list is not maintained by inspection:
+`TestNoRouteLeavesAMultipartTempFileBehind` posts a spilling multipart body to
+every path `Handler()` registered and fails on any file left behind, with a
+positive control proving it can see one. It found `/internal/replica/group`,
+whose handler read `digest` with `r.FormValue` before `io.ReadAll`-ing the body
+it was about to adopt — the URL is where the client already sends it.
 
 Tenant headers (`AccountID`, `ProjectID`) propagate on every fan-out, so each
 backend answers for the same tenant.

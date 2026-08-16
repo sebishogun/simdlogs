@@ -649,6 +649,16 @@ func (s *Server) Handler() http.Handler {
 		sp := adminSpec()
 		return s.requireAuth(config.RoleAdmin, sp, s.guard(sp, h))
 	}
+	// st: reads neither a form nor a body -- the UI and the alerts page.
+	st := func(h http.HandlerFunc) http.HandlerFunc {
+		sp := staticSpec()
+		return s.requireAuth(config.RoleQuery, sp, s.guard(sp, h))
+	}
+	// es: reads r.Body ITSELF, so nothing upstream may consume it.
+	es := func(h http.HandlerFunc) http.HandlerFunc {
+		sp := rawBodySpec()
+		return s.requireAuth(config.RoleQuery, sp, s.guard(sp, h))
+	}
 	handle("/insert/jsonline", in(nd, s.insertJSONLine))
 	handle("/insert/logfmt", in(nd, s.insertLogfmt))
 	handle("/_bulk", in(nd, s.esBulk))                                                // Elasticsearch bulk ingest
@@ -704,7 +714,7 @@ func (s *Server) Handler() http.Handler {
 		return s.requireAuth(config.RoleAdmin, sp, s.guard(sp, s.acknowledgeDegraded))
 	}()) // accept a degraded store
 	handle("/metrics", s.requireAuth(config.RoleMetrics, opsSpec(), s.guard(opsSpec(), s.metrics))) // Prometheus text exposition
-	handle("/alerts", rd(s.alertsHandler))                                                          // alerting rule state
+	handle("/alerts", st(s.alertsHandler))                                                          // alerting rule state
 	// /health and /-/healthy are LIVENESS: the process. They answered a
 	// literal "OK" whatever the server was doing, including while draining --
 	// so an orchestrator kept routing to a process that was going to exit.
@@ -715,12 +725,12 @@ func (s *Server) Handler() http.Handler {
 	handle("/-/healthy", s.healthHandler(healthLive))
 	handle("/-/ready", s.healthHandler(healthReady))
 	handle("/flags", adm(s.flagsHandler)) // flag dump: administrative
-	handle("/vmui", rd(s.ui))             // web UI (vmui equivalent); same gate as /select/vmui
-	handle("/select/vmui", rd(s.ui))
+	handle("/vmui", st(s.ui))             // web UI (vmui equivalent); same gate as /select/vmui
+	handle("/select/vmui", st(s.ui))
 	// The catch-all serves the same UI page /vmui and /select/vmui gate, so
 	// it carries the same role. It was the one registration in this function
 	// with no wrapper.
-	handle("/", rd(s.ui))
+	handle("/", st(s.ui))
 	handle("/select/logsql/query", rd(s.selectQuery))
 	handle("/select/sql", rd(s.sqlQuery))        // SQL SELECT subset (beyond VL)
 	handle("/select/vector", rd(s.vectorSearch)) // k-NN over embeddings (beyond VL)
@@ -741,8 +751,8 @@ func (s *Server) Handler() http.Handler {
 	// needs the query role like every other read route. Registered bare, it
 	// also skipped the method guard, the media-type allowlist and the body
 	// limit: an anonymous POST /_search returned another tenant's payloads.
-	handle("/_search", rd(s.esSearch))
-	handle("/_count", rd(s.esCount))
+	handle("/_search", es(s.esSearch))
+	handle("/_count", es(s.esCount))
 	// In router mode, writes forward to storage nodes (outermost, before the
 	// tenant/local path); reads fall through to withTenant -> federatedSelect.
 	// recoverPanic is outermost so one bad request can never take the server down.
