@@ -395,17 +395,93 @@ func TestAReplacedMachineDoesNotInheritTheOldFloor(t *testing.T) {
 	}
 }
 
-// An EMPTY replacement is a different case, and it is refused: see
-// TestAnEmptyReplicaIsNotServedAsAWholeAnswer. A machine holding nothing cannot
-// stand in for a shard a live sibling reports data for, however it got there.
-func TestAnEmptyReplacementIsRefusedRatherThanServed(t *testing.T) {
+// An empty replica is REPORTED, not refused, and that is a capability this
+// check does not have rather than one it chose not to use.
+//
+// The previous version refused a peer reporting zero while a live sibling's
+// mark was above zero. It was wrong twice over, and the two are opposite:
+//
+//   - it could not reach the case it was written for, because the own-floor
+//     arm returns first and a replica that RESTARTS onto an empty volume
+//     carries a new generation (see TestARestartedEmptyReplicaIsNotRefused);
+//   - and where it did fire it was wrong, because highWatermark() is a
+//     per-process running maximum that SURVIVES RETENTION, so a sibling's
+//     nonzero mark does not mean the shard currently holds anything.
+//
+// Catching a replica that lost its dataset means comparing what the replicas
+// actually HOLD. That is the digest and repair machinery, not a watermark.
+func TestAnEmptyReplicaIsReportedRatherThanRefused(t *testing.T) {
 	h := &shardHigh{}
 	members := []string{"http://a:1", "http://b:1"}
 	h.observe("http://a:1", "g1", 100, members)
 	behind, prev, certain := h.observe("http://b:1", "g1", 0, members)
-	if !behind || !certain || prev != 100 {
+	if !behind || prev != 100 {
 		t.Errorf("a replica reporting zero against a sibling at 100 gave "+
-			"behind=%v certain=%v prev=%d, want true true 100", behind, certain, prev)
+			"behind=%v prev=%d, want true and 100 -- it is still reported",
+			behind, prev)
+	}
+	if certain {
+		t.Errorf("certain=true, so this refuses the read. A sibling's mark is a " +
+			"running maximum that survives retention: it does not say the shard " +
+			"holds anything, so a peer at zero beside it is not evidence")
+	}
+}
+
+// A shard both of whose replicas legitimately hold nothing is not refused.
+//
+// Retention swept the shard; A has been up since before and its running maximum
+// is still 5000; B restarted afterwards and re-derived 0. Both would answer
+// with zero rows, and there is nothing wrong. The rule this replaces refused B
+// permanently -- and the floor only rises, so it never cleared.
+func TestAShardWhoseReplicasHoldNothingIsNotRefused(t *testing.T) {
+	a := newWMShard(t, 0, 5000) // running max from before retention swept
+	b := newWMShard(t, 0, 0)    // restarted after, re-derived nothing
+	ts := wmRouter(t, a.ts.URL, b.ts.URL)
+
+	if code, _, raw := hitsTotal(t, ts, "*"); code != 200 {
+		t.Fatalf("with A up: %d %s", code, raw)
+	}
+	a.dead.Store(true)
+	for i := 0; i < 4; i++ {
+		code, _, raw := hitsTotal(t, ts, "*")
+		if code != 200 {
+			t.Fatalf("read %d: replica B was refused %d. Both replicas hold "+
+				"nothing and the shard has nothing to give -- A's 5000 is a "+
+				"running maximum that outlived the data it counted: %s",
+				i, code, raw)
+		}
+	}
+}
+
+// A replica that RESTARTS onto an empty volume is served, and this test exists
+// to say so rather than to approve of it.
+//
+// It is the wrong answer at 200 the watermark cannot catch: the peer carries a
+// new generation, so its own floor re-bases and there is nothing left to
+// compare. The rule that claimed to catch it never reached this case at all --
+// the own-floor arm returns first -- and could not have been made to without
+// refusing the healthy shard in TestAShardWhoseReplicasHoldNothingIsNotRefused.
+//
+// The mechanism for it is the digest comparison in cluster_repair.go, which
+// asks what the replicas HOLD instead of what their clocks say.
+func TestARestartedEmptyReplicaIsNotRefused(t *testing.T) {
+	sh := newWMShard(t, 12, 2000)
+	ts := wmRouter(t, sh.ts.URL)
+
+	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 12 {
+		t.Fatalf("first read: %d total=%d %s", code, total, raw)
+	}
+	// It comes back on an empty volume: new process, nothing loaded.
+	sh.restart(0)
+	sh.hits.Store(0)
+
+	code, total, raw := hitsTotal(t, ts, "*")
+	if code != 200 {
+		t.Fatalf("a restarted peer was refused %d. A restart is not evidence "+
+			"of loss and refusing it outages a healthy cluster: %s", code, raw)
+	}
+	if total != 0 {
+		t.Errorf("total=%d, want 0", total)
 	}
 }
 
@@ -522,44 +598,6 @@ func TestAPeerWithNoGenerationIsReportedNotRefused(t *testing.T) {
 }
 
 // ---- the three the second reviewer proved, all of them mine ----
-
-// F1. A replica that has accepted NOTHING is not a whole answer.
-//
-// The extreme value of the exact defect this check exists to close, and the
-// check skipped it: `p.HighWatermark == 0` read a reported zero as "the peer
-// did not say" and returned before comparing anything. A replica that lost its
-// data reports 0, so the whole shard's rows went missing at HTTP 200.
-//
-// Absent and zero are different answers. The client already told them apart --
-// it parses the header only `if hw != ""` -- and PeerResponse threw the
-// distinction away by storing both as int64(0).
-//
-// Zero is unambiguous in a way that "lower than a sibling" is not: a node that
-// has accepted no data at all cannot be a correct replica of a shard that has
-// some. That is why this refuses and TestASiblingHoldingTheSameRowsIsNotRefused
-// does not.
-func TestAnEmptyReplicaIsNotServedAsAWholeAnswer(t *testing.T) {
-	leader := newWMShard(t, 12, 2000)
-	empty := newWMShard(t, 0, 0) // lost its data: nothing accepted, ever
-	ts := wmRouter(t, leader.ts.URL, empty.ts.URL)
-
-	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 12 {
-		t.Fatalf("with the leader up: %d total=%d %s", code, total, raw)
-	}
-	leader.dead.Store(true)
-
-	code, _, raw := hitsTotal(t, ts, "*")
-	if code == 200 {
-		t.Fatalf("a replica holding NO data answered 200 for a shard whose "+
-			"other replica held 12 rows: %s\n\nThat is the whole shard "+
-			"disappearing from the result with nothing to say so -- the worst "+
-			"case of the defect the watermark check was written for, and it was "+
-			"the one case the check returned early on.", raw)
-	}
-	if code != 503 {
-		t.Errorf("empty replica answered %d, want 503: %s", code, raw)
-	}
-}
 
 // F3. A sibling holding the SAME rows is not refused.
 //

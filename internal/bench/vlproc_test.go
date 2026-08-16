@@ -61,7 +61,11 @@ func newVLAt(t *testing.T, addr, dir string, extra ...string) *vlProc {
 	return &vlProc{bin: bin, dir: dir, addr: addr, url: "http://" + addr, extra: extra}
 }
 
-func (p *vlProc) start() error {
+func (p *vlProc) start() error { return p.startWithin(60 * time.Second) }
+
+// startWithin is start with the readiness limit as a parameter, so a test can
+// force the failure path without waiting a minute for it.
+func (p *vlProc) startWithin(limit time.Duration) error {
 	args := append([]string{
 		"-httpListenAddr=" + p.addr,
 		"-storageDataPath=" + p.dir,
@@ -73,7 +77,23 @@ func (p *vlProc) start() error {
 		return fmt.Errorf("start victoria-logs: %w", err)
 	}
 	p.cmd = cmd
-	return p.waitReady(60 * time.Second)
+	// STOPPED BY start ITSELF when readiness fails.
+	//
+	// cmd.Start() has already succeeded here: the child is running. Every call
+	// site registers its t.Cleanup(p.stop) or defer p.stop() on the line AFTER
+	// the t.Fatalf that fires on this error, so nothing was ever registered and
+	// the child outlived the test binary -- reparented to init, holding its
+	// port, serving from a directory the framework had already deleted. Proven
+	// by forcing the wait to time out: `pid 1560623 ppid 1 victoria-logs`.
+	//
+	// f3fc6e2 closed the zombie leak and left this one, which is the worse of
+	// the two: a zombie is a few bytes of kernel bookkeeping, this is a
+	// multi-gigabyte process with no parent left to kill it.
+	if err := p.waitReady(limit); err != nil {
+		p.stop()
+		return err
+	}
+	return nil
 }
 
 // stop kills this process by its own PID and reaps it. Never a pattern kill:
@@ -348,4 +368,73 @@ func TestStoppingVictoriaLogsReapsItAndClosesItsPipes(t *testing.T) {
 			"per-cycle growth, which is the unclosed pipes of a child that was "+
 			"killed but never waited for", cycles, fd, beforeFD)
 	}
+}
+
+// A child that starts but never becomes ready is killed by start itself.
+//
+// This is the leak f3fc6e2 did not close. cmd.Start() succeeding and the
+// readiness wait failing are different things, and between them sits a running
+// process that no call site had yet registered a stop for -- because every one
+// of them registers it on the line after the t.Fatalf that fires on the error.
+//
+// Forced by pointing the readiness poll at a port nothing answers on, with a
+// short limit, so the wait fails while the child is alive.
+func TestAChildThatNeverBecomesReadyIsStillKilled(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("/proc is where the child state is readable")
+	}
+	p := newVL(t, "127.0.0.1:19497")
+	if p == nil {
+		skipNoVL(t, "the unready-child gate")
+	}
+	// Point the readiness poll somewhere nothing will ever answer, so the wait
+	// fails with the child running.
+	p.url = "http://127.0.0.1:1"
+
+	before := childPIDs(t)
+	err := p.startWithin(1500 * time.Millisecond)
+	if err == nil {
+		t.Fatal("the readiness wait did not fail, so this test proves nothing")
+	}
+	if p.cmd != nil {
+		t.Errorf("start returned an error and left p.cmd set: %v", p.cmd.Process)
+	}
+	// Nothing new of ours is still alive.
+	for pid := range childPIDs(t) {
+		if !before[pid] {
+			t.Errorf("pid %d is still a live child after start failed. It has "+
+				"no parent left to kill it once this binary exits", pid)
+		}
+	}
+}
+
+// childPIDs is this process's live (non-zombie) children.
+func childPIDs(t *testing.T) map[int]bool {
+	t.Helper()
+	ents, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatalf("read /proc: %v", err)
+	}
+	me := strconv.Itoa(os.Getpid())
+	out := map[int]bool{}
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		b, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		s := string(b)
+		i := strings.LastIndexByte(s, ')')
+		if i < 0 || i+2 >= len(s) {
+			continue
+		}
+		f := strings.Fields(s[i+2:])
+		if len(f) >= 2 && f[0] != "Z" && f[1] == me {
+			out[pid] = true
+		}
+	}
+	return out
 }

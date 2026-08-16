@@ -1235,25 +1235,38 @@ func (h *shardHigh) observe(peer, gen string, hw int64, members []string) (behin
 		}
 	}
 
-	// A PEER THAT HAS ACCEPTED NOTHING, standing in for a shard that has data.
+	// THERE IS NO CROSS-REPLICA ZERO RULE, AND THERE CANNOT BE.
 	//
-	// Zero is unambiguous where "lower than a sibling" is not: a node holding
-	// no data at all cannot be a correct replica of a shard some live member
-	// reports data for. It is also the extreme case of the defect this whole
-	// check exists for -- the entire shard vanishing from the result at 200 --
-	// and the version that skipped every zero as "the peer did not say" let
-	// exactly that through.
-	if hw == 0 {
-		for _, m := range members {
-			if m == peer {
-				continue
-			}
-			if mk, ok := h.marks[m]; ok && mk.hw > 0 {
-				return true, mk.hw, true
-			}
-		}
-		return false, 0, gen != ""
-	}
+	// A previous version refused a peer reporting zero while a live sibling's
+	// mark was above zero -- "a node holding nothing cannot be a correct
+	// replica of a shard that has some". Both halves of that turned out to be
+	// wrong, in opposite directions:
+	//
+	//   - It never fired where it mattered. The own-floor arm above returns
+	//     first, so a peer that RESTARTED onto an empty volume -- new
+	//     generation, watermark zero -- took the restart branch and was served
+	//     at 200 with the shard's rows gone. Measured on the fixture in this
+	//     file: leader 12 rows at 2000, leader restarts with 0, third read
+	//     answers `200 total=0` and logs "a peer restarted". The extreme case
+	//     the rule was written for was the case it could not reach.
+	//
+	//   - And where it did fire it was wrong. `sibling.hw > 0` does not mean
+	//     the shard currently holds anything: highWatermark() is a per-process
+	//     RUNNING MAXIMUM that survives retention, which is the same property
+	//     this file already cites as the reason a cross-replica comparison
+	//     cannot be trusted. A shard both of whose replicas legitimately hold
+	//     nothing -- retention swept it, one replica restarted afterwards --
+	//     was refused 503 permanently.
+	//
+	// The two pull opposite ways: making the rule reachable after a restart
+	// worsens the false refusal, and dropping the comparison makes the missed
+	// case moot. Neither is decidable from one peer's answer.
+	//
+	// So the refusal is ONE observation: a process below its own floor inside
+	// its own generation. A replica that lost its dataset is real and is not
+	// caught here -- catching it means comparing what the replicas actually
+	// HOLD, which is the digest and repair machinery in cluster_repair.go, not
+	// a watermark.
 
 	// BELOW A SIBLING. Reported, never refused: see the doc comment.
 	for _, m := range members {

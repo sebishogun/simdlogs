@@ -7135,3 +7135,86 @@ The `sevNum > 0 && sevNum < len(severityNumberName)` bound in
 `otlpRecordFields` is shared by both paths, so closing it for one closed it for
 both. Recorded as checked rather than left on the list: a finding that is fixed
 and still listed costs the next reader the same measurement.
+
+## 102. Entry 97's zero rule is retracted: it could not reach its case, and fired on the wrong one
+
+A third reviewer took entries 97 and 98 apart. Two of its three blockers are the
+same rule, failing in opposite directions, and the conclusion is that the rule
+cannot exist.
+
+Entry 97 narrowed the watermark refusal to two observations and called the
+second one unambiguous: **"a peer reporting ZERO while a live member of the same
+shard has reported data"**, on the reasoning that "a node holding nothing cannot
+be a correct replica of a shard that has some". Both halves are wrong.
+
+**It never reached the case it was written for.** The own-floor arm returns
+first, so a peer that RESTARTS onto an empty volume -- new generation, watermark
+zero -- takes the restart branch and is tolerated. Measured on this file's own
+fixture: leader with 12 rows at watermark 2000, leader restarts reporting 0, and
+the third read answers
+
+	200 total=0
+	log: a peer restarted, so its watermark floor starts again ... watermark=0 previous_floor=2000
+
+The whole shard's rows gone, at 200, with nothing in `X-Simdlogs-Shards-Missing`
+or `-Lagging`. That is the extreme case the rule claimed to close, and the rule
+could not see it whenever the router had seen that peer before with data. The
+behaviour was also self-contradictory: the identical observation was refused for
+an UNSEEN peer and served for a seen-and-restarted one, and entry 97's table
+listed "zero beside a live sibling -> refused" and "a restart -> tolerated" as
+separate rows without saying which wins.
+
+**And where it did fire, it was wrong.** `sibling.hw > 0` does not mean the
+shard currently holds anything: `highWatermark()` is a per-process running
+maximum that SURVIVES RETENTION -- which is the property entry 97 itself cites,
+four paragraphs earlier, as the reason a cross-replica comparison cannot be
+trusted. A shard both of whose replicas legitimately hold nothing:
+
+	A: up since before retention swept, running max 5000, store now empty
+	B: restarted afterwards, re-derived 0
+
+	read 1 (A)  200 total=0
+	kill A
+	read 2 (B)  503  1 of 1 shards could not answer completely (0(watermark))
+	read 3, 4   503
+
+Both would have answered with zero rows. Nothing was missing. Aggravated by
+staleness: `askShard` returns the first replica that answers, so a sibling's
+mark is only refreshed when it serves a read -- a dead-but-still-configured
+peer's last mark refuses its live sibling until it leaves the member list.
+
+**The two pull opposite ways.** Making the rule reachable after a restart makes
+the false refusal worse; dropping the comparison makes the missed case moot.
+Neither is decidable from one peer's answer, for the reason already written
+down. So the rule is gone, and the refusal is now exactly one observation:
+
+	a process reporting below its OWN floor, inside its OWN generation.
+
+**What that costs, stated rather than implied.** A replica that lost its dataset
+and came back is served at 200 with the shard's rows absent. It is real, it is
+not caught here, and it cannot be caught here -- catching it means comparing
+what the replicas actually HOLD, which is the digest and repair machinery in
+`cluster_repair.go`. `TestARestartedEmptyReplicaIsNotRefused` exists to say so
+rather than to approve of it.
+
+**And a live orphan, which is the worse half of the leak entry 100's commit
+closed.** `start()` returns an error from `waitReady` -- by which point
+`cmd.Start()` has already succeeded and the child is running -- and every call
+site registers its `t.Cleanup(p.stop)` on the line AFTER the `t.Fatalf` that
+fires on that error. Forced by pointing the readiness poll at a dead port:
+
+	pid 1560623  ppid 1  victoria-logs -httpListenAddr=127.0.0.1:19496
+	              -storageDataPath=/tmp/TestReviewC.../001 -retentionPeriod=10y
+
+Reparented to init, holding its port, serving from a directory the framework had
+already deleted. A zombie is a few bytes of kernel bookkeeping; this is a
+multi-gigabyte process with no parent left to kill it. `start` stops its own
+child on the failure path now, so no call site can forget.
+
+The first version of the test for that did not start a child at all -- it called
+the readiness half directly -- and the mutation stayed green. It reddens now,
+naming the surviving pid.
+
+Three mutations, all red: the own-floor refusal, the sibling report, and
+**restoring the retracted zero rule**, which the two new fixtures catch. A
+retraction that nothing gates is a comment.
