@@ -77,3 +77,75 @@ func TestAPostFormBodySurvivesTheFanOut(t *testing.T) {
 		})
 	}
 }
+
+// A POST form does not overwrite the query the ROUTER built.
+//
+// http.Request.Clone copies Form and PostForm, so ParseForm inside the fan-out
+// returned immediately with the caller's parsed form still attached, and
+// replacing RawQuery with it discarded every rewrite the handler had just made.
+// The same question answered differently by method:
+//
+//   - | stats count() c   over 2 shards of 5 rows
+//     GET  -> {"c":"10"}
+//     POST -> {"c":"2"}     each shard ran the whole pipeline and the
+//     coordinator re-ran it over the two results
+//
+// Both at HTTP 200. And /select/logsql/query over a POST form was CORRECT
+// before the commit that introduced this -- the fix broke the one endpoint that
+// already worked.
+func TestAPostFormDoesNotOverwriteTheRoutersOwnQuery(t *testing.T) {
+	rows := func(n int, svc string) []string {
+		var out []string
+		for i := 0; i < n; i++ {
+			out = append(out, `{"_time":"2024-01-01T00:00:0`+string(rune('0'+i))+`Z","_msg":"m","svc":"`+svc+`"}`)
+		}
+		return out
+	}
+	a := realShard(t, rows(5, "a"))
+	b := realShard(t, rows(5, "b"))
+	ts := router(t, a.URL, b.URL)
+
+	const q = `* | stats count() c`
+	_, getRows, getRaw := queryRows(t, ts, q)
+
+	form := url.Values{"query": {q}}
+	resp, err := http.Post(ts.URL+"/select/logsql/query", "application/x-www-form-urlencoded",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	postBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if len(getRows) == 0 {
+		t.Fatalf("the GET answered nothing: %s", getRaw)
+	}
+	if got := strings.TrimSpace(string(postBody)); got != strings.TrimSpace(getRaw) {
+		t.Errorf("the same query answers differently by method:\n  GET  %s\n  POST %s",
+			strings.TrimSpace(getRaw), got)
+	}
+}
+
+// A form the router cannot parse is refused, not turned into the empty query.
+//
+// `return r` on a ParseForm error sent the shards a request with no query at
+// HTTP 200 -- the exact behaviour this function's doc comment names as the
+// reason it exists, left in place on the error path.
+func TestAnUnparseableFormIsRefusedRatherThanEmptied(t *testing.T) {
+	var seen []string
+	sh := echoQueryShard(t, &seen)
+	ts := router(t, sh.URL)
+
+	resp, err := http.Post(ts.URL+"/select/logsql/hits?step=1h",
+		"application/x-www-form-urlencoded", strings.NewReader("query=%zz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode/100 == 2 {
+		t.Errorf("an unparseable form answered %d: the shards were asked the empty "+
+			"query (%d reached them) %.200s", resp.StatusCode, len(seen), body)
+	}
+}

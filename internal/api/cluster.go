@@ -746,11 +746,48 @@ func withFormInURL(r *http.Request) *http.Request {
 	if strings.TrimSpace(ct) != "application/x-www-form-urlencoded" {
 		return r
 	}
-	if err := r.ParseForm(); err != nil || len(r.Form) == 0 {
+	if err := r.ParseForm(); err != nil {
+		// A form the router cannot parse is not a request it can fan out. This
+		// used to `return r`, which sent the shards the EMPTY query at HTTP 200
+		// -- the exact behaviour this function's own doc comment names as the
+		// reason it exists, left in place for the error path.
+		return nil
+	}
+	if len(r.Form) == 0 {
+		return r
+	}
+	// MERGED UNDER the query string, never over it.
+	//
+	// http.Request.Clone copies Form and PostForm. Every federated handler that
+	// rewrites the shard URL -- federatedSelect's plan, withoutLimits' facets
+	// bounds, federatedValueCounts -- clones the request first, so ParseForm
+	// here returns immediately with the CALLER's parsed form still attached, and
+	// replacing RawQuery with it discarded the rewrite.
+	//
+	// That made a POST form answer a different question than the same GET:
+	// `stats count()` over two shards of five rows answered 10 over GET and 2
+	// over POST, because each shard ran the whole pipeline and the coordinator
+	// re-ran it over the two results. It also handed the shards the caller's
+	// `limit=3` in place of the `limit=0` the facets path sets, so the cluster
+	// merged shard-local top-3s -- the defect 883508c exists to prevent.
+	//
+	// Worst of it: /select/logsql/query over a POST form was CORRECT before the
+	// commit that added this, and the commit message said so. A key already in
+	// the query string wins; the form only supplies what the URL does not have.
+	q := r.URL.Query()
+	added := false
+	for k, vs := range r.Form {
+		if _, ok := q[k]; ok {
+			continue
+		}
+		q[k] = vs
+		added = true
+	}
+	if !added {
 		return r
 	}
 	out := r.Clone(r.Context())
-	out.URL.RawQuery = r.Form.Encode()
+	out.URL.RawQuery = q.Encode()
 	return out
 }
 
@@ -1655,7 +1692,15 @@ const (
 func (s *Server) fanOutChecked(
 	w http.ResponseWriter, r *http.Request, path string, body []byte,
 ) ([]shardAnswer, http.ResponseWriter, bool) {
-	peers := s.fanOutPeers(withFormInURL(r), path, body)
+	fr := withFormInURL(r)
+	if fr == nil {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+			"simdlogs: the request body is not a readable form, so the query it "+
+				"carries cannot be sent to the shards. Asking them the empty query "+
+				"instead would answer a question you did not ask.")
+		return nil, w, false
+	}
+	peers := s.fanOutPeers(fr, path, body)
 
 	var missing []string
 	var incomplete []string

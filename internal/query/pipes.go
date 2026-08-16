@@ -74,12 +74,6 @@ func (p *StatsPipe) apply(rows []Row) []Row {
 	var order []string
 	var key []byte
 	for _, r := range rows {
-		// A row that does not CARRY every by-field is not a member of any group
-		// for it -- see rowFieldOK. Without this, absent and empty were the same
-		// value and the phantom group could rank first.
-		if !hasAllFields(r, p.By) {
-			continue
-		}
 		key = key[:0]
 		for _, f := range p.By {
 			key = append(key, rowField(r, f)...)
@@ -229,6 +223,16 @@ func accSample(e *statEntry, aggs []Agg, valOf func(j int) string, valOf2 func(j
 func statEntryRow(sp *StatsPipe, e *statEntry) Row {
 	fields := make([]Field, 0, len(sp.By)+len(sp.Aggs))
 	for j, f := range sp.By {
+		// An EMPTY by-value is omitted, not emitted as `f=""`.
+		//
+		// This is what the reference does, and it is the whole of the original
+		// defect: the cluster answered {"svc":"","c":"10"} where VictoriaLogs
+		// answers {"c":"10"}. A fix that DROPPED those rows instead was worse --
+		// it lost 10 of 19 rows and made the node and the cluster disagree in
+		// the other direction. The group is real; only its label was wrong.
+		if e.by[j] == "" {
+			continue
+		}
 		fields = append(fields, Field{f, e.by[j]})
 	}
 	for j := range sp.Aggs {
@@ -927,11 +931,16 @@ func rowFieldOK(r Row, key string) (string, bool) {
 	return "", false
 }
 
-// hasAllFields reports whether r carries every field in by. An empty `by` is
-// "one group over everything", which every row belongs to.
-func hasAllFields(r Row, by []string) bool {
+// allByFieldsEmpty reports whether every by-field of r is empty -- absent or
+// present-and-empty, which the reference treats as the SAME group.
+//
+// Measured against VictoriaLogs with one row at svc="c", two at svc="" and one
+// with no svc at all: `stats by (svc) count()` answers {"svc":"c","c":"1"} and
+// {"c":"3"}. The three empty-or-absent rows are ONE group, and its output row
+// omits the svc key rather than carrying svc="".
+func allByFieldsEmpty(r Row, by []string) bool {
 	for _, f := range by {
-		if _, ok := rowFieldOK(r, f); !ok {
+		if rowField(r, f) != "" {
 			return false
 		}
 	}
@@ -1011,8 +1020,14 @@ func (p *UniqPipe) apply(rows []Row) []Row {
 	seen := make(map[string]bool, len(rows))
 	out := rows[:0]
 	for _, r := range rows {
-		if !hasAllFields(r, p.By) {
-			continue // see rowFieldOK: absent is not a value
+		// The empty group produces no `uniq` entry.
+		//
+		// Measured against VictoriaLogs: `uniq by (svc)` over rows where ten
+		// carry no svc returns only the real values. stats and top DO emit that
+		// group -- top even ranks it first -- so this is a per-pipe rule and not
+		// a shared one, which is why it is written here rather than hoisted.
+		if len(p.By) > 0 && allByFieldsEmpty(r, p.By) {
+			continue
 		}
 		k := rowKey(r, p.By)
 		if seen[k] {
@@ -1044,9 +1059,6 @@ func (p *TopPipe) apply(rows []Row) []Row {
 	cnt := map[string]int{}
 	vals := map[string][]string{}
 	for _, r := range rows {
-		if !hasAllFields(r, p.By) {
-			continue // see rowFieldOK: absent is not a value
-		}
 		k := rowKey(r, p.By)
 		if cnt[k] == 0 {
 			v := make([]string, len(p.By))
@@ -1064,6 +1076,9 @@ func (p *TopPipe) apply(rows []Row) []Row {
 	for k, c := range cnt {
 		fields := make([]Field, 0, len(p.By)+1)
 		for i, f := range p.By {
+			if vals[k][i] == "" {
+				continue // see statEntryRow: the empty group carries no label
+			}
 			fields = append(fields, Field{f, vals[k][i]})
 		}
 		// VictoriaLogs names the column `hits`, and breaks count ties by the

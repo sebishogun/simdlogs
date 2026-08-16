@@ -66,53 +66,77 @@ func groupRows() []Row {
 	return rows
 }
 
-func TestARowWithoutTheGroupByFieldIsNotAGroup(t *testing.T) {
+// Every expectation here is MEASURED against the victoria-logs binary, on the
+// same shape: 4 rows at svc=c, 5 at svc=d, 2 at svc="" and 10 with no svc.
+//
+//   - | stats by (svc) count() c   {"svc":"d","c":"5"} {"svc":"c","c":"4"} {"c":"12"}
+//   - | top 5 by (svc)             {"hits":"12"} {"svc":"d","hits":"5"} {"svc":"c","hits":"4"}
+//   - | uniq by (svc)              {"svc":"c"} {"svc":"d"}
+//
+// and, with 1 at c / 2 at "" / 1 absent, `stats by (svc) count()` answers
+// {"svc":"c","c":"1"} and {"c":"3"}: absent and explicitly-empty are ONE group.
+//
+// Two wrong answers preceded this. The cluster labelled the group `svc:""`,
+// where the reference omits the key. The fix for THAT dropped the rows
+// entirely, which lost 10 of 19, made stats and top disagree with the reference
+// in the other direction, and made the node and the cluster disagree with each
+// other. The group is real, it merges with explicitly-empty, and only its label
+// was ever wrong.
+func TestTheEmptyGroupMatchesTheReference(t *testing.T) {
 	rows := groupRows()
 
 	t.Run("stats", func(t *testing.T) {
 		p := &StatsPipe{By: []string{"svc"}, Aggs: []Agg{{Kind: AggCount, Alias: "c"}}}
 		got := p.apply(rows)
-		// c(4), d(5) and the explicitly-empty group (2). NOT a group of 10.
+		if len(got) != 3 {
+			t.Fatalf("stats by svc produced %d groups, want 3: %s", len(got), renderGroups(got))
+		}
 		counts := map[string]string{}
 		for _, r := range got {
 			counts[rowField(r, "svc")] = rowField(r, "c")
 		}
-		if len(got) != 3 {
-			t.Fatalf("stats by svc produced %d groups, want 3 (c, d and the "+
-				"explicitly-empty one): %s", len(got), renderGroups(got))
-		}
-		for svc, want := range map[string]string{"c": "4", "d": "5", "": "2"} {
+		// The 2 explicitly-empty and the 10 absent are ONE group of 12, and its
+		// row carries NO svc field -- so it reads back under the "" key here.
+		for svc, want := range map[string]string{"c": "4", "d": "5", "": "12"} {
 			if counts[svc] != want {
-				t.Errorf("group %q counted %s, want %s (all: %s)", svc, counts[svc], want, renderGroups(got))
+				t.Errorf("group %q counted %s, want %s (all: %s)",
+					svc, counts[svc], want, renderGroups(got))
 			}
 		}
-		if counts[""] == "10" || counts[""] == "12" {
-			t.Errorf("the rows carrying no svc were folded into the empty-string "+
-				"group: %s", renderGroups(got))
+		// And the label is OMITTED, not emitted as svc="".
+		for _, r := range got {
+			if rowField(r, "c") != "12" {
+				continue
+			}
+			if _, carries := rowFieldOK(r, "svc"); carries {
+				t.Errorf("the empty group carries an svc field: %s", renderGroups(got))
+			}
 		}
 	})
 
 	t.Run("top", func(t *testing.T) {
-		p := &TopPipe{By: []string{"svc"}, N: 2}
+		p := &TopPipe{By: []string{"svc"}, N: 3}
 		got := p.apply(rows)
-		if len(got) == 0 {
-			t.Fatal("top by svc returned nothing")
+		if len(got) != 3 {
+			t.Fatalf("top by svc returned %d rows, want 3: %s", len(got), renderGroups(got))
 		}
-		// Whatever the ranking, the phantom 10 must not be in it.
-		for _, r := range got {
-			if rowField(r, "hits") == "10" {
-				t.Errorf("top by svc ranked the rows that carry no svc: %s", renderGroups(got))
-			}
+		// The empty group is the largest and the reference ranks it first.
+		if h := rowField(got[0], "hits"); h != "12" {
+			t.Errorf("top by svc ranks %s first, want the empty group at 12: %s",
+				h, renderGroups(got))
+		}
+		if _, carries := rowFieldOK(got[0], "svc"); carries {
+			t.Errorf("the empty group carries an svc field: %s", renderGroups(got))
 		}
 	})
 
 	t.Run("uniq", func(t *testing.T) {
 		p := &UniqPipe{By: []string{"svc"}}
 		got := p.apply(append([]Row(nil), rows...))
-		// c, d, "" -- three distinct values, and the ten absent rows are not a
-		// fourth.
-		if len(got) != 3 {
-			t.Errorf("uniq by svc returned %d values, want 3: %s", len(got), renderGroups(got))
+		// c and d only: the reference emits no uniq entry for the empty group.
+		if len(got) != 2 {
+			t.Errorf("uniq by svc returned %d values, want 2 (c and d): %s",
+				len(got), renderGroups(got))
 		}
 	})
 }
