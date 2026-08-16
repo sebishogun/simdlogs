@@ -5215,17 +5215,36 @@ fix.
   the code is rather than only in a commit message.
 
 Also corrected: `maxPeerQueryBytes` is 60 KiB of **encoded** parameters, and
-percent-encoding a LogsQL query roughly doubles it — measured boundary 30,720 raw /
-61,440 encoded still in the URL against 30,721 raw / 61,443 in the body, so the
-raw budget is exactly 30 KiB and the comment claimed 60.
+percent-encoding a LogsQL query roughly doubles it, so the raw budget is about
+half what the comment claimed.
 
-Two drafts of this number were wrong before that one. "30,001 against 31,001" is
-a 1,000-wide bracket, not a switch point. "30,719 / 61,439 in the URL against
-30,720 / 61,442 in the body" is one raw byte and two encoded bytes off, in the
-direction that mislabels the boundary case: the comparison is
-`len(enc) > maxPeerQueryBytes`, strict, so 61,440 stays in the URL, and 61,442
-is not an attainable length in this shape's sequence at all
-(…61,439, 61,440, 61,443…). `PeerUnavailable`'s "remedy —
+**Three drafts of the switch point were wrong, and the third argued the second
+was wrong for a reason that applied to itself.** "30,001 against 31,001" is a
+1,000-wide bracket, not a switch point. "30,719 / 61,439 in the URL against
+30,720 / 61,442 in the body" was called one raw byte and two encoded bytes off.
+Its replacement — "30,720 raw / 61,440 encoded still in the URL against 30,721 /
+61,443 in the body … 61,442 is not an attainable length in this shape's sequence
+at all (…61,439, 61,440, 61,443…)" — names four lengths this generator cannot
+emit, including both of its own published boundaries, and asserts a sequence
+containing a Δ1 and a Δ3 where the real step is a constant 4. `bigQuery` appends
+`,v` per iteration: +2 raw, +4 encoded, because `,` becomes `%2C`.
+
+Measured, by feeding each n to `withFormInURL` and recording which side it came
+back on — not by arithmetic, which is what produced all three wrong versions:
+
+| shape | last in URL | first in body |
+|---|---|---|
+| `query` alone | n=30722, raw 30,723, enc **61,437** | n=30723, raw 30,725, enc **61,441** |
+| `query` + `step=1h` | n=30718, raw 30,719, enc **61,437** | n=30719, raw 30,721, enc **61,441** |
+
+Attainable encoded lengths across the bound: …61,433, 61,437, 61,441, 61,445….
+`maxPeerQueryBytes` is 61,440 and the comparison is `len(enc) > maxPeerQueryBytes`,
+strict — but 61,438, 61,439 and 61,440 are not attainable in this shape, so the
+bound itself cannot be observed exactly with this generator and the switch is
+only ever seen as the gap between 61,437 and 61,441. A boundary quoted to the
+byte from a shape whose step is 4 is a boundary nobody measured.
+
+`PeerUnavailable`'s "remedy —
 another replica — is the one that can actually help" is false for the 431 that
 motivated the change: the refusal is deterministic and every replica gives the
 same answer; what the class buys is an accurate name. `docs/wrong.md` cited an
@@ -5372,11 +5391,30 @@ GET      shard received  limit=5&query=%2A     (unchanged)
 ```
 
 The answer stayed correct — `mergeRows` applies the bound from the original
-request — so this is blast radius, not a wrong number. One storage node, 20,000
-rows: `query=*` is **3,808,890 bytes** against **955** with `limit=5`, at
-190.4 B/row. Every shard streamed its whole matching set to the router, on the
-exact path POST exists for. The router buffers each shard body against a 256 MiB
-cap, so ~1.41M rows per shard before the read fails outright.
+request — so this is blast radius, not a wrong number.
+
+**The first published triple — 3,808,890 / 955 / 190.4 B/row — had no recorded
+fixture, and the number is a property of the rows.** Re-measured twice it gave
+3,493,317 / 877 / 174.7 and 3,762,650 / 944 / 188.1: same order, same
+conclusion, different digits every time, because nothing said what a row was.
+The fixture, written down so the number means something:
+
+```
+20,000 rows of NDJSON, 2,184,890 bytes in (109.2 B/row), one storage node:
+  {"_time":"2026-08-14T00:00:SS.mmmZ","_msg":"request N completed",
+   "level":"info","svc":"api","user":"uK"}     SS=i%60 mmm=i%1000 K=i%50
+
+  query=*          3,762,650 bytes   188.1 B/row out
+  query=*&limit=5        944 bytes
+  ratio            ~3,990x
+  peerMaxBodyBytes 268,435,456 -> ~1.43M rows per shard before the read fails
+```
+
+Every shard streamed its whole matching set to the router, on the exact path
+POST exists for. What is stable across all three measurements is the ratio —
+about four thousand — and the order of the per-row cost; the digits are not,
+and quoting them to seven figures without the fixture claimed a precision the
+measurement never had.
 
 Marked only when the plan deletes it now. `query` is not marked at all:
 `shardQueryURL` always `Set`s it, so it is always a URL key and the existing
@@ -5415,7 +5453,119 @@ carried none.
 Two stale claims corrected. `pack_test.go` still carried *"VL's `p` CONTAINS
 `_time`, `_stream_id` and `_stream`, and this server's does not"* — the sentence
 entry 59 was corrected to remove; `_stream` is on both and the gap is `_time`
-and `_stream_id`. And the switch point is **30,720 raw / 61,440 encoded still in
-the URL** against 30,721 / 61,443 in the body: the comparison is strict, so
-61,440 stays, and the previously-published 61,442 is not an attainable length in
-this shape's sequence at all.
+and `_stream_id`. The switch point published here was wrong for the third time
+and is corrected in entry 58 with the measurement that produced it.
+
+## 65. The fix for "an empty body is not two bodies" changed one arm of a switch, and the other arm made it a silent wrong number
+
+Entry 62 changed `body != nil` to `len(body) > 0` on the refusing arm of a
+two-arm switch, on the premise — correct — that `io.ReadAll` never returns nil.
+The premise falsifies the OTHER arm too, and that one was left as
+`body == nil`. For an empty body `len(body) == 0` **and** `body != nil`, so
+**neither arm ran**: the switch was non-exhaustive at exactly the value the
+commit was about. `withFormInURL` has already executed `out.URL.RawQuery = ""`
+by then, so the shard was handed an empty query string and an empty body.
+
+Measured, spy shard answering `count:3` when it sees `q` and `count:1000` when
+it does not:
+
+```
+POST /_count?q=<1 KiB filter>   form content type, no body
+  -> 200 {"count":3}      shard saw q of 1025 bytes    correct
+POST /_count?q=<70 KiB filter>  same headers, no body
+  -> 200 {"count":1000}   shard saw q of 0 bytes       WRONG, silent
+```
+
+A/B with that one line reverted to `body != nil`: the 70 KiB case answers 400.
+**The fix turned a loud refusal into a silent wrong number at exactly the size
+the large-form path exists for.** Also reproduces with
+`application/x-www-form-urlencoded; charset=UTF-8` and `Content-Length: 0`.
+
+The comment three lines above it states the consequence verbatim — *"dropping
+it would hand the shard neither, and the answer would be a smaller one at HTTP
+200"* — and so does entry 62. `TestAnEmptyBodyIsNotTwoBodies` passed at that
+commit while the shard was asked nothing: it asserted `!= 400` and the absence
+of one phrase, and neither is affected by what the shard receives. It now
+asserts the shard was asked the caller's query, and the non-exhaustive switch
+reddens it.
+
+The switch is gone. One `if formBody != nil` with the length test inside it is
+total in `len(body)` by construction, which is the property that was missing.
+
+## 66. Gating on the content type did not remove the six-vs-six split; it moved it one character along
+
+Entry 64 closed with *"it parses only a form content type now and all twelve
+answer 200"*. Measured on the neighbouring content type,
+`application/x-www-form-urlencoded; charset` — jQuery's default header with the
+value lost — it was **7 refused / 5 answered**:
+
+```
+query 200 | hits 400 | facets 200 | field_names 400 | field_values 400
+stream_field_names 400 | stream_field_values 400 | streams 400 | stream_ids 400
+stats_query 200 | stats_query_range 200 | sql 200
+```
+
+`mime.ParseMediaType` returns the media type **and** `ErrInvalidMediaParameter`,
+so `parsePostForm` reads and parses the body perfectly and `ParseForm` returns
+the correct values with a non-nil error. `isFormPost` accepts; `withoutLimits`
+then refuses a form it has just parsed correctly. Whether it refuses at all
+depends on whether an earlier `FormValue` primed `r.PostForm` — the same
+argument-evaluation-order accident entry 64 said it had removed, now covering
+five routes.
+
+The obvious repair is the wrong one. `errors.Is(err, mime.ErrInvalidMediaParameter)`
+and carry on looks right and is not, because `parsePostForm` keeps the header's
+error and **discards** `url.ParseQuery`'s:
+
+```
+ct "...urlencoded; charset", body "query=%zz&limit=2"
+  err      = mime: invalid media parameter     the body error is gone
+  PostForm = map[limit:[2]]                    `query` is gone with it
+```
+
+A dropped `query` forwarded at HTTP 200 — the defect class, reintroduced by the
+fix for it. So the header is CORRECTED before parsing instead
+(`normalizeFormContentType`), which restores the precedence: `ParseForm` then
+fails on `%zz` and the request is refused, naming the body.
+
+`withFormInURL` carried a second copy of `isFormPost`'s rule and disagreed with
+it on what a `ParseForm` error means, which is why `hits` was the last route
+still answering 400. It calls the predicate now.
+
+## 67. A header fault reported as a shard fault, and a counter that counted its own failures
+
+Three smaller findings from the same round.
+
+**The diagnosis regression.** `POST /select/logsql/field_values`,
+`Content-Type: text/plain; charset`, parameters in the body. Before the content
+-type gate: `400 this request's Content-Type ("text/plain; charset") could not
+be parsed`. After it, against real storage nodes:
+`503 2 of 2 shards could not answer completely (0(rejected),1(rejected))`.
+Consistent across the twelve routes, and it sends an operator to inspect the
+storage nodes for a fault in their own request's header. A body under a content
+type no form parser will read is now refused at the router on all twelve,
+naming the Content-Type — `/select/sql` included, which reached its own "SQL
+must start with SELECT" on the empty string and blamed a statement the caller
+did send.
+
+**`carried` counted failures as successes.** `carried.Add(1)` sat after a
+`t.Errorf`, and `t.Errorf` does not stop a subtest. Under a mutation appending
+one byte to every shard query, all twelve subtests failed AND the summary line
+printed *"12 of 46 federated reads carried a 1200001-byte query"* — asserting
+the thing that had just failed. It reads `12 of 14` now (the federated count,
+not every route the mux registers) and the guard fires at 1.
+
+**`limitImmune` was a reader that gated nothing.** Entry 64 turned a struct
+field with no reader into a field with a reader — and deleting the three lines
+changed no result, because facets' shard `limit` is `0` and the assertion looked
+for `limit=2`. A field with no reader had become a reader with no effect. It is
+`limitSetTo string` now and asserts what the shard WAS told (`limit=0`), which
+reddens when the plan stops setting the unlimited value.
+
+**The shape, twice more.** Two of the three defects in entries 65 and 66 are the
+previous round's fixes, and both were shipped with a test that passed through
+them. The round before that said the same. What distinguishes the fixes that
+held from the ones that did not is not care taken: it is whether the assertion
+names what the SHARD RECEIVED. Every test that asserted a status code passed
+through its own defect; every test that asserted the shard's parameter set
+caught it.

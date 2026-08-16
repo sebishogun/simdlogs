@@ -371,6 +371,7 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 	// ParseForm and swallows the error before this runs. Gating on the content
 	// type makes all twelve agree, and agree with a single node.
 	if isFormPost(r) {
+		normalizeFormContentType(r)
 		if err := r.ParseForm(); err != nil {
 			// A form this node cannot parse -- but NOT necessarily a bad query
 			// string. ParseForm also fails on a malformed Content-Type, because
@@ -443,6 +444,52 @@ func isFormPost(r *http.Request) bool {
 		ct = ct[:i]
 	}
 	return strings.TrimSpace(ct) == "application/x-www-form-urlencoded"
+}
+
+// normalizeFormContentType drops unparseable parameters from a form request's
+// Content-Type, in place, so ParseForm's error is about the BODY and nothing
+// else.
+//
+// `application/x-www-form-urlencoded; charset` -- jQuery's default spelling
+// with the value lost -- is a valid media type with an invalid parameter.
+// mime.ParseMediaType returns BOTH the correct media type and
+// ErrInvalidMediaParameter, so net/http's parsePostForm reads and parses the
+// body perfectly and then returns the header's error anyway. withoutLimits
+// refused a form it had just parsed correctly, and only on the routes that
+// reach it -- so gating on the content type moved the six-vs-six split to the
+// neighbouring content type rather than removing it. Measured, body
+// `query=%2A&field=level&limit=2`, `Content-Type: ...urlencoded; charset`:
+//
+//	/select/logsql/query        200  shard: field=level limit=2 query=*
+//	/select/logsql/field_values 400  shard never asked
+//
+// Excusing the error instead -- errors.Is(err, mime.ErrInvalidMediaParameter)
+// and carry on -- is the version that looks right and is not. parsePostForm
+// keeps the header's error and DISCARDS url.ParseQuery's, so a request that is
+// malformed in both halves reports only the header:
+//
+//	ct "...urlencoded; charset", body "query=%zz&limit=2"
+//	  err = mime: invalid media parameter        the body error is gone
+//	  PostForm = map[limit:[2]]                  `query` is gone with it
+//
+// That is a dropped query forwarded at HTTP 200. Correcting the header first
+// keeps the precedence: ParseForm then fails on `%zz` and the request is
+// refused, and refuseUnparseableQuery names the body, which is the half that
+// is wrong.
+//
+// In place, and not restored afterwards. isFormPost already reads this header
+// by stripping at the first `;`, so the router has decided what it means; the
+// clone and the error path both then see the header the router acted on.
+func normalizeFormContentType(r *http.Request) {
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		return
+	}
+	mt, _, err := mime.ParseMediaType(ct)
+	if err == nil || mt == "" {
+		return
+	}
+	r.Header.Set("Content-Type", mt)
 }
 
 // refuseUnparseableQuery answers the caller when withoutLimits could not read

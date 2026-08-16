@@ -184,9 +184,12 @@ func TestALimitInAPostFormDoesNotReachTheShards(t *testing.T) {
 		// and removing it makes timeFacet materialize every matching row --
 		// measured at 640,000 rows / 54.9 MB / 482 ms / +496 MiB on one shard.
 		forwarded []string
-		// limitImmune marks a row whose `limit` half cannot fail, because this
-		// endpoint's plan SETS the key rather than deleting it.
-		limitImmune bool
+		// limitSetTo is the value this endpoint's plan SETS `limit` to, for the
+		// endpoints that set it rather than deleting it. Non-empty switches the
+		// `limit` half of the check from "the caller's value did not come
+		// through" -- which is vacuous when the value that DOES come through is
+		// a different one -- to "the shard was told exactly this".
+		limitSetTo string
 	}{
 		{path: "/select/logsql/field_values", params: "field=user&limit=2"},
 		{path: "/select/logsql/field_names", params: "limit=2"},
@@ -201,9 +204,9 @@ func TestALimitInAPostFormDoesNotReachTheShards(t *testing.T) {
 		// max_values_per_field half, which is real, and labelled so the pass
 		// is not read as coverage of the limit half.
 		{path: "/select/logsql/facets", params: "limit=2",
-			forwarded: []string{"max_values_per_field"}, limitImmune: true},
+			forwarded: []string{"max_values_per_field"}, limitSetTo: "0"},
 		{path: "/select/logsql/facets", params: "limit=2&max_values_per_field=2",
-			forwarded: []string{"max_values_per_field"}, limitImmune: true},
+			forwarded: []string{"max_values_per_field"}, limitSetTo: "0"},
 		{path: "/select/logsql/field_values", params: "field=user&max_values_per_field=7"},
 	} {
 		t.Run(ep.path+"?"+ep.params, func(t *testing.T) {
@@ -238,18 +241,28 @@ func TestALimitInAPostFormDoesNotReachTheShards(t *testing.T) {
 			// And a bound the plan STRIPS is not passed through. Equality alone
 			// would be satisfied by both methods being wrong together.
 			//
-			// limitImmune skips the `limit` half where the plan SETS the key
-			// rather than deleting it, so it was never in `extra` and the row
-			// measures nothing about this defect. It was a struct field with no
-			// reader before -- "labelled rather than left to read as coverage"
-			// where the label was a field nothing consulted, which the repo's
-			// own unwired gate cannot see because it skips _test.go.
+			// Where the plan SETS `limit` rather than deleting it, the check
+			// is what the shard WAS told, not what it was not.
+			//
+			// facets sets limit=0, so `Contains(gotPost, "limit=2")` is false
+			// however the router behaves. The first version of this label was
+			// a `limitImmune bool` that skipped a check which never fired --
+			// deleting the three lines changed no result. A field with no
+			// reader had become a reader with no effect, which is the same
+			// defect one step along, and the repo's unwired gate cannot see
+			// it because that gate skips _test.go.
 			for _, k := range []string{"limit", "max_values_per_field"} {
 				want := form.Get(k)
 				if want == "" || want == "0" || slices.Contains(ep.forwarded, k) {
 					continue
 				}
-				if k == "limit" && ep.limitImmune {
+				if k == "limit" && ep.limitSetTo != "" {
+					if !strings.Contains(gotPost, k+"="+ep.limitSetTo) {
+						t.Errorf("the plan sets %s=%s for this endpoint and the shard "+
+							"was told %s instead: an unlimited value that stops being "+
+							"sent is a shard-local top-N by another route", k,
+							ep.limitSetTo, gotPost)
+					}
 					continue
 				}
 				if strings.Contains(gotPost, k+"="+want) {
@@ -455,8 +468,11 @@ func TestTheRefusalNamesTheHalfThatIsUnreadable(t *testing.T) {
 //
 // The answer stayed correct -- mergeRows applies the bound from the original
 // request -- so this was blast radius, not a wrong number: one storage node,
-// 20,000 rows, `query=*` is 3,808,890 bytes against 955 with `limit=5`, at
-// 190.4 B/row. Every shard streamed its whole matching set to the router, on
+// 20,000 rows of ~109 B NDJSON, `query=*` is about 3.76 MB against 944 bytes
+// with `limit=5` -- roughly four thousand times the body, and the ratio is the
+// part that reproduces (see docs/wrong.md entry 63 for the fixture; without one
+// the same claim measured 3,808,890, 3,493,317 and 3,762,650 on three runs).
+// Every shard streamed its whole matching set to the router, on
 // the exact path POST exists for.
 func TestAShardLimitThePlanKeepsIsNotSuppressedByAPostForm(t *testing.T) {
 	for _, tc := range []struct {
@@ -515,7 +531,8 @@ func TestAShardLimitThePlanKeepsIsNotSuppressedByAPostForm(t *testing.T) {
 // io.ReadAll(r.Body) -- which never returns nil, because an empty body is an
 // empty non-nil slice. Measured, `POST /_count?q=<70 KiB>` with a form content
 // type and no body at all: 200 before, 400 after, with a message saying the
-// request carried both a body of its own and a form.
+// request carried both a body of its own and a query string too long for a
+// shard request line.
 func TestAnEmptyBodyIsNotTwoBodies(t *testing.T) {
 	sh := newRecordingShard(t)
 	ts := wmRouter(t, sh.ts.URL)
@@ -542,6 +559,25 @@ func TestAnEmptyBodyIsNotTwoBodies(t *testing.T) {
 	if resp.StatusCode == 400 {
 		t.Errorf("answered 400: %s", b)
 	}
+	// And the shard was ASKED it.
+	//
+	// "not 400" is the smaller half of the claim, and stopping there is what
+	// let the fix ship broken: the switch below the guard was corrected on one
+	// arm only, so `len(body)==0 && body!=nil` -- the value this very test
+	// sends -- matched NEITHER. withFormInURL had already cleared RawQuery, so
+	// the shard was handed an empty query string and an empty body, and
+	// answered about every row it holds at HTTP 200. Measured against a shard
+	// that answers 3 when it sees the filter and 1000 when it does not:
+	// 200 {"count":1000} with the `body == nil` arm, 200 {"count":3} with
+	// `len(body) == 0`. A status code cannot tell those apart.
+	got, asked := sh.askedES()
+	if !asked {
+		t.Fatalf("the shard was never asked anything: %d %s", resp.StatusCode, b)
+	}
+	if got != q {
+		t.Errorf("the shard was asked a %d-byte query, the caller sent %d:\n  got  %.60q\n  want %.60q",
+			len(got), len(q), got, q)
+	}
 }
 
 // All twelve federated reads answer a malformed Content-Type the same way.
@@ -559,16 +595,178 @@ func TestAnEmptyBodyIsNotTwoBodies(t *testing.T) {
 // facets escaped only by argument-evaluation order -- maxValuesParam primes
 // ParseForm and swallows the error before withoutLimits runs -- which is not a
 // property anyone chose.
+// The FORM spelling is tried too, and it is the one the first fix missed.
+//
+// `application/x-www-form-urlencoded; charset` is a valid media type with an
+// invalid parameter -- jQuery's default header with the value lost. Gating
+// withoutLimits on isFormPost did not remove the six-vs-six split; it moved it
+// here, where it was 7 refused / 5 answered, because ParseForm parses the body
+// perfectly and returns the header's error anyway. Trying only
+// `text/plain; charset` is trying the one content type the fix routes around.
 func TestAMalformedContentTypeAnswersTheSameOnEveryFederatedRead(t *testing.T) {
-	var codes []string
+	const form = "application/x-www-form-urlencoded"
+	for _, ct := range []string{
+		"text/plain; charset",
+		form + "; charset",
+		form + "; charset=UTF-8", // well-formed: the baseline the others must match
+		form + " ;charset",
+	} {
+		t.Run(ct, func(t *testing.T) {
+			var codes []string
+			for _, rt := range surfaceRoutes() {
+				if rt.kind != federated || rt.write || rt.body != "" {
+					continue
+				}
+				sh := newRecordingShard(t)
+				ts := wmRouter(t, sh.ts.URL)
+
+				req, err := http.NewRequest("POST", ts.URL+rt.path+"?"+rt.query, strings.NewReader(""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Content-Type", ct)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				codes = append(codes, fmt.Sprintf("%s=%d", rt.path, resp.StatusCode))
+				if resp.StatusCode == 400 {
+					t.Errorf("%s answers 400 to Content-Type %q on a request whose query "+
+						"string parses; other federated reads answer 200 to the same "+
+						"request: %s", rt.path, ct, b)
+				}
+			}
+			if len(codes) < 10 {
+				t.Fatalf("only %d federated reads were tried: %v", len(codes), codes)
+			}
+			t.Logf("%d routes: %v", len(codes), codes)
+		})
+	}
+}
+
+// A malformed media PARAMETER does not change what the shard is asked.
+//
+// Not a status code: the split this replaces was visible as one, but the
+// failure that matters is a shard sent a different question. The well-formed
+// `; charset=UTF-8` spelling is the baseline, and every other spelling of the
+// same header must produce the identical shard parameter set.
+//
+// The body carries the parameters, which is the case a header fault can
+// actually corrupt -- a router that gives up on the header forwards whatever
+// survived, and `query` is exactly what does not survive a discarded body
+// error.
+func TestAMalformedMediaParameterDoesNotChangeWhatTheShardIsAsked(t *testing.T) {
+	const form = "application/x-www-form-urlencoded"
+	const body = "query=%2A&field=level&limit=2"
+
+	ask := func(t *testing.T, path, ct string) (int, string, string) {
+		t.Helper()
+		sh := newRecordingShard(t)
+		ts := wmRouter(t, sh.ts.URL)
+		req, err := http.NewRequest("POST", ts.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", ct)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		q, _ := sh.asked()
+		return resp.StatusCode, q, sh.bounds()
+	}
+
+	for _, path := range []string{
+		"/select/logsql/query",
+		"/select/logsql/field_values",
+		"/select/logsql/field_names",
+		"/select/logsql/facets",
+		"/select/logsql/streams",
+		"/select/logsql/stream_ids",
+	} {
+		t.Run(path, func(t *testing.T) {
+			wantCode, wantQ, wantB := ask(t, path, form+"; charset=UTF-8")
+			for _, ct := range []string{form, form + "; charset", form + " ;charset"} {
+				gotCode, gotQ, gotB := ask(t, path, ct)
+				if gotCode != wantCode || gotQ != wantQ || gotB != wantB {
+					t.Errorf("Content-Type %q diverges from the well-formed spelling:\n"+
+						"  got  %d query=%q %s\n  want %d query=%q %s",
+						ct, gotCode, gotQ, gotB, wantCode, wantQ, wantB)
+				}
+			}
+		})
+	}
+}
+
+// A body that will not parse is still refused, and is named as the body.
+//
+// This is the case that makes excusing ErrInvalidMediaParameter wrong rather
+// than merely loose: net/http's parsePostForm keeps the header's error and
+// DISCARDS url.ParseQuery's, so a request malformed in both halves reports
+// only the header while `query` has silently vanished from the parsed form.
+// Correcting the header first restores the precedence.
+func TestAMalformedBodyIsStillRefusedUnderAMalformedMediaParameter(t *testing.T) {
+	const form = "application/x-www-form-urlencoded"
+	for _, ct := range []string{form, form + "; charset"} {
+		sh := newRecordingShard(t)
+		ts := wmRouter(t, sh.ts.URL)
+		req, err := http.NewRequest("POST", ts.URL+"/select/logsql/field_values",
+			strings.NewReader("query=%zz&field=level&limit=2"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", ct)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Errorf("Content-Type %q, body `query=%%zz`: answered %d, want 400 -- "+
+				"the query the caller sent does not parse, and forwarding what "+
+				"survived asks the shards a question with no filter in it: %s",
+				ct, resp.StatusCode, b)
+		}
+		if !strings.Contains(string(b), "request body") {
+			t.Errorf("Content-Type %q: the refusal names %q, and the half that is "+
+				"wrong is the body", ct, string(b))
+		}
+		if q, asked := sh.askedES(); asked {
+			t.Errorf("Content-Type %q: the shard was asked %q despite the refusal", ct, q)
+		}
+	}
+}
+
+// A body the router cannot read is refused, on EVERY federated read, naming
+// the Content-Type.
+//
+// `POST /select/logsql/field_values` with `Content-Type: text/plain; charset`
+// and `query=level%3Aerror&field=user&limit=5` in the body: the parameters are
+// in a body no form parser will touch, so the shards would be asked the URL
+// query -- which is empty. Against real storage nodes that came back as
+//
+//	503 2 of 2 shards could not answer completely (0(rejected),1(rejected))
+//
+// which sends an operator to inspect the storage nodes for a fault in their own
+// request's header. Twelve identical 400s naming the Content-Type is the answer
+// that is both consistent across the routes and true about the cause.
+//
+// Asserted on the MESSAGE as well as the code, because 400 alone was already
+// the answer on six routes for the wrong reason.
+func TestAnUnreadableBodyIsRefusedByEveryFederatedReadNamingTheHeader(t *testing.T) {
+	const body = "query=level%3Aerror&field=user&limit=5"
+	tried := 0
 	for _, rt := range surfaceRoutes() {
 		if rt.kind != federated || rt.write || rt.body != "" {
 			continue
 		}
 		sh := newRecordingShard(t)
 		ts := wmRouter(t, sh.ts.URL)
-
-		req, err := http.NewRequest("POST", ts.URL+rt.path+"?"+rt.query, strings.NewReader(""))
+		req, err := http.NewRequest("POST", ts.URL+rt.path, strings.NewReader(body))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -577,16 +775,24 @@ func TestAMalformedContentTypeAnswersTheSameOnEveryFederatedRead(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		codes = append(codes, fmt.Sprintf("%s=%d", rt.path, resp.StatusCode))
-		if resp.StatusCode == 400 {
-			t.Errorf("%s answers 400 to a malformed Content-Type whose query string "+
-				"parses; six other federated reads answer 200 to the same request",
-				rt.path)
+		tried++
+		if resp.StatusCode != 400 {
+			t.Errorf("%s answered %d to parameters in a body under a non-form "+
+				"Content-Type; the shards were asked the empty URL query: %.200s",
+				rt.path, resp.StatusCode, b)
+			continue
+		}
+		if !strings.Contains(string(b), "Content-Type") {
+			t.Errorf("%s refused without naming the Content-Type, which is the half "+
+				"that is wrong: %.200s", rt.path, b)
+		}
+		if q, asked := sh.askedES(); asked {
+			t.Errorf("%s refused and still asked the shard %q", rt.path, q)
 		}
 	}
-	if len(codes) < 10 {
-		t.Fatalf("only %d federated reads were tried: %v", len(codes), codes)
+	if tried < 10 {
+		t.Fatalf("only %d federated reads were tried", tried)
 	}
-	t.Logf("%d routes: %v", len(codes), codes)
 }

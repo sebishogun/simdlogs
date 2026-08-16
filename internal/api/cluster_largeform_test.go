@@ -36,6 +36,21 @@ type recordingShard struct {
 	q  []string
 	lm []string
 	bd []string
+	// esq is the Elasticsearch spelling of the query parameter. /_count and
+	// /_search send `q`, not `query`, so a shard asked nothing at all on those
+	// routes is indistinguishable from a shard asked correctly if only `query`
+	// is recorded -- both are "".
+	esq []string
+}
+
+// askedES is the last `q` the shard was asked, and whether it was asked at all.
+func (sh *recordingShard) askedES() (string, bool) {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if len(sh.esq) == 0 {
+		return "", false
+	}
+	return sh.esq[len(sh.esq)-1], true
 }
 
 // bounds is the pair of result-shaping parameters the shard was asked for, as
@@ -59,6 +74,7 @@ func newRecordingShard(t *testing.T) *recordingShard {
 		_ = r.ParseForm()
 		sh.mu.Lock()
 		sh.q = append(sh.q, r.FormValue("query"))
+		sh.esq = append(sh.esq, r.FormValue("q"))
 		sh.lm = append(sh.lm, r.FormValue("limit"))
 		sh.bd = append(sh.bd, "limit="+r.FormValue("limit")+
 			" max_values_per_field="+r.FormValue("max_values_per_field"))
@@ -174,27 +190,42 @@ func TestEveryFederatedReadCarriesALargeQuery(t *testing.T) {
 				t.Fatalf("%s answered 200 without asking the shard anything", rt.path)
 			}
 			if got != want {
+				// return, not a bare Errorf. t.Errorf does not stop the
+				// subtest, so the count below ran anyway: a mutation that
+				// appended one byte to every shard query failed all twelve
+				// AND reported "12 of 14 carried the query", asserting the
+				// thing that had just failed.
 				t.Errorf("the shard was asked %d bytes, the caller sent %d",
 					len(got), len(want))
+				return
 			}
-			// Counted only on the routes that actually carried it. `n++`
-			// before the skip made n == 14 always, so the guard below could
-			// never fire and the log line said fourteen carried a query that
-			// twelve carried.
+			// Counted only on the routes that actually carried it, unchanged.
+			// `n++` before the skip made n == 14 always, so the guard below
+			// could never fire and the log line said fourteen carried a query
+			// that twelve carried.
 			carried.Add(1)
 		})
 	}
 	// The count is part of the assertion: a classification change that empties
 	// this loop would otherwise pass in silence.
+	//
+	// Against the FEDERATED count, not len(surfaceRoutes()) -- that is every
+	// path the mux registers, so the line read "12 of 46" and invited the
+	// reader to conclude thirty-four federated reads were skipped.
+	nFederated := 0
+	for _, rt := range surfaceRoutes() {
+		if rt.kind == federated && !rt.write {
+			nFederated++
+		}
+	}
 	if n := carried.Load(); n < 12 {
-		t.Errorf("only %d federated reads carried the query; surfaceRoutes "+
-			"classifies fourteen, two of which have a JSON body and are skipped "+
-			"with the reason. A hand-kept list drifting to nine is what this test "+
-			"replaced, and a count that includes the skips cannot see that happen "+
-			"again", n)
+		t.Errorf("only %d of %d federated reads carried the query; two have a JSON "+
+			"body and are skipped with the reason. A hand-kept list drifting to "+
+			"nine is what this test replaced, and a count that includes the skips "+
+			"-- or the failures -- cannot see that happen again", n, nFederated)
 	} else {
 		t.Logf("%d of %d federated reads carried a %d-byte query; the rest have a "+
-			"JSON body", n, len(surfaceRoutes()), len(q))
+			"JSON body", n, nFederated, len(q))
 	}
 }
 

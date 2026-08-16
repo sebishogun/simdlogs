@@ -476,10 +476,14 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 	// the same request over GET still carried it.
 	//
 	// The answer stayed correct -- mergeRows applies the bound from the
-	// original request -- so this was blast radius, not a wrong number: one
-	// storage node, 20,000 rows, `query=*` is 3,808,890 bytes against 955 with
-	// `limit=5`. Every shard streamed its whole matching set to the router on
-	// the exact path POST exists for.
+	// original request -- so this was blast radius, not a wrong number. One
+	// storage node, 20,000 rows of ~109 B NDJSON, `query=*` against
+	// `query=*&limit=5` measured at about 3.76 MB against 944 bytes: roughly
+	// four thousand times the body. The RATIO is the stable part; the exact
+	// bytes are a property of the fixture, which is written down in
+	// docs/wrong.md entry 63 because three measurements of this without one
+	// gave three different seven-figure numbers. Every shard streamed its whole
+	// matching set to the router on the exact path POST exists for.
 	//
 	// `query` is NOT marked: shardQueryURL always Sets it, so it is always a
 	// URL key and the "already in the query" rule covers it. Marking it was
@@ -801,16 +805,17 @@ const maxPeerQueryBytes = 60 << 10
 // and, when the parameters are too large for a request line, the form body the
 // peer request must carry instead.
 func withFormInURL(r *http.Request) (*http.Request, []byte) {
-	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+	// isFormPost, not a second copy of its rule. This function used to inline
+	// the same method check and strip-at-`;` comparison, and the two copies
+	// still disagreed -- not about which requests are forms, but about what a
+	// ParseForm error means. `...urlencoded; charset` parsed here and was
+	// refused in withoutLimits, so /select/logsql/hits answered 400 to the
+	// request eleven other federated reads answered 200. Both surfaces now ask
+	// one predicate and correct the header the same way before parsing.
+	if !isFormPost(r) {
 		return r, nil
 	}
-	ct := r.Header.Get("Content-Type")
-	if i := strings.IndexByte(ct, ';'); i >= 0 {
-		ct = ct[:i]
-	}
-	if strings.TrimSpace(ct) != "application/x-www-form-urlencoded" {
-		return r, nil
-	}
+	normalizeFormContentType(r)
 	if err := r.ParseForm(); err != nil {
 		// A form the router cannot parse is not a request it can fan out. This
 		// used to `return r`, which sent the shards the EMPTY query at HTTP 200
@@ -1818,9 +1823,78 @@ const (
 // this function would be overtaken by the handler's first Write, which sends
 // 200. Returning the writer makes the substitution visible at the call site
 // rather than hidden in a wrapper the handler does not know about.
+// unreadableBody reports whether r carries a body this router cannot read as a
+// form -- a non-empty body under a content type that is not
+// application/x-www-form-urlencoded.
+//
+// It consumes at most one byte, which is safe only for the routes that do not
+// forward the caller's body. fanOutChecked calls it exactly there, under
+// body == nil.
+//
+// Content-Length is not the test: a chunked request declares -1, and a client
+// posting a form under the wrong header is exactly the client whose framing
+// cannot be assumed. One byte read answers the question for every framing.
+// refuseUnreadableBody answers the caller when the parameters are in a body no
+// form parser will read, and reports whether the caller should stop.
+//
+// Separate from fanOutChecked because federatedSQL parses r.FormValue("query")
+// BEFORE it fans out, so it reached its own "SQL must start with SELECT" on the
+// empty string and refused for a reason that is not the reason. Eleven routes
+// naming the header and one naming the caller's SQL is the same inconsistency
+// this exists to remove, one route wide.
+func (s *Server) refuseUnreadableBody(w http.ResponseWriter, r *http.Request) bool {
+	if !unreadableBody(r) {
+		return false
+	}
+	ct := r.Header.Get("Content-Type")
+	s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+		fmt.Sprintf("simdlogs: this request's Content-Type (%q) is not a form, so "+
+			"the parameters in its body cannot be read, and the shards would be "+
+			"asked the URL query alone -- a different question, at HTTP 200. Send "+
+			"the parameters as application/x-www-form-urlencoded, or in the query "+
+			"string.", ct))
+	return true
+}
+
+func unreadableBody(r *http.Request) bool {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		return false
+	}
+	if r.Body == nil || isFormPost(r) {
+		return false
+	}
+	var one [1]byte
+	n, _ := io.ReadFull(r.Body, one[:])
+	return n > 0
+}
+
 func (s *Server) fanOutChecked(
 	w http.ResponseWriter, r *http.Request, path string, body []byte,
 ) ([]shardAnswer, http.ResponseWriter, bool) {
+	// A body this route reads as a form, in a content type that is not one, is
+	// refused HERE -- where the fault is -- rather than downstream.
+	//
+	// body == nil is exactly the set of routes whose parameters come from the
+	// form and the URL; the Elasticsearch routes pass their own body and are
+	// untouched. For those form routes a non-form Content-Type means the
+	// parameters in the body are unreadable, so the shards would be asked the
+	// URL query alone -- which for `POST /select/logsql/field_values` with
+	// `Content-Type: text/plain; charset` and `query=level%3Aerror&field=user`
+	// in the body is no query at all.
+	//
+	// Before the content-type gate this answered 400 naming the header on the
+	// six routes that reach withoutLimits, and 200 on the other six. After it,
+	// all twelve forwarded and real shards answered
+	// `503 2 of 2 shards could not answer completely (0(rejected),1(rejected))`
+	// -- consistent, and it sends an operator to inspect the storage nodes for
+	// a fault in their own request's header. Twelve identical 400s naming the
+	// Content-Type is the answer that is both consistent and true.
+	//
+	// An EMPTY body is not this case: the parameters are then in the URL, there
+	// is nothing unreadable, and the request is answered.
+	if body == nil && s.refuseUnreadableBody(w, r) {
+		return nil, w, false
+	}
 	fr, formBody := withFormInURL(r)
 	if fr == nil {
 		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
@@ -1831,29 +1905,48 @@ func (s *Server) fanOutChecked(
 	}
 	// The form overflow only applies where the caller sent no body of its own.
 	//
-	// len(body), not body != nil. The two ES handlers pass io.ReadAll(r.Body),
-	// which NEVER returns nil -- an empty body is an empty non-nil slice -- so
-	// the guard fired on `POST /_count?q=<70 KiB>` with a form content type and
-	// no body at all, answering 400 with a message saying the request carried
-	// two bodies when it carried none. Measured: 200 before, 400 after.
+	// len(body) on BOTH arms, and that is the whole point: the two ES handlers
+	// pass io.ReadAll(r.Body), which NEVER returns nil, so an empty body is an
+	// empty non-nil slice. Fixing only the first arm and leaving the second as
+	// `body == nil` made the switch non-exhaustive at exactly that value --
+	// `len(body)==0 && body!=nil` matched neither -- and since withFormInURL
+	// has already cleared RawQuery, the shard was then sent an empty query
+	// string and an empty body. Measured on `POST /_count?q=<70 KiB filter>`
+	// with a form content type and no body, against a shard answering 3 when
+	// it sees the filter and 1000 when it does not:
 	//
-	// The remaining case really is a client that sends both. That is a
+	//	body == nil arm:  200 {"count":1000}   the shard was asked nothing
+	//	len(body)==0 arm: 200 {"count":3}      the shard was asked the filter
+	//
+	// A loud 400 became a silent wrong number at the one size this path
+	// exists for. The switch is now total in len(body), so no value of it
+	// falls through with a formBody in hand.
+	//
+	// The refusing case really is a client that sends both. That is a
 	// statement about what CLIENTS send, not a property of this code -- so it
 	// is refused rather than reasoned away. Under the previous shape the
 	// query string survived a dropped formBody; now RawQuery has been cleared,
 	// so dropping it would hand the shard neither, and the answer would be a
 	// smaller one at HTTP 200.
 	ct := ""
-	switch {
-	case len(body) > 0 && formBody != nil:
-		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
-			"simdlogs: this request carries both a body of its own and a form "+
-				"large enough to need one, and the router has one body to send. "+
-				"Refused rather than silently dropping either: sending the form "+
-				"would discard the request body, and sending the body would ask "+
-				"the shards a shorter question than you asked")
-		return nil, w, false
-	case body == nil && formBody != nil:
+	if formBody != nil {
+		if len(body) > 0 {
+			// What this actually refuses, named as it is. Both Elasticsearch
+			// handlers io.ReadAll the body before fanOutChecked, so r.Form
+			// holds only URL-query keys and formBody is that query re-encoded
+			// -- "a form large enough to need one" is never a form the client
+			// sent, and the message described a situation this code cannot
+			// produce. The reachable one is `POST /_count?q=<70 KiB>` with a
+			// body of its own.
+			s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+				"simdlogs: this request carries both a body of its own and a query "+
+					"string too long to forward in a shard's request line, and the "+
+					"router has one body to send. Refused rather than silently "+
+					"dropping either: sending the query would discard the request "+
+					"body, and sending the body would ask the shards a shorter "+
+					"question than you asked")
+			return nil, w, false
+		}
 		body, ct = formBody, "application/x-www-form-urlencoded"
 	}
 	peers := s.fanOutPeers(fr, path, body, ct)
