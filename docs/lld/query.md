@@ -14,7 +14,11 @@ controls:
   first (what a log viewer shows; the reference draws the same distinction).
 - `MaxRows` — a cap that errors rather than truncates; it only has to DETECT
   overflow, so it keeps the parallel scan.
-- `MatAll` — materialize every column (bare selects, live tail).
+- `MatCols` — materialize every COLUMN (a stats or by-pipe row needs every
+  field the pipeline touches). `MatAll` — the full-RECORD output the API reads
+  as `withStream`, which adds `_stream` and `_stream_id`. The two were one flag,
+  and setting it for a stats query put `_stream`/`_stream_id` onto stats rows
+  that have no stream.
 - `Now` — request time for relative `_time:` filters.
 
 ## Parsing

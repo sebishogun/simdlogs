@@ -752,9 +752,20 @@ func (s *Server) fanOutPeers(r *http.Request, path string, body []byte, ct strin
 // node is answered. POST exists so a query can be larger than a URL, and
 // folding the form into the URL took that away in clustered mode only.
 //
-// 60 KiB rather than something near the 1 MiB ceiling: the point is to leave
-// the ordinary GET path untouched -- no dashboard emits 60 KB of parameters --
-// while the oversized case, which cannot work in a URL at all, takes the body.
+// 60 KiB of ENCODED parameters, which is not 60 KB of query text.
+//
+// The comparison is against url.Values.Encode(), and percent-encoding a LogsQL
+// query roughly doubles it -- every `{`, `}`, `"`, `:`, `(`, `)` and space
+// becomes three bytes. Measured switch point on an `in(...)` list: 30,001 raw
+// characters still travelled in the URL, 31,001 (62,001 encoded) took the body.
+// So the raw budget is about 30 KB, and an earlier version of this comment said
+// "no dashboard emits 60 KB of parameters" while the real threshold was half
+// what it named.
+//
+// The number is still chosen to leave the ordinary GET path untouched -- 30 KB
+// of query text is far past anything a dashboard emits -- while the oversized
+// case, which cannot work in a URL at all, takes the body. Stated in encoded
+// bytes because that is what the request line actually carries.
 const maxPeerQueryBytes = 60 << 10
 
 // withFormInURL folds a POST form into the peer request. It returns the request
@@ -807,26 +818,47 @@ func withFormInURL(r *http.Request) (*http.Request, []byte) {
 		}
 		extra[k] = vs
 	}
+	out := r.Clone(r.Context())
+
+	// The MERGED set, resolved here, so exactly one of the two carries it.
+	//
+	// The first version of this moved only the form's contribution to the body
+	// and left the query string alone. That covered eleven of the twelve
+	// fan-out endpoints and missed the one the change was written for:
+	// federatedSelect writes the PLANNED query into the shard URL
+	// (shardQueryURL -> vals.Set("query", ...)) before this runs, so `query` is
+	// already a URL key, is skipped from `extra`, and cannot move. With nothing
+	// else in the form there was no body at all and the request line was
+	// unchanged. Measured on one router and one shard: a 520 KB query answered
+	// 200, a 560 KB one answered 503 `0(unavailable)` with the shard never
+	// reached, and the same query on a NON-router node answered 200.
+	//
+	// Resolving first and sending the whole set one way removes the precedence
+	// question rather than relying on disjointness: r.Form copies PostForm
+	// BEFORE the URL query, so on the peer a body value beats a query one, and
+	// a set split across both depends on which half each key landed in. With
+	// RawQuery cleared there is one source and the plan wins because the plan
+	// is what was merged in.
+	//
+	// Safe because every fan-out endpoint's shard handler reads r.FormValue,
+	// which is the union of both. The one deliberate r.URL.Query() reader,
+	// ingestOptions, is on the ingest paths and never reaches here.
+	merged := make(url.Values, len(q)+len(extra))
+	for k, vs := range q {
+		merged[k] = vs
+	}
+	for k, vs := range extra {
+		merged[k] = vs
+	}
+	enc := merged.Encode()
+	if len(enc) > maxPeerQueryBytes {
+		out.URL.RawQuery = ""
+		return out, []byte(enc)
+	}
 	if len(extra) == 0 {
 		return r, nil
 	}
-	out := r.Clone(r.Context())
-
-	// Over the request-line budget, the form's contribution travels as a BODY.
-	//
-	// The two sets are disjoint by construction -- a key already in the query
-	// was skipped above -- so Go's precedence between r.PostForm and the URL
-	// query never comes up, and the router's plan keeps winning exactly as it
-	// does on the small path. That matters: r.Form copies PostForm FIRST, so a
-	// body value would otherwise beat the query value the router just wrote.
-	enc := extra.Encode()
-	if len(r.URL.RawQuery)+1+len(enc) > maxPeerQueryBytes {
-		return out, []byte(enc)
-	}
-	for k, vs := range extra {
-		q[k] = vs
-	}
-	out.URL.RawQuery = q.Encode()
+	out.URL.RawQuery = enc
 	return out, nil
 }
 

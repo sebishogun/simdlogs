@@ -33,6 +33,18 @@ type recordingShard struct {
 	mu sync.Mutex
 	q  []string
 	lm []string
+	bd []string
+}
+
+// bounds is the pair of result-shaping parameters the shard was asked for, as
+// one string, so a difference is visible in the failure message.
+func (sh *recordingShard) bounds() string {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if len(sh.bd) == 0 {
+		return "<the shard was never asked>"
+	}
+	return sh.bd[len(sh.bd)-1]
 }
 
 func newRecordingShard(t *testing.T) *recordingShard {
@@ -46,6 +58,8 @@ func newRecordingShard(t *testing.T) *recordingShard {
 		sh.mu.Lock()
 		sh.q = append(sh.q, r.FormValue("query"))
 		sh.lm = append(sh.lm, r.FormValue("limit"))
+		sh.bd = append(sh.bd, "limit="+r.FormValue("limit")+
+			" max_values_per_field="+r.FormValue("max_values_per_field"))
 		sh.mu.Unlock()
 		writeEnvelope(w.Header(), 0, 0, true, 0, "")
 		w.Write([]byte(`{"hits":[{"timestamp":"1970-01-01T00:00:00Z","total":1}]}`))
@@ -88,6 +102,57 @@ func postForm(t *testing.T, ts *httptest.Server, path string, form url.Values) (
 	buf := make([]byte, 8192)
 	n, _ := resp.Body.Read(buf)
 	return resp.StatusCode, string(buf[:n])
+}
+
+// EVERY fan-out endpoint, not the two that happened to work.
+//
+// The first version of this tested /select/logsql/hits and /select/logsql/facets
+// and passed while /select/logsql/query -- the endpoint the change was written
+// for -- was still capped. federatedSelect writes the PLANNED query into the
+// shard URL before the overflow check runs, so `query` was already a URL key and
+// could not move to the body; with nothing else in the form there was no body at
+// all. Measured then: 520 KB answered 200, 560 KB answered 503 `0(unavailable)`
+// with the shard never reached, and the same query on a non-router node
+// answered 200.
+func TestEveryFanOutEndpointCarriesALargeQuery(t *testing.T) {
+	q := bigQuery(1_200_000)
+	for _, ep := range []struct{ path, extra string }{
+		{"/select/logsql/query", ""},
+		{"/select/logsql/hits", "step=1h"},
+		{"/select/logsql/facets", ""},
+		{"/select/logsql/field_names", ""},
+		{"/select/logsql/field_values", "field=level"},
+		{"/select/logsql/streams", ""},
+		{"/select/logsql/stream_ids", ""},
+		{"/select/logsql/stream_field_names", ""},
+		{"/select/logsql/stream_field_values", "field=app"},
+		{"/select/logsql/hits_count", ""},
+	} {
+		t.Run(ep.path, func(t *testing.T) {
+			sh := newRecordingShard(t)
+			ts := wmRouter(t, sh.ts.URL)
+			form := url.Values{"query": {q}}
+			if ep.extra != "" {
+				k, v, _ := strings.Cut(ep.extra, "=")
+				form.Set(k, v)
+			}
+			code, body := postForm(t, ts, ep.path, form)
+			if code == 503 {
+				t.Fatalf("%s refused a %d-byte POST query (%d): the request line is "+
+					"still carrying it. %s", ep.path, len(q), code, body)
+			}
+			if code != 200 && code != 404 {
+				t.Fatalf("%s answered %d: %s", ep.path, code, body)
+			}
+			if code == 404 {
+				t.Skipf("%s is not a fan-out endpoint on this build", ep.path)
+			}
+			if got, _ := sh.asked(); got != q {
+				t.Errorf("the shard was asked %d bytes, the caller sent %d",
+					len(got), len(q))
+			}
+		})
+	}
 }
 
 func TestALargePostQueryReachesTheShardsWhole(t *testing.T) {

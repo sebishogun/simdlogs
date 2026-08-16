@@ -293,6 +293,24 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 	if err != nil {
 		return nil, false
 	}
+	// PARSE the form before cloning, so there is something to delete from.
+	//
+	// The first attempt at this deleted the two keys from out.Form and
+	// out.PostForm after the clone -- and on a POST that nothing has parsed yet
+	// both are nil, so it deleted nothing and withFormInURL later parsed the
+	// body fresh and put the caller's limit back. A test asserting on the two
+	// final ANSWERS stayed green through that, because two differently
+	// truncated shard-local lists can sum to the same visible number; a test
+	// asserting on what the SHARD RECEIVES failed immediately.
+	//
+	// A body that will not parse is not a request that can be planned. The
+	// caller turns false into a 400 (refuseUnparseableQuery), which is the same
+	// answer withFormInURL gives for the same reason.
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		if err := r.ParseForm(); err != nil {
+			return nil, false
+		}
+	}
 	vals.Del("limit")
 	vals.Del("max_values_per_field")
 	for k, v := range unlimited {
@@ -300,6 +318,37 @@ func withoutLimits(r *http.Request, unlimited map[string]string) (*http.Request,
 	}
 	out := r.Clone(r.Context())
 	out.URL.RawQuery = vals.Encode()
+
+	// The PARSED FORM as well, not only the query string.
+	//
+	// On a POST these parameters are in the body, so deleting them from
+	// RawQuery deleted nothing and withFormInURL merged them straight back.
+	// Measured, three shards, 30 rows, `query=*&field=user&limit=2`:
+	//
+	//	GET  200 {"values":[{"value":"u0","hits":5},{"value":"u1","hits":5}]}
+	//	POST 200 {"values":[{"value":"u0","hits":4},{"value":"u1","hits":4},
+	//	                    {"value":"u2","hits":2},{"value":"u3","hits":2}]}
+	//
+	// u0 has five hits across the cluster and the POST answer said four: each
+	// shard truncated to its own top 2 and the coordinator summed the truncated
+	// lists. HTTP 200, a smaller number, nothing to tell it apart from a
+	// correct answer. That is what deleting a limit from the shard request
+	// exists to prevent, and it only worked over GET.
+	//
+	// Request.Clone copies Form and PostForm, so the clone carries the caller's
+	// parsed values and they have to be removed from BOTH -- r.Form is the
+	// union the peer reads and r.PostForm is what re-parsing would rebuild it
+	// from.
+	for _, f := range []url.Values{out.Form, out.PostForm} {
+		if f == nil {
+			continue
+		}
+		f.Del("limit")
+		f.Del("max_values_per_field")
+		for k, v := range unlimited {
+			f.Set(k, v)
+		}
+	}
 	return out, true
 }
 

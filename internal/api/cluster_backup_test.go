@@ -4,9 +4,11 @@ import (
 	"archive/tar"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -240,66 +242,111 @@ func TestTheManifestReportsHowFarApartTheShardsWere(t *testing.T) {
 	}
 }
 
-// The spread the runbook tells an operator to read is IN the archive.
+// The spread the runbook tells an operator to read is in the archive the SERVER
+// produces.
 //
 // docs/runbooks/backup-restore.md computes cluster RPO from the skew between
 // shard archives. It used to name `ClusterManifest.Spread()` -- a method on an
-// internal/ type, reachable from no endpoint and no command, so the runbook
+// internal/ type, reachable from no endpoint and no command -- so the runbook
 // asked for a number an operator had no way to obtain, and the method itself
 // had no production caller at all.
 //
-// Asserted through the MANIFEST'S JSON rather than by calling Spread(), because
-// calling the method is exactly the thing an operator cannot do: the test has
-// to fail if the field stops being marshalled, not merely if the arithmetic
-// changes.
-func TestTheClusterBackupCarriesItsOwnSpread(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		hw   []int64
-		want int64
-	}{
-		{"one shard has no spread", []int64{5000}, 0},
-		{"earliest to latest", []int64{5000, 1000, 3000}, 4000},
-		{"already in order", []int64{1000, 9000}, 8000},
-		{"a shard with no watermark widens it", []int64{0, 7000}, 7000},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			man := ClusterManifest{Format: 1}
-			for i, hw := range tc.hw {
-				man.Shards = append(man.Shards, ShardBackup{Shard: i, HighWatermark: hw})
-			}
-			man.SpreadNanos = man.Spread()
-
-			blob, err := json.Marshal(man)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var got map[string]any
-			if err := json.Unmarshal(blob, &got); err != nil {
-				t.Fatal(err)
-			}
-			v, ok := got["spreadNanos"]
-			if !ok {
-				t.Fatalf("cluster.json has no spreadNanos: the runbook tells an "+
-					"operator to read it from this file. Keys: %v", got)
-			}
-			f, ok := v.(float64)
-			if !ok {
-				t.Fatalf("spreadNanos is %T, not a number", v)
-			}
-			if int64(f) != tc.want {
-				t.Errorf("spreadNanos=%d, want %d (watermarks %v)", int64(f), tc.want, tc.hw)
-			}
-		})
+// Driven through /admin/cluster/backup and read out of the tar. The first
+// version of this test did `man.SpreadNanos = man.Spread()` ITSELF and then
+// marshalled, so commenting out the production assignment left the whole
+// internal/api package green -- while the test's own doc claimed it "has to
+// fail if the field stops being marshalled". It asserted on a manifest it had
+// populated. TestTheManifestReportsHowFarApartTheShardsWere above pins the
+// arithmetic; this one pins that the server calls it and ships the result.
+func TestTheClusterBackupArchiveCarriesTheSpread(t *testing.T) {
+	// Three shards whose newest row is a day apart, so the spread is a number
+	// and not zero -- an expected value of zero cannot tell a computed answer
+	// from an absent field.
+	var urls []string
+	for i := 0; i < 3; i++ {
+		sh := realShard(t, []string{fmt.Sprintf(
+			`{"_time":"2024-01-0%dT00:00:00Z","_msg":"m","shard":"%d"}`, i+1, i)})
+		urls = append(urls, sh.URL)
 	}
-
-	// An empty manifest still carries the field, at zero. `omitempty` here would
-	// make "no shards" and "no spread" the same absent key.
-	blob, err := json.Marshal(ClusterManifest{Format: 1})
+	srv, err := NewServer(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(blob, []byte(`"spreadNanos"`)) {
-		t.Errorf("an empty manifest omits spreadNanos entirely: %s", blob)
+	t.Cleanup(func() { srv.Close() })
+	srv.SetBackends(urls)
+	srv.SetReplicas(1)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	code, blob := takeClusterBackup(t, ts)
+	if code != 200 {
+		t.Fatalf("the backup answered %d: %.300s", code, blob)
 	}
+	man, names := readArchive(t, blob)
+	if len(man.Shards) != 3 {
+		t.Fatalf("the manifest names %d shards, want 3 (entries %v)", len(man.Shards), names)
+	}
+
+	// From the RAW manifest bytes: a field the server never set decodes to 0
+	// through the struct and is indistinguishable from a computed zero.
+	var asMap map[string]any
+	if err := json.Unmarshal(manifestBytes(t, blob), &asMap); err != nil {
+		t.Fatalf("the manifest does not parse: %v", err)
+	}
+	v, ok := asMap["spreadNanos"]
+	if !ok {
+		keys := make([]string, 0, len(asMap))
+		for k := range asMap {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		t.Fatalf("cluster.json has no spreadNanos, and the runbook tells an operator "+
+			"to read it from this file. Keys: %v", keys)
+	}
+	f, ok := v.(float64)
+	if !ok {
+		t.Fatalf("spreadNanos is %T, not a number", v)
+	}
+
+	lo, hi := man.Shards[0].HighWatermark, man.Shards[0].HighWatermark
+	for _, sb := range man.Shards[1:] {
+		if sb.HighWatermark < lo {
+			lo = sb.HighWatermark
+		}
+		if sb.HighWatermark > hi {
+			hi = sb.HighWatermark
+		}
+	}
+	if hi == lo {
+		t.Fatalf("every shard reported watermark %d, so this run cannot tell a "+
+			"computed spread from an unset field", hi)
+	}
+	if want := hi - lo; int64(f) != want {
+		t.Errorf("cluster.json says spreadNanos=%d; the shard watermarks in the same "+
+			"file span %d", int64(f), want)
+	}
+}
+
+// manifestBytes returns cluster.json's raw bytes from the archive.
+func manifestBytes(t *testing.T, blob []byte) []byte {
+	t.Helper()
+	tr := tar.NewReader(bytes.NewReader(blob))
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.Name == clusterManifestName {
+			b, err := io.ReadAll(tr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return b
+		}
+	}
+	t.Fatalf("the archive has no %s", clusterManifestName)
+	return nil
 }

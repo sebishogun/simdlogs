@@ -203,8 +203,16 @@ func (c *clusterClient) do(
 	// else, which is worse than one that does not parse.
 	if resp.Header.Get(HdrProtocolVersion) == "" && preHandlerStatus(resp.StatusCode) {
 		// Not a version statement: nothing on the peer that knows the version
-		// ran. Reported as unavailable, which is the class whose remedy --
-		// another replica -- is the one that can actually help.
+		// ran. Reported as unavailable, which is the class that retries another
+		// replica.
+		//
+		// For a 502/503/504 from a proxy in between, that retry IS the remedy.
+		// For the 431 or 413 that motivated this it is not: the refusal is
+		// deterministic and every replica answers the same way. What the class
+		// buys there is an accurate NAME -- the operator is no longer sent to
+		// compare node versions on a cluster running one build -- and the retry
+		// count is unchanged either way, because retryAnotherReplica() is
+		// already true for PeerVersionMismatch too.
 		out.Class = PeerUnavailable
 		out.Err = fmt.Errorf("peer's HTTP server refused the request before any "+
 			"handler ran (HTTP %d), so it sent no protocol version; this is not a "+

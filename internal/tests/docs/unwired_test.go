@@ -96,10 +96,14 @@ func TestDocumentedMechanismsHaveCallers(t *testing.T) {
 		//     ValidateClusterBackup had test callers and no production one, and
 		//     "it has a test" is exactly the reassurance that let it ship
 		//     unused.
-		//   - an assignment LHS and a composite-literal key are WRITES. A field
-		//     that is only ever written is the shape this gate is named for:
-		//     PeerResponse.HighWatermark was parsed into on every response and
-		//     branched on nowhere.
+		//   - an assignment LHS is a WRITE. A composite-literal KEY is NOT --
+		//     it is a write only in a struct literal, and telling that from a
+		//     map or indexed-array literal needs the literal's type, which this
+		//     gate does not resolve. So the founding shape is caught when the
+		//     field is written by assignment and MISSED when it is written
+		//     inside a composite literal, which is how PeerResponse.HighWatermark
+		//     and ReplicasConsulted were both written. See the note above
+		//     countReads; the substitute is a reader, not a smarter regex.
 		//
 		// The count is of read positions in non-test files, minus the
 		// declaration itself.
@@ -215,8 +219,8 @@ var exempt = map[string]string{
 	// gate cannot see reflection and does not pretend to.
 	"ValidateClusterBackup": "no production caller. Its doc says it is 'called BEFORE anything is unpacked' because 'a restore that discovers the mismatch halfway has already written some of it' -- and the restore path does not call it. The example this gate's own header cites, which the first two versions of the gate could not see",
 	"routeCount":            "the audit DOES call it -- route_audit_test.go:38, route_count_test.go:23, contracts_test.go:333 -- and the audit is a test, which is the actual reason. The doc block at server.go:602 describes registeredPaths and is attached to routeCount, which is why the gate sees this name at all",
-	"ExecuteCount":          "an Executor method with no caller",
-	"AppendGroupIdempotent": "one of TWO idempotent-write entry points, not the only one: production deliberately takes CommittedWrite + FlushWithReceipt -> Store.CommitReceipt (writer.go:678), and receipts.go:192-201 says the split is intentional. It is still the one that commits the receipt in the SAME record as the group, which is the guarantee production does not get -- docs/wrong.md entry 54, task #433",
+	"ExecuteCount":          "an Executor method with no PRODUCTION caller -- executor_test.go:221, :231 and :329 do call it, and an earlier version of this note said \"no caller\" flat",
+	"AppendGroupIdempotent": "one of TWO idempotent-write entry points, not the only one: production deliberately takes CommittedWrite + FlushWithReceipt -> Store.CommitReceipt (writer.go:679; :678 is the comment above it), and receipts.go:192-201 says the split is intentional. It is still the one that commits the receipt in the SAME record as the group, which is the guarantee production does not get -- docs/wrong.md entry 54, task #433",
 	"QuarantinedGroups":     "the COUNT reaches production (countQuarantined -> the simdlogs_storage_quarantined_groups gauge); only the LISTING -- which group, why, how many bytes, when -- has no reader, so an operator can alert on the number and cannot ask what it is",
 	"SnapshotAll":           "superseded by SnapshotAllWithSeq, which is what callers use",
 	"RestoreTar":            "the older unstaged restore path; protocols.go:27 says the staged one replaced it",
@@ -229,10 +233,24 @@ var exempt = map[string]string{
 	"FieldRows":             "same",
 }
 
-// buildExcluded reports whether f carries a //go:build line naming a GOOS or
-// GOARCH other than this one. Deliberately crude: it is a filter on "this file
-// is compiled for a different platform", not a constraint evaluator, and it
-// errs towards INCLUDING a file, so a reader is never wrongly discounted.
+// buildExcluded reports whether f is compiled for a DIFFERENT platform than
+// this one, so its declarations do not count as readers here.
+//
+// It evaluates the constraint rather than substring-matching it. The first
+// version asked `strings.Contains(line, plat) && !strings.Contains(line,
+// "linux")`, which excluded every `//go:build !windows` file -- three of them
+// in internal/storage, all compiled on linux -- and took 18 production names'
+// readers with them, `dirLock` from 15 down to 1. Its own comment claimed "it
+// errs towards INCLUDING a file, so a reader is never wrongly discounted";
+// the negation form does the opposite. That is a live missed detection and a
+// latent false positive: the day one of those names is read only from a
+// !windows file, the gate fails on correct code.
+//
+// Deliberately small: it understands !, &&, || and the GOOS/GOARCH/unix terms
+// this repository actually writes, and treats anything else -- a release tag, a
+// custom tag like purego -- as SATISFIED, so an unrecognised constraint
+// includes the file. Erring towards including is the safe direction and this
+// time the code does it.
 func buildExcluded(f *ast.File) bool {
 	for _, cg := range f.Comments {
 		for _, c := range cg.List {
@@ -240,24 +258,108 @@ func buildExcluded(f *ast.File) bool {
 			if !ok {
 				continue
 			}
-			for _, plat := range []string{"windows", "plan9", "darwin", "js", "wasip1",
-				"aix", "solaris", "freebsd", "openbsd", "netbsd", "ios", "android"} {
-				if strings.Contains(line, plat) && !strings.Contains(line, "linux") {
-					return true
-				}
+			if !constraintHolds(strings.TrimSpace(line)) {
+				return true
 			}
 		}
 	}
 	return false
 }
 
+// constraintHolds evaluates a //go:build expression for linux/amd64.
+//
+// || binds loosest, then &&, then ! and parentheses -- Go's own precedence.
+func constraintHolds(e string) bool {
+	e = strings.TrimSpace(e)
+	if e == "" {
+		return true
+	}
+	if d := splitTop(e, "||"); len(d) > 1 {
+		for _, part := range d {
+			if constraintHolds(part) {
+				return true
+			}
+		}
+		return false
+	}
+	if d := splitTop(e, "&&"); len(d) > 1 {
+		for _, part := range d {
+			if !constraintHolds(part) {
+				return false
+			}
+		}
+		return true
+	}
+	if strings.HasPrefix(e, "!") {
+		return !constraintHolds(e[1:])
+	}
+	if strings.HasPrefix(e, "(") && strings.HasSuffix(e, ")") {
+		return constraintHolds(e[1 : len(e)-1])
+	}
+	switch e {
+	case "linux", "amd64", "unix", "gc", "cgo":
+		return true
+	}
+	// Any other GOOS or GOARCH this build is not.
+	for _, t := range []string{
+		"windows", "plan9", "darwin", "js", "wasip1", "aix", "solaris",
+		"freebsd", "openbsd", "netbsd", "dragonfly", "ios", "android", "illumos",
+		"386", "arm", "arm64", "riscv64", "s390x", "ppc64", "ppc64le",
+		"loong64", "mips", "mips64", "mips64le", "mipsle", "wasm",
+	} {
+		if e == t {
+			return false
+		}
+	}
+	// A tag this function does not model -- a release tag, purego, a custom
+	// one. Treated as satisfied so the file is INCLUDED and no reader is lost.
+	return true
+}
+
+// splitTop splits e on sep at parenthesis depth zero.
+func splitTop(e, sep string) []string {
+	var out []string
+	depth, last := 0, 0
+	for i := 0; i+len(sep) <= len(e); i++ {
+		switch e[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		if depth == 0 && e[i:i+len(sep)] == sep {
+			out = append(out, e[last:i])
+			last = i + len(sep)
+			i += len(sep) - 1
+		}
+	}
+	return append(out, e[last:])
+}
+
+// The founding shape is only half-detected, and this is the disclosure.
+//
+// PeerResponse.HighWatermark is named at the top of this file as founding
+// example #1. Written inside a composite literal, it is now MISSED. Written by
+// assignment, it is still found. Nothing here recovers the other half.
+
 // countReads adds every READ of an identifier in f to uses.
 //
-// A read is any appearance except: the left-hand side of an assignment, a
-// composite-literal key, and a struct field's own declaration. Those are writes
-// and declarations, and a mechanism that is only ever written to is precisely
-// what this gate exists to find -- PeerResponse.HighWatermark was assigned on
-// every peer response and read by no branch.
+// A read is any appearance except the left-hand side of an assignment and a
+// struct field's own declaration.
+//
+// A composite-literal KEY counts as a READ, and that is a deliberate loss. It
+// is a write in a struct literal and a read in a map or indexed-array literal,
+// and telling the two apart needs the literal's resolved type. Treating every
+// key as a write failed on correct code -- a documented constant used only as a
+// map key was reported unwired while production read it. Treating every key as
+// a read costs a detection instead: a field written ONLY inside a composite
+// literal is no longer found, which is how PeerResponse.HighWatermark and
+// ReplicasConsulted were written. A field written by ASSIGNMENT and never read
+// still is.
+//
+// A gate that fails on correct code stops being trusted when it goes red, which
+// is worse than one that misses a case. What covers the missed case is a
+// reader: a test that asks whether the field changes any decision.
 //
 // Name-based and therefore conservative in one direction only: two different
 // types with a same-named field share a count, so it under-reports and never
@@ -315,4 +417,74 @@ func countReads(f *ast.File, uses map[string]int) {
 		}
 		return true
 	})
+}
+
+// The build-constraint evaluator, on the shapes this repository writes.
+//
+// The substring version excluded three internal/storage files that ARE compiled
+// on linux -- atomicfile_unix.go, lock_unix.go and flock_unix.go, all
+// `!windows` -- because the line contains "windows" and does not contain
+// "linux". 18 production names lost their readers (dirLock 15 -> 1,
+// errLockHeld 3 -> 0), and two documented declarations became invisible to the
+// gate entirely.
+func TestTheBuildConstraintEvaluatorAgreesWithTheCompiler(t *testing.T) {
+	for _, tc := range []struct {
+		expr string
+		want bool // compiled on linux/amd64?
+	}{
+		// The three that were wrongly excluded.
+		{"!windows", true},
+		{"!windows && !plan9", true},
+		{"!windows && !plan9 && !js && !wasip1", true},
+		// Genuinely other platforms.
+		{"windows", false},
+		{"plan9", false},
+		{"darwin || windows", false},
+		{"js && wasm", false},
+		{"!linux", false},
+		{"!unix", false},
+		// This one.
+		{"linux", true},
+		{"unix", true},
+		{"linux || darwin", true},
+		{"linux && amd64", true},
+		{"linux && arm64", false},
+		{"(linux || darwin) && !cgo", false},
+		{"(linux || darwin) && amd64", true},
+		// A tag the evaluator does not model is SATISFIED, so the file is
+		// included and no reader is discounted.
+		{"purego", true},
+		{"!purego", false},
+		{"go1.21", true},
+		{"", true},
+	} {
+		if got := constraintHolds(tc.expr); got != tc.want {
+			t.Errorf("constraintHolds(%q) = %v, want %v", tc.expr, got, tc.want)
+		}
+	}
+}
+
+// The three files the substring version dropped are counted again.
+//
+// Named explicitly rather than left to the aggregate count: the aggregate went
+// 254 -> 256 and either number could be wrong for a different reason.
+func TestTheUnixOnlyStorageFilesCountAsReaders(t *testing.T) {
+	for _, rel := range []string{
+		"internal/storage/atomicfile_unix.go",
+		"internal/storage/lock_unix.go",
+		"internal/storage/flock_unix.go",
+	} {
+		path := filepath.Join(repoRoot, rel)
+		if _, err := os.Stat(path); err != nil {
+			t.Skipf("%s is gone; if it moved, move this list with it", rel)
+		}
+		f, err := parser.ParseFile(gotoken.NewFileSet(), path, nil, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("%s: %v", rel, err)
+		}
+		if buildExcluded(f) {
+			t.Errorf("%s is excluded, and it is compiled on linux: every name read "+
+				"only from here looks unwired", rel)
+		}
+	}
 }

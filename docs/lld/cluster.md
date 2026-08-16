@@ -394,6 +394,33 @@ data to every member.
 
 ## Merges per endpoint
 
+### How a read reaches a shard
+
+A read fan-out is a **GET** with its parameters in the query string, until the
+encoded parameter set exceeds `maxPeerQueryBytes` (60 KiB encoded, about 30 KB
+of query text). Past that the request becomes a **POST** carrying the whole
+resolved parameter set as an `application/x-www-form-urlencoded` body, with the
+query string **empty**.
+
+Why the whole set and not the overflow: `federatedSelect` writes the planned
+query into the shard URL before the size is known, so a scheme that moved only
+the caller's form left `query` stuck in the request line — the one endpoint the
+change existed for. And Go's `ParseForm` copies `PostForm` before the URL query,
+so a set split across both has the body winning; sending one resolved set
+removes the question instead of relying on the two halves staying disjoint.
+
+Every shard handler reads `r.FormValue`, which is the union of both, so the
+switch is invisible to them. `ingestOptions` is the one deliberate
+`r.URL.Query()` reader and is on the ingest paths, which never take this route.
+
+A bound the coordinator applies itself — `limit`, `max_values_per_field` — is
+stripped from **both** the query string and the parsed form before the request
+goes out. Stripping only the query string was a silent wrong answer over POST:
+each shard truncated to its own top N and the coordinator summed the truncated
+lists, so a value with five cluster-wide hits was reported with four, at
+HTTP 200.
+
+
 | Endpoint | Merge | Status |
 |---|---|---|
 | `/select/logsql/query` | `federatedSelect`, after `planQuery` splits the pipeline (see **Distributed query planning**). Bare filters and the row-local prefix run on the shards; rows merge in time order (newest first, parsed from each line's `_time`) and `limit` applies across the merged set. Rows are kept as slices into each shard's response body (no per-row string copies — that was the router's dominant cost); the timestamp parse uses the fast RFC3339Nano path, and only a query with a coordinator half pays the decode back into fields. | works |
@@ -527,7 +554,7 @@ appearing twice, and a shard naming no archive. The shard-count check is the one
 a directory of per-node archives cannot even express: restoring an N-shard
 backup into an M-shard cluster puts rows where no query looks for them.
 
-Per-shard high watermarks are recorded and `Spread()` reports the distance
+Per-shard high watermarks are recorded and `spreadNanos` in the archive's `cluster.json` reports the distance
 between the earliest and latest. Reported, not enforced — no bound is right for
 every deployment, and a threshold invented here would either refuse good backups
 or bless bad ones.

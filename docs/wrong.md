@@ -5081,8 +5081,10 @@ Neither fix covers for the other.
 **The precedence test guards less than it looked like it guarded.** The overflow
 travels as a form body, and Go's `ParseForm` copies `PostForm` *first* — so on
 the peer a body value beats a query value, the opposite of the ordering the
-small path relies on (entry 108: `stats count()` answering 10 by GET and 2 by
-POST). What actually holds is that the two sets are **disjoint**: a key already
+small path relies on (the `stats count()` defect, which answered 10 by GET and 2
+by POST -- recorded in the commit that introduced withFormInURL, not as a
+numbered entry here; an earlier draft of this paragraph cited "entry 108", and
+this file's entries run 1-55). What actually holds is that the two sets are **disjoint**: a key already
 in the query is never put in the body. Sending the body unconditionally at every
 size leaves `TestTheRouterPlanStillWinsOverALargeForm` **green**; only removing
 the skip turns it red. The test is a guard on the disjointness and on nothing
@@ -5091,3 +5093,109 @@ else, and its comment says so now rather than claiming the threshold.
 The threshold is 60 KiB rather than something near the 1 MiB ceiling, so the
 ordinary GET path is untouched — no dashboard emits 60 KB of parameters — and
 only the case that cannot work in a URL at all changes shape.
+
+
+## 56. The fix reached eleven endpoints and missed the twelfth — the one it was written for
+
+Entry 55 moved a large POST form into a request body so a query bigger than a
+URL could reach the shards. It moved the FORM's contribution and left the query
+string alone. `federatedSelect` writes the planned query into the shard **URL**
+before that runs (`shardQueryURL` -> `vals.Set("query", ...)`), so on
+`/select/logsql/query` the key was already a URL key, was skipped, and could not
+move; with nothing else in the form there was no body at all.
+
+Measured, one router and one shard, `level:in(v,v,…)`:
+
+| raw query | encoded shard URL | result |
+|---|---|---|
+| 520,001 | 1,039,993 | 200 |
+| 560,001 | — | **503 `0(unavailable)`**, the shard never reached |
+| 1,200,001 | — | **503 `0(unavailable)`** |
+| 1,200,001, **single node** | n/a | **200** |
+
+The sweep across all twelve fan-out endpoints found eleven delivering the whole
+query as a form body and one failing. The committed tests used
+`/select/logsql/hits` and `/select/logsql/facets`. The repository already
+recorded why that endpoint is different — `cluster_postform_test.go:19-20`:
+"that one survives because planQuery rebuilds the shard URL from the parsed form
+itself." **The property that saved it from the previous defect is the property
+that broke it under this one.**
+
+The fix resolves the merged set first and sends all of it one way, with
+`RawQuery` cleared. That also removes the precedence argument the first version
+leaned on: `ParseForm` copies `PostForm` before the URL query, so a set split
+across both has the body winning, and "the two are disjoint by construction" is
+a property one refactor away from being false.
+
+## 57. A limit the router strips over GET reached the shards over POST
+
+`withoutLimits` deletes `limit` and `max_values_per_field` from the shard
+request so each shard answers unbounded and the coordinator bounds the merged
+set once. It deleted them from `r.URL.RawQuery`. On a POST they are in the
+**body**, so the deletion removed nothing.
+
+Measured, three shards, 30 rows, `query=*&field=user&limit=2`:
+
+```
+GET  200 {"values":[{"value":"u0","hits":5},{"value":"u1","hits":5}]}
+POST 200 {"values":[{"value":"u0","hits":4},{"value":"u1","hits":4},
+                    {"value":"u2","hits":2},{"value":"u3","hits":2}]}
+```
+
+`u0` has five hits cluster-wide and the POST answer says four: each shard
+truncated to its own top 2 and the coordinator summed the truncated lists. Six
+endpoints affected, on both the small and the large path. Pre-existing, and
+found because the new test was *named* for this property and had picked the one
+endpoint (`facets`) where the plan **sets** `limit=0` rather than deleting it.
+
+**Two attempts at the fix, and a test that could not see the first one fail.**
+Deleting from `out.Form`/`out.PostForm` after the clone does nothing: on a POST
+that nothing has parsed yet, both are nil, and `withFormInURL` later parses the
+body fresh and puts the caller's limit back. `ParseForm` has to run first.
+
+The test that missed it compared the GET and POST **answers**. With ties in the
+fixture, two differently-truncated shard-local lists sum to the same visible
+number, so it stayed green with the fix reverted. Asserting on what the **shard
+receives** failed immediately, and fails on 8 of 9 cases for either half of the
+fix.
+
+## 58. Three more gates that could not fail, in the commit that was about gates
+
+- **`TestTheClusterBackupCarriesItsOwnSpread` populated the field it checked.**
+  It did `man.SpreadNanos = man.Spread()` itself and then marshalled, so
+  commenting out the production assignment left the whole `internal/api` package
+  green — while the test's own doc said it "has to fail if the field stops being
+  marshalled". Both probes that were run (broken arithmetic, dropped json tag)
+  tested the test's own arithmetic. It is driven through
+  `/admin/cluster/backup` now and reads `spreadNanos` out of the tar; the
+  reviewer's mutation gives `spreadNanos=0` against a 172800000000000 span.
+
+- **`buildExcluded` dropped three files that ARE compiled on linux.**
+  `strings.Contains(line, plat) && !strings.Contains(line, "linux")` excludes
+  every `//go:build !windows` file. Three in `internal/storage`, taking 18
+  production names' readers with them — `dirLock` 15 down to 1, `errLockHeld` 3
+  to 0 — and hiding two documented declarations from the gate entirely. Its own
+  comment claimed "it errs towards INCLUDING a file, so a reader is never
+  wrongly discounted"; the negation form does the opposite. Replaced with a real
+  constraint evaluator (`!`, `&&`, `||`, parentheses) that treats an unmodelled
+  tag as satisfied, so the safe direction is the actual direction. 254 -> 256
+  documented declarations.
+
+- **The founding shape is no longer detected, and three places said otherwise.**
+  Treating a composite-literal key as a read — necessary, because treating it as
+  a write failed on correct code — means a field written only inside a composite
+  literal is missed. `PeerResponse.HighWatermark` and `ReplicasConsulted` are
+  both of that kind, and `ReplicasConsulted` left the exempt baseline because
+  the detector was weakened, not because anything was wired. The commit
+  disclosed the weakening; the file header and `countReads`' own doc still
+  asserted the opposite in two places. Both corrected, with the disclosure where
+  the code is rather than only in a commit message.
+
+Also corrected: `maxPeerQueryBytes` is 60 KiB of **encoded** parameters, and
+percent-encoding a LogsQL query roughly doubles it — measured switch point 30,001
+raw characters in the URL against 31,001 (62,001 encoded) in the body, so the
+raw budget is ~30 KB and the comment claimed 60. `PeerUnavailable`'s "remedy —
+another replica — is the one that can actually help" is false for the 431 that
+motivated the change: the refusal is deterministic and every replica gives the
+same answer; what the class buys is an accurate name. `docs/wrong.md` cited an
+"entry 108" in a file whose entries run 1-55.

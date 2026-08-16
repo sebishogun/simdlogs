@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -147,5 +148,95 @@ func TestAnUnparseableFormIsRefusedRatherThanEmptied(t *testing.T) {
 	if resp.StatusCode/100 == 2 {
 		t.Errorf("an unparseable form answered %d: the shards were asked the empty "+
 			"query (%d reached them) %.200s", resp.StatusCode, len(seen), body)
+	}
+}
+
+// A limit in a POST FORM does not reach the shards, any more than one in the
+// query string does.
+//
+// withoutLimits deletes `limit` and `max_values_per_field` from the shard
+// request so each shard answers unbounded and the coordinator applies the bound
+// once. It deleted them from r.URL.RawQuery only. On a POST they are in the
+// BODY, so the deletion removed nothing and withFormInURL merged them straight
+// back -- each shard truncated to its own top N and the router summed the
+// truncated lists. Measured, three shards, 30 rows, `field=user&limit=2`:
+//
+//	GET  200 {"values":[{"value":"u0","hits":5},{"value":"u1","hits":5}]}
+//	POST 200 {"values":[{"value":"u0","hits":4},{"value":"u1","hits":4},
+//	                    {"value":"u2","hits":2},{"value":"u3","hits":2}]}
+//
+// u0 has five hits across the cluster and the POST answer said four. HTTP 200,
+// a smaller number, and nothing in the response to tell it from a correct one.
+//
+// Asserted on WHAT THE SHARD RECEIVES, not on the two final answers. The first
+// version of this compared the GET and POST bodies and stayed green with the
+// fix reverted: with ties in the fixture, two differently-truncated shard-local
+// lists can sum to the same visible answer. The bound reaching the shard at all
+// is the defect, whether or not this particular data makes it show.
+func TestALimitInAPostFormDoesNotReachTheShards(t *testing.T) {
+	for _, ep := range []struct {
+		path, params string
+		// forwarded names the parameters this endpoint's plan deliberately
+		// passes through rather than strips. facets forwards
+		// max_values_per_field on purpose: `limit` is a RESULT shape and
+		// unlimited is cheap, but max_values_per_field is a CARDINALITY bound,
+		// and removing it makes timeFacet materialize every matching row --
+		// measured at 640,000 rows / 54.9 MB / 482 ms / +496 MiB on one shard.
+		forwarded []string
+	}{
+		{path: "/select/logsql/field_values", params: "field=user&limit=2"},
+		{path: "/select/logsql/field_names", params: "limit=2"},
+		{path: "/select/logsql/streams", params: "limit=2"},
+		{path: "/select/logsql/stream_ids", params: "limit=2"},
+		{path: "/select/logsql/stream_field_names", params: "limit=2"},
+		{path: "/select/logsql/stream_field_values", params: "field=app&limit=2"},
+		{path: "/select/logsql/facets", params: "limit=2",
+			forwarded: []string{"max_values_per_field"}},
+		{path: "/select/logsql/facets", params: "limit=2&max_values_per_field=2",
+			forwarded: []string{"max_values_per_field"}},
+		{path: "/select/logsql/field_values", params: "field=user&max_values_per_field=7"},
+	} {
+		t.Run(ep.path+"?"+ep.params, func(t *testing.T) {
+			form := url.Values{"query": {"*"}}
+			for _, kv := range strings.Split(ep.params, "&") {
+				k, v, _ := strings.Cut(kv, "=")
+				form.Set(k, v)
+			}
+
+			// The same request twice, each against its own shard, so the two
+			// recordings cannot interfere.
+			viaGet := newRecordingShard(t)
+			gts := wmRouter(t, viaGet.ts.URL)
+			if code, _, raw := getJSONFrom(t, gts, ep.path+"?"+form.Encode()); code != 200 {
+				t.Skipf("GET answered %d: %s", code, raw)
+			}
+			gotGet := viaGet.bounds()
+
+			viaPost := newRecordingShard(t)
+			pts := wmRouter(t, viaPost.ts.URL)
+			if code, body := postForm(t, pts, ep.path, form); code != 200 {
+				t.Skipf("POST answered %d: %s", code, body)
+			}
+			gotPost := viaPost.bounds()
+
+			if gotGet != gotPost {
+				t.Errorf("the shard is asked for a different bound depending on the "+
+					"caller's method, so a limit the router strips over GET reaches "+
+					"the shards over POST and each one truncates to its own top N:\n"+
+					"  via GET : %s\n  via POST: %s", gotGet, gotPost)
+			}
+			// And a bound the plan STRIPS is not passed through. Equality alone
+			// would be satisfied by both methods being wrong together.
+			for _, k := range []string{"limit", "max_values_per_field"} {
+				want := form.Get(k)
+				if want == "" || want == "0" || slices.Contains(ep.forwarded, k) {
+					continue
+				}
+				if strings.Contains(gotPost, k+"="+want) {
+					t.Errorf("the shard received the caller's %s=%s: shard-local top-N "+
+						"lists merged into a wrong total. shard saw %s", k, want, gotPost)
+				}
+			}
+		})
 	}
 }
