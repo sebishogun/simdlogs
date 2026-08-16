@@ -5988,3 +5988,29 @@ it. And the assertion compared line counts and a substring until both sides
 agreed on the number, at which point it still passed on two different
 envelopes; it compares bodies byte for byte now.
 
+## 77. A field faceted twice on a node became a doubled number on a router
+
+`FacetList` iterates the stored column names and then appends `_stream` and
+`_stream_id` at the tail, because they are synthesized onto every record. Once
+`_stream_fields` is configured they are ALSO stored columns — so both were
+faceted twice, once from the column and once from the tail.
+
+```
+30 rows, 3 streams of 10
+  node   "_stream" appears TWICE, 10/10/10 in each
+  router "_stream" once, 20/20/20
+```
+
+Both HTTP 200, and the truth is 10. The duplicate on the node is merely odd; the
+router's merge sums the pair by (field, value), so it becomes a **number twice
+the size of the data**, on the endpoint a dashboard uses to draw a distribution.
+
+The main loop skips them now: they are emitted once, from `Streams`/`StreamIDs`,
+which is the authoritative source for a field that exists whether or not a
+column was materialized for it.
+
+Found by giving the router/node differential REAL DATA. The parity matrix it
+grew out of compares status codes over an empty store, which is "returns the
+same three digits over no data" — both sides answered 200 here, and the
+difference is entirely in the body.
+

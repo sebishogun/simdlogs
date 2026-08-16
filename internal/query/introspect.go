@@ -207,6 +207,24 @@ func FacetList(s Store, q *Query, limit, maxPerField int, keepConst bool) []Fiel
 			}
 			continue
 		}
+		// `_stream` and `_stream_id` are emitted ONCE, below, from Streams and
+		// StreamIDs.
+		//
+		// They are synthesized onto every record, and they are ALSO stored
+		// columns once `_stream_fields` is configured -- so a store with
+		// streams had them faceted twice, once from the column here and once
+		// from the tail. A single node answered with two `_stream` blocks of
+		// 10/10/10, and a router summed the pair into one block of 20/20/20:
+		//
+		//	30 rows, 3 streams of 10
+		//	  node   "_stream" appears TWICE, 10/10/10 in each
+		//	  router "_stream" once, 20/20/20
+		//
+		// Both HTTP 200, and the truth is 10. The duplicate on the node is
+		// merely odd; the router's sum is a wrong number a dashboard draws.
+		if name == "_stream" || name == "_stream_id" {
+			continue
+		}
 		// A field has at least as many distinct values as the largest single
 		// group's dictionary holds, so a high-cardinality field is rejected from
 		// the footers -- without building the map over its values that made

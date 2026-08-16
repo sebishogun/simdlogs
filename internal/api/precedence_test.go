@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -97,5 +98,46 @@ func TestAParameterInBothTheURLAndTheBodyResolvesTheSameWay(t *testing.T) {
 					"  single %.250s\n  router %.250s", nBody, rBody)
 			}
 		})
+	}
+}
+
+// A field is faceted ONCE, and a router does not sum a node's duplicate.
+//
+// `_stream` and `_stream_id` are synthesized onto every record AND are stored
+// columns once `_stream_fields` is configured, so FacetList emitted them twice:
+// once from the column in its main loop, once from Streams/StreamIDs at the
+// tail. A single node answered with two `_stream` blocks and the router summed
+// the pair:
+//
+//	30 rows, 3 streams of 10
+//	  node   "_stream" appears TWICE, 10/10/10 in each
+//	  router "_stream" once, 20/20/20
+//
+// Both HTTP 200, and the truth is 10. The duplicate on the node is odd; the
+// router's sum is a wrong number a dashboard draws.
+func TestAFieldIsFacetedOnceAndTheRouterAgrees(t *testing.T) {
+	node, router := loadedPair(t, 10)
+	const path = "/select/logsql/facets?query=%2A"
+	nCode, nBody := postRaw(t, node, path, "", "")
+	rCode, rBody := postRaw(t, router, path, "", "")
+	if nCode != 200 || rCode != 200 {
+		t.Fatalf("node %d router %d", nCode, rCode)
+	}
+	for _, name := range []string{"_stream", "_stream_id", "_msg", "level", "svc"} {
+		key := `"field_name":"` + name + `"`
+		if n := strings.Count(nBody, key); n > 1 {
+			t.Errorf("a single node facets %s %d times: %.300s", name, n, nBody)
+		}
+		if n := strings.Count(rBody, key); n > 1 {
+			t.Errorf("the router facets %s %d times: %.300s", name, n, rBody)
+		}
+	}
+	// 30 rows over 3 streams is 10 each, on both. A doubled block sums to 20.
+	if strings.Contains(rBody, `"hits":20`) {
+		t.Errorf("the router reports 20 hits where the cluster holds 10: %.400s", rBody)
+	}
+	if nBody != rBody {
+		t.Errorf("the router and a single node disagree:\n  node   %.350s\n  router %.350s",
+			nBody, rBody)
 	}
 }
