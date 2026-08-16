@@ -36,9 +36,11 @@ import (
 func TestDocumentedMechanismsHaveCallers(t *testing.T) {
 	// A doc comment that claims to prevent something, in the words this
 	// repository actually uses.
-	claims := regexp.MustCompile(`(?i)\b(prevents?|exists to|exists for|would otherwise|` +
-		`otherwise would|so a caller can tell|so an operator can tell|guards? against|` +
-		`stops? a|is what lets a caller tell)\b`)
+	claims := regexp.MustCompile(`(?i)(\bprevents?\b|\bexists to\b|\bexists for\b|` +
+		`\bwould otherwise\b|\botherwise would\b|\bso a caller can tell\b|` +
+		`\bso an operator can tell\b|\bguards? against\b|\bstops? a\b|` +
+		`\bis what lets a caller tell\b|\brather than\b|\bsilently\b|` +
+		`\bwithout (?:anyone|a caller|an operator) (?:noticing|being told)\b)`)
 
 	fset := gotoken.NewFileSet()
 	type decl struct {
@@ -67,18 +69,26 @@ func TestDocumentedMechanismsHaveCallers(t *testing.T) {
 		}
 		isTest := strings.HasSuffix(path, "_test.go")
 
-		// Every identifier used anywhere counts as a reference, including in
-		// tests: a mechanism exercised only by a test is still wired to
-		// something, and this gate is about mechanisms wired to NOTHING.
-		ast.Inspect(f, func(n ast.Node) bool {
-			switch x := n.(type) {
-			case *ast.SelectorExpr:
-				uses[x.Sel.Name]++
-			case *ast.Ident:
-				uses[x.Name]++
-			}
-			return true
-		})
+		// PRODUCTION reads only.
+		//
+		// Two tightenings over the first version of this gate, which counted any
+		// identifier anywhere and consequently reported zero unreferenced
+		// declarations while a reviewer was naming four unwired mechanisms:
+		//
+		//   - a test reference does not wire a mechanism to production.
+		//     ValidateClusterBackup had test callers and no production one, and
+		//     "it has a test" is exactly the reassurance that let it ship
+		//     unused.
+		//   - an assignment LHS and a composite-literal key are WRITES. A field
+		//     that is only ever written is the shape this gate is named for:
+		//     PeerResponse.HighWatermark was parsed into on every response and
+		//     branched on nowhere.
+		//
+		// The count is of read positions in non-test files, minus the
+		// declaration itself.
+		if !isTest {
+			countReads(f, uses)
+		}
 		if isTest {
 			return nil // a documented test helper is not a shipped mechanism
 		}
@@ -132,16 +142,126 @@ func TestDocumentedMechanismsHaveCallers(t *testing.T) {
 
 	var unwired []decl
 	for _, d := range documented {
-		// One use is the declaration itself.
-		if uses[d.name] <= 1 {
+		// One read is the declaration's own name in its signature or spec.
+		if _, ok := exempt[d.name]; uses[d.name] <= 1 && !ok {
 			unwired = append(unwired, d)
 		}
 	}
 	for _, d := range unwired {
-		t.Errorf("%s:%d %s documents a failure it prevents and is referenced nowhere "+
-			"else in this module: the mechanism was built and wired to nothing",
+		t.Errorf("%s:%d %s documents a failure it prevents and is READ nowhere in "+
+			"this module's non-test code: the mechanism was built and wired to "+
+			"nothing. Wire it, or add it to `exempt` with the reason",
 			d.file, d.line, d.name)
 	}
-	t.Logf("%d declarations document a failure they prevent; %d unreferenced",
+	// The other direction: an exemption that is no longer needed silently
+	// exempts its name from every future run.
+	for name, why := range exempt {
+		if uses[name] <= 1 {
+			continue
+		}
+		t.Errorf("exempt names %q, which now HAS a production reader. Delete the "+
+			"entry -- an exemption nobody removes is how the next unwired "+
+			"mechanism gets in under it: %s", name, why)
+	}
+	t.Logf("%d declarations document a failure they prevent; %d with no production reader",
 		len(documented), len(unwired))
+}
+
+// exempt is the BASELINE this gate was retrofitted over: everything that had no
+// production reader on the day it was written, with what each one is.
+//
+// It is a ratchet in both directions. A name NOT here that has no production
+// reader fails, so nothing new gets in. A name here that GAINS one also fails,
+// so an entry cannot outlive its reason and quietly cover the next unwired
+// mechanism. Empty is the goal state.
+//
+// It is a baseline and not an excuse: several of these are the same defect the
+// reviewer named, sitting in the open. Task #431 works them down.
+var exempt = map[string]string{
+	// DELIBERATE test-only hooks. These exist to let a test reach a failure
+	// path that production must never take, so "no production reader" is the
+	// design and not a defect. They are the reason this gate cannot simply
+	// fail on everything it finds.
+	"SetFaultHookForTest":     "fault injection: a test-only hook by name and by design",
+	"SetDiskUsageForTest":     "same -- a test forces a disk-usage reading production reads from the OS",
+	"NonWriteFaultPointNames": "the fault-point inventory a test enumerates; production injects nothing",
+	"FailAt":                  "arms a fault point; production never arms one",
+
+	// GENUINELY UNWIRED. Each is a mechanism that was built, documented with
+	// the failure it prevents, and never connected -- which is what this gate
+	// was written to surface. Listed so the gate can run today rather than
+	// staying off until every one is fixed.
+	"ValidateVector":        "its doc says the PARSE path calls it so a record is refused rather than silently zero-filled; no path does. The reviewer's own example",
+	"ReplicasConsulted":     "written into the manifest at cluster_backup.go:172 and read by nothing -- the same written-never-read shape as HighWatermark",
+	"Spread":                "a ClusterManifest method with no caller at all",
+	"routeCount":            "documented as feeding the audit; the audit does not call it",
+	"ExecuteCount":          "an Executor method with no caller",
+	"AppendGroupIdempotent": "the idempotent-write entry point, called only by tests",
+	"QuarantinedGroups":     "lists a store's quarantine; nothing production-side asks",
+	"SnapshotAll":           "superseded by SnapshotAllWithSeq, which is what callers use",
+	"RestoreTar":            "the older unstaged restore path; protocols.go:27 says the staged one replaced it",
+	"SetMaxRows":            "a configuration setter the command layer never calls, so the cap it documents is unreachable",
+	"SetDirRereadInterval":  "same shape: a flag exists at cmd/simdlogs/main.go:141 and this setter is not what it feeds",
+	"readiness":             "a name shared with unrelated prose; the declaration this flags has no reader",
+	"FieldRequestID":        "a log field constant no log line uses",
+	"FieldStatus":           "same",
+	"FieldDurationMS":       "same",
+	"FieldRows":             "same",
+}
+
+// countReads adds every READ of an identifier in f to uses.
+//
+// A read is any appearance except: the left-hand side of an assignment, a
+// composite-literal key, and a struct field's own declaration. Those are writes
+// and declarations, and a mechanism that is only ever written to is precisely
+// what this gate exists to find -- PeerResponse.HighWatermark was assigned on
+// every peer response and read by no branch.
+//
+// Name-based and therefore conservative in one direction only: two different
+// types with a same-named field share a count, so it under-reports and never
+// invents a finding. It also cannot see WHICH path reads a name, so a field read
+// by one subsystem and ignored by another -- HighWatermark again, read by the
+// backup path and not the read path -- is invisible to it. That is a real limit
+// and not a claim this gate makes.
+func countReads(f *ast.File, uses map[string]int) {
+	writes := map[ast.Node]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range x.Lhs {
+				writes[lhs] = true
+			}
+		case *ast.KeyValueExpr:
+			writes[x.Key] = true
+		}
+		return true
+	})
+	ast.Inspect(f, func(n ast.Node) bool {
+		if writes[n] {
+			// The value being assigned INTO is a write; an index or a receiver
+			// inside it is still read (`m[k].F = v` reads m, k and F).
+			switch x := n.(type) {
+			case *ast.Ident:
+				return false
+			case *ast.SelectorExpr:
+				ast.Inspect(x.X, func(inner ast.Node) bool {
+					switch y := inner.(type) {
+					case *ast.SelectorExpr:
+						uses[y.Sel.Name]++
+					case *ast.Ident:
+						uses[y.Name]++
+					}
+					return true
+				})
+				return false
+			}
+		}
+		switch x := n.(type) {
+		case *ast.SelectorExpr:
+			uses[x.Sel.Name]++
+		case *ast.Ident:
+			uses[x.Name]++
+		}
+		return true
+	})
 }
