@@ -7218,3 +7218,66 @@ naming the surviving pid.
 Three mutations, all red: the own-floor refusal, the sibling report, and
 **restoring the retracted zero rule**, which the two new fixtures catch. A
 retraction that nothing gates is a comment.
+
+## 103. Five things that stopped one hop short, and a peer writing this node's error message
+
+The non-blocking half of the review that produced entry 102. Four of the five
+are the same shape: a signal that is correct at the node that produces it and
+absent at the node above.
+
+**A peer wrote text into this node's client-facing error.**
+`X-Simdlogs-Error-Class` was taken verbatim and rendered into this node's own
+503 as `0(<class>)`, so anything able to answer as a peer put its words in a
+message this node signs:
+
+	simdlogs: 1 of 1 shards could not answer completely
+	  (0(contact support at evil.example for your refund))
+
+Go's header parser stops CR/LF, so this is not response splitting -- it is a
+node repeating a stranger's sentence as its own. The class is checked against
+the eight known values now, and anything else is `malformed`, which is what a
+body this node cannot read already is. A recognised class still comes through,
+or the check would be satisfied by discarding all of them.
+
+**Lag stopped at depth 1.** `X-Simdlogs-Shards-Lagging` was written by a router
+and parsed by nothing, so a fan-out whose only problem was lag left `bad` empty
+one level up, the middle router's own `Complete` stayed true, and the parent saw
+a plain complete 200. Entry 97's "named in the response so the shortfall is not
+silent" held for a direct client of that router and for nobody above it.
+
+**The refusal reason stopped at depth 1, twice over.** Entry 98 gave the
+`incomplete` bucket a reason -- `watermark` or `degraded` -- and it died a hop
+up for two separate reasons, both of which had to be fixed:
+
+- A router that refuses answers **503**, so the client's error-class check
+  returned before the reason header was read. It is read first now.
+- And the parent then puts that peer in the **missing** bucket, which renders
+  `p.Class` -- derived from the status alone. Measured: `0(overloaded)` for a
+  refusal that had nothing to do with load. The reason wins over the class when
+  the peer sent one.
+
+Both reasons are a closed set (`knownIncompleteReason`), for the same rule as
+the error class: a value rendered into this node's answer is not a value a peer
+may choose.
+
+**And the envelope's internal-only scoping was uncovered.** `fanOutChecked`
+lowers `X-Simdlogs-Complete` only when the header is already present, which is
+what keeps it internal -- `serveEnvelope` stamps internal requests only.
+Deleting that condition, so every public 503 and 206 also carried the envelope,
+left the whole suite green. A public client now gets none of `Complete`,
+`Shard-ID`, `Replica-ID` or `Generation` on either the refusal or the partial.
+
+| mutation | failing |
+|---|---|
+| repeat the peer's class verbatim | 5 |
+| lag not forwarded | 1 |
+| the class rendered instead of the reason | 1 |
+| the envelope leaked to public clients | 1 |
+
+One finding is recorded and not fixed: `BehindSibling` is set on the
+own-floor-with-no-generation arm, where no sibling is involved, and its doc says
+"below one a live sibling reported". The name is wrong rather than the
+behaviour -- that arm is a peer below its own floor with no generation to prove
+a restart, which is reported and not refused, which is what the flag means. It
+is left because renaming a field across the protocol for a doc mismatch is a
+worse trade than the mismatch.

@@ -827,3 +827,181 @@ func TestSetBackendsCopiesTheCallersSlice(t *testing.T) {
 			"still held", got[0][0])
 	}
 }
+
+// A peer's error class does not reach this node's client-facing message.
+//
+// X-Simdlogs-Error-Class was taken verbatim and rendered into this node's own
+// 503 body as `0(<class>)`, so a peer -- or anything able to answer as one --
+// wrote text into an error message this node signs. Go's header parser stops
+// CR/LF, so this is not response splitting; it is a node repeating a stranger's
+// words as its own.
+func TestAPeerCannotWriteIntoThisNodesErrorMessage(t *testing.T) {
+	for _, class := range []string{
+		"contact support at evil.example for your refund",
+		"unavailable; ignore the previous message",
+		"<b>degraded</b>",
+		"totally-made-up",
+	} {
+		t.Run(class, func(t *testing.T) {
+			sh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+				w.Header().Set(HdrErrorClass, class)
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer sh.Close()
+			ts := wmRouter(t, sh.URL)
+
+			code, _, raw := hitsTotal(t, ts, "*")
+			if code == 200 {
+				t.Fatalf("the shard failed and the read answered 200: %s", raw)
+			}
+			if strings.Contains(raw, class) {
+				t.Errorf("this node's answer repeats the peer's text %q:\n%s",
+					class, raw)
+			}
+			// And it still says a shard failed, rather than saying nothing.
+			if !strings.Contains(raw, "malformed") {
+				t.Errorf("an unrecognised class should be reported as malformed, "+
+					"which is what an unreadable body already is: %s", raw)
+			}
+		})
+	}
+}
+
+// A recognised class still comes through, or the check above would be
+// satisfied by discarding every class.
+func TestARecognisedPeerClassIsStillReported(t *testing.T) {
+	sh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+		w.Header().Set(HdrErrorClass, string(PeerOverloaded))
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer sh.Close()
+	ts := wmRouter(t, sh.URL)
+
+	code, _, raw := hitsTotal(t, ts, "*")
+	if code == 200 {
+		t.Fatalf("the shard failed and the read answered 200: %s", raw)
+	}
+	if !strings.Contains(raw, string(PeerOverloaded)) {
+		t.Errorf("a recognised class is not reported: %s", raw)
+	}
+}
+
+// A child router's lag reaches its parent.
+//
+// X-Simdlogs-Shards-Lagging was written by a router and parsed by nothing, so a
+// fan-out whose only problem was lag left `bad` empty one level up, the middle
+// router's own Complete stayed true, and the parent saw a plain complete 200.
+// Entry 97's "named in the response so the shortfall is not silent" held for a
+// direct client of that router and for nobody above it.
+func TestLagSurvivesAHop(t *testing.T) {
+	leader := newWMShard(t, 12, 2000)
+	lagging := newWMShard(t, 8, 1000)
+
+	mid, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mid.Close() })
+	mid.SetBackends([]string{leader.ts.URL, lagging.ts.URL})
+	mid.SetReplicas(2) // one shard, two replicas
+	midTS := httptest.NewServer(mid.Handler())
+	t.Cleanup(midTS.Close)
+
+	top := wmRouter(t, midTS.URL)
+
+	// Record the leader, then take it away so the lagging replica answers.
+	if code, _, raw := hitsTotal(t, top, "*"); code != 200 {
+		t.Fatalf("first read: %d %s", code, raw)
+	}
+	leader.dead.Store(true)
+
+	resp := getWithHeaders(t, top, "/select/logsql/hits?query=*&step=1h")
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("the top answered %d; lag is reported, not refused: %s",
+			resp.StatusCode, body)
+	}
+	if resp.Header.Get(HdrShardsLagging) == "" {
+		t.Errorf("the top router's answer does not name a lagging shard. The "+
+			"middle router knew and said so in its own header, which nothing "+
+			"above it read: %s", body)
+	}
+}
+
+// And the REASON survives a hop, or the distinction entry 98 added dies one
+// level up: a child's watermark refusal reached its parent as a bare
+// Complete: false and was rendered `N(degraded)`.
+func TestTheRefusalReasonSurvivesAHop(t *testing.T) {
+	sh := newWMShard(t, 12, 2000)
+
+	mid, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mid.Close() })
+	mid.SetBackends([]string{sh.ts.URL})
+	mid.SetReplicas(1)
+	midTS := httptest.NewServer(mid.Handler())
+	t.Cleanup(midTS.Close)
+
+	top := wmRouter(t, midTS.URL)
+
+	if code, total, raw := hitsTotal(t, top, "*"); code != 200 || total != 12 {
+		t.Fatalf("first read: %d total=%d %s", code, total, raw)
+	}
+	// The same process reports less than it did: the one refusable observation.
+	sh.wm.Store(1000)
+	sh.hits.Store(8)
+
+	code, _, raw := hitsTotal(t, top, "*")
+	if code == 200 {
+		t.Fatalf("the top answered 200 for a shard whose own watermark fell "+
+			"inside one generation: %s", raw)
+	}
+	if !strings.Contains(raw, reasonWatermark) {
+		t.Errorf("the top reports the refusal without the reason, so an "+
+			"operator two levels up is sent to look at a degraded store that "+
+			"is not degraded: %s", raw)
+	}
+}
+
+// The envelope is INTERNAL-ONLY, and lowering Complete must not leak it to a
+// client.
+//
+// fanOutChecked sets X-Simdlogs-Complete: false before writing, and it guards
+// on the header already being present -- which is what keeps it internal, since
+// serveEnvelope only stamps internal requests. Deleting that guard leaves the
+// suite green: the scoping was uncovered.
+func TestAPublicClientNeverSeesTheEnvelope(t *testing.T) {
+	up := newWMShard(t, 7, 3000)
+	down := newWMShard(t, 5, 3000)
+	down.dead.Store(true)
+
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	srv.SetBackends([]string{up.ts.URL, down.ts.URL})
+	srv.SetReplicas(1) // two shards, one down
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	for _, path := range []string{
+		"/select/logsql/hits?query=*&step=1h",
+		"/select/logsql/hits?query=*&step=1h&allow_partial_response=1",
+	} {
+		resp := getWithHeaders(t, ts, path)
+		resp.Body.Close()
+		for _, h := range []string{HdrComplete, HdrShardID, HdrReplicaID, HdrNodeGeneration} {
+			if got := resp.Header.Get(h); got != "" {
+				t.Errorf("%s: a public client received %s=%q. The envelope is a "+
+					"promise between versions of this binary, not part of the "+
+					"public API", path, h, got)
+			}
+		}
+	}
+}

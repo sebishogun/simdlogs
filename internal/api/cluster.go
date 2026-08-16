@@ -1077,7 +1077,7 @@ func (s *Server) checkWatermark(p *PeerResponse, shard int) {
 		// the answer is refused and the client retries.
 		if certain {
 			p.Complete = false
-			p.IncompleteReason = "watermark"
+			p.IncompleteReason = reasonWatermark
 			return
 		}
 		// NOT certain, so not refused -- and not silent either. The shard is
@@ -2133,6 +2133,18 @@ const (
 	// indistinguishable from one that lost a day, so the answer is served and
 	// the shortfall is said out loud instead of only being logged.
 	HdrShardsLagging = "X-Simdlogs-Shards-Lagging"
+	// HdrIncompleteReason carries WHY a router's own answer is not whole, so
+	// the distinction survives a hop. Without it a child's watermark refusal
+	// reached its parent as a bare Complete: false and was rendered
+	// `N(degraded)` -- an operator sent to look at the wrong thing, one level
+	// up.
+	HdrIncompleteReason = "X-Simdlogs-Incomplete-Reason"
+
+	// The reasons that header may carry. A closed set, because it is rendered
+	// into this node's client-facing error and a peer must not be able to
+	// write text into it -- the same rule as PeerErrorClass.
+	reasonWatermark = "watermark"
+	reasonDegraded  = "degraded"
 )
 
 // fanOutChecked fans out, then enforces the completeness rule.
@@ -2232,7 +2244,18 @@ func (s *Server) fanOutChecked(
 		}
 		switch {
 		case !p.OK():
-			missing = append(missing, fmt.Sprintf("%d(%s)", i, p.Class))
+			// THE REASON WINS OVER THE CLASS when the peer sent one.
+			//
+			// A router that refuses answers 503, so its parent classes it from
+			// the status alone -- `0(overloaded)` -- and the watermark/degraded
+			// distinction died one level up even though the child had said
+			// exactly which it was. An operator two levels from the shard was
+			// sent to look at an overloaded node that was not overloaded.
+			why := string(p.Class)
+			if p.IncompleteReason != "" {
+				why = p.IncompleteReason
+			}
+			missing = append(missing, fmt.Sprintf("%d(%s)", i, why))
 		case !p.Complete:
 			// Answered, but not from its whole dataset. Counted as missing for
 			// the completeness rule: a shard serving from a degraded store is
@@ -2246,13 +2269,21 @@ func (s *Server) fanOutChecked(
 			// second.
 			reason := p.IncompleteReason
 			if reason == "" {
-				reason = "degraded" // the peer's own report on its own store
+				reason = reasonDegraded // the peer's own report on its own store
 			}
 			incomplete = append(incomplete, fmt.Sprintf("%d(%s)", i, reason))
 		}
 	}
 	if len(lagging) > 0 {
 		w.Header().Set(HdrShardsLagging, strings.Join(lagging, ","))
+	}
+	// And the reason, so a parent of this router gets the same distinction its
+	// own client does.
+	for _, p := range peers {
+		if p.IncompleteReason != "" {
+			w.Header().Set(HdrIncompleteReason, p.IncompleteReason)
+			break
+		}
 	}
 	bad := append(append([]string(nil), missing...), incomplete...)
 	if len(bad) == 0 {
@@ -2278,6 +2309,10 @@ func (s *Server) fanOutChecked(
 	}
 
 	if r.FormValue(partialParam) != "1" {
+		// The reason rides the REFUSAL too. A router that refuses answers 503,
+		// so its parent classes it as a failed peer -- `0(overloaded)`, from
+		// the status alone -- and the watermark/degraded distinction died with
+		// the body it was never in.
 		obs.L().Error("cluster read refused: shards missing",
 			obs.FieldEvent, "cluster.read_incomplete",
 			obs.FieldRoute, r.URL.Path,
@@ -2422,4 +2457,10 @@ func sortESHits(hits []json.RawMessage) {
 		}
 		return a < b // oldest first, as a single node returns them
 	})
+}
+
+// knownIncompleteReason keeps a peer's own text out of this node's answer, the
+// same way knownPeerClass does for the error class.
+func knownIncompleteReason(v string) bool {
+	return v == reasonWatermark || v == reasonDegraded
 }

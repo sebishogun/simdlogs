@@ -238,10 +238,32 @@ func (c *clusterClient) do(
 		out.Version = n
 	}
 
-	if cls := PeerErrorClass(resp.Header.Get(HdrErrorClass)); cls != PeerOK {
-		out.Class = cls
-		out.Err = fmt.Errorf("peer reported %s (HTTP %d)", cls, resp.StatusCode)
-		return out
+	// READ BEFORE THE ERROR RETURN. A router that refuses answers 503, so the
+	// class check below returns immediately -- and the reason it refused for is
+	// on that same response. Reading it afterwards meant it was never read at
+	// all on the path where it matters most.
+	if v := resp.Header.Get(HdrShardsLagging); v != "" {
+		out.BehindSibling = true
+	}
+	if v := resp.Header.Get(HdrIncompleteReason); v != "" && knownIncompleteReason(v) {
+		out.IncompleteReason = v
+	}
+	if raw := resp.Header.Get(HdrErrorClass); raw != "" {
+		cls := PeerErrorClass(raw)
+		if !knownPeerClass(cls) {
+			// NOT REPEATED. This value is rendered into this node's own
+			// client-facing 503 body, so taking it verbatim let a peer write
+			// text into an error message this node signs.
+			out.Class = PeerMalformed
+			out.Err = fmt.Errorf("peer sent an unrecognised %s header (HTTP %d)",
+				HdrErrorClass, resp.StatusCode)
+			return out
+		}
+		if cls != PeerOK {
+			out.Class = cls
+			out.Err = fmt.Errorf("peer reported %s (HTTP %d)", cls, resp.StatusCode)
+			return out
+		}
 	}
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
@@ -414,5 +436,23 @@ func (c *clusterClient) spool(
 		return nil, 0, out, func() {}
 	}
 	out.Complete = hr.Header.Get(HdrComplete) == "true"
+	// A CHILD ROUTER'S OWN FINDINGS, forwarded rather than dropped.
+	//
+	// X-Simdlogs-Shards-Lagging was set by a router and parsed by nothing, so a
+	// fan-out where the only problem was lag left `bad` empty one level up, this
+	// node's Complete stayed true, and a parent saw a plain complete 200.
+	// Measured on the internal path: middle router -> status=200 complete=true
+	// lagging=0. "Named in the response so the shortfall is not silent" held
+	// for a direct client of that router and for nobody above it.
+	//
+	// The reason travels with it for the same reason: a child's watermark
+	// refusal reached the parent as a bare Complete: false and was rendered
+	// `N(degraded)`, so the distinction survived exactly one level.
+	if v := hr.Header.Get(HdrShardsLagging); v != "" {
+		out.BehindSibling = true
+	}
+	if v := hr.Header.Get(HdrIncompleteReason); v != "" && knownIncompleteReason(v) {
+		out.IncompleteReason = v
+	}
 	return tmp, n, out, cleanup
 }

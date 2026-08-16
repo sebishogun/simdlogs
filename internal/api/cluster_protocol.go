@@ -119,6 +119,26 @@ const (
 	PeerRejected PeerErrorClass = "rejected"
 )
 
+// knownPeerClass keeps a peer's own text out of this node's answer.
+//
+// The class arrives in X-Simdlogs-Error-Class, was taken verbatim, and is
+// rendered into this node's client-facing 503 as `0(<class>)`. So a peer -- or
+// anything able to answer as one -- put arbitrary text into an error message
+// this node signs. No CR/LF smuggling is possible (Go's header parser rejects
+// those), but "the peer said so" is not a reason to repeat it to a client.
+//
+// An unrecognised class is reported as PeerMalformed, which is what a body this
+// node cannot read already is: the peer failed, and how it described itself is
+// not usable.
+func knownPeerClass(c PeerErrorClass) bool {
+	switch c {
+	case PeerOK, PeerUnavailable, PeerVersionMismatch, PeerUnauthorized,
+		PeerDegraded, PeerMalformed, PeerOverloaded, PeerRejected:
+		return true
+	}
+	return false
+}
+
 // retryAnotherReplica reports whether a different replica of the same shard is
 // worth trying.
 //
