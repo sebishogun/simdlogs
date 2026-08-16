@@ -430,7 +430,16 @@ func StatsByField(s Store, q *Query, field string) []ValueCount {
 	for v, c := range counts {
 		out = append(out, ValueCount{Value: v, Count: c})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Count > out[j].Count })
+	// sortValueCounts, not a bare count comparison.
+	//
+	// This sorted by count with NO tie-break, over a slice built by ranging a Go
+	// map -- so equal counts came out in whatever order the map handed them
+	// over, which Go deliberately randomizes per run. Five identical requests
+	// for `stats by (svc) | limit 3` returned five different sets of three
+	// values, and an operator comparing two dashboard loads saw data change that
+	// had not. sortValueCounts and runTopFast both break the tie by value, and
+	// both say why; this was the one place that did not.
+	sortValueCounts(out)
 	return out
 }
 

@@ -43,19 +43,20 @@ type FieldValuesPipe struct {
 
 func (p *FieldValuesPipe) apply(rows []Row) []Row {
 	counts := map[string]int{}
-	var order []string
 	for _, r := range rows {
-		v := rowField(r, p.Field)
-		if _, ok := counts[v]; !ok {
-			order = append(order, v)
-		}
-		counts[v]++
+		counts[rowField(r, p.Field)]++
 	}
-	vcs := make([]ValueCount, 0, len(order))
-	for _, v := range order {
-		vcs = append(vcs, ValueCount{Value: v, Count: counts[v]})
-	}
-	return valueCountRows(vcs, p.Limit)
+	// Sorted BEFORE the limit truncates, which it was not.
+	//
+	// This built the list in first-seen order and handed it to valueCountRows,
+	// which truncates whatever it is given. `| field_values svc limit 2` over a
+	// log stream therefore returned the two values that appeared EARLIEST, and
+	// in a stream those are typically the rarest: the reviewer got the two least
+	// frequent values presented as the top two, HTTP 200, from an endpoint whose
+	// whole purpose is "which values are there, most first". StatsByField and
+	// every /select values endpoint sort by hits, and this pipe shares their
+	// output shape, so nothing in the response said its ordering rule differed.
+	return valueCountRows(mapToValueCounts(counts), p.Limit)
 }
 
 // FieldNamesPipe is `field_names` -- each distinct field name and its hit count.

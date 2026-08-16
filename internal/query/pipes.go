@@ -74,6 +74,12 @@ func (p *StatsPipe) apply(rows []Row) []Row {
 	var order []string
 	var key []byte
 	for _, r := range rows {
+		// A row that does not CARRY every by-field is not a member of any group
+		// for it -- see rowFieldOK. Without this, absent and empty were the same
+		// value and the phantom group could rank first.
+		if !hasAllFields(r, p.By) {
+			continue
+		}
 		key = key[:0]
 		for _, f := range p.By {
 			key = append(key, rowField(r, f)...)
@@ -855,14 +861,43 @@ func quantileOf(vals []float64, p float64) float64 {
 	return vals[idx]
 }
 
-// rowField returns a row's value for key.
+// rowField returns a row's value for key, or "" when the row does not carry it.
 func rowField(r Row, key string) string {
+	v, _ := rowFieldOK(r, key)
+	return v
+}
+
+// rowFieldOK is rowField plus whether the row CARRIES the field at all.
+//
+// rowField alone returns "" both for "absent" and for "present and empty", and
+// every group-by pipe keyed on it -- so a row with no `svc` joined a group
+// labelled svc="" beside rows whose svc genuinely is empty. That group can
+// outrank the real ones: 22 rows of which 10 carry no `svc` gave the cluster a
+// top-2 of {"svc":"","c":"10"} then d(5), where the same query on a single node
+// answers d(5), c(4). The node's introspect path reads a group's dictionary and
+// a group with no such column has none, so those rows contribute nothing there.
+// The two halves of one system answered differently and neither said so.
+//
+// A row that does not carry the field is not a member of any group for that
+// field. A row whose value IS empty still is, and the two stay distinguishable.
+func rowFieldOK(r Row, key string) (string, bool) {
 	for _, f := range r.Fields {
 		if f.Key == key {
-			return f.Value
+			return f.Value, true
 		}
 	}
-	return ""
+	return "", false
+}
+
+// hasAllFields reports whether r carries every field in by. An empty `by` is
+// "one group over everything", which every row belongs to.
+func hasAllFields(r Row, by []string) bool {
+	for _, f := range by {
+		if _, ok := rowFieldOK(r, f); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func lessVal(a, b string) bool {
@@ -938,6 +973,9 @@ func (p *UniqPipe) apply(rows []Row) []Row {
 	seen := make(map[string]bool, len(rows))
 	out := rows[:0]
 	for _, r := range rows {
+		if !hasAllFields(r, p.By) {
+			continue // see rowFieldOK: absent is not a value
+		}
 		k := rowKey(r, p.By)
 		if seen[k] {
 			continue
@@ -968,6 +1006,9 @@ func (p *TopPipe) apply(rows []Row) []Row {
 	cnt := map[string]int{}
 	vals := map[string][]string{}
 	for _, r := range rows {
+		if !hasAllFields(r, p.By) {
+			continue // see rowFieldOK: absent is not a value
+		}
 		k := rowKey(r, p.By)
 		if cnt[k] == 0 {
 			v := make([]string, len(p.By))
