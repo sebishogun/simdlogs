@@ -109,6 +109,29 @@ func TestPackAllPacksTheRowUnderAProjectingPipe(t *testing.T) {
 // select. The packed VALUE was correct throughout -- the leak was beside it.
 //
 // q.MatCols is the half that is only about what the scan reads.
+//
+// SCOPE, measured against victoria-logs at v1.x rather than reasoned about.
+// This test's three rows all carry a PROJECTING pipe, which is the whole set
+// where the fix applies. A BARE pack still takes MatAll = true, and that is
+// correct -- VictoriaLogs returns the full record for it:
+//
+//	VL  * | pack_json as p
+//	    {"_msg":"hello","_stream":"{svc=\"api\"}","_stream_id":"0000…aa07…",
+//	     "_time":"2026-08-16T03:00:00Z","lvl":"info",
+//	     "p":"{\"_time\":…,\"_stream_id\":…,\"_stream\":…,\"_msg\":…,
+//	           \"lvl\":…,\"svc\":…}","svc":"api"}
+//
+//	VL  * | fields lvl | pack_json as p   ->  {"lvl":"info","p":"{\"lvl\":\"info\"}"}
+//	VL  * | stats by (svc) count() n | pack_json as p
+//	                                      ->  {"svc":"api","n":"1","p":"{\"svc\":…,\"n\":…}"}
+//
+// The two projected shapes match this server exactly. The bare one does not,
+// and not in the direction this test is about: VL's `p` CONTAINS `_time`,
+// `_stream_id` and `_stream`, and this server's does not, because the pack runs
+// in the query layer while those fields are synthesized at serialization
+// (appendRowJSON). So the row is right and the packed value is short -- the
+// mirror image of the defect fixed here. Making them agree means synthesizing
+// the pair before the pipes run, which changes what every pipe sees; task #437.
 func TestAPackAllDoesNotSynthesiseStreamFields(t *testing.T) {
 	node := realShard(t, []string{
 		`{"_time":"2024-01-01T00:00:00Z","_msg":"one","svc":"api"}`,

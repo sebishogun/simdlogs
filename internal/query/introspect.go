@@ -323,7 +323,16 @@ func timeFacet(s Store, q *Query, limit, maxPerField int, keepConst bool) (Field
 	// rows while every other field counted all of them -- one response with a
 	// _time distribution summing to 25 and an svc distribution summing to 30.
 	sub.LastN = 0
+	// BOTH halves. MatAll was one flag and is now two: MatAll is full-record
+	// output, MatCols is "the scan reads every column". Clearing only MatAll
+	// left an inherited MatCols to make this timestamps-only scan read every
+	// column of every matching row -- and since sub shares the parent's
+	// stopReason, blowing the 256 MiB budget here would fail the whole request.
+	// Not reachable today (runFacets skips _time, and the one FacetList caller
+	// does not come through RunPipeline), which is exactly why it would be
+	// found late.
 	sub.MatAll = false
+	sub.MatCols = false
 	sub.Materialize = nil
 	rows := Run(s, &sub)
 	if len(rows) > bound {

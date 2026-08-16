@@ -203,7 +203,16 @@ func shardQueryURL(r *http.Request, shardQuery string, coordPipes []query.Pipe) 
 func (s *Server) applyCoordinatorPipes(
 	r *http.Request, rows []query.Row, pipes []query.Pipe,
 ) ([]query.Row, error) {
-	q := &query.Query{Pipes: pipes, MatAll: true}
+	// Neither flag, and that is deliberate now rather than incidental.
+	//
+	// This used to set MatAll: true. ApplyPipes reads neither flag -- it runs
+	// over rows it is HANDED, so there is no scan to widen and no output shape
+	// to choose -- so it was inert. It is removed rather than left because
+	// MatAll's meaning changed: it is now "full-RECORD output", which the API
+	// reads as "synthesize _stream/_stream_id onto every row". The coordinator
+	// writes with withStream=false so nothing happened, and the day that
+	// changes an inert true would put the pair back on merged stats rows.
+	q := &query.Query{Pipes: pipes}
 	// The returned flag is not read: applyQueryBudget binds the query, so
 	// every stop() records a reason and q.StopErr() below is the whole signal.
 	// It was assigned to `_` with no explanation, which reads as a hole.

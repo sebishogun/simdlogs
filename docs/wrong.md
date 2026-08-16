@@ -5199,3 +5199,43 @@ another replica — is the one that can actually help" is false for the 431 that
 motivated the change: the refusal is deterministic and every replica gives the
 same answer; what the class buys is an accurate name. `docs/wrong.md` cited an
 "entry 108" in a file whose entries run 1-55.
+
+## 59. A bare `pack_json`'s packed value is short, and the row beside it is right
+
+Entry 58's `MatCols` split fixed the leak on a projected pack. Measured against
+the staged `victoria-logs` binary, one row with `svc` as a stream field:
+
+```
+VL  * | pack_json as p
+    row {"_msg":"hello","_stream":"{svc=\"api\"}","_stream_id":"0000…aa07…",
+         "_time":"2026-08-16T03:00:00Z","lvl":"info","p":"…","svc":"api"}
+    p   {"_time":…,"_stream_id":…,"_stream":…,"_msg":…,"lvl":…,"svc":…}
+```
+
+So `MatAll = true` for a bare pack is **correct** — VictoriaLogs does return the
+full record — and the two projected shapes match this server exactly:
+
+```
+VL  * | fields lvl | pack_json as p             {"lvl":"info","p":"{\"lvl\":\"info\"}"}
+VL  * | stats by (svc) count() n | pack_json as p  {"svc":"api","n":"1","p":"{\"svc\":…,\"n\":…}"}
+```
+
+What differs is the packed VALUE on the bare shape: VL's `p` carries `_time`,
+`_stream_id` and `_stream`; this server's does not. `pack_json` runs in the
+query layer and those three are synthesized at serialization
+(`appendRowJSON`), so the pack cannot see them. The row is right and the packed
+value is short — the mirror image of the defect entry 58 fixed, and the reason
+that test's three rows all happened to carry a projecting pipe.
+
+Recorded rather than fixed: making them agree means putting the pair onto the
+record before the pipes run, which changes what every pipe sees. Task #437.
+
+Two latent ones closed alongside it. `applyCoordinatorPipes` set `MatAll: true`
+into a `Query` that `ApplyPipes` never reads either flag from — inert, and
+inert on a flag whose meaning had just changed to "synthesize the stream pair",
+so the day the coordinator writes with `withStream=true` it would put the pair
+back on merged stats rows. Removed. And `FacetList`'s sub-query cleared `MatAll`
+and not `MatCols`, so an inherited `MatCols` would make a timestamps-only scan
+read every column of every matching row, against a 256 MiB budget it shares with
+the parent request. Unreachable today, which is why it would have been found
+late.
