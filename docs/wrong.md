@@ -5865,3 +5865,76 @@ matches its key SET; the ORDER differs — VL emits
 matching its internal field ordering, which this server does not have. The test
 asserts the set for that reason and says so.
 
+## 74. "Inert, measured" — measured with the two routes it mattered for filtered out
+
+Entry 72 deleted `normalizeFormContentType` from `withFormInURL` on the ground
+that nothing reddened. Nothing reddened because the parity matrix filters
+`rt.body != ""`, and that excludes exactly the two Elasticsearch routes — the
+ones that pass a NON-NIL body to `fanOutChecked`, so its missing-query guard
+(whose `FormValue` is what primes `r.Form` for every other route) is skipped and
+`withFormInURL`'s parse becomes the FIRST parse of the request.
+
+With `; charset` that parse returns `ErrInvalidMediaParameter`, `withFormInURL`
+returns nil, and the router refuses what a node answers:
+
+```
+POST /_count   ct "…urlencoded; charset"  body {"query":{"match_all":{}}}
+  single node 200 {"count":30}
+  router      400 the request body is not a readable form
+POST /_search  same content type          200 / 400 the same way
+```
+
+jQuery's spelling, on the two routes whose body IS a document. Restored, and the
+matrix now runs the ES routes with their own framings — a JSON body under four
+content types — so deleting the call again reddens two cells instead of none.
+
+**Two more claims in that entry were wrong.** There were TWO call sites, not
+three, and one was deleted — so "two of the three are deleted" and "both copies
+deleted" describe a change that did not happen, and the row
+`delete it from fanOutChecked → nothing red` measures deleting a call
+`fanOutChecked` never had. And the surviving row is off: deleting it from
+`withoutLimits` reddens **four** top-level tests, not two.
+
+```
+TestAMalformedContentTypeAnswersTheSameOnEveryFederatedRead
+TestAMalformedMediaParameterDoesNotChangeWhatTheShardIsAsked
+TestAMalformedBodyIsStillRefusedUnderAMalformedMediaParameter
+TestEveryFederatedReadAnswersWhatASingleNodeAnswers
+```
+
+An "inert, measured" claim is worth exactly what its coverage is worth, and this
+one's coverage had a filter in it.
+
+## 75. Multipart temp files were never removed
+
+`net/http` removes them itself — `finishRequest` calls
+`w.req.MultipartForm.RemoveAll()` — but it checks the request the SERVER holds,
+and every `r.WithContext(...)` in this server's chain (the query deadline in
+`guard`, the tenant middleware, the write-id middleware) hands the handler a
+COPY. `ParseMultipartForm` then sets `MultipartForm` on a copy the server never
+sees, so nothing removes anything.
+
+```
+40 MiB multipart to /select/logsql/query, node and router:
+  /tmp/multipart-* grows by one 41,943,040-byte file per request, and they
+  persist. 32 files = 1.25 GiB left behind.
+```
+
+Bounded per request by `MaxBodyBytes`, unbounded in total, on a server whose job
+is to run for months. `guard` parses the multipart form itself now, before any
+copy is made, and defers `RemoveAll` — so every copy shares the pointer and the
+cleanup reaches the form the handler used. A second `ParseMultipartForm`
+downstream returns nil immediately, so no handler changes.
+
+**Two versions of the test could not fail.** The first posted to a real route on
+a test server that happens to make no copy — `MaxQueryDuration` unset, no
+tenancy — so `net/http` cleaned up correctly and the test passed with the fix
+removed: it measured a configuration in which the defect does not exist. The
+handler now makes a copy deliberately, which is the condition.
+
+The second still created no files, because the padding part had no `filename`.
+`multipart.ReadForm` keeps VALUE parts in memory and returns
+`ErrMessageTooLarge` past the budget; only FILE parts spill. With
+`filename="pad.bin"` the fix removed leaves three files behind for three
+requests, and the fix leaves none.
+

@@ -253,9 +253,43 @@ func (s *Server) guard(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
 		if limit != config.Unlimited && r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, limit)
 		}
+		// MULTIPART is parsed HERE, so its temp files can be removed when the
+		// request ends.
+		//
+		// net/http removes them itself -- finishRequest calls
+		// `w.req.MultipartForm.RemoveAll()` -- but it checks the request the
+		// SERVER holds, and every middleware below this line replaces the
+		// request with an `r.WithContext(...)` copy. ParseMultipartForm then
+		// sets MultipartForm on a copy the server never sees, so nothing ever
+		// removes anything:
+		//
+		//	40 MiB multipart to /select/logsql/query, node and router:
+		//	  /tmp/multipart-* grows by one 41,943,040-byte file per request
+		//	  and they persist. 32 files = 1.25 GiB left behind.
+		//
+		// Bounded per request by MaxBodyBytes and unbounded in total, on a
+		// server whose whole job is to run for months.
+		//
+		// Parsing before the copies means every copy shares this pointer, so
+		// the deferred RemoveAll reaches the form the handler used. A second
+		// ParseMultipartForm downstream returns nil immediately, so the
+		// handlers are unchanged; a parse that FAILS leaves MultipartForm nil
+		// and the error surfaces where it did before.
+		if formKind(r) == formMultipart {
+			normalizeFormContentType(r)
+			_ = r.ParseMultipartForm(multipartMemory)
+			if r.MultipartForm != nil {
+				defer r.MultipartForm.RemoveAll()
+			}
+		}
 		h(w, r)
 	}
 }
+
+// multipartMemory is how much of a multipart body is held in memory before it
+// spills to a temp file -- net/http's own FormValue default. The spill is what
+// the deferred RemoveAll above cleans up; this bounds how often it happens.
+const multipartMemory = 32 << 20
 
 func allowedMethod(allowed []string, m string) bool {
 	for _, a := range allowed {

@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -951,6 +953,39 @@ func TestEveryFederatedReadAnswersWhatASingleNodeAnswers(t *testing.T) {
 		{name: "no body, params in URL", ct: "", body: "", inURL: true},
 	}
 
+	// The two ELASTICSEARCH routes are in the matrix, and they are the reason
+	// it exists.
+	//
+	// `rt.body != ""` excluded exactly them, and they are the routes that pass
+	// a non-nil body to fanOutChecked -- so the missing-query guard is skipped
+	// and withFormInURL's parse is the FIRST one. Deleting the header
+	// correction there reddened nothing precisely because this filter hid the
+	// only two routes it still mattered for, and `/_count` began answering 400
+	// to a document a single node answers 200 to.
+	//
+	// Their framings are their own: a JSON document body, not form parameters.
+	esFramings := []framing{
+		{name: "json body", ct: "application/json", body: `{"query":{"match_all":{}}}`},
+		{name: "urlencoded ct, json body", ct: "application/x-www-form-urlencoded", body: `{"query":{"match_all":{}}}`},
+		{name: "urlencoded ct bad charset, json body", ct: "application/x-www-form-urlencoded; charset", body: `{"query":{"match_all":{}}}`},
+		{name: "no ct, json body", ct: "", body: `{"query":{"match_all":{}}}`},
+	}
+	for _, rt := range surfaceRoutes() {
+		if rt.kind != federated || rt.write || rt.body == "" {
+			continue
+		}
+		for _, f := range esFramings {
+			t.Run(rt.path+" "+f.name, func(t *testing.T) {
+				nCode, nBody := postRaw(t, node, rt.path, f.ct, f.body)
+				rCode, rBody := postRaw(t, ts, rt.path, f.ct, f.body)
+				if nCode != rCode {
+					t.Errorf("single node %d, router %d\n  single %.200s\n  router %.200s",
+						nCode, rCode, nBody, rBody)
+				}
+			})
+		}
+	}
+
 	for _, rt := range surfaceRoutes() {
 		if rt.kind != federated || rt.write || rt.body != "" {
 			continue
@@ -989,4 +1024,82 @@ func TestEveryFederatedReadAnswersWhatASingleNodeAnswers(t *testing.T) {
 			})
 		}
 	}
+}
+
+// A multipart request leaves no temp file behind, even when a middleware
+// replaced the request.
+//
+// net/http removes them itself -- finishRequest calls
+// `w.req.MultipartForm.RemoveAll()` -- but it checks the request the SERVER
+// holds. Every `r.WithContext(...)` in this server's chain (the query deadline
+// in guard, the tenant middleware, the write-id middleware) hands the handler a
+// COPY, and ParseMultipartForm then sets MultipartForm on a copy the server
+// never sees:
+//
+//	40 MiB multipart to /select/logsql/query, node and router:
+//	  /tmp/multipart-* grew by one 41,943,040-byte file per request, and they
+//	  persisted. 32 files = 1.25 GiB left behind.
+//
+// Bounded per request by MaxBodyBytes and unbounded in total, on a server whose
+// job is to run for months.
+//
+// THE COPY IS THE CONDITION, and the handler here makes one deliberately. The
+// first version of this test posted to a real route on a test server that
+// happens to make no copy -- MaxQueryDuration unset, no tenancy -- so net/http
+// cleaned up correctly and the test passed with the fix removed. It measured a
+// configuration in which the defect does not exist.
+func TestAMultipartRequestLeavesNoTempFileWhenTheRequestWasCopied(t *testing.T) {
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	// A handler that does what every middleware below guard does: replace the
+	// request, then read a form value from the copy.
+	h := srv.guard(readSpec(), func(w http.ResponseWriter, r *http.Request) {
+		cp := r.WithContext(context.WithValue(r.Context(), struct{ k string }{"probe"}, 1))
+		_ = cp.FormValue("query")
+		w.WriteHeader(200)
+	})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	// A FILE part larger than multipartMemory, so the parse must spill to
+	// disk. A part with no filename is a VALUE part: multipart.ReadForm keeps
+	// those in memory and returns ErrMessageTooLarge past the budget rather
+	// than writing a file, which is why the first version of this test created
+	// none and passed with the fix removed.
+	pad := strings.Repeat("x", multipartMemory+(1<<20))
+	body := "--B\r\nContent-Disposition: form-data; name=\"query\"\r\n\r\n*\r\n" +
+		"--B\r\nContent-Disposition: form-data; name=\"pad\"; filename=\"pad.bin\"\r\n" +
+		"Content-Type: application/octet-stream\r\n\r\n" + pad + "\r\n--B--\r\n"
+
+	before := countTempMultipart(t)
+	for i := 0; i < 3; i++ {
+		code, rb := postRaw(t, ts, "/select/logsql/query", `multipart/form-data; boundary=B`, body)
+		if code != 200 {
+			t.Fatalf("answered %d: %.200s", code, rb)
+		}
+	}
+	if after := countTempMultipart(t); after > before {
+		t.Errorf("%d multipart temp files left behind by three requests (%d -> %d): "+
+			"the server removes them from a request copy the handler never used",
+			after-before, before, after)
+	}
+}
+
+func countTempMultipart(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir(os.TempDir())
+	if err != nil {
+		t.Skipf("cannot read %s: %v", os.TempDir(), err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "multipart-") {
+			n++
+		}
+	}
+	return n
 }

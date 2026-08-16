@@ -815,19 +815,25 @@ func withFormInURL(r *http.Request) (*http.Request, []byte) {
 	if !isFormPost(r) {
 		return r, nil
 	}
-	// No normalizeFormContentType here, MEASURED rather than assumed.
+	// The Content-Type is corrected before parsing, and this call is NOT
+	// redundant with withoutLimits'.
 	//
-	// ParseForm caches: the first call populates r.Form and returns the error;
-	// every later call sees r.Form non-nil and returns nil. So the header
-	// correction only matters where an error from THAT first parse is treated
-	// as fatal, which is withoutLimits and nowhere else -- deleting it there
-	// reddens two tests, deleting it here or in fanOutChecked reddens none,
-	// including a matrix that now covers `; charset` on the form content type
-	// across all twelve federated reads.
+	// It was deleted once on the measurement that nothing reddened. The measure
+	// was blind: the parity matrix filters `rt.body != ""`, which excludes
+	// exactly the two Elasticsearch routes -- and those pass a non-nil body to
+	// fanOutChecked, so its missing-query guard (whose FormValue is what primes
+	// r.Form for every other route) is skipped and THIS becomes the first parse
+	// of the request. With `; charset` that parse returns
+	// ErrInvalidMediaParameter and the router refuses what a node answers:
 	//
-	// So the copy is gone rather than kept "for safety". An inert guard reads
-	// as a load-bearing one, which is how three rounds' worth of dead code got
-	// in.
+	//	POST /_count   ct "...urlencoded; charset"  body {"query":{"match_all":{}}}
+	//	  single node 200 {"count":30}
+	//	  router      400 the request body is not a readable form
+	//	POST /_search  same content type             200 / 400 the same way
+	//
+	// jQuery's spelling, on the two routes whose body IS a document. The test
+	// the deletion cited as its coverage is the one that could not see them.
+	normalizeFormContentType(r)
 	if err := parseFormBody(r); err != nil {
 		// A form the router cannot parse is not a request it can fan out. This
 		// used to `return r`, which sent the shards the EMPTY query at HTTP 200
