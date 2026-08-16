@@ -45,15 +45,31 @@ func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
 	// cluster is dropped by each shard before the coordinator can see it.
 	shardReq, ok := withoutLimits(r, map[string]string{
 		"limit": "0",
-		// The sibling parameter, and the same reason: FacetList reads it as
-		// intParam(r, "max_values_per_field", DefaultFacetMaxValues), so
-		// DELETING it means 1000, not unlimited. A field with 1200 distinct
-		// values per shard was dropped by every shard and the cluster answered
-		// {"facets":[]} at HTTP 200 for a caller asking for 5000 -- with _time
-		// gone too, because timeFacet bounds its own scan to maxPerField+1.
-		// This was left on one of the two parameters the round that documented
-		// the rule for the other.
-		"max_values_per_field": "0",
+		// The CALLER's value, forwarded -- not zero.
+		//
+		// Deleting it left every shard at its own default of 1000, so a field
+		// with 1200 distinct values per shard was dropped by all of them and a
+		// caller asking for 5000 got {"facets":[]}. Sending "0" fixed that and
+		// was worse: `limit` is a RESULT shape and unlimited is cheap, but
+		// max_values_per_field is a CARDINALITY bound and removing it makes
+		// timeFacet materialize every matching row -- `_time` has roughly one
+		// distinct value per row in a log store. Measured on one shard:
+		//
+		//	  40,000 rows   3.4 MB body    27.9 ms   +30 MiB
+		//	 160,000 rows   13.6 MB body  114.7 ms  +127 MiB
+		//	 640,000 rows   54.9 MB body   482 ms   +496 MiB
+		//
+		// 85.8 B/row, dead linear, on the default dashboard path -- and
+		// peerMaxBodyBytes is 256 MiB, so above ~3.1M rows in the window every
+		// cluster facets request FAILS, after each shard has allocated ~2.4 GiB
+		// building a body the router discards. The answer it produced kept one
+		// field.
+		//
+		// Forwarding the caller's value fixes the original defect without
+		// removing the bound: a caller asking 5000 gets 5000 on every shard, a
+		// caller asking nothing gets the shard default on every shard, and the
+		// coordinator applies the same number again over the union.
+		"max_values_per_field": maxValuesParam(r),
 		"keep_const_fields":    "1",
 	})
 	if !ok {
@@ -145,6 +161,12 @@ func (s *Server) federatedFacets(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"facets": out})
+}
+
+// maxValuesParam is the caller's max_values_per_field as a string, or the
+// storage node's own default when absent -- the value forwarded to the shards.
+func maxValuesParam(r *http.Request) string {
+	return strconv.Itoa(intParam(r, "max_values_per_field", query.DefaultFacetMaxValues))
 }
 
 // facetKeepUnion is query.facetKeep over the merged distribution. It is

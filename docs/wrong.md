@@ -4931,3 +4931,50 @@ rather than by endpoint, and to sweep the ingest protocols, which five previous
 rounds had not touched at all. The boolean bug is not subtle and is not new; it
 is in the first `switch` of the most-used ingest path. Nothing had looked
 there, because every round looked where the last round's findings were.
+
+## 53. The facets fix removed a bound instead of narrowing it, and could OOM a shard
+
+Entry 48 changed `max_values_per_field` from deleted to `0` on the shard
+request, and made `timeFacet` read `<= 0` as unlimited. Both halves were wrong
+in the same way: `limit` is a RESULT SHAPE and unlimited is cheap;
+`max_values_per_field` is a CARDINALITY BOUND, and `_time` has roughly one
+distinct value per row in a log store.
+
+Measured on one shard, the default cluster dashboard path, no special
+parameter:
+
+| rows in window | shard body | wall | allocated |
+|---|---|---|---|
+| 40,000 | 3,389,259 B | 27.9 ms | +30 MiB |
+| 160,000 | 13,649,261 B | 114.7 ms | +127 MiB |
+| 640,000 | 54,929,263 B | 482 ms | +496 MiB |
+
+85.8 bytes of response per row, dead linear. `peerMaxBodyBytes` is 256 MiB and
+an over-cap body is discarded as `PeerMalformed`, so **above ~3.1M rows in the
+queried window every cluster facets request fails** — after every shard has
+allocated ~2.4 GiB building a body the router throws away. The same request
+measured 3,389,259 B through the cluster path against 113 B direct: 29,993×
+body amplification, for an answer that kept one field.
+
+The shards are sent the CALLER's value now. That fixes the defect entry 48 was
+written for — a caller asking 5000 was capped at each shard's 1000 and got
+`{"facets":[]}` — without removing the bound: ask 5000 and every shard uses
+5000, ask nothing and every shard uses its default, and the coordinator applies
+the same number again over the union. An explicit `0` is bounded at 100,000
+rows in `timeFacet` rather than being infinite, and the field is dropped past
+it, which is what it always did past 1000.
+
+**And the test entry 48 shipped for this could not fail.** It stubbed the
+shard's facets body with `facetShard`, so `timeFacet` — the function it names —
+never executed. A reviewer reverted the fix completely and the test stayed
+green. Replaced with one that runs against a real storage node; it goes red
+with the fix reverted, and it caught a second defect while being written:
+`timeFacet` inherited `q.LastN` from the endpoint's `limit`, so one response
+carried a `_time` distribution summing to 25 beside an `svc` distribution
+summing to 30.
+
+**The shape, again.** Entry 48's own last line says the closed test "is the
+least bad of three, not an answer". This entry is the same lesson one file
+over: a bound was in the way of a fix, and removing it was easier than
+narrowing it. Both the removal and its test shipped in one commit, and neither
+the removal nor the test had been run against a real shard.

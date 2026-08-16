@@ -300,15 +300,33 @@ func facetKeep(distinct, maxPerField int, keepConst bool) bool {
 // Unlimited here is a real scan of every matching row, which is why the
 // caller has to ask for it: it is the same bargain `limit=0` makes.
 func timeFacet(s Store, q *Query, limit, maxPerField int, keepConst bool) (FieldFacet, bool) {
+	// An explicit 0 does NOT mean an unbounded scan here.
+	//
+	// facetKeep reads 0 as "no cardinality cap", which is free for a field
+	// read from a dictionary. _time has no dictionary -- its values are the
+	// timestamps, roughly one distinct per row -- so removing the bound made
+	// this materialize every matching row in the window. Measured at 85.8
+	// bytes of response per row, linear, on the default cluster dashboard
+	// path, failing outright above ~3.1M rows after allocating gigabytes.
+	//
+	// So the field is DROPPED past the ceiling, which is what it always did
+	// past 1000, and the ceiling for an explicit "unlimited" is a large
+	// constant rather than infinity.
 	bound := maxPerField
-	sub := *q
-	if bound > 0 {
-		sub.Limit = bound + 1
+	if bound <= 0 {
+		bound = maxTimeFacetRows
 	}
+	sub := *q
+	sub.Limit = bound + 1
+	// LastN is the endpoint's `limit`, which shapes the ROWS a select
+	// returns. Inherited here it made the _time facet count only the newest N
+	// rows while every other field counted all of them -- one response with a
+	// _time distribution summing to 25 and an svc distribution summing to 30.
+	sub.LastN = 0
 	sub.MatAll = false
 	sub.Materialize = nil
 	rows := Run(s, &sub)
-	if bound > 0 && len(rows) > bound {
+	if len(rows) > bound {
 		return FieldFacet{}, false
 	}
 	// Counted as integers, and formatted only for the values that survive the
@@ -348,7 +366,11 @@ func timeFacet(s Store, q *Query, limit, maxPerField int, keepConst bool) (Field
 // The reference's facet defaults: ten values shown per field, and a field with
 // more than a thousand distinct values is not a facet.
 const (
-	DefaultFacetLimit     = 10
+	DefaultFacetLimit = 10
+	// maxTimeFacetRows is the ceiling on an explicitly-unlimited _time facet.
+	// _time has one distinct value per row in the worst case, so "no cap" has
+	// to mean "a large cap" or the scan is the whole window.
+	maxTimeFacetRows      = 100000
 	defaultFacetMaxValues = 1000
 	DefaultFacetMaxValues = defaultFacetMaxValues
 )

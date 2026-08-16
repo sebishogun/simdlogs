@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -486,42 +487,88 @@ func TestAMalformedMiddleLineIsRefused(t *testing.T) {
 	}
 }
 
-// `max_values_per_field=0` means unlimited to _time as well as to every other
-// field.
+// The _time facet is bounded, and it counts every matching row rather than the
+// newest `limit` of them. Through a REAL storage node.
 //
-// timeFacet read `<= 0` as defaultFacetMaxValues while facetKeep's own guard
-// reads it as unlimited, so `0` meant two different things in the two
-// functions that consume it. The coordinator sends the shards `0` to get their
-// whole distribution -- and that bounded each shard's _time scan to 1000 ROWS,
-// not distinct values, so _time vanished from every cluster facet answer on
-// any tenant with more than 1000 matching rows per shard. The rest of the
-// answer being right made it more plausible, not less.
-func TestTheTimeFacetTreatsZeroAsUnlimited(t *testing.T) {
-	var saw string
-	// 1200 rows over two distinct timestamps: far past the old 1000-row bound,
-	// and only two values, so a distinct-value cap would keep it.
-	body := `{"facets":[{"field_name":"_time","values":[
-		{"field_value":"2026-06-01T12:00:00Z","hits":600},
-		{"field_value":"2026-06-01T12:00:01Z","hits":600}]},
-		{"field_name":"level","values":[{"field_value":"a","hits":700},{"field_value":"b","hits":500}]}]}`
-	a := facetShard(t, &saw, body)
-	ts := router(t, a.URL)
+// The test this replaces stubbed the shard's facets body with facetShard, so
+// timeFacet -- the function whose behaviour it named -- never executed. A
+// reviewer reverted the fix completely and the test stayed green. That is the
+// same shape as round four's adjacency test: an assertion on a helper the
+// decision no longer flows through.
+//
+// Two properties, both measured against a node holding the rows:
+//
+//   - `limit=N` must not shrink the _time counts. q.LastN is the endpoint's
+//     row limit, and timeFacet inherited it -- so one response carried a
+//     _time distribution summing to 25 and an svc distribution summing to 30.
+//   - an explicitly unlimited max_values_per_field must not become an
+//     unbounded scan. _time has one distinct value per row in the worst case,
+//     so removing the cap made every shard materialize the whole window: 85.8
+//     bytes of body per row, failing outright above ~3.1M rows.
+func TestTheTimeFacetIsBoundedAndCountsEveryRow(t *testing.T) {
+	rows := make([]string, 0, 30)
+	for i := 0; i < 30; i++ {
+		ts := []string{"2026-06-01T12:00:00Z", "2026-06-01T12:00:01Z", "2026-06-01T12:00:02Z"}[i%3]
+		rows = append(rows, line(ts, "m"+strconv.Itoa(i)))
+	}
+	node := realShard(t, rows)
 
-	_, got, raw := getJSONFrom(t, ts,
-		"/select/logsql/facets?query=*&max_values_per_field=5000&limit=5000")
-	names := facetNames(got)
-	found := false
-	for _, n := range names {
-		if n == "_time" {
-			found = true
+	count := func(q string) map[string]int {
+		t.Helper()
+		_, got, raw := getJSONFrom(t, node, "/select/logsql/facets?"+q)
+		out := map[string]int{}
+		facets, _ := got["facets"].([]any)
+		for _, f := range facets {
+			m := f.(map[string]any)
+			if m["field_name"] != "_time" {
+				continue
+			}
+			for _, v := range m["values"].([]any) {
+				vm := v.(map[string]any)
+				out[vm["field_value"].(string)] = int(vm["hits"].(float64))
+			}
+		}
+		if len(out) == 0 {
+			t.Logf("no _time facet in: %s", truncate(raw, 300))
+		}
+		return out
+	}
+
+	base := count("query=*")
+	if len(base) != 3 {
+		t.Fatalf("want three _time buckets over 30 rows, got %v", base)
+	}
+	for ts, n := range base {
+		if n != 10 {
+			t.Errorf("bucket %s has %d hits, want 10", ts, n)
 		}
 	}
-	if !found {
-		t.Errorf("_time is missing from %v for a caller asking for 5000 values "+
-			"per field: %s", names, raw)
+
+	// `limit` truncates the VALUES a facet returns -- that is what it means on
+	// a storage node, and the cluster applies the same rule. What it must not
+	// touch is the COUNTS: those come from the rows the facet was computed
+	// over, and inheriting limit as q.LastN made them the newest N rows, so
+	// one response carried a _time distribution summing to 25 beside an svc
+	// distribution summing to 30.
+	for _, lim := range []string{"2", "15", "25"} {
+		got := count("query=*&limit=" + lim)
+		if len(got) == 0 {
+			t.Errorf("limit=%s removed the _time facet entirely", lim)
+			continue
+		}
+		for ts, n := range got {
+			if base[ts] != n {
+				t.Errorf("limit=%s made bucket %s %d hits instead of %d; limit shapes "+
+					"which values come back, not how many rows were counted",
+					lim, ts, n, base[ts])
+			}
+		}
 	}
-	if saw != "0" {
-		t.Errorf("the shard was sent max_values_per_field=%q, want \"0\"", saw)
+
+	// An explicit unlimited still answers, and still agrees.
+	if got := count("query=*&max_values_per_field=0"); len(got) != len(base) {
+		t.Errorf("max_values_per_field=0 gave %v, want the same three buckets as %v",
+			got, base)
 	}
 }
 
