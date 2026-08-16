@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"time"
 )
@@ -457,23 +456,4 @@ func readBackup(r io.Reader, lim backupReadLimits, onManifest func(*BackupManife
 func errAfterTerminator(name string) error {
 	return fmt.Errorf("storage: the archive carries %s after its %s; the terminator must come last",
 		name, backupCompleteName)
-}
-
-// RestoreTar unpacks a backup into dir (created if absent), so a fresh store
-// can be opened over it.
-//
-// A format-1 archive is validated entry by entry as it is read: size,
-// checksum, and a full ReadGroup parse. A pre-format-1 archive has nothing to
-// validate against and is restored with ErrBackupUnverified returned, so a
-// caller that requires a verified restore fails rather than being told
-// success. The files are already written in that case -- this is the
-// unstaged restore, and Task 5.2 replaces it with a staged one.
-func RestoreTar(r io.Reader, dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	_, _, err := readBackup(r, backupReadLimits{}, nil, func(name string, data []byte) error {
-		return writeFileAtomic(filepath.Join(dir, name), data, DataFileMode)
-	})
-	return err
 }

@@ -87,7 +87,7 @@ func FuzzRestoreTar(f *testing.F) {
 			return
 		}
 		dir := t.TempDir()
-		err := RestoreTar(bytes.NewReader(data), dir)
+		err := restoreTarForTest(bytes.NewReader(data), dir)
 		if err == nil {
 			return
 		}

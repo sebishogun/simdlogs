@@ -218,6 +218,14 @@ var exempt = map[string]string{
 	// was written to surface. Listed so the gate can run today rather than
 	// staying off until every one is fixed.
 	//
+	// SnapshotAll and RestoreTar are gone too. SnapshotAll was a two-line
+	// wrapper that dropped the manifest sequence -- the number that makes a
+	// snapshot verifiable -- and its four callers all wanted the pair.
+	// RestoreTar is the superseded UNSTAGED restore; its two callers outside
+	// internal/storage moved to Restore, and it lives in a _test file now,
+	// where production cannot call it and the eight tests that use it as
+	// readBackup's validation harness still can.
+	//
 	// The four Field* log-field constants are gone rather than exempted: a
 	// field name no log line writes cannot cause the drift its own comment
 	// warns about, and its presence says those fields are in the logs.
@@ -240,8 +248,6 @@ var exempt = map[string]string{
 	// gate cannot see reflection and does not pretend to.
 	"routeCount":   "the audit DOES call it -- route_audit_test.go:38, route_count_test.go:23, contracts_test.go:333 -- and the audit is a test, which is the actual reason. The doc block at server.go:602 describes registeredPaths and is attached to routeCount, which is why the gate sees this name at all",
 	"ExecuteCount": "an Executor method with no PRODUCTION caller -- executor_test.go:221, :231 and :329 do call it, and an earlier version of this note said \"no caller\" flat",
-	"SnapshotAll":  "superseded by SnapshotAllWithSeq, which is what callers use",
-	"RestoreTar":   "the older unstaged restore path; protocols.go:27 says the staged one replaced it",
 	"readiness":    "server.go:2045 is a SUPERSEDED readiness handler; /-/ready goes to s.healthHandler(healthReady) at server.go:716. The earlier reason blamed 'a name shared with unrelated prose', which describes a mechanism this gate does not have -- comments never contribute to uses",
 }
 

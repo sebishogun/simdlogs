@@ -143,7 +143,7 @@ func TestTruncatedBackupIsRejected(t *testing.T) {
 	// is Task 5.2, and this asserts the shape of what is left so that task has
 	// something to change.
 	dst := t.TempDir()
-	rerr := RestoreTar(bytes.NewReader(full[:cut]), dst)
+	rerr := restoreTarForTest(bytes.NewReader(full[:cut]), dst)
 	if rerr == nil {
 		t.Fatal("a truncated archive restored without error")
 	}
@@ -407,7 +407,7 @@ func TestBackupAtScale(t *testing.T) {
 	}
 
 	dst := t.TempDir()
-	if err := RestoreTar(bytes.NewReader(buf.Bytes()), dst); err != nil {
+	if err := restoreTarForTest(bytes.NewReader(buf.Bytes()), dst); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	s2, err := OpenStore(dst)
@@ -464,7 +464,7 @@ func TestUnverifiedRestoreIsReportedAsSuch(t *testing.T) {
 	}
 
 	dst := t.TempDir()
-	err = RestoreTar(bytes.NewReader(legacy.Bytes()), dst)
+	err = restoreTarForTest(bytes.NewReader(legacy.Bytes()), dst)
 	if !errors.Is(err, ErrBackupUnverified) {
 		t.Fatalf("restore of a manifest-less archive returned %v, want ErrBackupUnverified", err)
 	}
@@ -562,7 +562,7 @@ func TestBackupIsCompleteUnderConcurrentStoreChanges(t *testing.T) {
 			// And every byte still reads back, which is the property the lease
 			// exists for: the mapping outlives an unlink.
 			dst := t.TempDir()
-			if err := RestoreTar(bytes.NewReader(bw.buf.Bytes()), dst); err != nil {
+			if err := restoreTarForTest(bytes.NewReader(bw.buf.Bytes()), dst); err != nil {
 				t.Fatalf("restore: %v", err)
 			}
 			s2, err := OpenStore(dst)
@@ -570,7 +570,7 @@ func TestBackupIsCompleteUnderConcurrentStoreChanges(t *testing.T) {
 				t.Fatalf("open restored: %v", err)
 			}
 			defer s2.Close()
-			snap, err := s2.SnapshotAll()
+			snap, _, err := s2.SnapshotAllWithSeq()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -682,7 +682,7 @@ func TestManifestMustComeFirst(t *testing.T) {
 		t.Fatalf("refused for the wrong reason: %v", verr)
 	}
 	dst := t.TempDir()
-	if err := RestoreTar(bytes.NewReader(reordered.Bytes()), dst); err == nil {
+	if err := restoreTarForTest(bytes.NewReader(reordered.Bytes()), dst); err == nil {
 		t.Fatal("a manifest-last archive restored")
 	}
 }
@@ -693,7 +693,7 @@ func TestNoManifestIsStillDistinctFromManifestLast(t *testing.T) {
 	s, _ := backupStore(t, 2, 4)
 	var groups [][]byte
 	var names []string
-	snap, err := s.SnapshotAll()
+	snap, _, err := s.SnapshotAllWithSeq()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -721,7 +721,7 @@ func TestNoManifestIsStillDistinctFromManifestLast(t *testing.T) {
 	}
 
 	dst := t.TempDir()
-	if err := RestoreTar(bytes.NewReader(legacy.Bytes()), dst); !errors.Is(err, ErrBackupUnverified) {
+	if err := restoreTarForTest(bytes.NewReader(legacy.Bytes()), dst); !errors.Is(err, ErrBackupUnverified) {
 		t.Fatalf("a manifest-less archive returned %v, want ErrBackupUnverified", err)
 	}
 }
@@ -883,7 +883,7 @@ func TestRefusedArchiveWritesNothingUnreadable(t *testing.T) {
 	}
 
 	dst := t.TempDir()
-	if err := RestoreTar(bytes.NewReader(reordered.Bytes()), dst); err == nil {
+	if err := restoreTarForTest(bytes.NewReader(reordered.Bytes()), dst); err == nil {
 		t.Fatal("a manifest-last archive of corrupt groups restored")
 	}
 	ents, err := os.ReadDir(dst)

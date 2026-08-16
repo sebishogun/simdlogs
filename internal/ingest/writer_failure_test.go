@@ -797,7 +797,7 @@ func TestClosedWriterDoesNotClaimACleanRetry(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	snap, err := s.SnapshotAll()
+	snap, _, err := s.SnapshotAllWithSeq()
 	if err != nil {
 		t.Fatal(err)
 	}

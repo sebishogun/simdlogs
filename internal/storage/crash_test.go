@@ -871,7 +871,7 @@ func TestRestoreIgnoresNonGroupEntries(t *testing.T) {
 	}
 
 	dst := t.TempDir()
-	if err := RestoreTar(&withExtras, dst); err != nil {
+	if err := restoreTarForTest(&withExtras, dst); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{ManifestFileName, "LOCK", "notes.txt"} {

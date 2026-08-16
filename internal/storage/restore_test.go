@@ -70,7 +70,7 @@ func TestRestoreIsAtomic(t *testing.T) {
 		t.Fatalf("open restored: %v", err)
 	}
 	defer s.Close()
-	snap, err := s.SnapshotAll()
+	snap, _, err := s.SnapshotAllWithSeq()
 	if err != nil {
 		t.Fatal(err)
 	}

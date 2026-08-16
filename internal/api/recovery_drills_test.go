@@ -46,7 +46,8 @@ func TestDrillARestoredBackupAnswersIdentically(t *testing.T) {
 
 	// The documented restore: onto a CLEAN directory, never over a live store.
 	fresh := t.TempDir()
-	if err := storage.RestoreTar(strings.NewReader(string(archive)), fresh); err != nil {
+	if _, err := storage.Restore(strings.NewReader(string(archive)), fresh,
+		storage.RestoreOptions{}); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 

@@ -148,23 +148,14 @@ func (s *Store) Snapshot(from, to int64) (*Snapshot, error) {
 	return snap, nil
 }
 
-// SnapshotAll is every group the store holds, with no time filter, each held
-// against unmapping until the returned snapshot is closed.
+// SnapshotAllWithSeq leases every group and reads the manifest sequence at the
+// SAME instant, under one lock acquisition.
 //
-// A backup is not a query, and reaching for Snapshot(MinInt64, MaxInt64)
-// instead is not equivalent: the overlap test is `TimeMin < to && TimeMax >=
-// from`, which is a HALF-OPEN window, so a group whose TimeMin is MaxInt64
-// fails it. That group is then absent from the archive and absent from the
-// manifest built out of the same snapshot, so the backup verifies clean while
-// missing data -- the exact failure a self-describing archive exists to make
-// impossible. A timestamp is a number a client sends.
-func (s *Store) SnapshotAll() (*Snapshot, error) {
-	snap, _, err := s.SnapshotAllWithSeq()
-	return snap, err
-}
-
-// SnapshotAllWithSeq is SnapshotAll plus the manifest sequence at the SAME
-// instant, under one lock acquisition.
+// There was a SnapshotAll beside it that dropped the sequence, and nothing in
+// production called it -- every caller needs the pair, which is the whole
+// reason this exists. It was a two-line wrapper that let a caller take the
+// snapshot without the number that makes it verifiable, so it is gone rather
+// than kept for symmetry.
 //
 // Reading the sequence in a second acquisition is not the same number: an
 // AppendGroup between the two advances it, and the archive then declares a

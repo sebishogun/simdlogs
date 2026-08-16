@@ -260,7 +260,8 @@ func TestBackupRestore(t *testing.T) {
 	// A per-tenant backup restores into that tenant's store dir; the default
 	// tenant lives under tenant-0-0.
 	dir := t.TempDir()
-	if err := storage.RestoreTar(&buf, filepath.Join(dir, "tenant-0-0")); err != nil {
+	if _, err := storage.Restore(&buf, filepath.Join(dir, "tenant-0-0"),
+		storage.RestoreOptions{}); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	srv2, err := NewServer(dir)

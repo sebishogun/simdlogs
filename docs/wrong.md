@@ -6670,3 +6670,33 @@ one line and will then be true.
 The baseline is 16 entries down to 11. It is a ratchet in both directions, so
 none of these can come back quietly: an exemption that gains a reader fails the
 gate just as a new name without one does.
+
+## 94. Two superseded paths, kept alive by the tests that tested them
+
+Task #431, continued. Both entries said "superseded" and both were true, and
+neither was reachable from production — the question each poses is what happens
+to the tests that keep it compiling.
+
+**`SnapshotAll` was a two-line wrapper that threw away the number.** It calls
+`SnapshotAllWithSeq` and drops the manifest sequence — the value that makes a
+snapshot verifiable, and the reason the `WithSeq` form exists at all: reading
+the sequence in a second lock acquisition gives a different number, and the
+archive then declares a watermark covering a group it does not contain. Its four
+callers are tests, and every one of them wanted the pair anyway. Deleted, and
+they take it.
+
+**`RestoreTar` is the superseded UNSTAGED restore**, replaced by Task 5.2's
+staged one, and its own doc says so — *"The files are already written in that
+case -- this is the unstaged restore"*. Twelve callers, all tests, and eight of
+them are not testing restoring at all: they use it as the harness for
+`readBackup`'s entry-by-entry validation (size, checksum, `ReadGroup` parse,
+ordering, the terminator). That harness is worth keeping and is not worth
+reaching through a staged restore, which would test the staging too.
+
+So it moved into a `_test.go` file, where production cannot call it, and the two
+callers in `internal/api` moved to `Restore` — which is what a real restore
+does, and both passed unchanged.
+
+That is a fourth shape for entry 93's list: **a superseded API that survives as
+a test harness — scope it to tests rather than delete or keep**. The baseline is
+16 entries down to 9.
