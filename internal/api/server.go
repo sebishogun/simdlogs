@@ -711,6 +711,7 @@ func (s *Server) Handler() http.Handler {
 		sp := replicaGroupSpec()
 		return s.requireAuth(config.RoleAdmin, sp, s.guard(sp, s.serveReplicaGroup))
 	}())
+	handle("/admin/storage/quarantine", adm(s.listQuarantined)) // which group, why, how big
 	handle("/admin/cluster/repair", adm(s.repairCluster))
 	handle("/admin/cluster/backup", adm(s.clusterBackup))
 	// Exempt from the query budget, for opsSpec's own argument with one word
@@ -2302,6 +2303,44 @@ func (s *Server) degradedLocked(key string, h storage.Health) {
 // Administrative, because it silences a readiness failure. It reports how many
 // tenants it accepted and what is still degraded, so the operator sees what
 // they just took responsibility for rather than a bare 200.
+// listQuarantined answers what this node has quarantined and why.
+//
+// The COUNT already reached an operator through the
+// simdlogs_storage_quarantined_groups gauge, so an alert could fire and nothing
+// could say WHICH group, why, how many bytes, or when. That is the shape the
+// unwired-mechanism gate exists to surface: a mechanism built, documented with
+// the failure it prevents, and connected to nothing.
+//
+// Admin-authorized, like every other storage endpoint: the reasons name file
+// paths and checksums, which describe the shape of the data.
+//
+// Refused in router mode rather than answered empty. A router's own store never
+// quarantines anything, so an empty list there reads as "nothing is wrong"
+// about shards this node has not asked.
+func (s *Server) listQuarantined(w http.ResponseWriter, r *http.Request) {
+	if s.refuseInRouterMode(w, r, "listing quarantined groups",
+		"a router's own store holds no data and quarantines nothing, so this "+
+			"would answer an empty list about shards it never asked") {
+		return
+	}
+	recs, err := s.tn(r).store.Quarantined()
+	if err != nil {
+		s.writeErr(w, r, adminSpec(), http.StatusInternalServerError, err.Error())
+		return
+	}
+	// A NON-NIL slice, so the body is `[]` and not `null`: a client that
+	// distinguishes them reads null as "this node cannot say" and an empty
+	// list as "nothing is quarantined", and those are different answers.
+	if recs == nil {
+		recs = []storage.QuarantineRecord{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Count  int                        `json:"count"`
+		Groups []storage.QuarantineRecord `json:"groups"`
+	}{len(recs), recs})
+}
+
 func (s *Server) acknowledgeDegraded(w http.ResponseWriter, r *http.Request) {
 	if s.refuseInRouterMode(w, r, "acknowledging a degraded store",
 		"the router's own store is empty and never degrades; acknowledging here "+

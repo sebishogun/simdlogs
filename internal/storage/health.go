@@ -471,6 +471,15 @@ func countQuarantined(dir string) (int, bool) {
 // QuarantinedGroups lists what is in a store directory's quarantine, newest
 // record first. It reads the directory rather than any in-memory state, so it
 // answers for groups quarantined by an earlier process.
+// Quarantined lists what this store has quarantined.
+//
+// The COUNT already reached an operator, as the
+// simdlogs_storage_quarantined_groups gauge -- so an alert could fire on "three
+// groups are quarantined" and nothing could answer which, why, how big, or
+// when. QuarantinedGroups had that answer and no production reader; this is the
+// method that gives it one.
+func (s *Store) Quarantined() ([]QuarantineRecord, error) { return QuarantinedGroups(s.dir) }
+
 func QuarantinedGroups(dir string) ([]QuarantineRecord, error) {
 	qdir := filepath.Join(dir, QuarantineDirName)
 	ents, err := os.ReadDir(qdir)

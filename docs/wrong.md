@@ -6601,3 +6601,42 @@ act on. Four malformed manifests are refused by name.
 The gate's baseline is a ratchet in both directions, and this is the first entry
 it has given back: an exemption that gains a production reader fails the gate,
 so it cannot outlive its reason.
+
+## 92. The count could be alerted on and nothing could say what it was
+
+Task #431, second entry off the unwired baseline. `QuarantinedGroups` returns
+every quarantine record — which group, why, its checksum, its size, when, and
+where the file went. Its entry said *"the COUNT reaches production
+(`countQuarantined` → the `simdlogs_storage_quarantined_groups` gauge); only the
+LISTING has no reader"*, and that is exactly the gap: an operator could put an
+alert on "one group is quarantined" and had no way to ask which one.
+
+`/admin/storage/quarantine` serves it through `Store.Quarantined`. Admin-only,
+like every other storage endpoint — the records name file paths and checksums,
+which describe the shape of the data.
+
+**Four gates fired on the new route before it worked**, which is the route
+surface doing its job:
+
+```
+/admin/storage/quarantine is registered but not classified
+/admin/storage/quarantine has no contract and no exemption
+docs say "46 routes" and the mux registers 47   (twice, two documents)
+surfaceRoutes() classifies 46 and the mux registers 47
+```
+
+and then a fifth caught a real defect: `tenantPaths` is an explicit allow-list,
+and without an entry `s.tn(r)` had nothing to return, so the handler panicked
+into a 500. `TestNoRouteAnswersWithAServerErrorOnAStorageNode` named it.
+
+Two behaviours are worth stating because they were chosen rather than fallen
+into:
+
+- **`[]`, never `null`.** A client that distinguishes them reads `null` as "this
+  node cannot say" and an empty list as "nothing is quarantined". Those are
+  different answers, and the encoder's default for a nil slice is the wrong one.
+- **A router refuses.** Its own store quarantines nothing, so an empty list
+  there reads as "nothing is wrong" about shards it has not asked.
+
+Three mutations redden it: answering `null`, letting a router answer, and making
+the store report nothing.

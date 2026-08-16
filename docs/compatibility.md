@@ -5,7 +5,7 @@ with no test beside it is a promise nobody is keeping.
 
 ## HTTP surface
 
-46 routes, each classified federated / router-local / refused, and the
+47 routes, each classified federated / router-local / refused, and the
 classification is checked against the mux itself
 (`TestEverySurfaceRouteIsClassified`) — a handler added without being
 classified fails a build.

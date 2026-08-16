@@ -268,6 +268,9 @@ func routeContracts() []contract {
 		// because it silences a readiness failure ---
 		{method: "POST", path: "/admin/acknowledge-degraded", token: tokAdmin, wantStatus: 200,
 			wantCT: "text/plain"},
+		// --- what is quarantined and why: the listing behind the gauge ---
+		{method: "GET", path: "/admin/storage/quarantine", token: tokAdmin, wantStatus: 200,
+			wantCT: "application/json"},
 	}
 }
 

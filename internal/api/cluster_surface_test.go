@@ -177,6 +177,9 @@ func surfaceRoutes() []surfaceRoute {
 		{path: "/admin/acknowledge-degraded", method: "POST", kind: refused,
 			why: "acknowledging degradation on the router clears nothing on the " +
 				"shards that are actually degraded"},
+		{path: "/admin/storage/quarantine", method: "GET", kind: refused,
+			why: "a router's own store quarantines nothing, so an empty list " +
+				"there reads as `nothing is wrong` about shards it never asked"},
 	}
 }
 
@@ -526,5 +529,36 @@ func TestNoRouteAnswersWithAServerErrorOnAStorageNode(t *testing.T) {
 				t.Fatalf("%s answered %d on a storage node: %.300s", rt.path, code, body)
 			}
 		})
+	}
+}
+
+// The quarantine listing answers an empty LIST, not a null, and refuses on a
+// router.
+//
+// `[]` and `null` are different answers: a client that distinguishes them reads
+// null as "this node cannot say" and an empty list as "nothing is quarantined".
+// A router refuses rather than answering empty, because its own store
+// quarantines nothing and an empty list there reads as "nothing is wrong" about
+// shards it never asked.
+func TestTheQuarantineListingSaysNothingRatherThanNull(t *testing.T) {
+	node := realShard(t, nil)
+	code, _, body := getJSONFrom(t, node, "/admin/storage/quarantine")
+	if code != http.StatusOK {
+		t.Fatalf("a storage node answered %d: %s", code, body)
+	}
+	if !strings.Contains(body, `"groups":[]`) {
+		t.Errorf("a node with nothing quarantined answered %q; `null` and `[]` "+
+			"are different answers and this must be the empty list", body)
+	}
+	if !strings.Contains(body, `"count":0`) {
+		t.Errorf("the body carries no count: %q", body)
+	}
+
+	// A router refuses.
+	ts := router(t, node.URL)
+	code, _, body = getJSONFrom(t, ts, "/admin/storage/quarantine")
+	if code == http.StatusOK {
+		t.Errorf("a router answered 200 for its own empty store: %q -- that reads "+
+			"as `nothing is wrong` about shards it never asked", body)
 	}
 }

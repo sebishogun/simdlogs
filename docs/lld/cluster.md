@@ -210,7 +210,7 @@ shard index.
 
 ## The route surface
 
-46 routes. Each is federated, router-local by design, or refused — and the
+47 routes. Each is federated, router-local by design, or refused — and the
 classification is machine-checked against the mux, not maintained by hand.
 
 A select-router holds no data. Only a handler that knows it is a router fans

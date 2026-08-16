@@ -935,3 +935,56 @@ func TestQuarantinedIDIsNeverReissued(t *testing.T) {
 			"the id was reissued across opens", newID, top)
 	}
 }
+
+// Store.Quarantined answers what this store quarantined, not just how many.
+//
+// The COUNT already reached an operator, through the
+// simdlogs_storage_quarantined_groups gauge -- so an alert could fire on "one
+// group is quarantined" and nothing could say which, why, how many bytes, or
+// when. QuarantinedGroups held that answer and had no production reader; this
+// method is what /admin/storage/quarantine serves.
+func TestAStoreSaysWhatItQuarantined(t *testing.T) {
+	dir, badID := corruptStore(t, 3)
+	st, err := OpenStoreWith(dir, OpenOptions{Policy: CorruptionQuarantine})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	recs, err := st.Quarantined()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("%d records, want the 1 group that was quarantined", len(recs))
+	}
+	r := recs[0]
+	// Every field an operator would ask for, because the point of the listing
+	// is that the count could not answer any of them.
+	if r.GroupID != badID {
+		t.Errorf("record names group %d, want %d", r.GroupID, badID)
+	}
+	if r.Reason == "" {
+		t.Error("the record does not say WHY the group was quarantined")
+	}
+	if r.Bytes <= 0 {
+		t.Errorf("the record says %d bytes", r.Bytes)
+	}
+	if r.QuarantinedAt == "" {
+		t.Error("the record does not say when")
+	}
+	if r.QuarantinedName == "" {
+		t.Error("the record does not say where the file went")
+	}
+
+	// A healthy store says nothing was quarantined, and says it as an empty
+	// list rather than an error.
+	clean := aeStore(t)
+	got, err := clean.Quarantined()
+	if err != nil {
+		t.Fatalf("a healthy store: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("a healthy store reports %d quarantined groups", len(got))
+	}
+}

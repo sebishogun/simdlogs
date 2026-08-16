@@ -296,6 +296,11 @@ var tenantPaths = map[string]bool{
 	"/_search":                           true,
 	"/_count":                            true,
 	"/admin/backup":                      true,
+	// The quarantine listing reads THIS tenant's store, so it needs the same
+	// tenant resolution every other storage endpoint gets. Without the entry
+	// s.tn(r) has nothing to return and the handler panics into a 500 -- which
+	// is what the route-surface gate caught before this route ever shipped.
+	"/admin/storage/quarantine": true,
 	// Anti-entropy reads and writes one tenant's store, like every other data
 	// path. /admin/cluster/repair is deliberately absent: it runs on a router,
 	// touches no local store, and only talks to peers.

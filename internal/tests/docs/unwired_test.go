@@ -216,6 +216,12 @@ var exempt = map[string]string{
 	// was written to surface. Listed so the gate can run today rather than
 	// staying off until every one is fixed.
 	//
+	// QuarantinedGroups is NOT here any more either. /admin/storage/quarantine
+	// serves it through Store.Quarantined, so the LISTING an operator could not
+	// reach -- which group, why, how many bytes, when -- is reachable now. Its
+	// entry said the count reaches production and only the listing does not,
+	// which was exactly right and exactly the gap.
+	//
 	// ValidateClusterBackup is NOT here any more. It has a production caller:
 	// cmd/simdlogs/restore.go runs it when the archive it was handed turns out
 	// to be a cluster one, before quoting what the manifest claims. That was
@@ -228,7 +234,6 @@ var exempt = map[string]string{
 	// gate cannot see reflection and does not pretend to.
 	"routeCount":           "the audit DOES call it -- route_audit_test.go:38, route_count_test.go:23, contracts_test.go:333 -- and the audit is a test, which is the actual reason. The doc block at server.go:602 describes registeredPaths and is attached to routeCount, which is why the gate sees this name at all",
 	"ExecuteCount":         "an Executor method with no PRODUCTION caller -- executor_test.go:221, :231 and :329 do call it, and an earlier version of this note said \"no caller\" flat",
-	"QuarantinedGroups":    "the COUNT reaches production (countQuarantined -> the simdlogs_storage_quarantined_groups gauge); only the LISTING -- which group, why, how many bytes, when -- has no reader, so an operator can alert on the number and cannot ask what it is",
 	"SnapshotAll":          "superseded by SnapshotAllWithSeq, which is what callers use",
 	"RestoreTar":           "the older unstaged restore path; protocols.go:27 says the staged one replaced it",
 	"SetMaxRows":           "a dead exported setter: -search.maxRows reaches the server through config (server.go:300), so the LIMIT works and this way of setting it has no caller",
