@@ -4978,3 +4978,68 @@ least bad of three, not an answer". This entry is the same lesson one file
 over: a bound was in the way of a fix, and removing it was easier than
 narrowing it. Both the removal and its test shipped in one commit, and neither
 the removal nor the test had been run against a real shard.
+
+## 54. The mechanism that closes the idempotency window has never been called
+
+`Store.AppendGroupIdempotent` commits the write id in the SAME manifest record
+as the group, and its own doc comment says exactly why:
+
+> The id is committed in the SAME manifest record as the group, because one
+> record is one transaction. Written separately there would be a window in which
+> the rows are visible and the receipt is not -- and a retry landing in that
+> window duplicates every row, which is the exact failure this exists to
+> prevent, made rarer and therefore harder to find.
+
+It has no production caller. It never has. The path production takes is
+`Writer.FlushWithReceipt`, which is:
+
+```go
+if err := w.Flush(); err != nil { return err }
+return w.store.CommitReceipt(id)
+```
+
+Two separate operations — precisely the shape the doc warns about, written four
+files away from the warning.
+
+**Measured, not argued.** Ingest ten rows under a write id, flush, and stop
+before the receipt, which is what a crash there leaves behind. Reopen the store:
+
+    10 rows durable, receipt remembered = false
+
+The rows are on disk and the id is not, so a client retry of the same id is
+treated as a first attempt and duplicates all ten. That is the failure
+`AppendGroupIdempotent` exists to prevent, live on the only path that runs.
+
+**Why it is not a small fix.** `AppendGroupIdempotent` cannot simply replace
+`FlushWithReceipt`, because the writer batches: `Flush`'s own doc says "the
+buffer is shared by every request and every syslog connection on the tenant, so
+a row added here is routinely carried away by another goroutine's Flush". One
+write id therefore does not correspond to one group, and the
+one-record-one-transaction property is unavailable through that path by
+construction.
+
+Nor do the obvious variants work:
+
+- Commit the receipt BEFORE the flush: a crash between them then loses the rows
+  and reports success. Strictly worse — a duplicate is recoverable, a silent
+  loss is not.
+- Stamp the id onto every group the flush writes: a PARTIAL flush then leaves
+  some groups carrying the receipt, so on restart the id is remembered, the
+  client's retry is refused as a duplicate, and the rows in the groups that were
+  never written are lost. Also worse, for the same reason.
+- Align the flush boundary with the request when a write id is present: correct,
+  and it gives up the cross-request batching that the ingest throughput numbers
+  are built on. That is a real design decision with a measurable cost, not an
+  edit.
+
+So the entry is the deliverable. The window is narrow — a crash inside one
+process's microsecond gap per request — and it is real, and it is now measured
+by a test that FAILS if it ever closes, rather than asserting the current
+behaviour forever. Task #433 holds the design decision.
+
+**The shape, again.** Round six's closing note was "the mechanism was built and
+never wired to a reader", and named four. The gate written for it found sixteen
+more. This is the most expensive one so far: not an unused helper, but the
+correct implementation of a guarantee, sitting beside the incorrect one that
+production calls, with a doc comment on the correct one describing the defect in
+the other.
