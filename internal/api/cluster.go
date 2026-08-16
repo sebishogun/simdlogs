@@ -715,6 +715,45 @@ func (s *Server) fanOutPeers(r *http.Request, path string, body []byte) []PeerRe
 	return out
 }
 
+// withFormInURL folds a POST form body into the request's query string so the
+// fan-out carries it.
+//
+// The peer client sends r.URL.RawQuery with every request and the read fan-out
+// sends no body -- askShard's `post` is nil for every read path. So a client
+// that POSTs `query=...` as a form, which the reference accepts and which is how
+// anything longer than a URL is sent, had its parameters dropped on the way to
+// the shards. Every federated endpoint except /select/logsql/query was affected:
+// that one survives only because planQuery rebuilds the shard URL from the
+// parsed form on its own, which is this fix written once for one endpoint.
+//
+// Worse than losing them: the shards then answered the EMPTY query, and the
+// router reported that as the shards having rejected the request -- pointing an
+// operator at the storage nodes for a fault in the router.
+//
+// Folded into the URL rather than forwarded as a body, because the shard call is
+// a GET and every parameter these endpoints take is a query parameter anyway.
+// r.Form is the union of the URL query and the parsed body, so re-encoding it
+// preserves both. Only for a form content type: ParseForm does not touch a JSON
+// body, and the two ES endpoints that DO send a body build their own.
+func withFormInURL(r *http.Request) *http.Request {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		return r
+	}
+	ct := r.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	if strings.TrimSpace(ct) != "application/x-www-form-urlencoded" {
+		return r
+	}
+	if err := r.ParseForm(); err != nil || len(r.Form) == 0 {
+		return r
+	}
+	out := r.Clone(r.Context())
+	out.URL.RawQuery = r.Form.Encode()
+	return out
+}
+
 // checkWatermark demotes an answer served by a replica that has fallen behind.
 //
 // askShard returns the FIRST replica that answers, and Complete is that peer's
@@ -1616,7 +1655,7 @@ const (
 func (s *Server) fanOutChecked(
 	w http.ResponseWriter, r *http.Request, path string, body []byte,
 ) ([]shardAnswer, http.ResponseWriter, bool) {
-	peers := s.fanOutPeers(r, path, body)
+	peers := s.fanOutPeers(withFormInURL(r), path, body)
 
 	var missing []string
 	var incomplete []string

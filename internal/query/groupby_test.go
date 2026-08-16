@@ -1,6 +1,8 @@
 package query
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -206,5 +208,58 @@ func TestStatsByFieldIsDeterministic(t *testing.T) {
 				vcs[i-1].Value, vcs[i].Value)
 			break
 		}
+	}
+}
+
+// The cardinality ceiling fires at a coordinator too.
+//
+// tooManyKeys returns false when q is nil, and ApplyPipes -- the coordinator's
+// pipe runner -- never stamped it. So search.maxGroupKeys was enforced on a
+// storage node and not at a router: the same query answered 413 against one node
+// and 200 with every group through the cluster. That is the worse direction, and
+// not by a little: the coordinator is the ONE place that holds every shard's
+// groups at once, so it is exactly where a cardinality ceiling matters.
+func TestTheGroupKeyCeilingFiresAtACoordinator(t *testing.T) {
+	var rows []Row
+	for i := 0; i < 12; i++ {
+		rows = append(rows, fieldRow("svc", fmt.Sprintf("svc-%d", i)))
+	}
+
+	for _, tc := range []struct {
+		name  string
+		pipes []Pipe
+	}{
+		{"stats by", []Pipe{&StatsPipe{By: []string{"svc"}, Aggs: []Agg{{Kind: AggCount, Alias: "c"}}}}},
+		{"top by", []Pipe{&TopPipe{By: []string{"svc"}, N: 100}}},
+		{"uniq by", []Pipe{&UniqPipe{By: []string{"svc"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &Query{Pipes: tc.pipes}
+			// Bound the way a coordinator binds it: an UNBOUND query has nowhere
+			// to record why it stopped, so it would return nil with a nil error
+			// -- the silent empty answer, not the ceiling working.
+			q.Bind(context.Background(), Limits{MaxGroupKeys: 3})
+
+			got := ApplyPipes(q, rows)
+			if got != nil {
+				t.Errorf("MaxGroupKeys=3 let %d groups through at the coordinator", len(got))
+			}
+			err := q.StopErr()
+			if err == nil {
+				t.Fatal("the query was not stopped, so nothing tells the caller the " +
+					"answer would have been truncated")
+			}
+			if !errors.Is(err, ErrTooManyGroupKeys) {
+				t.Errorf("stopped with %v, want ErrTooManyGroupKeys", err)
+			}
+		})
+	}
+
+	// Under the ceiling, the same query goes through: a gate that refuses
+	// everything is not a gate.
+	q := &Query{Pipes: []Pipe{&StatsPipe{By: []string{"svc"}, Aggs: []Agg{{Kind: AggCount, Alias: "c"}}}}}
+	q.Bind(context.Background(), Limits{MaxGroupKeys: 100})
+	if got := ApplyPipes(q, rows); len(got) != 12 {
+		t.Errorf("with MaxGroupKeys=100, 12 groups produced %d rows (err %v)", len(got), q.StopErr())
 	}
 }

@@ -334,16 +334,25 @@ func tooManyKeys(q *Query, have int, what string) bool {
 	return true
 }
 
-// RunPipeline runs q's filter and pipes. A leading stats pipe aggregates
-// during the scan; otherwise the filter's rows feed the pipe chain.
-func RunPipeline(s Store, q *Query) []Row {
-	resolveTimePreds(q)     // relative _time -> absolute before stats or Run see the window
-	resolveSubqueries(s, q) // in(<subquery>) -> value set, before the filter evaluates
-	rangeSec := float64(q.To-q.From) / 1e9
+// stampPipes gives each cardinality-bounded pipe the running query, and each
+// rate pipe the query window.
+//
+// Both entry points must call it. RunPipeline (a storage node) did; ApplyPipes
+// (a cluster coordinator) did not, and tooManyKeys returns false when q is nil
+// -- so search.maxGroupKeys was enforced on a node and not at a router. The
+// same query answered 413 against one storage node and 200 with 12 groups
+// through the cluster, which is the worse direction: the coordinator is the one
+// place holding every shard's groups at once, so it is where the ceiling
+// actually matters.
+//
+// It is a function rather than two copies of a switch for the reason the switch
+// itself exists: a new cardinality-bounded pipe added to one copy and not the
+// other is unbounded at a coordinator, and nothing would say so.
+func stampPipes(q *Query, rangeSec float64) {
 	for _, p := range q.Pipes {
 		// The window, for rate()/rate_sum(); and the running query, so a pipe
-		// that builds state proportional to CARDINALITY can stop when it
-		// blows its ceiling instead of returning a map it silently truncated.
+		// that builds state proportional to CARDINALITY can stop when it blows
+		// its ceiling instead of returning a map it silently truncated.
 		switch pp := p.(type) {
 		case *StatsPipe:
 			pp.rangeSec = rangeSec
@@ -354,6 +363,15 @@ func RunPipeline(s Store, q *Query) []Row {
 			pp.q = q
 		}
 	}
+}
+
+// RunPipeline runs q's filter and pipes. A leading stats pipe aggregates
+// during the scan; otherwise the filter's rows feed the pipe chain.
+func RunPipeline(s Store, q *Query) []Row {
+	resolveTimePreds(q)     // relative _time -> absolute before stats or Run see the window
+	resolveSubqueries(s, q) // in(<subquery>) -> value set, before the filter evaluates
+	rangeSec := float64(q.To-q.From) / 1e9
+	stampPipes(q, rangeSec)
 	var rows []Row
 	pipes := q.Pipes
 	if len(pipes) > 0 {
@@ -1509,6 +1527,11 @@ func ApplyPipes(q *Query, rows []Row) []Row {
 	// size stay 0 and the ceiling never fire -- the same shape as the defect
 	// this replaced. The engine already has that predicate and uses it in four
 	// other places.
+	// The coordinator's pipes get the running query too -- see stampPipes.
+	// Without it every cardinality ceiling was nil-guarded away at the one place
+	// that holds every shard's groups at once.
+	stampPipes(q, float64(q.To-q.From)/1e9)
+
 	measure := q.countsBytes()
 	// Measured ONCE per pipe, carried forward.
 	//
