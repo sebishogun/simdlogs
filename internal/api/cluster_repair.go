@@ -261,6 +261,37 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 				"no backends configured, so it is not a router")
 		return
 	}
+	// One repair at a time on this router.
+	//
+	// Repair reads every replica's group digests, decides what is missing, and
+	// copies it. Two overlapping passes both read the same missing set before
+	// either has written any of it, and both then copy it: 5 of 5 runs
+	// duplicated rows, and BOTH reports said complete:true, blocked:0 -- which
+	// is the exact output the runbook tells an operator to repair until they
+	// see. The digest read and the copy that acts on it are separated by every
+	// peer round trip in the shard, so this is check-then-act with the widest
+	// window this code has.
+	//
+	// The backup path has admitted one at a time since it was written
+	// (tenant.backupBusy). Repair, which MUTATES, had nothing.
+	//
+	// This latch is per-PROCESS, and two routers pointed at the same cluster
+	// still duplicate -- the reviewer reproduced that case too. Closing it needs
+	// the decision to move to the destination, the only participant that can see
+	// it already holds the group; that is task #428. A process latch is the
+	// prerequisite and not the whole answer, and claiming otherwise here would
+	// be this repository's fourth guard placed one layer above the layer that
+	// can observe the failure.
+	if !s.repairBusy.CompareAndSwap(false, true) {
+		s.writeErr(w, r, adminSpec(), http.StatusConflict,
+			"simdlogs: a repair is already running on this router. Two overlapping "+
+				"passes read the same missing set before either writes it, then both "+
+				"copy it -- duplicating rows while both reports say complete. Wait for "+
+				"the running pass to finish.")
+		return
+	}
+	defer s.repairBusy.Store(false)
+
 	obs.Audit(r.Context(), obs.EventClusterRepair, subjectOf(r), obs.OutcomeOK,
 		obs.FieldTenant, tenantKeyOf(r), obs.FieldRoute, r.URL.Path)
 	rep := RepairReport{Complete: true}

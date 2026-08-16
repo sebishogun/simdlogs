@@ -75,6 +75,10 @@ type Server struct {
 	// because the fan-out writes them from one goroutine per shard.
 	hwMu sync.Mutex
 	hw   map[int]*atomic.Int64
+	// repairBusy admits one cluster repair at a time on this router. Repair
+	// mutates, and two overlapping passes read the same missing set before
+	// either writes it -- see repairCluster.
+	repairBusy atomic.Bool
 
 	// quota is the storage budget every tenant store opens under. Validated
 	// once at construction, so a tenant opening later cannot fail for a
