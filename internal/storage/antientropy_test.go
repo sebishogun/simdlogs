@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -322,5 +325,84 @@ func TestGrowthTrackingDoesNotInventASizeBeforeTheFirstSample(t *testing.T) {
 	}
 	if second := st.DiskBytes(); second <= first {
 		t.Fatalf("DiskBytes went %d -> %d across an append", first, second)
+	}
+}
+
+// Concurrent adopts of ONE group leave one copy.
+//
+// AdoptGroup is check-then-act: it asks whether this store already holds the
+// digest, then appends. The two steps each took the store lock and released
+// it, so every concurrent adopt of the same group saw it absent and every one
+// appended. Measured before the fix, one digest of four rows:
+//
+//	2 concurrent   1 said adopted, the store held 1 group,  4 rows
+//	4 concurrent   2 said adopted, the store held 2 groups, 8 rows
+//	8 concurrent   3 said adopted, the store held 3 groups, 12 rows
+//
+// The losers all returned adopted=false, so a caller counting successes saw
+// exactly one while the store held three -- the duplication is invisible from
+// the outside, which is why repair could report complete:true, blocked:0 over
+// a shard it had just doubled.
+//
+// This is what two routers repairing the same shard produce. The router's own
+// latch is per PROCESS and cannot close it; the destination is the only
+// participant that can see it already holds the group, which is task #428.
+//
+// THE COUNTS ARE THE ASSERTION, not the return values: a fix that made every
+// caller say false while still appending would satisfy a check on the booleans.
+func TestConcurrentAdoptsOfOneGroupLeaveOneCopy(t *testing.T) {
+	for _, n := range []int{2, 4, 8, 16} {
+		t.Run(strconv.Itoa(n)+" at once", func(t *testing.T) {
+			src := aeStore(t)
+			if _, err := src.AppendGroup(aeGroup("W1", 4, 1000)); err != nil {
+				t.Fatal(err)
+			}
+			ds, err := src.GroupDigests()
+			if err != nil || len(ds) != 1 {
+				t.Fatalf("the source holds %d groups: %v", len(ds), err)
+			}
+			blob, err := src.GroupBytes(ds[0].Digest)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			dst := aeStore(t)
+			var wg sync.WaitGroup
+			var adopted atomic.Int64
+			start := make(chan struct{})
+			for i := 0; i < n; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					ok, err := dst.AdoptGroup(ds[0].Digest, blob)
+					if err != nil {
+						t.Errorf("adopt: %v", err)
+					}
+					if ok {
+						adopted.Add(1)
+					}
+				}()
+			}
+			close(start) // released together, so they contend rather than queue
+			wg.Wait()
+
+			got, err := dst.GroupDigests()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 {
+				t.Errorf("%d concurrent adopts of one group left %d groups and %d "+
+					"rows; the group holds 4 rows and was adopted once by every "+
+					"measure the caller can see (%d said adopted)",
+					n, len(got), dst.TotalRows(), adopted.Load())
+			}
+			if dst.TotalRows() != 4 {
+				t.Errorf("the store holds %d rows, want the group's 4", dst.TotalRows())
+			}
+			if adopted.Load() != 1 {
+				t.Errorf("%d callers were told they adopted it, want exactly 1", adopted.Load())
+			}
+		})
 	}
 }

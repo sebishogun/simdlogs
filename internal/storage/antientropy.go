@@ -216,6 +216,17 @@ func (s *Store) AdoptGroup(digest string, blob []byte) (adopted bool, err error)
 		return false, fmt.Errorf("storage: refusing a group with %d rows", g.Rows)
 	}
 
+	// THE CHECK AND THE APPEND ARE ONE STEP.
+	//
+	// Held across both, because between them is where the duplicate lands: the
+	// two used to take s.mu separately, so concurrent adopts of one group all
+	// saw it absent and all appended. The destination is the only participant
+	// that can see it already holds the group -- a router deciding what is
+	// missing is reading a state another router may already be changing, which
+	// is why the router's own latch cannot close this.
+	s.adoptMu.Lock()
+	defer s.adoptMu.Unlock()
+
 	if s.hasDigest(digest) {
 		return false, nil // already here; repair is idempotent
 	}

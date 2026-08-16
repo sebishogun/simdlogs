@@ -20,6 +20,25 @@ type Store struct {
 	digestMu   sync.Mutex
 	digestByID map[uint64]string
 
+	// adoptMu serializes AdoptGroup, which is check-then-act: it asks whether
+	// this store already holds the digest and then appends. The two steps each
+	// took s.mu and released it, so concurrent adopts of ONE group all saw it
+	// absent and all appended. Measured, one digest of four rows:
+	//
+	//	2 concurrent adopts   1 said adopted, the store held 1 group,  4 rows
+	//	4 concurrent adopts   2 said adopted, the store held 2 groups, 8 rows
+	//	8 concurrent adopts   3 said adopted, the store held 3 groups, 12 rows
+	//
+	// Every loser returned adopted=false, so a caller counting successes saw
+	// exactly one while the store held three. That is what two routers
+	// repairing the same shard produce, and the process latch on the router
+	// cannot help, because the routers are different processes.
+	//
+	// A whole-store mutex rather than one per digest: adoption is an
+	// anti-entropy path measured in groups per pass, not a hot one, and the
+	// alternative is a map of locks that has to be reaped.
+	adoptMu sync.Mutex
+
 	dir      string
 	mu       sync.RWMutex
 	groups   []*groupEntry

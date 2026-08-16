@@ -289,13 +289,19 @@ func (s *Server) repairCluster(w http.ResponseWriter, r *http.Request) {
 	// The backup path has admitted one at a time since it was written
 	// (tenant.backupBusy). Repair, which MUTATES, had nothing.
 	//
-	// This latch is per-PROCESS, and two routers pointed at the same cluster
-	// still duplicate -- the reviewer reproduced that case too. Closing it needs
-	// the decision to move to the destination, the only participant that can see
-	// it already holds the group; that is task #428. A process latch is the
-	// prerequisite and not the whole answer, and claiming otherwise here would
-	// be this repository's fourth guard placed one layer above the layer that
-	// can observe the failure.
+	// This latch is per-PROCESS and cannot close the two-router case: two
+	// routers pointed at the same cluster both read the same missing set and
+	// neither sees the other. That is closed at the DESTINATION, which is the
+	// only participant that can see it already holds the group --
+	// storage.AdoptGroup now holds one lock across its "do I have this?" and
+	// its append, so a second POST of the same digest is a no-op however many
+	// routers send it (task #428). Before, four concurrent adopts of one
+	// four-row group left 2 groups and 8 rows, and eight left 3 and 12, with
+	// every loser returning adopted=false.
+	//
+	// This latch still earns its place: it stops one router doing the whole
+	// pass twice, which wastes a full round of fetches even when nothing
+	// duplicates. It is the cheap half, and it is no longer the only half.
 	if !s.repairBusy.CompareAndSwap(false, true) {
 		s.writeErr(w, r, adminSpec(), http.StatusConflict,
 			"simdlogs: a repair is already running on this router. Two overlapping "+

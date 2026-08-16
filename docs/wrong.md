@@ -6522,3 +6522,37 @@ departed peer's floor stand, and not recording which peer set the high. The
 second of those first appeared to survive — the mutation left `present`
 assigned and never read, which does not compile, and a grep for `--- FAIL`
 counts a build failure as zero.
+
+## 90. The repair duplicate was a check-then-act in the store, not in the router
+
+Task #428. The router admits one repair at a time, and its own comment said the
+latch is per-process and cannot help when two routers point at the same
+cluster — closing that needs the decision at the destination, the only
+participant that can see it already holds the group.
+
+The destination already had the check. `AdoptGroup` asks `hasDigest` and then
+appends, and **the two steps took the store lock separately**. Measured, one
+digest of four rows, callers released together:
+
+| concurrent adopts | said adopted | groups in the store | rows |
+|---|---|---|---|
+| 2 | 1 | 1 | 4 |
+| 4 | 2 | **2** | **8** |
+| 8 | 3 | **3** | **12** |
+
+Every loser returned `adopted=false`. A caller counting successes saw exactly
+one while the store held three — which is how a repair pass reports
+`complete:true, blocked:0` over a shard it has just doubled, and why the
+duplication could not be seen from the router at all.
+
+One lock across both steps. End to end, two separate routers repairing one
+shard: the replica that was missing a group holds it once, and reverting the
+lock reddens that test on every run of ten.
+
+**Both passes may still report `copied>0`, and that is not the defect.** Each
+decided from a state that was true when it read it, and a report is about the
+decision. The rows are the assertion.
+
+The router's latch stays. It stops one router doing the whole pass twice, which
+wastes a round of fetches even when nothing duplicates — the cheap half, and no
+longer the only half.
