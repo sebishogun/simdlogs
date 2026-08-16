@@ -24,6 +24,13 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, so TestTheChangelogCommitCountsAreReal can resolve
+          # the sha CHANGELOG.md pins. Its skip branch exists for a source
+          # tarball, and a depth-1 checkout took it in EVERY CI run -- the gate
+          # written to stop those counts going stale ran nowhere but a
+          # developer's own clone. Proved with `git clone --depth 1`.
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.5'
@@ -49,6 +56,13 @@ jobs:
         goarch: [s390x, ppc64le, riscv64]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, so TestTheChangelogCommitCountsAreReal can resolve
+          # the sha CHANGELOG.md pins. Its skip branch exists for a source
+          # tarball, and a depth-1 checkout took it in EVERY CI run -- the gate
+          # written to stop those counts going stale ran nowhere but a
+          # developer's own clone. Proved with `git clone --depth 1`.
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.5'

@@ -38,8 +38,29 @@ func TestTheChangelogCommitCountsAreReal(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not available")
 	}
+	if err := run(t, "git", "rev-parse", "--git-dir"); err != nil {
+		t.Skip("not a git repository (a source tarball)")
+	}
+
+	// A SHALLOW checkout fails rather than skips.
+	//
+	// The skip branch exists for a source tarball, which genuinely has no
+	// history. A shallow clone is a different thing: it is a CI configuration
+	// that CAN have the history and was not asked for it. Every checkout in
+	// this repository's workflows was depth-1, so this gate -- written to stop
+	// the changelog counts going stale -- ran nowhere except a developer's own
+	// clone, and reported SKIP while doing it. Skipping quietly is how a gate
+	// stops being a gate.
+	if out, err := output(t, "git", "rev-parse", "--is-shallow-repository"); err == nil &&
+		strings.TrimSpace(out) == "true" {
+		t.Fatal("this is a shallow checkout, so the sha CHANGELOG.md pins cannot " +
+			"be resolved and this gate cannot run. Set `fetch-depth: 0` on the " +
+			"checkout step. A tarball with no .git at all skips above; a clone " +
+			"that could have the history and does not is a misconfiguration")
+	}
 	if err := run(t, "git", "cat-file", "-e", sha+"^{commit}"); err != nil {
-		t.Skipf("%s is not in this repository (shallow clone or tarball)", sha)
+		t.Fatalf("%s is not in this repository, and it is not a shallow clone or "+
+			"a tarball: the sha CHANGELOG.md pins does not exist here", sha)
 	}
 
 	out, err := output(t, "git", "log", "--pretty=%s", sha)

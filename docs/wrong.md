@@ -4769,3 +4769,40 @@ values, and `_time` vanished from every cluster facet answer on any tenant with
 more than 1000 matching rows per shard. Fixing the parameter for one field
 exposed the same trap one layer down, in the function that reads the same
 value with the opposite convention.
+
+## 49. The gate that stops the counts going stale ran nowhere but a developer's clone
+
+`TestTheChangelogCommitCountsAreReal` (entry: added with the pinned-sha
+changelog counts) resolves the sha `CHANGELOG.md` names and recomputes every
+count from history. It has a skip branch for a source tarball, which genuinely
+has no `.git`.
+
+Every `actions/checkout@v4` in this repository — ten of them, across `ci.yml`,
+`cross.yml`, `fuzz.yml` and `release.yml` — used the default `fetch-depth: 1`.
+A depth-1 clone cannot resolve a sha that is not its tip, so the gate took the
+tarball branch in **every CI run since it was written**. Proved directly:
+
+```
+$ git clone --depth 1 file:///…/simdlogs shallow
+$ go test -run TestTheChangelogCommitCountsAreReal ./internal/tests/docs/
+    changelog_test.go:42: 7efa127 is not in this repository (shallow clone or tarball)
+--- SKIP
+```
+
+Two changes, and the second matters more.
+
+`fetch-depth: 0` on the seven checkouts whose job runs the suite. That makes
+the gate able to run.
+
+And a shallow checkout now FAILS rather than skips. A tarball has no `.git` and
+legitimately cannot run this; a shallow clone is a CI configuration that could
+have had the history and was not asked for it, which is a misconfiguration
+wearing a skip's clothing. The two are now distinguished by
+`git rev-parse --is-shallow-repository`, and the failure says which flag to
+set.
+
+**The shape.** Every previous entry in this record is a test or a check that
+could not fail. This one could — it simply never ran, and announced that fact
+in a line nobody reads, in the one status (`SKIP`) that looks like success in
+every summary view. A gate that skips is worth less than no gate, because it
+occupies the place where somebody would otherwise notice one is missing.
