@@ -11,6 +11,8 @@ import (
 	"time"
 
 	obs "github.com/sebishogun/simdlogs/internal/observability"
+
+	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
 // A backup of a cluster, rather than a backup of each machine.
@@ -226,6 +228,49 @@ func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
 			obs.L().Error("cluster backup failed mid-stream",
 				obs.FieldEvent, "cluster.backup_failed", "shard", i,
 				"source", sources[i], "class", string(resp.Class), "err", resp.Err)
+			panic(http.ErrAbortHandler)
+		}
+		// The completeness header, which this path read and then ignored.
+		//
+		// cluster_client.go sets resp.Complete from X-Simdlogs-Complete on the
+		// spooled response, the READ path enforces it, and four lines from where
+		// it is parsed the backup path did not look. A node serving 1 of 2
+		// groups under quarantine -- failing its own readiness probe -- produced
+		// a valid cluster backup at HTTP 200. That is the worst place in the
+		// system for a silent partial: the archive is what an operator restores
+		// from after losing the original, so the gap surfaces when the data it
+		// is missing is the only copy.
+		if !resp.Complete {
+			cleanup()
+			obs.L().Error("cluster backup refused: source replica is not complete",
+				obs.FieldEvent, "cluster.backup_failed", "shard", i,
+				"source", sources[i],
+				"reason", "peer did not report "+HdrComplete+"=true")
+			panic(http.ErrAbortHandler)
+		}
+		// VERIFY the shard archive before it goes into the cluster tar.
+		//
+		// spool accepted any 2xx and any body: a 200 with an empty body, a 204,
+		// a truncated archive and an HTML error page all produced a well-formed
+		// cluster tar whose manifest claimed the rows. ValidateClusterBackup
+		// checks the manifest against the entry NAMES and does not look inside
+		// them, so nothing anywhere read the bytes -- until a restore did.
+		//
+		// storage.VerifyBackup is the streaming check the single-node backup
+		// already ships and had no caller here. It costs one extra read of the
+		// spooled file, which is local disk, against an archive that is
+		// otherwise unchecked until the day it is needed.
+		if _, err := storage.VerifyBackup(f); err != nil {
+			cleanup()
+			obs.L().Error("cluster backup refused: shard archive did not verify",
+				obs.FieldEvent, "cluster.backup_failed", "shard", i,
+				"source", sources[i], "bytes", size, "err", err)
+			panic(http.ErrAbortHandler)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			cleanup()
+			obs.L().Error("cluster backup failed rewinding a verified shard archive",
+				obs.FieldEvent, "cluster.backup_failed", "shard", i, "err", err)
 			panic(http.ErrAbortHandler)
 		}
 		err := streamTarFile(tw, sb.Archive, f, size)
