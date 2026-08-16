@@ -708,10 +708,83 @@ func (s *Server) fanOutPeers(r *http.Request, path string, body []byte) []PeerRe
 		go func(i int, sh []string) {
 			defer wg.Done()
 			out[i] = s.askShard(r, i, sh, path, body)
+			s.checkWatermark(&out[i], i)
 		}(i, sh)
 	}
 	wg.Wait()
 	return out
+}
+
+// checkWatermark demotes an answer served by a replica that has fallen behind.
+//
+// askShard returns the FIRST replica that answers, and Complete is that peer's
+// report on its OWN store -- true, and useless here, because a lagging replica's
+// store is complete as far as it knows. Two replicas of one shard holding 12 and
+// 8 rows answered the same query with 12 or 8 depending on which was up, both at
+// HTTP 200, with nothing in the response saying which had happened.
+//
+// PeerResponse.HighWatermark is the field that tells them apart, and its own
+// documentation says so -- "what lets a caller tell no results from no results
+// yet". It was populated on the wire, parsed by the client, and read by no read
+// path: built, documented, and wired to nothing, which is the shape round six
+// found four times over.
+//
+// This is the reader. The router remembers the highest watermark it has seen
+// from each shard; an answer below that came from a replica behind the one that
+// produced an earlier answer, so it is marked incomplete -- which routes it into
+// the completeness rule that already exists, and it becomes a 503, or an
+// explicitly-asked-for 206, instead of a short 200.
+//
+// # What it does not do
+//
+// One atomic per read, no extra replica asked, and it pays for that with a blind
+// spot: a router with no history for a shard -- freshly started, or one whose
+// only answer for that shard ever came from the lagging replica -- has nothing
+// to compare against and lets the answer through. Catching THAT needs a quorum
+// read, a request per replica on every query. The check is monotone and can only
+// mark an answer incomplete, never complete, so the blind spot costs a detection
+// and never produces a false assurance.
+func (s *Server) checkWatermark(p *PeerResponse, shard int) {
+	// A zero watermark is "the peer did not say", not "the epoch". A peer that
+	// omits the header is on an older protocol version, and treating silence as
+	// maximally-lagging would fail every read against it.
+	if !p.OK() || p.HighWatermark == 0 {
+		return
+	}
+	seen := s.shardHW(shard)
+	for {
+		hi := seen.Load()
+		if p.HighWatermark < hi {
+			obs.L().Warn("shard answered from a replica behind the highest watermark seen",
+				obs.FieldEvent, "cluster.replica_lagging",
+				obs.FieldShard, shard, "replica", p.Replica, "peer", p.URL,
+				"watermark", p.HighWatermark, "highest_seen", hi,
+				obs.FieldErrorClass, string(obs.ClassUpstream))
+			p.Complete = false
+			return
+		}
+		if p.HighWatermark == hi || seen.CompareAndSwap(hi, p.HighWatermark) {
+			return
+		}
+		// Lost the race to another shard's goroutine; re-read and decide again.
+	}
+}
+
+// shardHW is the per-shard highest watermark this router has observed. Created
+// on first use: the shard count is a runtime property of the backend list, and
+// sizing a slice from it would need re-sizing every time that list changes.
+func (s *Server) shardHW(shard int) *atomic.Int64 {
+	s.hwMu.Lock()
+	defer s.hwMu.Unlock()
+	if s.hw == nil {
+		s.hw = map[int]*atomic.Int64{}
+	}
+	v, ok := s.hw[shard]
+	if !ok {
+		v = &atomic.Int64{}
+		s.hw[shard] = v
+	}
+	return v
 }
 
 // mergeDecode unmarshals one shard's answer into v, refusing rather than

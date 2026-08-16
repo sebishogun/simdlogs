@@ -69,6 +69,12 @@ type Server struct {
 	// incomplete rather than that something was.
 	shardID   int
 	replicaID int
+	// hw is the highest HighWatermark this router has seen from each shard,
+	// which is what makes a lagging replica's answer detectable at all -- see
+	// checkWatermark. hwMu guards creation of an entry; each entry is atomic
+	// because the fan-out writes them from one goroutine per shard.
+	hwMu sync.Mutex
+	hw   map[int]*atomic.Int64
 
 	// quota is the storage budget every tenant store opens under. Validated
 	// once at construction, so a tenant opening later cannot fail for a
