@@ -49,7 +49,7 @@ func TestAMalformedQueryStringIsRefusedNotIgnored(t *testing.T) {
 func facetShard(t *testing.T, sawLimit *string, body string) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w.Header(), 0, 0, true, 1, "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
 		if strings.Contains(r.URL.Path, "facets") {
 			*sawLimit = r.URL.Query().Get("limit")
 			w.Write([]byte(body))
@@ -150,7 +150,7 @@ func TestTheFederatedESSearchValidatesLikeASingleNode(t *testing.T) {
 func TestARowEndpointRefusesALineThatIsNotARow(t *testing.T) {
 	good := goodShard(t)
 	html := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w.Header(), 0, 0, true, 1, "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
 		w.Write([]byte("<html><body>502 Bad Gateway</body></html>"))
 	}))
 	t.Cleanup(html.Close)
@@ -400,7 +400,7 @@ func TestATruncatedShardLineIsRefused(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			good := goodShard(t)
 			bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				writeEnvelope(w.Header(), 0, 0, true, 1, "")
+				writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
 				w.Write([]byte(tc.body))
 			}))
 			t.Cleanup(bad.Close)
@@ -470,7 +470,7 @@ func TestAMalformedMiddleLineIsRefused(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			good := goodShard(t)
 			bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				writeEnvelope(w.Header(), 0, 0, true, 1, "")
+				writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
 				w.Write([]byte(tc.body))
 			}))
 			t.Cleanup(bad.Close)

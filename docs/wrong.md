@@ -6733,3 +6733,81 @@ would land on before the live one.
 The list ratchets both ways, so none of this can come back quietly: an
 exemption that gains a production reader fails the gate, and a new name without
 one fails it too.
+
+## 96. The watermark needed a generation, not durability
+
+Task #434 asked for a durable watermark so lag could be refused again. It did
+not need one. What the refusal was missing was never persistence — it was the
+ability to tell a **restart** from **lag**, and one header settles that.
+
+The watermark comparison had been demoted to a log line because three benign
+causes each looked exactly like a lagging replica:
+
+| cause | why it lowered the watermark | closed by |
+|---|---|---|
+| a per-query maximum | a narrow query saw fewer groups than a wide one | node-level running maximum (`s.hwOwn`, CAS) |
+| a different replica answering | replica B's floor compared against replica A's | recording `peer` with the floor |
+| the node restarted | the in-memory maximum started over at 0 | **this entry** |
+
+The first two are properties the node can fix about itself. The third cannot
+be: after a restart the node's watermark is genuinely lower, and no amount of
+care on the reader's side distinguishes that from a replica that has fallen
+behind. Durable state was the obvious answer and the wrong one — it makes every
+node's correctness depend on a file surviving, for a fact that expires in
+milliseconds.
+
+A **per-process generation** is enough. `newNodeGeneration()` (crypto/rand hex,
+time+pid fallback) is stamped into the `Server` at construction and travels on
+every peer envelope as `X-Simdlogs-Generation`. `observe` then has evidence:
+
+```go
+if peer == h.peer && gen != "" && h.gen != "" && gen != h.gen {
+    prev = h.hw
+    h.hw, h.peer, h.gen = hw, peer, gen
+    return false, prev, true // a restart, not lag
+}
+```
+
+Same peer, different generation, lower watermark: that is a restart, and the
+floor is re-based rather than refused. Same peer, same generation, lower
+watermark: nothing benign explains it, and the read is refused —
+`p.Complete = false`, which surfaces as 503, with `allow_partial_response=1`
+as the recoverable 206.
+
+**The fourth guard is the one that makes it deployable.** `observe` returns
+`certain`, and `checkWatermark` refuses only when `certain`. Either side
+predating the header leaves `certain` false, so during the first half of a
+rolling upgrade — when every peer is an older build sending no generation — a
+fall is logged and never refused. A false 503 across a whole cluster is worse
+than the short answer it would be preventing.
+
+Each guard was probed by mutation, and the fourth is why this entry has a
+number. Three of them redden the suite when removed:
+
+| mutation | result |
+|---|---|
+| never refuse (`p.Complete` untouched) | 3 tests red |
+| a restart counts as lag (`if false`) | 3 tests red |
+| no generation on the wire | 3 tests red |
+| **refuse without evidence (drop `certain`)** | **green** |
+
+Green, because every fixture carried a generation — `certain` was true
+everywhere and the guard could not be seen. The guard that only matters during
+an upgrade is invisible to a suite where nothing is mid-upgrade.
+`TestAPeerWithNoGenerationIsReportedNotRefused` builds the older node's
+envelope by hand, omitting exactly one header, and the fourth mutation reddens.
+
+What the fixtures mean now, which is the other half of the change:
+
+| fixture | before | now |
+|---|---|---|
+| a replica whose watermark falls within one generation | logged | **503**, 206 with `allow_partial_response=1` |
+| a peer that restarts (new generation) | logged | tolerated, floor re-based |
+| a restarted peer's **sibling** falling | logged | still refused — a restart excuses one peer |
+| a peer sending no generation | logged | logged |
+| an unchanged watermark | logged | not lag |
+| a replaced machine | logged | does not inherit the old floor |
+
+The superseded claim, corrected here rather than left standing: "#434 needs a
+durable watermark before lag can be refused (a restart still lowers it)". It
+does not. It needs to know which process answered.

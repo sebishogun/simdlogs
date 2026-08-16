@@ -1,9 +1,13 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
+	"time"
 )
 
 // The internal cluster wire protocol.
@@ -58,8 +62,12 @@ const (
 	HdrReplicaID       = "X-Simdlogs-Replica"
 	HdrComplete        = "X-Simdlogs-Complete"
 	HdrHighWatermark   = "X-Simdlogs-High-Watermark"
-	HdrErrorClass      = "X-Simdlogs-Error-Class"
-	HdrTraceID         = "X-Simdlogs-Trace"
+	// HdrNodeGeneration identifies this PROCESS. It changes on every restart
+	// and never within one, which is what lets a router tell a peer that
+	// restarted from a peer that fell behind -- see shardHigh.observe.
+	HdrNodeGeneration = "X-Simdlogs-Generation"
+	HdrErrorClass     = "X-Simdlogs-Error-Class"
+	HdrTraceID        = "X-Simdlogs-Trace"
 	// HdrInternal marks a request as coming from a peer rather than a client.
 	// A storage node answers internal requests with the envelope; a client
 	// request gets the public response unchanged.
@@ -142,6 +150,11 @@ type PeerResponse struct {
 	// false, and a router that merges it without saying so has turned a
 	// partial answer into a confident one.
 	Complete bool
+	// Generation identifies the peer's PROCESS. A watermark that fell because
+	// the peer restarted is not evidence that it is behind its siblings, and
+	// without this the two are the same observation.
+	Generation string
+
 	// HighWatermark is the newest timestamp this peer's data covers. It is
 	// what lets a caller tell "no results" from "no results yet": a shard that
 	// has ingested nothing since yesterday reports yesterday, and a merge that
@@ -175,15 +188,34 @@ func (p PeerResponse) String() string {
 // write is silently dropped, which would make completeness look true (the zero
 // value a reader sees for a missing header is "absent", and the first version
 // of this treated absent as complete).
-func writeEnvelope(h headerSetter, shard, replica int, complete bool, highWatermark int64, traceID string) {
+func writeEnvelope(h headerSetter, shard, replica int, complete bool, highWatermark int64, generation, traceID string) {
 	h.Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
 	h.Set(HdrShardID, strconv.Itoa(shard))
 	h.Set(HdrReplicaID, strconv.Itoa(replica))
 	h.Set(HdrComplete, strconv.FormatBool(complete))
 	h.Set(HdrHighWatermark, strconv.FormatInt(highWatermark, 10))
+	h.Set(HdrNodeGeneration, generation)
 	if traceID != "" {
 		h.Set(HdrTraceID, traceID)
 	}
+}
+
+// newNodeGeneration identifies one process, or in a test one simulated machine.
+//
+// Random, not the start time: two nodes started in the same second, or a clock
+// that steps backwards, must not produce the same value -- and the only thing
+// asked of it is that it differ across restarts and never within one. It is a
+// per-SERVER value rather than a package one so a test can build two machines,
+// and restart one, in a single process.
+func newNodeGeneration() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// A process that cannot read randomness still has to run. The fallback
+		// is unique per process on any real system and the consequence of a
+		// collision is a missed lag report, not a wrong answer.
+		return strconv.FormatInt(time.Now().UnixNano(), 36) + "-" + strconv.Itoa(os.Getpid())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // headerSetter is http.Header's Set, so writeEnvelope can be tested without a
@@ -232,7 +264,7 @@ func (s *Server) serveEnvelope(next http.Handler) http.Handler {
 			}
 		}
 		writeEnvelope(w.Header(), s.shardID, s.replicaID, complete,
-			s.highWatermark(), r.Header.Get(HdrTraceID))
+			s.highWatermark(), s.generation, r.Header.Get(HdrTraceID))
 		next.ServeHTTP(w, r)
 	})
 }

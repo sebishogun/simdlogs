@@ -293,6 +293,7 @@ func (c *clusterClient) do(
 	// yes would report a partial answer as whole -- which is the failure the
 	// envelope exists to prevent.
 	out.Complete = resp.Header.Get(HdrComplete) == "true"
+	out.Generation = resp.Header.Get(HdrNodeGeneration)
 	if hw := resp.Header.Get(HdrHighWatermark); hw != "" {
 		// The error is NOT discarded.
 		//

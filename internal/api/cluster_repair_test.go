@@ -406,7 +406,7 @@ func TestABodyThatParsesButIsNotAStateIsRefused(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				writeEnvelope(w.Header(), 0, 0, true, 1, "")
+				writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
 				w.Write([]byte(tc.body))
 			}))
 			t.Cleanup(peer.Close)

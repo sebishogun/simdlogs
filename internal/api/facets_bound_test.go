@@ -36,7 +36,7 @@ func paramShard(t *testing.T, seen *[]string) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*seen = append(*seen, r.URL.RawQuery)
-		writeEnvelope(w.Header(), 0, 0, true, 1, "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
 		fmt.Fprint(w, `{"facets":[{"field":"svc","values":[{"value":"a","hits":1}]}]}`)
 	}))
 	t.Cleanup(ts.Close)

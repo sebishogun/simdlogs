@@ -86,6 +86,9 @@ type Server struct {
 	// maximum so that evicting a tenant or expiring data cannot lower what it
 	// reports. See highWatermark.
 	hwOwn atomic.Int64
+	// generation identifies this PROCESS, so a router can tell a peer that
+	// restarted from a peer that fell behind. Set once, never changed.
+	generation string
 	// repairBusy admits one cluster repair at a time on this router. Repair
 	// mutates, and two overlapping passes read the same missing set before
 	// either writes it -- see repairCluster.
@@ -246,7 +249,7 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	}
 	srv := &Server{dir: dir, tenants: map[string]*tenant{},
 		degraded: map[string]storage.Health{}, dirRereadEvery: DefaultDirRereadEvery,
-		started: time.Now()}
+		started: time.Now(), generation: newNodeGeneration()}
 	srv.vecFlds = vecFlds
 	// Built even on a non-router: SetBackends can be called after
 	// construction, and a nil client at that point would be a nil dereference

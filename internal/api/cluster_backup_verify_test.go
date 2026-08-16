@@ -38,7 +38,7 @@ func backupShard(t *testing.T, complete bool, status int, body []byte) *httptest
 			proxyTo(w, r, inner.URL)
 			return
 		}
-		writeEnvelope(w.Header(), 0, 0, complete, 1, "")
+		writeEnvelope(w.Header(), 0, 0, complete, 1, "gen-test", "")
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		w.WriteHeader(status)
 		w.Write(body)

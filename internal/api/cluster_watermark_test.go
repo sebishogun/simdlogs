@@ -36,6 +36,18 @@ type wmShard struct {
 	dead atomic.Bool
 	hits atomic.Int64
 	wm   atomic.Int64
+	// gen is this simulated MACHINE's process generation. Two shards must not
+	// share one, or a router cannot tell them apart; and restart() changes it,
+	// which is how a fixture models the one way a real node's watermark falls.
+	gen atomic.Value
+}
+
+var wmGen atomic.Int64
+
+// restart gives this shard a new generation, as a process does when it starts.
+func (sh *wmShard) restart(wm int64) {
+	sh.gen.Store("gen-" + strconv.FormatInt(wmGen.Add(1), 10))
+	sh.wm.Store(wm)
 }
 
 func newWMShard(t *testing.T, hits, watermark int64) *wmShard {
@@ -43,6 +55,7 @@ func newWMShard(t *testing.T, hits, watermark int64) *wmShard {
 	sh := &wmShard{}
 	sh.hits.Store(hits)
 	sh.wm.Store(watermark)
+	sh.gen.Store("gen-" + strconv.FormatInt(wmGen.Add(1), 10))
 	sh.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if sh.dead.Load() {
 			// Answered, but not with an answer: the class a router retries on.
@@ -51,7 +64,7 @@ func newWMShard(t *testing.T, hits, watermark int64) *wmShard {
 		}
 		// complete=true, because that is the whole point: this peer's own store
 		// IS complete. Only the watermark says it is behind.
-		writeEnvelope(w.Header(), 0, 0, true, sh.wm.Load(), "")
+		writeEnvelope(w.Header(), 0, 0, true, sh.wm.Load(), sh.gen.Load().(string), "")
 		fmt.Fprintf(w, `{"hits":[{"timestamp":"1970-01-01T00:00:00Z","total":%d}]}`, sh.hits.Load())
 	}))
 	t.Cleanup(sh.ts.Close)
@@ -105,52 +118,77 @@ func TestALaggingReplicaDoesNotServeAShortAnswerAsComplete(t *testing.T) {
 		t.Fatalf("with the leader up: %d total=%d %s", code, total, raw)
 	}
 
-	// The leader goes away. The lagging replica answers, complete=true about its
-	// own store, with an older watermark.
+	// The leader goes away. The lagging replica answers, complete=true about
+	// its own store, with an older watermark -- and it is a DIFFERENT machine,
+	// carrying its own generation, so its shortfall is not explained by a
+	// restart.
 	//
-	// The answer is SERVED, and the lag is logged. An earlier version of this
-	// refused with 503, and that was wrong: a watermark going backwards is not
-	// reliable evidence of a lagging replica. Tenant eviction lowers it (the
-	// node reports the max over OPEN tenants), a topology change lowers it (the
-	// history is keyed by shard index), and retention lowers it -- each on a
-	// healthy cluster, each an unrecoverable 503. See checkWatermark.
+	// This is refused now. The first version refused unconditionally and was
+	// reverted because three ways to lower a watermark on a healthy cluster
+	// were found; all three are closed, and the fourth guard is that both
+	// sides of the comparison must carry a generation. 8 of 12 rows served at
+	// 200 is the confident-and-wrong answer the envelope exists to prevent.
 	leader.dead.Store(true)
 	code, total, raw = hitsTotal(t, ts, "*")
-	if code != 200 {
-		t.Fatalf("the cluster refused a read from a lagging replica (%d): a watermark "+
-			"going backwards has three benign causes and refusing on it outages a "+
-			"healthy cluster. %s", code, raw)
+	if code == 200 {
+		t.Fatalf("served total=%d at 200 from a replica behind the highest "+
+			"watermark seen, from a different machine: %s", total, raw)
 	}
-	if total != 8 {
-		t.Errorf("the lagging replica's answer is total=%d, want 8: %s", total, raw)
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("answered %d, want 503: %s", code, raw)
+	}
+	// And the escape hatch still works, which is what makes the refusal
+	// recoverable rather than an outage: a caller that would rather have the
+	// short answer can ask for it.
+	// hitsTotal returns early on any non-200, so the body is read directly:
+	// 206 IS the answer here, not a failure to parse.
+	code, _, raw = getJSONFrom(t, ts,
+		"/select/logsql/hits?query=*&step=1h&allow_partial_response=1")
+	if code != http.StatusPartialContent {
+		t.Errorf("with allow_partial_response=1: %d, want 206: %s", code, raw)
+	}
+	if !strings.Contains(raw, `"total":8`) && !strings.Contains(raw, `"total":"8"`) {
+		t.Errorf("the partial answer does not carry the lagging replica's 8: %s", raw)
 	}
 }
 
-// A watermark that goes backwards for a BENIGN reason does not refuse the read.
+// A watermark that falls because the peer RESTARTED does not refuse the read.
 //
-// Three ways to lower a node's reported watermark with nothing wrong: evicting a
-// tenant (highWatermark() is the max over OPEN tenants), repointing a shard
-// index at another machine, and retention deleting the newest data. Each one
-// produced a permanent 503 from the version of checkWatermark that refused.
-func TestABenignWatermarkDropDoesNotRefuseTheRead(t *testing.T) {
+// This is the only way a real node's report falls now. Tenant eviction and
+// retention cannot: highWatermark is a running maximum, node-level, that moves
+// only when a write arrives. A restart re-derives it from the stores that load,
+// so a replica whose newest data retention already deleted comes back lower --
+// and it says which it is by carrying a new generation.
+//
+// The version that refused unconditionally never recovered from this, because
+// the floor only rises.
+func TestARestartedPeerDoesNotRefuseTheRead(t *testing.T) {
 	sh := newWMShard(t, 7, 5000)
 	ts := wmRouter(t, sh.ts.URL)
 
 	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 7 {
 		t.Fatalf("first read: %d total=%d %s", code, total, raw)
 	}
-	// The shard's watermark drops, as it does when a tenant is evicted.
-	sh.wm.Store(1000)
+	// The process restarts with less data than it had.
+	sh.restart(1000)
 	for i := 0; i < 3; i++ {
 		code, total, raw := hitsTotal(t, ts, "*")
 		if code != 200 {
-			t.Fatalf("read %d after a benign watermark drop answered %d -- and the "+
-				"version that refused never recovered, because the floor only rises: %s",
-				i, code, raw)
+			t.Fatalf("read %d after a restart answered %d -- a new generation "+
+				"says the fall is the process and not the data, and the floor "+
+				"only rises, so refusing here never recovers: %s", i, code, raw)
 		}
 		if total != 7 {
-			t.Errorf("read %d is total=%d, want 7: %s", i, total, raw)
+			t.Errorf("read %d: total=%d, want 7", i, total)
 		}
+	}
+	// And within the NEW generation the check is live again: a fall with no
+	// restart behind it is refused.
+	sh.wm.Store(500)
+	if code, _, raw := hitsTotal(t, ts, "*"); code == 200 {
+		t.Errorf("a fall inside one generation was served at 200; a store that "+
+			"goes backwards within one process is an anomaly whatever caused "+
+			"it: %s", raw)
 	}
 }
 
@@ -173,12 +211,12 @@ func TestAnUnchangedWatermarkIsNotLag(t *testing.T) {
 	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 9 {
 		t.Fatalf("after the watermark advanced: %d total=%d %s", code, total, raw)
 	}
-	// And going back is REPORTED, not refused: the read is still served. See
-	// TestABenignWatermarkDropDoesNotRefuseTheRead for why.
+	// And going back INSIDE one generation is refused: nothing a live process
+	// does lowers its own running maximum, so this is a peer that lost data.
 	sh.wm.Store(2000)
-	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 9 {
-		t.Errorf("a watermark that went backwards (3000 -> 2000) answered %d total=%d: %s",
-			code, total, raw)
+	if code, _, raw := hitsTotal(t, ts, "*"); code == 200 {
+		t.Errorf("a watermark that went backwards (3000 -> 2000) with no restart "+
+			"was served at 200: %s", raw)
 	}
 }
 
@@ -267,18 +305,18 @@ func TestAReplacedMachineDoesNotInheritTheOldFloor(t *testing.T) {
 	h := &shardHigh{}
 
 	// The original machine sets a high.
-	if behind, _ := h.observe("http://old:1", 100, []string{"http://old:1", "http://sib:1"}); behind {
+	if behind, _, _ := h.observe("http://old:1", "g1", 100, []string{"http://old:1", "http://sib:1"}); behind {
 		t.Fatal("the first report was called behind")
 	}
 	// Its sibling, genuinely behind, is reported.
-	behind, prev := h.observe("http://sib:1", 50, []string{"http://old:1", "http://sib:1"})
+	behind, prev, _ := h.observe("http://sib:1", "g1", 50, []string{"http://old:1", "http://sib:1"})
 	if !behind || prev != 100 {
 		t.Errorf("a sibling at 50 against a high of 100 gave behind=%v prev=%d, "+
 			"want true and 100 -- this is the cross-replica lag the check exists for",
 			behind, prev)
 	}
 	// Now the topology repoints the index: `old` is gone, `new` is empty.
-	behind, prev = h.observe("http://new:1", 0, []string{"http://new:1", "http://sib:1"})
+	behind, prev, _ = h.observe("http://new:1", "g1", 0, []string{"http://new:1", "http://sib:1"})
 	if behind {
 		t.Error("a machine that replaced the one which set the floor was called " +
 			"lagging; it has never been asked before and cannot be behind anything")
@@ -287,38 +325,123 @@ func TestAReplacedMachineDoesNotInheritTheOldFloor(t *testing.T) {
 		t.Errorf("the discarded floor was %d, want 100", prev)
 	}
 	// And the new machine's own history takes over: a peer below IT is behind.
-	if behind, _ := h.observe("http://new:1", 200, []string{"http://new:1", "http://sib:1"}); behind {
+	if behind, _, _ := h.observe("http://new:1", "g1", 200, []string{"http://new:1", "http://sib:1"}); behind {
 		t.Fatal("the new machine's own advance was called behind")
 	}
-	if behind, prev := h.observe("http://sib:1", 150, []string{"http://new:1", "http://sib:1"}); !behind || prev != 200 {
+	if behind, prev, _ := h.observe("http://sib:1", "g1", 150, []string{"http://new:1", "http://sib:1"}); !behind || prev != 200 {
 		t.Errorf("after the replacement a sibling at 150 against 200 gave "+
 			"behind=%v prev=%d, want true and 200", behind, prev)
 	}
 }
 
-// The remaining cause, recorded rather than claimed closed.
+// A peer that RESTARTED is not a peer that fell behind.
 //
-// A node restart re-derives the watermark from the stores that load, so a
-// replica whose newest data retention already deleted comes back below its
-// sibling with nothing wrong. That is why checkWatermark still reports instead
-// of refusing, and this test states the shape so the claim is not a comment
-// nobody checked.
-func TestARestartStillLowersTheWatermark(t *testing.T) {
-	h := &shardHigh{}
+// This was the third of the three healthy-cluster causes and the one that kept
+// checkWatermark a log line: a node re-derives its watermark from the stores
+// that load, so a replica whose newest data retention already deleted comes
+// back below its own previous report with nothing wrong.
+//
+// It needs no durable watermark, only the ability to tell the two apart, and a
+// process that restarted says so by carrying a different generation.
+func TestARestartIsNotLag(t *testing.T) {
 	members := []string{"http://a:1", "http://b:1"}
-	if behind, _ := h.observe("http://a:1", 100, members); behind {
-		t.Fatal("the first report was called behind")
+
+	t.Run("the same peer, a new generation", func(t *testing.T) {
+		h := &shardHigh{}
+		if behind, _, _ := h.observe("http://a:1", "gen1", 100, members); behind {
+			t.Fatal("the first report was called behind")
+		}
+		behind, prev, _ := h.observe("http://a:1", "gen2", 40, members)
+		if behind {
+			t.Error("a restarted peer was called lagging; its watermark fell " +
+				"because the process is new, which is not evidence about its data")
+		}
+		if prev != 100 {
+			t.Errorf("the discarded floor was %d, want 100", prev)
+		}
+		// And the new generation's own floor takes over.
+		if behind, prev, _ := h.observe("http://a:1", "gen2", 20, members); !behind || prev != 40 {
+			t.Errorf("within ONE generation a fall gave behind=%v prev=%d, want "+
+				"true and 40: a store that goes backwards inside one process is "+
+				"an anomaly whatever caused it", behind, prev)
+		}
+	})
+
+	t.Run("the same peer, the same generation", func(t *testing.T) {
+		h := &shardHigh{}
+		h.observe("http://a:1", "gen1", 100, members)
+		if behind, prev, _ := h.observe("http://a:1", "gen1", 40, members); !behind || prev != 100 {
+			t.Errorf("a peer that did NOT restart reporting 40 against its own "+
+				"100 gave behind=%v prev=%d, want true and 100", behind, prev)
+		}
+	})
+
+	t.Run("a restart does not excuse a SIBLING", func(t *testing.T) {
+		h := &shardHigh{}
+		// b sets the floor and does not restart.
+		h.observe("http://b:1", "genB", 100, members)
+		// a restarts and is genuinely behind b. The floor is b's, so a's new
+		// generation is beside the point: it really is missing b's data.
+		if behind, prev, _ := h.observe("http://a:1", "genA2", 40, members); !behind || prev != 100 {
+			t.Errorf("a restarted peer behind a HEALTHY sibling gave behind=%v "+
+				"prev=%d, want true and 100 -- a restart explains a peer's own "+
+				"fall, not a gap against a peer that did not restart",
+				behind, prev)
+		}
+	})
+
+	t.Run("a peer that sends no generation is not excused", func(t *testing.T) {
+		h := &shardHigh{}
+		h.observe("http://a:1", "", 100, members)
+		if behind, _, _ := h.observe("http://a:1", "", 40, members); !behind {
+			t.Error("an empty generation excused a fall; absent is not `I " +
+				"restarted`, it is an older peer that cannot say")
+		}
+	})
+}
+
+// A peer that sends a watermark but NO generation is reported, never refused.
+//
+// That is a node on a build older than the generation header, which is what
+// every node is during the first half of a rolling upgrade. Its watermark
+// falling is genuinely ambiguous -- restart or lag, and nothing on the wire
+// says which -- and a false 503 is the worse of the two failures.
+//
+// This is the fourth guard, and the only one the other tests cannot exercise:
+// every fixture there carries a generation, so `certain` is always true and
+// deleting it changes nothing they can see.
+func TestAPeerWithNoGenerationIsReportedNotRefused(t *testing.T) {
+	var wm atomic.Int64
+	wm.Store(5000)
+	var hits atomic.Int64
+	hits.Store(6)
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The envelope an older build writes: everything except the generation.
+		w.Header().Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+		w.Header().Set(HdrShardID, "0")
+		w.Header().Set(HdrReplicaID, "0")
+		w.Header().Set(HdrComplete, "true")
+		w.Header().Set(HdrHighWatermark, strconv.FormatInt(wm.Load(), 10))
+		fmt.Fprintf(w, `{"hits":[{"timestamp":"1970-01-01T00:00:00Z","total":%d}]}`, hits.Load())
+	}))
+	defer old.Close()
+	ts := wmRouter(t, old.URL)
+
+	if code, total, raw := hitsTotal(t, ts, "*"); code != 200 || total != 6 {
+		t.Fatalf("first read: %d total=%d %s", code, total, raw)
 	}
-	// The SAME machine, back after a restart with less data. It is still in the
-	// topology, so the floor stands and it reads as lagging -- which is exactly
-	// the false positive that keeps this a log line and not a 503.
-	behind, prev := h.observe("http://a:1", 40, members)
-	if !behind || prev != 100 {
-		t.Fatalf("a restarted peer reporting 40 against its own 100 gave "+
-			"behind=%v prev=%d; if this ever becomes false the refusal can be "+
-			"turned back on and task #434 is finished", behind, prev)
+	// Its watermark falls. Whether it restarted cannot be known.
+	wm.Store(1000)
+	for i := 0; i < 3; i++ {
+		code, total, raw := hitsTotal(t, ts, "*")
+		if code != 200 {
+			t.Fatalf("read %d from a peer that sends no generation answered %d: "+
+				"during a rolling upgrade every peer looks like this, and its "+
+				"restart is indistinguishable from lag -- so this must be a log "+
+				"line and not a refusal: %s", i, code, raw)
+		}
+		if total != 6 {
+			t.Errorf("read %d: total=%d, want 6", i, total)
+		}
 	}
-	t.Log("a restarted peer still reads as lagging: the watermark is monotonic " +
-		"within a process and not across one, so the reader reports and does " +
-		"not refuse")
 }

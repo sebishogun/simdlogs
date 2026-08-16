@@ -32,7 +32,7 @@ func fakePeer(t *testing.T, h http.HandlerFunc) *httptest.Server {
 // envelopePeer answers with a correct envelope and the given body.
 func envelopePeer(t *testing.T, body string) *httptest.Server {
 	return fakePeer(t, func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w.Header(), 0, 0, true, time.Now().UnixNano(), r.Header.Get(HdrTraceID))
+		writeEnvelope(w.Header(), 0, 0, true, time.Now().UnixNano(), "gen-test", r.Header.Get(HdrTraceID))
 		w.Write([]byte(body))
 	})
 }
@@ -147,7 +147,7 @@ func TestADeadPeerIsUnavailable(t *testing.T) {
 // partial answer that looks complete -- so the router must not keep either.
 func TestAnOversizedPeerResponseIsDiscarded(t *testing.T) {
 	peer := fakePeer(t, func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w.Header(), 0, 0, true, 1, "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
 		big := strings.Repeat("x", 4096)
 		for i := 0; i < 64; i++ {
 			w.Write([]byte(big))
@@ -190,7 +190,7 @@ func TestAnUnauthorizedPeerIsNotRetried(t *testing.T) {
 // A TLS failure is a peer that did not answer, not a crash.
 func TestATLSFailureIsUnavailable(t *testing.T) {
 	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeEnvelope(w.Header(), 0, 0, true, 1, "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
 		w.Write([]byte("{}"))
 	}))
 	defer peer.Close()
@@ -216,7 +216,7 @@ func TestThePeerClientForwardsOnlyWhatItNames(t *testing.T) {
 	seen := make(chan http.Header, 1)
 	peer := fakePeer(t, func(w http.ResponseWriter, r *http.Request) {
 		seen <- r.Header.Clone()
-		writeEnvelope(w.Header(), 0, 0, true, 1, r.Header.Get(HdrTraceID))
+		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", r.Header.Get(HdrTraceID))
 		w.Write([]byte("{}"))
 	})
 

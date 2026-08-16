@@ -34,7 +34,7 @@ func echoQueryShard(t *testing.T, seen *[]string) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*seen = append(*seen, r.URL.RawQuery)
-		writeEnvelope(w.Header(), 0, 0, true, 1, "")
+		writeEnvelope(w.Header(), 0, 0, true, 1, "gen-test", "")
 		switch {
 		case strings.Contains(r.URL.Path, "hits"):
 			fmt.Fprint(w, `{"hits":[{"timestamp":"1970-01-01T00:00:00Z","total":1}]}`)
