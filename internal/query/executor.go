@@ -79,6 +79,16 @@ var (
 	// mapping has one place to live.
 	ErrRejected = errors.New("query: rejected")
 
+	// ErrNotDistributable is a query a cluster coordinator can never answer:
+	// a pipe that needs a store, a subquery with nothing to run against.
+	//
+	// Separate from ErrRejected because the two need different STATUSES. A
+	// rejection is about this server right now and answers 429; this is a
+	// permanent property of the request, so it answers 400 and a client that
+	// retries learns nothing. Every coordinator refusal used ErrRejected and
+	// told callers to try again later about a query that will never work.
+	ErrNotDistributable = errors.New("query: not distributable")
+
 	// ErrTooManyGroupKeys is an aggregate with more distinct keys than the
 	// caller allowed. Distinct from ErrTooManyGroups, which counts ROW GROUPS
 	// on disk: one is how much of the store a query reads, the other is how
@@ -258,6 +268,13 @@ func HTTPStatus(err error) int {
 		// A memory ceiling is about this server right now, not about the
 		// request, so it is retryable and 503 says so.
 		return http.StatusServiceUnavailable
+	case errors.Is(err, ErrNotDistributable):
+		// A permanent property of the QUERY, not of this moment: the same
+		// request will be refused for the same reason forever, so 400 says
+		// "change the request" where 429 says "try again later". Every
+		// coordinator refusal used ErrRejected and therefore answered 429 for
+		// a query no amount of waiting will make answerable.
+		return http.StatusBadRequest
 	case errors.Is(err, ErrRejected):
 		return http.StatusTooManyRequests
 	}

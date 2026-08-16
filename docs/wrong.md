@@ -4893,3 +4893,41 @@ all of it, behind a type switch that already had the right shape and the wrong
 membership, and the first reviewer to enumerate cluster reads BY PIPE rather
 than by endpoint found all five in one pass. Attention follows the last defect,
 which is exactly where the next one is not.
+
+## 52. Every JSON boolean was stored as "false", and the switch that did it was dead code
+
+`internal/ingest/jsonline.go`, the `simdjson.Bool` case:
+
+```go
+case simdjson.Bool:
+    if val.Int() != 0 { fields[key] = "true" } else { fields[key] = "false" }
+```
+
+`simdjson`'s `Value.Int()` returns 0 for every kind that is not a `Number`
+(`value.go:220-222`), so on a `Bool` the condition was always false and the
+branch was unreachable. **Every JSON boolean ever ingested — `true` and
+`false` alike — was stored as the string `"false"`**, at HTTP 200 with
+`{"ingested":1,"skipped":0}`. `v:=true` matched no row in the store and
+`v:=false` matched all of them.
+
+`Value.Bool()` is declared four lines below `Value.Int()` in the same
+dependency file and was called nowhere in this repository.
+
+**The same line lost integer digits.** Every number went through `Float()`, so
+`9007199254740993` — one past the last integer a float64 holds exactly — came
+back `9007199254740992`. A snowflake id, a trace id and an epoch-nanosecond
+timestamp are all in that range, and the row is off by one with nothing to say
+so. An integer literal now keeps the wire's own digits.
+
+**And the refusal I shipped one commit earlier answered 429.** The five
+store-aware pipes were refused with `ErrRejected`, which `HTTPStatus` maps to
+`429 Too Many Requests` — the code for "try again later" on a query no amount
+of waiting will make answerable. The `join`/`union`/`stream_context` refusals
+had the same status for the same reason and had had it all along.
+`ErrNotDistributable` answers 400.
+
+**What found all three.** A reviewer told to enumerate cluster reads BY PIPE
+rather than by endpoint, and to sweep the ingest protocols, which five previous
+rounds had not touched at all. The boolean bug is not subtle and is not new; it
+is in the first `switch` of the most-used ingest path. Nothing had looked
+there, because every round looked where the last round's findings were.

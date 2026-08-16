@@ -1486,7 +1486,7 @@ func ApplyPipes(q *Query, rows []Row) []Row {
 		switch p.(type) {
 		case *JoinPipe, *UnionPipe, *StreamContextPipe:
 			q.stop(fmt.Errorf("%w: %T cannot run at a cluster coordinator, which has no "+
-				"store to run its subquery against", ErrRejected, p))
+				"store to run its subquery against", ErrNotDistributable, p))
 			return nil
 
 		// The STORE-AWARE source pipes, refused for the same reason and with
@@ -1517,7 +1517,7 @@ func ApplyPipes(q *Query, rows []Row) []Row {
 			q.stop(fmt.Errorf("%w: %T reads this node's own storage layout, and a "+
 				"cluster coordinator has no store -- it holds the merged rows, which "+
 				"are not blocks. Run this against a storage node directly",
-				ErrRejected, p))
+				ErrNotDistributable, p))
 			return nil
 		case *FieldNamesPipe, *FieldValuesPipe, *FacetsPipe:
 			q.stop(fmt.Errorf("%w: %T answers from a store's index on a storage node, "+
@@ -1525,7 +1525,7 @@ func ApplyPipes(q *Query, rows []Row) []Row {
 				"rows counts fields the shards synthesized on the wire and misses "+
 				"fields no matching row happens to carry. Use the matching "+
 				"/select/logsql/ endpoint, which fans out and merges",
-				ErrRejected, p))
+				ErrNotDistributable, p))
 			return nil
 		}
 		rows = p.apply(rows)

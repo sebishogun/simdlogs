@@ -366,9 +366,30 @@ func IngestJSONLinesOpts(w *Writer, data []byte, fallback func() int64, opts *Op
 					ts, haveTS = val.Int(), true
 					return true
 				}
-				fields[key] = strconv.FormatFloat(val.Float(), 'f', -1, 64)
+				// An INTEGER keeps its digits.
+				//
+				// Every number went through Float(), so 9007199254740993 --
+				// one past the last integer a float64 represents exactly --
+				// was stored as 9007199254740992. A snowflake id, a trace id
+				// and an epoch-nanosecond timestamp are all in that range, and
+				// the row comes back off by one with nothing to say so.
+				if raw := val.Raw(); isIntegerLiteral(raw) {
+					fields[key] = string(raw) // the wire's own digits
+				} else {
+					fields[key] = strconv.FormatFloat(val.Float(), 'f', -1, 64)
+				}
 			case simdjson.Bool:
-				if val.Int() != 0 {
+				// Bool(), not Int().
+				//
+				// simdjson's Value.Int() returns 0 for every kind that is not
+				// a Number, so on a Bool this branch was dead and EVERY JSON
+				// boolean -- true and false alike -- was stored as the string
+				// "false". `v:=true` matched no row ever ingested and
+				// `v:=false` matched all of them, at HTTP 200 with
+				// {"ingested":1,"skipped":0}. Value.Bool() is four lines below
+				// Value.Int() in the same file and was used nowhere in this
+				// repository.
+				if val.Bool() {
 					fields[key] = "true"
 				} else {
 					fields[key] = "false"
@@ -502,4 +523,30 @@ func parseTime(s string) (int64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// isIntegerLiteral reports whether a JSON number's raw bytes are a plain
+// integer -- optional sign, then digits, and nothing else.
+//
+// The raw text is used verbatim for those, because routing them through
+// float64 loses digits above 2^53 and a snowflake id, a trace id and an
+// epoch-nanosecond timestamp are all in that range. Costs one string
+// conversion, which is what FormatFloat cost on the same path.
+func isIntegerLiteral(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	i := 0
+	if b[0] == '-' {
+		i = 1
+	}
+	if i == len(b) {
+		return false
+	}
+	for ; i < len(b); i++ {
+		if b[i] < '0' || b[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
