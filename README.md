@@ -110,9 +110,10 @@ materialize only fields needed by their predicates and transforms.
 ### Additional surfaces
 
 - `/_search` and `/_count` support a log-oriented Elasticsearch subset:
-  `bool` with `must`/`filter`, `term`, and timestamp `range`. An `exists`
-  clause is accepted on the wire but currently changes no answer (decoded,
-  not mapped to a predicate — see `docs/wrong.md` entry 37).
+  `bool` with `must`/`filter`/`must_not`/`should` and `minimum_should_match`,
+  `term`, `terms`, `match`, `prefix`, `exists`, and timestamp `range`. `exists`
+  maps to `NOT (field == "")`, which is what it means over a store where an
+  absent column reads as the empty value.
 - `/select/sql` translates a SQL `SELECT` subset into the same LogsQL engine.
 - `/select/vector` performs cosine k-nearest-neighbor search over an embedding
   field supplied by the ingested logs.
@@ -249,8 +250,8 @@ entries 32–37:
   decode span to the matched rows (`1a85d8a`, `5419c80`).
 - The point-read threshold was expressed as a fraction of the group when the
   cost is absolute.
-- The Elasticsearch `exists` clause is accepted and changes no answer; it is
-  decoded but not mapped to a predicate.
+- The Elasticsearch `exists` clause was accepted and changed no answer; it was
+  decoded but not mapped to a predicate. It maps to `NOT (field == "")` now.
 
 | category | implemented |
 |---|---|

@@ -33,7 +33,24 @@ No version has been tagged. This section is what a first release would carry.
 - Make the cluster route surface complete (`328cbbc`)
 - Add static-cluster repair and backup (`0216ec1`)
 
+### Changed
+
+- Bucket both range surfaces the way VictoriaLogs does (`08b0215`). A wire
+  change: `/select/logsql/hits` and `/select/logsql/stats_query_range` now
+  floor bucket starts to a multiple of `step` and give every bucket its whole
+  `[k*step, (k+1)*step)`, on the node and on the router. Bucket labels, bucket
+  count and per-bucket values all change for any window whose `start` or `end`
+  is not a step multiple; the first bucket counts instants before `start` and
+  the last counts instants after `end`, so `/hits` `total` can exceed the row
+  count inside the window. Measured byte-for-byte against
+  `internal/bench/victoria-logs`. `/select/logsql/query` is unchanged.
+
 ### Fixed
+
+- Carry every writer setting onto the sharded ingest path (`7e6aa28`). A body
+  over `MinParallelBytes` on `/insert/jsonline` or `/_bulk` silently discarded
+  every embedding: 27 277 rows ingested at 200, `/select/vector` returned none.
+
 
 - Preserve durability and stream identity in parallel ingest (`d1b6618`)
 - Make every storage replacement durably atomic (`eef82fe`)
@@ -83,15 +100,22 @@ an advertisement:
   compaction or retention: there is no lineage to tell a group that was never
   received from one that was deliberately deleted or superseded.
 - Non-mergeable aggregates (`quantile`, `avg`, `uniq`, `count_uniq`,
-  `histogram`, `rate`) are refused across shards rather than answered, on every
-  stats surface.
+  `histogram`, `rate`) are answered exactly across shards, at the cost of every
+  matching row crossing the network: a router cannot combine partial states for
+  them, so it fetches the rows and aggregates once, the way a single node does.
+  They were REFUSED with a 400 on all three stats surfaces until the exact path
+  landed (docs/wrong.md entry 106), and this bullet went on claiming the
+  refusal after it was lifted, which is the failure `docs/wrong.md` records as
+  a stated limitation outliving its condition.
 - A query whose text does not split the way it parses -- a filter containing an
   apostrophe or an unbalanced bracket -- is refused by the router rather than
   planned.
 - `/select/logsql/tail` and `/select/vector` are not federated; they answer 501
   on a router.
-- No single command restores a cluster archive, and `ValidateClusterBackup` has
-  no caller: the checks it encodes are performed by the operator by hand.
+- No single command restores a whole cluster archive across shards; a node
+  restores its own. `ValidateClusterBackup` runs on that path
+  (`cmd/simdlogs/restore.go`), so the checks it encodes are no longer left to
+  the operator by hand.
 - linux/386 is not supported: a dependency does not compile for a 32-bit int.
 - The published scale and head-to-head numbers have not been re-measured since
   the quiet-machine gate was added and wired to every publishing harness.

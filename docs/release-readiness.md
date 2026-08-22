@@ -9,11 +9,11 @@ as an announcement: the point of the list is the rows that are not green.
 |---|---|
 | `gofmt -l .` | clean |
 | `go vet ./...` | clean |
-| `go test ./...` | 9 packages ok |
-| `go test -race ./...` | 9 packages ok, no data races |
-| `go test -tags purego ./...` | 9 packages ok |
-| Fuzz seed corpus (22 targets) | 9 packages ok |
-| Crash / recovery / restart / drills, ×5 | 9 packages ok |
+| `go test ./...` | 10 packages ok |
+| `go test -race ./...` | 10 packages ok, no data races |
+| `go test -tags purego ./...` | 10 packages ok |
+| Fuzz seed corpus (23 targets) | 10 packages ok |
+| Crash / recovery / restart / drills, ×5 | 10 packages ok |
 | Soak, 60 s with retention running | ok — groups peak 5,899 and fall to 5,677 |
 | `scripts/release-check.sh` (the artifact, not the source) | passed |
 | Cross-build arm64, ppc64le, s390x, riscv64 | ok |
@@ -45,7 +45,10 @@ limitations as well:
 
 - No incremental backup. RPO is bounded by capture frequency.
 - Repair is an operator action, not automatic, and only within a shard.
-- Non-mergeable aggregates are refused across shards rather than answered.
+- Non-mergeable aggregates (`quantile`, `avg`, `uniq`, `count_uniq`,
+  `histogram`, `rate`) cost every matching row on the wire across shards: the
+  router fetches the rows and aggregates once instead of merging per-shard
+  numbers. The answer is exact and equal to a single node's.
 - `/select/logsql/tail` and `/select/vector` answer 501 on a router.
 - No single command restores a cluster archive.
 - linux/386 does not build, because a dependency does not compile for a 32-bit
