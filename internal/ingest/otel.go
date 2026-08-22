@@ -432,7 +432,15 @@ func IngestOTLPLogsOpts(w *Writer, data []byte, fallback func() int64, opts *Opt
 				if tsStr == "" {
 					tsStr = lr.ObservedTimeUnixNano
 				}
-				ts, ok := parseTime(tsStr)
+				ts, ok, tsErr := parseTime(tsStr)
+				if tsErr != nil {
+					// See ErrTimeOutOfRange. OTLP reports a rejected count in
+					// its partial-success body, so the exporter is told.
+					ord := res.Accepted + res.Rejected
+					res.Reject(ord)
+					res.WarnAt(ord, "%v", tsErr)
+					continue
+				}
 				if !ok {
 					ts = fallback()
 				}

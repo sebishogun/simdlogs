@@ -3,8 +3,10 @@ package ingest
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/golang/snappy"
 )
@@ -98,7 +100,9 @@ func IngestLokiProto(w *Writer, data []byte, fallback func() int64, opts *Option
 		lbl, lerr := parseLokiLabels(labels)
 		if lerr != nil {
 			res.Rejected += len(entries)
-			res.Warn(0, "stream labels %q: %v", first80(labels), lerr)
+			// Neither position is known: the labels belong to the STREAM, not
+			// to one entry, and the body is protobuf.
+			res.Warn(UnknownPos, "stream labels %q: %v", first80(labels), lerr)
 			return
 		}
 		for _, ent := range entries {
@@ -155,7 +159,19 @@ func IngestLokiProto(w *Writer, data []byte, fallback func() int64, opts *Option
 			}
 			fields["_msg"] = line
 
-			ts := seconds*1e9 + nanos
+			// seconds is a protobuf varint the client chose, so `seconds*1e9`
+			// overflows for anything past the year 2262 -- and a wrapped
+			// product is a row filed in the distant past, accepted at 200 and
+			// invisible to every query. Refused and counted, the same call
+			// ErrTimeOutOfRange makes for every other protocol.
+			ts, tsOK := lokiNanos(seconds, nanos)
+			if !tsOK {
+				ord := res.Accepted + res.Rejected
+				res.Reject(ord)
+				res.WarnAt(ord, "%v: %d s + %d ns since the epoch",
+					ErrTimeOutOfRange, seconds, nanos)
+				continue
+			}
 			if seconds == 0 && nanos == 0 {
 				ts = fallback()
 			}
@@ -263,4 +279,25 @@ func parseLokiLabels(s string) (map[string]string, error) {
 		}
 		i++
 	}
+}
+
+// lokiNanos combines a protobuf Timestamp's seconds and nanos into epoch
+// nanoseconds, reporting false when the result is outside the storable range.
+//
+// Both halves come off the wire as arbitrary integers, so neither the multiply
+// nor the addition is safe on its own: `seconds*1e9` overflows past the year
+// 2262, and a nanos field the sender did not normalise can carry the sum over
+// the edge from a seconds value that was inside it.
+func lokiNanos(seconds, nanos int64) (int64, bool) {
+	if seconds > math.MaxInt64/int64(time.Second) || seconds < math.MinInt64/int64(time.Second) {
+		return 0, false
+	}
+	ns := seconds * int64(time.Second)
+	if nanos > 0 && ns > math.MaxInt64-nanos {
+		return 0, false
+	}
+	if nanos < 0 && ns < math.MinInt64-nanos {
+		return 0, false
+	}
+	return ns + nanos, true
 }

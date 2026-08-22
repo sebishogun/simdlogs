@@ -53,10 +53,10 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 		for _, ent := range st.Values {
 			if len(ent) < 2 {
 				res.Reject(ordinal)
-				// Offset 0: Warning.Offset is a BYTE offset and this parser
-				// decoded JSON into a struct, so it knows the entry's position
-				// in the batch (recorded above) and not its position in bytes.
-				res.Warn(0, "stream entry has fewer than two elements")
+				// The ORDINAL, not a byte offset: this parser decoded JSON
+				// into a struct, so it knows the entry's position in the batch
+				// and not its position in bytes.
+				res.WarnAt(ordinal, "stream entry has fewer than two elements")
 				ordinal++
 				continue
 			}
@@ -69,7 +69,7 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 			var meta map[string]string
 			if len(ent) >= 3 {
 				if err := json.Unmarshal(ent[2], &meta); err != nil {
-					res.Warn(0, "entry's structured metadata is not an object: %v", err)
+					res.WarnAt(ordinal, "entry's structured metadata is not an object: %v", err)
 					meta = nil
 				}
 			}
@@ -93,7 +93,15 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 				fields[k] = v
 			}
 			fields["_msg"] = line
-			ts, ok := parseTime(tsStr)
+			ts, ok, tsErr := parseTime(tsStr)
+			if tsErr != nil {
+				// See ErrTimeOutOfRange: refused and counted, not stored at an
+				// instant the client did not send.
+				res.Reject(ordinal)
+				res.WarnAt(ordinal, "%v", tsErr)
+				ordinal++
+				continue
+			}
 			if !ok {
 				ts = fallback()
 			}

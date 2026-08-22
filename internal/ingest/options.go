@@ -150,7 +150,7 @@ func addWithStreamVec(w *Writer, ts int64, fields map[string]string, o *Options,
 func addOrReject(w *Writer, ts int64, fields map[string]string, o *Options, res *Result, ordinal int) bool {
 	if err := addWithStream(w, ts, fields, o); err != nil {
 		res.Reject(ordinal)
-		res.Warn(int64(ordinal), "%s", err)
+		res.WarnAt(ordinal, "%s", err)
 		return false
 	}
 	res.Accepted++

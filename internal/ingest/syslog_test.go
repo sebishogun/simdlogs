@@ -4,7 +4,7 @@ import "testing"
 
 func TestParseSyslog5424(t *testing.T) {
 	f := map[string]string{}
-	_, ok := parseSyslogInto(`<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - 'su root' failed for lonvick`, f)
+	_, ok, _ := parseSyslogInto(`<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - 'su root' failed for lonvick`, f)
 	if !ok {
 		t.Fatal("5424: no timestamp parsed")
 	}

@@ -1,7 +1,9 @@
 package ingest
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/sebishogun/simdlogs/internal/storage"
@@ -150,5 +152,97 @@ func TestNoVectorFieldsConfiguredChangesNothing(t *testing.T) {
 	if res.Accepted != 1 || res.Rejected != 0 {
 		t.Errorf("accepted=%d rejected=%d, want 1/0: with no vector field configured "+
 			"`embedding` is an ordinary string field", res.Accepted, res.Rejected)
+	}
+}
+
+// The JSON-lines vector reject arm builds its message in Error(), not at
+// construction, and says exactly what it used to say.
+//
+// `/_bulk` and `/insert/jsonline` both call IngestJSONLinesOpts, so this arm
+// is per document on the route that carries the most of them, and past the
+// 32nd warning the message it builds is dropped unread. The list on
+// tsRangeError claimed of every member that "none is on the `_bulk` path,
+// which is why none was converted"; this one was, and was not on the list.
+//
+// The old implementation is the specification: the message is compared against
+// the `fmt.Errorf` it replaced rather than against a string typed here, so a
+// change of wording is a failure and not a silent divergence from what a
+// client used to read on a partial ingest.
+func TestTheVectorRejectMessageIsDeferred(t *testing.T) {
+	const field, dim = "emb", 4
+	want := fmt.Errorf("%w: %s has an unusable value for a %d-dimension field",
+		ErrVector, field, dim)
+	got := error(&vecShapeError{field: field, dim: dim})
+
+	if got.Error() != want.Error() {
+		t.Errorf("message changed:\n  now:  %s\n  was:  %s", got, want)
+	}
+	if !errors.Is(got, ErrVector) {
+		t.Error("errors.Is(err, ErrVector) is false; the reject arm and the status " +
+			"mapping both ask it")
+	}
+
+	// The two constructions, measured both ways in ONE run so the comparison is
+	// not against a number written down in another session.
+	var sink error
+	deferred := testing.AllocsPerRun(20000, func() {
+		sink = &vecShapeError{field: field, dim: dim}
+	})
+	formatted := testing.AllocsPerRun(20000, func() {
+		sink = fmt.Errorf("%w: %s has an unusable value for a %d-dimension field",
+			ErrVector, field, dim)
+	})
+	_ = sink
+	if deferred >= formatted {
+		t.Errorf("the deferred form costs %.3f allocations and fmt.Errorf costs %.3f. "+
+			"Deferring the message is the whole point: it must be cheaper on the "+
+			"reject arm, where the string is discarded past the 32nd warning.",
+			deferred, formatted)
+	}
+	t.Logf("construction: deferred %.3f allocs, fmt.Errorf %.3f allocs", deferred, formatted)
+
+	// AND THE REAL PATH, because the construction being cheaper proves nothing
+	// about which one the parser calls. 2,000 documents whose embedding is the
+	// wrong length -- the shape a `/_bulk` of bad vectors takes -- through
+	// IngestJSONLinesOpts, interleaved A/B in one session, three rounds each,
+	// every figure identical across them:
+	//
+	//	allocations per rejected record   fmt.Errorf   this
+	//	                                    20.027    18.043
+	//
+	// The delta is 1.984 rather than the 1.000 the constructions differ by,
+	// because the real `key` is a dynamic string and boxing it into the
+	// variadic allocates as well; the constant in the probe above does not.
+	// The bound below sits between the two measurements with room for
+	// unrelated drift on the parse path, and a revert of the call site alone
+	// crosses it.
+	st, err := storage.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	w := NewWriter(st)
+	w.SetVectorFields(VectorFields{field: dim})
+	const n = 2000
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, `{"_time":1700000000000000000,"_msg":"m%d","emb":[1,2,3]}`+"\n", i)
+	}
+	body := []byte(sb.String())
+	fallback := func() int64 { return 1 }
+	perRecord := testing.AllocsPerRun(20, func() {
+		res, err := IngestJSONLinesOpts(w, body, fallback, nil)
+		if err != nil || res.Rejected != n || res.Accepted != 0 {
+			t.Fatalf("the fixture did not reject every record: accepted=%d rejected=%d err=%v",
+				res.Accepted, res.Rejected, err)
+		}
+	}) / float64(n)
+	t.Logf("real path: %.4f allocations per rejected record", perRecord)
+	if perRecord >= 19.5 {
+		t.Errorf("%.4f allocations per rejected record. The deferred form measures "+
+			"18.043 here and fmt.Errorf measures 20.027; anything at or above 19.5 "+
+			"means the reject arm is building its message again, on a path /_bulk "+
+			"reaches and where the message is discarded past the 32nd warning.",
+			perRecord)
 	}
 }

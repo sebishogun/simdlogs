@@ -3,6 +3,7 @@ package ingest
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"testing"
@@ -274,4 +275,154 @@ func rowRenderable(key, value string) error {
 			"structured fields for this fixture instead", key, value)
 	}
 	return nil
+}
+
+// A time_unix_nano PAST 2262 IS REFUSED, NOT WRAPPED INTO THE PAST.
+//
+// A proto3 `fixed64` is UNSIGNED. `int64(binary.LittleEndian.Uint64(fp))` was
+// raw, so every instant after 2262-04-11 -- a legal value of this field, and
+// what a producer with a broken clock or a nanosecond/millisecond unit mixup
+// sends -- became a NEGATIVE nanosecond count and the record was stored,
+// counted and filed before 1970.
+//
+// This is `/v1/logs` with `Content-Type: application/x-protobuf`, which is the
+// OpenTelemetry Collector's DEFAULT encoding. The round that fixed the JSON
+// encoding of the same export (otel.go, through parseTime) left the file
+// beside it -- commit a92b638's finding again, "two OTLP encodings of one
+// export were storing different things", which is why this asserts the two
+// encodings AGREE rather than just that the protobuf one refuses.
+func TestAnUnstorableProtobufTimestampIsRefused(t *testing.T) {
+	// 2^63 exactly: one nanosecond past MaxInt64, and the smallest fixed64
+	// this must refuse. The old conversion turned it into MinInt64.
+	const past2262 = uint64(1) << 63
+
+	for _, tc := range []struct {
+		name               string
+		field              int // 1 = time_unix_nano, 11 = observed_time_unix_nano
+		ts                 uint64
+		accepted, rejected int
+		// stored is separate from accepted because every query window in this
+		// tree is half-open: a row AT MaxInt64 is accepted and stored and no
+		// `[from, to)` can name it. That is a pre-existing property of the
+		// window, not of this refusal, and folding the two numbers together
+		// would have reported the boundary control as a lost row.
+		stored int
+	}{
+		{"time_unix_nano at 2^63", 1, past2262, 0, 1, 0},
+		{"time_unix_nano at MaxUint64", 1, ^uint64(0), 0, 1, 0},
+		{"observed_time_unix_nano at 2^63", 11, past2262, 0, 1, 0},
+		// The controls. MaxInt64 is the last storable nanosecond and must
+		// still be accepted: a refusal one comparison wide the wrong way would
+		// satisfy every row above.
+		{"time_unix_nano at MaxInt64 (control)", 1, uint64(math.MaxInt64), 1, 0, 0},
+		{"time_unix_nano one ns below MaxInt64 (control)", 1, uint64(math.MaxInt64) - 1, 1, 0, 1},
+		{"an ordinary instant (control)", 1, 1_700_000_000_000_000_000, 1, 0, 1},
+		{"observed_time_unix_nano at MaxInt64 (control)", 11, uint64(math.MaxInt64), 1, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var rec []byte
+			rec = pfixed64(rec, tc.field, tc.ts)
+			rec = pbytes(rec, 5, anyString("body"))
+			var scope []byte
+			scope = pbytes(scope, 2, rec)
+			var rl []byte
+			rl = pbytes(rl, 2, scope)
+			body := pbytes(nil, 1, rl)
+
+			st, err := storage.OpenStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			w := NewWriter(st)
+			res, err := IngestOTLPLogsProto(w, body, func() int64 { return 42 }, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.Close()
+			if res.Accepted != tc.accepted || res.Rejected != tc.rejected {
+				t.Errorf("accepted=%d rejected=%d, want %d/%d.\n"+
+					"A fixed64 is UNSIGNED: an instant past 2262 is a legal wire "+
+					"value, and converting it raw files the row before 1970.",
+					res.Accepted, res.Rejected, tc.accepted, tc.rejected)
+			}
+			// The WIDEST window, not storeRows': storeRows stops at 1<<62
+			// (the year 2116) and the MaxInt64 controls are stored above it,
+			// so reusing it would have reported a stored row as missing.
+			if got := len(rowsOverTheWholeDomain(t, st)); got != tc.stored {
+				t.Errorf("the store holds %d rows over the whole int64 domain, want %d",
+					got, tc.stored)
+			}
+		})
+	}
+}
+
+// THE TWO ENCODINGS OF ONE EXPORT MUST AGREE ABOUT AN UNSTORABLE TIMESTAMP.
+//
+// The JSON path reads `timeUnixNano` as a decimal string through parseTime;
+// the protobuf path reads a fixed64. Same export, same instant, and until this
+// round the JSON one refused it while the protobuf one stored it before 1970.
+func TestTheTwoOTLPEncodingsAgreeOnAnUnstorableTimestamp(t *testing.T) {
+	const ns = "9223372036854775808" // 2^63: one past MaxInt64
+
+	stJSON, err := storage.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stJSON.Close()
+	wJSON := NewWriter(stJSON)
+	jRes, err := IngestOTLPLogs(wJSON, []byte(
+		`{"resourceLogs":[{"scopeLogs":[{"logRecords":[`+
+			`{"timeUnixNano":"`+ns+`","body":{"stringValue":"body"}}]}]}]}`),
+		func() int64 { return 42 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	wJSON.Close()
+
+	var rec []byte
+	rec = pfixed64(rec, 1, uint64(1)<<63)
+	rec = pbytes(rec, 5, anyString("body"))
+	var scope []byte
+	scope = pbytes(scope, 2, rec)
+	var rl []byte
+	rl = pbytes(rl, 2, scope)
+
+	stPB, err := storage.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stPB.Close()
+	wPB := NewWriter(stPB)
+	pRes, err := IngestOTLPLogsProto(wPB, pbytes(nil, 1, rl), func() int64 { return 42 }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wPB.Close()
+
+	if jRes.Accepted != pRes.Accepted || jRes.Rejected != pRes.Rejected {
+		t.Errorf("JSON accepted=%d rejected=%d, protobuf accepted=%d rejected=%d.\n"+
+			"One export, two encodings, two different answers about the same instant.",
+			jRes.Accepted, jRes.Rejected, pRes.Accepted, pRes.Rejected)
+	}
+	if jRes.Rejected != 1 {
+		t.Errorf("the JSON path accepted an instant past MaxInt64: %+v", jRes)
+	}
+	if j, p := storeRows(t, stJSON), storeRows(t, stPB); len(j) != len(p) {
+		t.Errorf("JSON stored %d rows, protobuf %d: %v vs %v", len(j), len(p), j, p)
+	}
+}
+
+// rowsOverTheWholeDomain is storeRows' window widened to every instant an int64
+// nanosecond count can hold. storeRows uses [0, 1<<62), which stops in 2116 --
+// fine for its fixtures and wrong for a timestamp near MaxInt64, where a row
+// that IS stored reads as a row that is not.
+func rowsOverTheWholeDomain(t *testing.T, st *storage.Store) []query.Row {
+	t.Helper()
+	q, err := query.ParseLogsQL("*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.From, q.To, q.MatAll = math.MinInt64, math.MaxInt64, true
+	return query.RunPipeline(st, q)
 }

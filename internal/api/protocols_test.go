@@ -640,43 +640,169 @@ func TestBulkDocsCompaction(t *testing.T) {
 	}
 }
 
-// TestESBulkParallelPath drives a body over MinParallelBytes so the sharded
-// ingest branch is covered, not just the small-body writer.
+// TestESBulkParallelPath drives a body whose DOCUMENT bytes are over
+// MinParallelBytes so the sharded ingest branch is covered, not just the
+// small-body writer, and runs both the derived shard count and a forced one.
+//
+// THE GUARD ASKED HALF THE CONDITION AND ITS MESSAGE ASSERTED THE WHOLE, and
+// the name of the test is the claim. It read `sb.Len() < MinParallelBytes` and
+// said "test would not cover the parallel path", which is a negative signal
+// read as positive: the condition it tested cannot fail on this body, so the
+// sentence it would have printed was never measured. Three things were wrong
+// underneath it -- the same three entry 134 found one file over:
+//
+//   - `ParallelConfig.ShardsFor` needs `Shards >= 2` as well, derived as
+//     runtime.NumCPU()/3: 1 on a four-core host, and below 2 shards the
+//     SERIAL fallback runs. `NewServer` takes the derived value.
+//   - The bulk parallel branch is keyed on len(DOCS) (es.go), not len(body):
+//     the 20,000 action lines are 580,000 of these 1,928,890 bytes and never
+//     reach the ingester. The number the guard read was the wrong number.
+//   - No shard override, in a package that has `setIngestShardsForTest` for
+//     exactly this.
+//
+// Measured with the last shard's chunk dropped in
+// IngestJSONLinesParallelResult (`internal/ingest/jsonline.go`):
+//
+//	                        32 CPUs                        taskset -c 0-3
+//	before this fix         RED "bulk _count = 18021 ..."  GREEN
+//	after, both rows        RED                            RED
 func TestESBulkParallelPath(t *testing.T) {
 	t.Parallel()
-	srv, _ := NewServer(t.TempDir())
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
 	var sb strings.Builder
 	const n = 20000
+	docBytes := 0
 	for i := 0; i < n; i++ {
 		sb.WriteString("{\"create\":{\"_index\":\"logs\"}}\n")
+		before := sb.Len()
 		fmt.Fprintf(&sb, "{\"@timestamp\":\"2023-11-14T22:13:20Z\",\"level\":\"error\",\"seq\":\"%d\"}\n", i)
+		docBytes += sb.Len() - before
 	}
-	if sb.Len() < ingest.MinParallelBytes {
-		t.Fatalf("body %d bytes is under MinParallelBytes %d -- test would not cover the parallel path",
-			sb.Len(), ingest.MinParallelBytes)
+	// The fixture counted where it can be counted, not in prose: 20,000 action
+	// lines of 29 bytes, 20,000 documents of 63 bytes plus the digits of seq
+	// (88,890 across 0..19,999). docBytes is what es.go compares against
+	// MinParallelBytes; sb.Len() is what the old guard compared.
+	const wantDocBytes = 20000*63 + 88890 // 1,348,890
+	const wantBody = 20000*29 + wantDocBytes
+	if docBytes != wantDocBytes || sb.Len() != wantBody {
+		t.Fatalf("the fixture is %d document bytes in a %d-byte body; this file says "+
+			"%d and %d. Fix the numbers in this comment or fix the fixture.",
+			docBytes, sb.Len(), wantDocBytes, wantBody)
 	}
-	r, err := http.Post(ts.URL+"/insert/elasticsearch/_bulk", "application/x-ndjson", strings.NewReader(sb.String()))
+	body := sb.String()
+	for _, tc := range []struct {
+		name   string
+		shards int
+	}{
+		{"the derived shard count", 0},
+		{"shards forced to 4", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := ingest.ParallelConfig{Shards: tc.shards}
+			if tc.shards != 0 && cfg.ShardsFor(docBytes) < 2 {
+				t.Fatalf("shards forced to %d resolves to %d over %d document bytes: "+
+					"this row runs the serial fallback and covers nothing this test is named for",
+					tc.shards, cfg.ShardsFor(docBytes), docBytes)
+			}
+			srv, err := NewServer(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer srv.Close()
+			srv.setIngestShardsForTest(tc.shards)
+			ts := httptest.NewServer(srv.Handler())
+			defer ts.Close()
+			r, err := http.Post(ts.URL+"/insert/elasticsearch/_bulk", "application/x-ndjson", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var resp struct {
+				Items  []any `json:"items"`
+				Errors bool  `json:"errors"`
+			}
+			json.NewDecoder(r.Body).Decode(&resp)
+			r.Body.Close()
+			if len(resp.Items) != n || resp.Errors {
+				t.Fatalf("bulk items = %d errors = %v, want %d false", len(resp.Items), resp.Errors, n)
+			}
+			cbody := `{"query":{"bool":{"filter":[{"term":{"level":"error"}}]}}}`
+			r, _ = http.Post(ts.URL+"/_count", "application/json", strings.NewReader(cbody))
+			var cnt struct{ Count int }
+			json.NewDecoder(r.Body).Decode(&cnt)
+			r.Body.Close()
+			if cnt.Count != n {
+				t.Fatalf("bulk _count = %d want %d", cnt.Count, n)
+			}
+		})
+	}
+}
+
+// A 204 CARRIES NO BODY, SO THE COUNTS GO IN HEADERS -- AND NOTHING READ THEM.
+//
+// `X-Simdlogs-Accepted` was spelled twice: a constant in middleware.go whose
+// only use sits after `if spec.format == errJSON { ... return }` in
+// writeIngestErr -- unreachable, because that function's one production caller
+// passes ndjsonSpec() -- and a string literal in protocols.go, which is the
+// one that reaches the wire. No test set, read or asserted either. So the
+// constant could be renamed to anything at all and nothing moved, and the
+// literal could be misspelled and nothing moved either: the only report a
+// client of a 204 route gets about refused records was untested on both
+// spellings at once.
+//
+// The Loki push route answers 204 on success. One storable record beside one
+// whose nanosecond timestamp is out of range is the smallest input that makes
+// both counts non-trivial.
+func TestAReject204ReportsTheCountsInHeaders(t *testing.T) {
+	t.Parallel()
+	srv, err := NewServer(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	var resp struct {
-		Items  []any `json:"items"`
-		Errors bool  `json:"errors"`
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	const ns9999 = "253402300800000000000" // year 9999 in nanoseconds
+	body := `{"streams":[{"stream":{"app":"a"},"values":[` +
+		`["1780315200000000000","normal"],["` + ns9999 + `","unstorable"]]}]}`
+	r, err := http.Post(ts.URL+"/insert/loki/api/v1/push", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
 	}
-	json.NewDecoder(r.Body).Decode(&resp)
 	r.Body.Close()
-	if len(resp.Items) != n || resp.Errors {
-		t.Fatalf("bulk items = %d errors = %v, want %d false", len(resp.Items), resp.Errors, n)
+	if r.StatusCode != http.StatusNoContent {
+		t.Fatalf("status %d, want 204: this route reports in headers only because "+
+			"its success code forbids a body", r.StatusCode)
 	}
-	cbody := `{"query":{"bool":{"filter":[{"term":{"level":"error"}}]}}}`
-	r, _ = http.Post(ts.URL+"/_count", "application/json", strings.NewReader(cbody))
-	var cnt struct{ Count int }
-	json.NewDecoder(r.Body).Decode(&cnt)
-	r.Body.Close()
-	if cnt.Count != n {
-		t.Fatalf("bulk _count = %d want %d", cnt.Count, n)
+	// READ BY ITS LITERAL WIRE NAME, not through hdrAccepted. Written the
+	// other way this line passed with the constant renamed to
+	// "X-Simdlogs-Accept" at 32 CPUs and under `taskset -c 0-3` -- the test
+	// and the handler moved together and the client saw a header it has never
+	// heard of. A header name is a compatibility surface: the test has to
+	// spell it the way a client does.
+	if got := r.Header.Get("X-Simdlogs-Accepted"); got != "1" {
+		t.Errorf("X-Simdlogs-Accepted = %q, want \"1\" (hdrAccepted is %q). A client "+
+			"of a 204 route has nowhere else to read how much landed, and re-sending "+
+			"the whole push duplicates the record that did.", got, hdrAccepted)
+	}
+	if got := r.Header.Get("X-Simdlogs-Rejected"); got != "1" {
+		t.Errorf("X-Simdlogs-Rejected = %q, want \"1\": one record was refused and "+
+			"the 204 says nothing about it", got)
+	}
+	// BY VALUE, like the two above it. Asserted as `got == ""` this line was
+	// GREEN with `ws[0]` in protocols.go replaced by the literal "x", at 32
+	// CPUs and under `taskset -c 0-3`: a Loki-push or syslog client -- whose
+	// 204 forbids a body, so this header is the entire diagnostic -- received
+	// `X-Simdlogs-Warning: x` and the gate that exists for those headers said
+	// nothing. Presence is not a report.
+	//
+	// The whole string, not a substring: the value is what an operator reads
+	// to find out WHICH record was refused and why, so the refused timestamp
+	// and the storable range both have to survive the trip.
+	wantWarn := ingest.ErrTimeOutOfRange.Error() + ": " + ns9999 + " ns since the epoch"
+	if got := r.Header.Get("X-Simdlogs-Warning"); got != wantWarn {
+		t.Errorf("X-Simdlogs-Warning = %q, want %q. It is the whole diagnostic a "+
+			"client of a 204 route gets: the record it names is the one to fix.",
+			got, wantWarn)
 	}
 }
 

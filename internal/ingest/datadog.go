@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"strings"
 )
 
@@ -47,6 +49,7 @@ func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Opti
 		}
 		var ts int64
 		haveTS := false
+		var tsErr error
 		for k, raw := range e {
 			switch k {
 			case "message":
@@ -80,7 +83,12 @@ func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Opti
 					fields["_ddtags"] = strings.Join(bare, ",")
 				}
 			case "timestamp", "date":
-				if t, ok := ddTime(raw); ok {
+				t, ok, terr := ddTime(raw)
+				if terr != nil {
+					tsErr = terr
+					continue
+				}
+				if ok {
 					ts, haveTS = t, true
 				}
 			default:
@@ -92,16 +100,25 @@ func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Opti
 		// wrong for an entry that HAS a message and nothing else (it would have
 		// one field and pass), and wrong again for one carrying only a
 		// timestamp (no fields, but a message is not what it is missing).
+		if tsErr != nil {
+			// A timestamp that parses and cannot be stored refuses the record
+			// and is counted -- see ErrTimeOutOfRange.
+			res.Reject(ordinal)
+			res.WarnAt(ordinal, "%v", tsErr)
+			continue
+		}
 		if len(fields) == 0 {
 			// The ordinal is the entry's position in the batch, which is what
 			// a client matches its own records against. It used to be recorded
 			// with no position at all, so there was nothing to match.
 			//
-			// The warning keeps offset 0: Warning.Offset is a BYTE offset, and
-			// this parser decoded JSON into a struct and no longer knows where
-			// in the body the entry was.
+			// The BYTE offset is unknown: this parser decoded JSON into a
+			// struct and no longer knows where in the body the entry was. The
+			// ordinal is known, so the warning carries that instead -- which
+			// is what Result.WarnAt exists for, and what the six sites that
+			// put an ordinal into Offset were reaching for.
 			res.Reject(ordinal)
-			res.Warn(0, "entry carries no storable attribute")
+			res.WarnAt(ordinal, "entry carries no storable attribute")
 			continue
 		}
 		if !haveTS {
@@ -117,16 +134,26 @@ func IngestDatadogOpts(w *Writer, data []byte, fallback func() int64, opts *Opti
 
 // ddTime reads a Datadog timestamp: a JSON number is milliseconds since epoch
 // (Datadog's default), a string is parsed as ns/RFC3339 via parseTime.
-func ddTime(raw json.RawMessage) (int64, bool) {
+//
+// The millisecond scale is CHECKED rather than wrapped. `int64(f) * 1_000_000`
+// overflows for any f past 9.2e12 ms (the year 2262), and the wrapped product
+// is a row filed in the distant past -- the same silent misplacement
+// ErrTimeOutOfRange exists to stop, arriving through the one protocol that
+// carries its timestamp as a bare number.
+func ddTime(raw json.RawMessage) (int64, bool, error) {
 	var f float64
 	if json.Unmarshal(raw, &f) == nil {
-		return int64(f) * 1_000_000, true // ms -> ns
+		ms := int64(f)
+		if f != f || f >= 9.3e18 || f <= -9.3e18 || ms > math.MaxInt64/1_000_000 || ms < math.MinInt64/1_000_000 {
+			return 0, false, fmt.Errorf("%w: %v ms since the epoch", ErrTimeOutOfRange, f)
+		}
+		return ms * 1_000_000, true, nil // ms -> ns
 	}
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
 		return parseTime(s)
 	}
-	return 0, false
+	return 0, false, nil
 }
 
 // rawToString renders a JSON value as a plain string: a JSON string is

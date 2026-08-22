@@ -231,6 +231,24 @@ func (s *Server) guard(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
 			// read the server has. One tenant could hold every tail slot
 			// indefinitely and admission would not see it.
 			//
+			// WRITES ARE STILL EXEMPT, AND THAT SENTENCE IS NOT WHY.
+			// It has now justified two exemptions, one of which had to be
+			// undone, so it is replaced here by the measured number rather than
+			// left standing for a third. `/_bulk` at four fields a document
+			// peaks at about 9.3x the body in live heap and churns 26x, linear
+			// across 8/16/32/60 MiB bodies -- so one request at MaxBodyBytes is
+			// ~600 MiB live and a GZIPPED one, bounded by MaxDecompressed
+			// instead, is ~4.8 GiB. writeSem counts requests, not bytes, so the
+			// ceiling on this surface is that times MaxConcurrentWrite.
+			// TestTheIngestMemoryCeilingIsPriced carries the table and fails on
+			// any of the three defaults moving.
+			//
+			// Per-tenant admission is not the lever for it: it would bound ONE
+			// tenant's share and leave the process-wide product alone. The
+			// lever is a byte budget across in-flight ingests, which is a new
+			// limit, a new metric and a change to this block, and is not this
+			// change.
+			//
 			// After the class semaphore, not before: that is the cheaper check
 			// and the one that protects the process.
 			if s.admission != nil && !spec.write {
@@ -631,10 +649,23 @@ func (s *Server) writeIngestErr(
 		"accepted": res.Accepted,
 		"rejected": res.Rejected,
 	}
-	if len(res.RejectedAt) > 0 {
-		body["rejectedAt"] = res.RejectedAt
+	// RENDERED SHORT, AND SAID SO. ingest.MaxRejectedAt is the ATTRIBUTION
+	// bound and it is sized for /_bulk's action cap (1<<20), which is where a
+	// missing position costs a document. This body is not that surface: it is
+	// a human-and-shipper-readable error, and a JSON array of a million
+	// ordinals is about 8 MB of it. The recorded list keeps its full length
+	// for the caller that maps positions onto items; what goes on this wire is
+	// bounded, and rejectedTruncated already means exactly "the list you have
+	// is shorter than the count".
+	at := res.RejectedAt
+	trunc := res.RejectedTruncated
+	if len(at) > maxRenderedRejectedAt {
+		at, trunc = at[:maxRenderedRejectedAt], true
 	}
-	if res.RejectedTruncated {
+	if len(at) > 0 {
+		body["rejectedAt"] = at
+	}
+	if trunc {
 		body["rejectedTruncated"] = true
 	}
 	if spec.format == errJSON {
@@ -645,10 +676,28 @@ func (s *Server) writeIngestErr(
 	}
 	// A non-JSON route still has to carry the count somewhere a client can read
 	// it, and its body is whatever that route's format is.
+	//
+	// UNREACHABLE TODAY, and its two neighbours in this file say so and this
+	// one did not. `writeIngestErr`'s only production caller is
+	// protocols.go's insert handler, which passes `ndjsonSpec()` --
+	// `format: errJSON` -- so the early return above always fires. The header
+	// that does reach a client is set by that same handler on its 204 routes
+	// (`/insert/loki/api/v1/push`, `/insert/syslog`), which is why the
+	// constant is used from there as well: one dispatch must not have two
+	// spellings, or renaming the constant moves nothing on the wire. Kept
+	// because a non-JSON insert route is a routeSpec away and the count would
+	// otherwise vanish silently on it.
 	w.Header().Set(hdrAccepted, strconv.Itoa(res.Accepted))
 	http.Error(w, msg, code)
 }
 
+// maxRenderedRejectedAt bounds how many positions one error body carries. It
+// is the bound ingest.MaxRejectedAt used to be, so this response's worst case
+// is unchanged by the attribution bound being raised to the _bulk action cap.
+const maxRenderedRejectedAt = 1 << 16
+
 // hdrAccepted carries the durable record count on a route whose error body is
-// not JSON.
+// not JSON, and on the 204 routes, whose success code forbids a body at all.
+// TestAReject204ReportsTheCountsInHeaders is what makes the name load-bearing:
+// without it this constant could be renamed to anything and no test moved.
 const hdrAccepted = "X-Simdlogs-Accepted"

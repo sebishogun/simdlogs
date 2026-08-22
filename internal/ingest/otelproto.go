@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"unicode/utf8"
@@ -50,6 +51,13 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 	// a fixed64, where Metric.name and Span.trace_id at the same field number
 	// are length-delimited.
 	sawLogShape := false
+	// wrongShapeRejects counts ONLY the records refused for wearing a log's
+	// field numbers with a metric's or a span's wire types. It is separate
+	// from res.Rejected because a record refused for an UNSTORABLE TIMESTAMP
+	// is a log record -- the discrimination below used res.Rejected and would
+	// have told an OTLP exporter that its logs export was "a metrics or traces
+	// payload" whenever every record in it carried a timestamp past 2262.
+	wrongShapeRejects := 0
 	eachField(data, func(num int, wire int, payload []byte) {
 		if num != 1 || wire != 2 { // resource_logs
 			return
@@ -145,6 +153,10 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 					fields["scope_version"] = scopeVersion
 				}
 				var ts, observed int64
+				// A time_unix_nano that cannot be stored refuses the RECORD,
+				// which is what the JSON encoding of the same export already
+				// did through parseTime. See tsErr's use below.
+				var tsErr error
 				var sevNum int
 				var sevText, traceID, spanID, eventName string
 				var flags, dropped uint32
@@ -154,11 +166,30 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				wrongShape := false
 				eachField(rec, func(fn, fw int, fp []byte) {
 					switch {
+					// A proto3 `fixed64` is UNSIGNED, and the conversion to
+					// int64 was raw. Every instant after 2262-04-11 is a legal
+					// value of this field and became a NEGATIVE nanosecond
+					// count: the row was accepted, counted, and filed before
+					// 1970. This is /v1/logs with
+					// `Content-Type: application/x-protobuf`, which is the
+					// OpenTelemetry Collector's DEFAULT encoding -- the round
+					// that fixed the JSON path (otel.go, through parseTime)
+					// left the file beside it, which is commit a92b638's
+					// finding again: "two OTLP encodings of one export were
+					// storing different things."
 					case fn == 1 && fw == 1: // time_unix_nano
-						ts = int64(binary.LittleEndian.Uint64(fp))
+						if v := binary.LittleEndian.Uint64(fp); v > math.MaxInt64 {
+							tsErr = fmt.Errorf("%w: %d ns since the epoch", ErrTimeOutOfRange, v)
+						} else {
+							ts = int64(v)
+						}
 						isLog = true
 					case fn == 11 && fw == 1: // observed_time_unix_nano
-						observed = int64(binary.LittleEndian.Uint64(fp))
+						if v := binary.LittleEndian.Uint64(fp); v > math.MaxInt64 {
+							tsErr = fmt.Errorf("%w: %d ns since the epoch", ErrTimeOutOfRange, v)
+						} else {
+							observed = int64(v)
+						}
 						isLog = true
 					case fn == 2 && fw == 0: // severity_number (enum, varint)
 						// Range-checked BEFORE the int conversion. A varint of
@@ -235,11 +266,23 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				if wrongShape {
 					res.Reject(ordinal)
 					ordinal++
-					res.Warn(0, "record's field 1 is not a timestamp; a metrics or traces payload, not logs")
+					wrongShapeRejects++
+					res.WarnAt(ordinal-1, "record's field 1 is not a timestamp; a metrics or traces payload, not logs")
 					return
 				}
 				if isLog {
 					sawLogShape = true
+				}
+				if tsErr != nil {
+					// See ErrTimeOutOfRange. OTLP reports the count in its
+					// partial-success body rather than as a 4xx, so the
+					// exporter is told without being asked to drop the whole
+					// batch. Counted AFTER sawLogShape, so a rejected record
+					// still proves this was a logs payload.
+					res.Reject(ordinal)
+					ordinal++
+					res.WarnAt(ordinal-1, "%v", tsErr)
+					return
 				}
 				otlpRecordFields(fields, sevNum, sevText, traceID, spanID, eventName, flags, dropped)
 				if ts == 0 {
@@ -273,8 +316,17 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 		if !sawResourceLogs {
 			return res, envelopeErr(errNoResourceLogsProto)
 		}
-		if res.Rejected > 0 {
+		if wrongShapeRejects > 0 {
 			return res, envelopeErr(errNotLogRecords)
+		}
+		// Every record refused for an unstorable timestamp and none for its
+		// shape: a LOGS export whose records this store cannot file. That is
+		// the partial-success body, not an envelope error -- the same answer
+		// the JSON encoding of the identical export gives, and a 4xx here
+		// would tell the exporter to drop a batch it should be told the count
+		// for.
+		if res.Rejected > 0 {
+			return res, nil
 		}
 		// A resource_logs that yielded no records is NOT an error. OTLP
 		// requires success for a request that carries no data, exporters

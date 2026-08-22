@@ -166,6 +166,15 @@ func FuzzIngestJournald(f *testing.F) {
 	f.Add([]byte("MESSAGE=hello\nPRIORITY=6\n\n"))
 	f.Add([]byte("MESSAGE\n\x08\x00\x00\x00\x00\x00\x00\x00binary!!\n"))
 	f.Add([]byte("MESSAGE\n\xff\xff\xff\xff\xff\xff\xff\xffoverflow"))
+	// 29 bytes that crashed this fuzzer: the truncated-field branch rejected
+	// the ordinal and then called emit(), which rejected it again, so ONE
+	// record answered Rejected=2 with RejectedAt=[0 0] and the envelope's
+	// "rejected positions are not increasing" check fired. The two other ways
+	// into emit's refusal branches are seeded with it.
+	f.Add([]byte("__REALTIME_TIMESTAMP=1\nORPHAN"))
+	f.Add([]byte("__REALTIME_TIMESTAMP=99999999999999999999\nORPHAN"))
+	f.Add([]byte("MESSAGE=x\nORPHAN"))
+	f.Add([]byte("__REALTIME_TIMESTAMP=-1\nMESSAGE=x\n\n"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		oneEnvelope(t, data, IngestJournald)
 	})

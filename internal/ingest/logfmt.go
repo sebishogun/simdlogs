@@ -36,9 +36,15 @@ func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 		}
 		var ts int64
 		haveTS := false
+		var tsErr error
 		parseLogfmtLine(line, func(k, v string) {
 			if isTimeKey(k) {
-				if t, ok := parseTime(v); ok {
+				t, ok, terr := parseTime(v)
+				if terr != nil {
+					tsErr = terr
+					return
+				}
+				if ok {
 					// Stored once, in the timestamp column -- see jsonline.
 					ts, haveTS = t, true
 					return
@@ -46,6 +52,14 @@ func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 			}
 			fields[k] = v
 		})
+		if tsErr != nil {
+			// A timestamp that parses and cannot be stored refuses the record
+			// and is counted -- see ErrTimeOutOfRange.
+			res.Reject(ordinal)
+			res.WarnAt(ordinal, "%v", tsErr)
+			ordinal++
+			continue
+		}
 		if len(fields) == 0 {
 			res.Reject(ordinal)
 			ordinal++

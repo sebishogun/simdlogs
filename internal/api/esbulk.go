@@ -481,21 +481,73 @@ func bulkHasError(ops []bulkOp) bool {
 // had landed -- a duplicate, in an append-only store -- and recorded what had
 // vanished as delivered.
 //
-// When the positions are NOT known (the parallel path shards the body, so a
-// shard's ordinals index nothing at batch scale), every candidate item is
-// marked instead of guessing at n of them. Over-reporting causes duplicates,
-// which a caller can reconcile; under-reporting causes loss, which it cannot.
-func markBulkRejects(ops []bulkOp, rejected int, rejectedAt []int32, truncated bool) {
+// THE POSITIONS ARE KNOWN ON BOTH PATHS NOW. The parallel path used to throw
+// them away -- a shard's ordinals are relative to its own chunk -- and the
+// caller declared them unknown for every body over 1 MiB. The chunks are
+// contiguous and in body order, so they rebase exactly
+// (`ingest.IngestJSONLinesParallelResult`).
+//
+// AND THE RESIDUAL CASE IS NO LONGER A PER-ITEM STATUS AT ALL. It was 429
+// `es_rejected_execution_exception`, on the reasoning that a 4xx which every
+// shipper re-sends over-reports without losing anything. That reasoning is
+// self-contradictory: "a 4xx is permanent to every shipper" is exactly why 400
+// beat 500, and 429 is the one 4xx that is NOT permanent -- it inherits the
+// 5xx's retry property and keeps none of the 4xx's. Measured on this tree,
+// a 5,254,000-byte body of 70,000 `index` actions with 66,000 carrying
+// `"_time":"9999-01-01T00:00:00Z"`, well inside the 64 MiB request limit:
+//
+//	HTTP 200  errors=true
+//	items                 70000
+//	byStatus              map[429:70000]
+//	byType                map[es_rejected_execution_exception:70000]
+//	rows on disk           4000
+//
+// Every shipper that honours a per-item 429 -- Beats, Logstash, Fluentd --
+// re-sends with backoff. 66,000 of those are deterministically unstorable
+// (ErrTimeOutOfRange refuses them identically forever), so the pipeline never
+// drains, which is the exact sentence the paragraph below gives as the reason
+// 500 was wrong. And the 4,000 that DID land are re-sent on every pass into an
+// append-only store: 4,000 duplicates per retry, unbounded. In the ES protocol
+// a per-item 429 means the write thread pool queue was full and that item was
+// shed -- a TRANSIENT condition. Stamping it on a permanently-bad document
+// asserts a transience that does not exist.
+//
+// What replaces it is two things:
+//
+//   - THE TRIGGER IS GONE. `ingest.MaxRejectedAt` was 65,536 against an action
+//     cap of 1<<20, so the 5 MB body above reached it. It is the action cap
+//     now, and TestTheAttributionBoundCoversTheActionCap holds them together,
+//     so no body /_bulk accepts can outrun the positions.
+//   - WHAT IS LEFT IS ANSWERED EXACTLY OR NOT AT ALL. With every candidate
+//     rejected the positions are not needed -- all of them are 400. Otherwise
+//     the mix of stored and unstorable documents cannot be split, no per-item
+//     status is true, and this reports failure so the CALLER answers a
+//     request-level error instead of writing 70,000 statuses it cannot stand
+//     behind. That state is a server-side inconsistency, not an input: after
+//     the bound change nothing a client can send reaches it.
+//
+// THE PLACED REJECTIONS ARE 400, NOT 500, AND THE DIFFERENCE IS A RETRY LOOP. Every
+// rejection that reaches this function is the INGESTER'S, which is to say the
+// client's: an unreadable document, one with no storable field, or a `_time`
+// outside the int64-nanosecond domain. Every storage failure has already
+// returned by the time it is called -- the parallel path on `werr`, the serial
+// path on the parse error and on FlushMark -- so a 500 here named a server
+// fault for something no server could have done differently.
+//
+// It was written when the only rejection was "the document was not stored",
+// and the timestamp refusal (ErrTimeOutOfRange) then arrived through it. Beats,
+// Logstash and Fluentd all retry a 5xx bulk item indefinitely with backoff and
+// give up permanently on a 4xx: a document whose `_time` says 9999 can never
+// succeed, so a 500 makes it a pipeline that never drains. This round applied
+// exactly that reasoning to OTLP ("exporters retry 5xx and give up on 4xx") in
+// the file next door and not here.
+// It reports whether every item now carries a status the server can stand
+// behind. False means the response must not be written: see the caller.
+func markBulkRejects(ops []bulkOp, rejected int, rejectedAt []int32, truncated bool) bool {
 	if rejected <= 0 {
-		return
+		return true
 	}
-	// The doc-carrying ops, in the order the ingester saw them.
-	idx := make([]int, 0, len(ops))
-	for i := range ops {
-		if ops[i].doc != nil && ops[i].errType == "" {
-			idx = append(idx, i)
-		}
-	}
+	idx := bulkCandidates(ops)
 
 	if !truncated && len(rejectedAt) == rejected {
 		for _, ord := range rejectedAt {
@@ -507,21 +559,50 @@ func markBulkRejects(ops []bulkOp, rejected int, rejectedAt []int32, truncated b
 		if !truncated {
 			for _, ord := range rejectedAt {
 				i := idx[ord]
-				ops[i].status = 500
-				ops[i].errType = "server_error"
-				ops[i].errMsg = "the document was not stored"
+				ops[i].status = 400
+				ops[i].errType = "document_parsing_exception"
+				ops[i].errMsg = bulkRejectReason
 			}
-			return
+			return true
 		}
 	}
 
-	// Positions unknown. Say so on every candidate rather than choosing.
-	msg := "the document may not have been stored: " +
-		strconv.Itoa(rejected) + " of " + strconv.Itoa(len(idx)) +
-		" documents in this batch were rejected and their positions are not known"
-	for _, i := range idx {
-		ops[i].status = 500
-		ops[i].errType = "server_error"
-		ops[i].errMsg = msg
+	// EVERY CANDIDATE REJECTED IS EXACT WITHOUT POSITIONS: there is no stored
+	// document among them to mislabel, so the permanent 400 each one has
+	// earned is the true answer for all of them.
+	if rejected >= len(idx) {
+		for _, i := range idx {
+			ops[i].status = 400
+			ops[i].errType = "document_parsing_exception"
+			ops[i].errMsg = bulkRejectReason
+		}
+		return true
 	}
+
+	// A mix of stored and unstorable documents whose positions are unknown.
+	// No per-item status is true here -- 400 loses the stored ones, 201 loses
+	// the bad ones, 429 asserts a transience two thirds of them do not have --
+	// so none is written and the caller fails the request instead.
+	return false
 }
+
+// bulkCandidates lists the doc-carrying ops, in the order the ingester saw
+// them: ordinal k of the ingester's batch is the k-th of these. An op that
+// already failed carries no document into the ingester and is not one.
+func bulkCandidates(ops []bulkOp) []int {
+	idx := make([]int, 0, len(ops))
+	for i := range ops {
+		if ops[i].doc != nil && ops[i].errType == "" {
+			idx = append(idx, i)
+		}
+	}
+	return idx
+}
+
+// bulkRejectReason is what the ingester refuses a document FOR. There is no
+// per-record reason on ingest.Result -- it carries positions and a warning
+// list, not a cause per ordinal -- so the item names the three possibilities
+// rather than inventing one.
+const bulkRejectReason = "the document was rejected by the ingester: it is not " +
+	"a readable JSON object, it carries no storable field, or its `_time` is " +
+	"outside the storable range (1677-09-21T00:12:43Z to 2262-04-11T23:47:16Z)"

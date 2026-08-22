@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/sebishogun/simdlogs/internal/ingest"
 )
 
 // The Elasticsearch _bulk action contract.
@@ -76,11 +78,21 @@ func postBulk(t *testing.T, ts string, body string) (items []bulkItem, errors bo
 	return items, out.Errors, status
 }
 
-func bulkServer(t *testing.T) string {
+func bulkServer(t *testing.T) string { return bulkServerCfg(t, nil) }
+
+// bulkServerCfg is bulkServer with a hook that configures the server before it
+// serves. It exists for the shard-count override: without one the concurrent
+// ingest branch needs runtime.NumCPU()/3 >= 2 and is unreachable on any host
+// with fewer than six cores, so a test that means to exercise it runs the
+// serial fallback and passes either way.
+func bulkServerCfg(t *testing.T, cfg func(*Server)) string {
 	t.Helper()
 	srv, err := NewServer(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg != nil {
+		cfg(srv)
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { ts.Close(); srv.Close() })
@@ -439,4 +451,467 @@ func TestBulkOverActionCapFails(t *testing.T) {
 	if !strings.Contains(perr, "actions") {
 		t.Errorf("error %q does not say what was exceeded", perr)
 	}
+}
+
+// A CLIENT-SIDE REJECTION IS A 4xx ITEM, NOT A 5xx.
+//
+// Every rejection that reaches markBulkRejects is the ingester's, and every
+// storage failure has already returned before it is called -- so a 500 named a
+// server fault for a document no server could have stored. Beats, Logstash and
+// Fluentd all retry a 5xx bulk item indefinitely and give up permanently on a
+// 4xx, so a document whose `_time` says 9999 became a pipeline that never
+// drains: the retry can never succeed and the batch behind it never moves.
+//
+// Both shapes are here because they are the same class through two different
+// paths -- one the ingester cannot read at all, one it reads and cannot file.
+func TestABulkRejectionIsAClientErrorNotAServerError(t *testing.T) {
+	for _, tc := range []struct {
+		name, bad string
+	}{
+		{"a document that does not parse", `{"@timestamp":"2023-11-14T22:13:21Z","level":}`},
+		{"a `_time` outside the storable range", `{"_time":"9999-01-01T00:00:00Z","level":"far"}`},
+		{"a `_time` past int64 as all digits", `{"_time":"253402300800000000000","level":"far"}`},
+		{"a `_time` past int64 as a JSON number", `{"_time":253402300800000000000,"level":"far"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := bulkServer(t)
+			body := `{"index":{"_index":"logs","_id":"GOOD"}}` + "\n" +
+				`{"@timestamp":"2023-11-14T22:13:20Z","level":"kept"}` + "\n" +
+				`{"index":{"_index":"logs","_id":"BAD"}}` + "\n" +
+				tc.bad + "\n"
+
+			items, errs, status := postBulk(t, ts, body)
+			if status != http.StatusOK {
+				t.Fatalf("the bulk request answered %d, want 200 with per-item statuses", status)
+			}
+			if !errs {
+				t.Fatalf("errors = false though a document was rejected: %+v", items)
+			}
+			if len(items) != 2 {
+				t.Fatalf("%d items, want 2: %+v", len(items), items)
+			}
+			if items[0].Status >= 300 {
+				t.Errorf("the STORED document is reported %d %q", items[0].Status, items[0].ErrTy)
+			}
+			if items[1].Status/100 != 4 {
+				t.Errorf("the rejected document is reported %d %q, want a 4xx.\n"+
+					"A 5xx tells Beats/Logstash/Fluentd to retry forever, and this "+
+					"document can never be stored however many times it is sent.",
+					items[1].Status, items[1].ErrTy)
+			}
+			if items[1].ErrTy == "server_error" {
+				t.Errorf("the rejected document's error type is %q: the fault is "+
+					"the document's, not the server's", items[1].ErrTy)
+			}
+		})
+	}
+}
+
+// A BULK BIG ENOUGH TO SHARD MUST NOT REPORT THE DOCUMENTS IT STORED AS FAILED.
+//
+// `esBulk` takes the parallel ingest path once the document lines reach
+// `ingest.MinParallelBytes` (1 MiB), and that path returned
+// `(ingested, skipped, error)` with the per-record positions thrown away. The
+// handler then declared the positions UNKNOWN, and `markBulkRejects` marks
+// EVERY candidate item when it cannot place the rejections -- which after
+// round 18 meant every item in the batch at 400 `document_parsing_exception`.
+//
+// Measured on this tree before the fix, a 6 MiB body of 20,871 `index` actions
+// with ONE unstorable `_time` in it:
+//
+//	items at 2xx                  0
+//	items at 400                  20871
+//	rows in the store afterwards  20870
+//
+// 400 is PERMANENT to every shipper -- Beats, Logstash and Fluentd all give up
+// on a 4xx and never re-send it -- so 20,870 documents that are on disk are
+// recorded by the client as lost, and nothing in the response says otherwise.
+// Round 18 changed the status from 500 to 400 for the right reason and left
+// this branch, whose justification four lines above it still read
+// "over-reporting causes duplicates, which a caller can reconcile". That was
+// true at 500. At 400 over-reporting produces no duplicates at all: it
+// produces exactly the loss the same sentence says a caller cannot recover.
+//
+// The shard ordinals ARE recoverable. `splitLines` cuts on line boundaries and
+// the chunks are contiguous and in body order, so shard k's first record is at
+// the sum of the earlier shards' record counts -- a number each shard already
+// returns (Accepted+Rejected is every non-blank line it saw).
+func TestALargeBulkReportsOnlyTheDocumentItRejected(t *testing.T) {
+	const (
+		n   = 12000 // enough doc bytes to cross MinParallelBytes
+		bad = 7777  // not the first and not the last: an off-by-one is visible
+	)
+	pad := strings.Repeat("x", 64)
+	var sb strings.Builder
+	sb.Grow(n * 160)
+	for i := 0; i < n; i++ {
+		sb.WriteString(`{"index":{"_index":"logs"}}` + "\n")
+		if i == bad {
+			// PARSES and cannot be STORED: outside the int64-nanosecond
+			// domain, which is the ingester's own refusal and not a syntax
+			// error, so it exercises the attribution path rather than the
+			// action parser.
+			sb.WriteString(`{"_time":"9999-01-01T00:00:00Z","level":"far","pad":"` + pad + `"}` + "\n")
+			continue
+		}
+		sb.WriteString(`{"_time":"2026-06-01T12:00:00Z","level":"info","pad":"` + pad + `"}` + "\n")
+	}
+	body := sb.String()
+
+	// BOTH SHARD COUNTS, because the derived one is not a choice this test
+	// gets to make. `runtime.NumCPU()/3` is below the 2-shard minimum on any
+	// host with fewer than six cores, so on a stock CI runner -- or under
+	// `taskset -c 0-3` -- the first row runs the SERIAL path and asserts
+	// nothing about the rebase. Measured: `base += 0` in mergeShardResults is
+	// RED at 32 CPUs and GREEN at 4 without the second row.
+	for _, tc := range []struct {
+		name   string
+		shards int
+	}{
+		{"the derived shard count", 0},
+		{"shards forced to 4", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The forced row must actually shard, and the byte count alone
+			// cannot say so: ParallelConfig needs Shards >= 2 as well, and the
+			// bulk branch is keyed on the DOCUMENT bytes, not the body's.
+			cfg := ingest.ParallelConfig{Shards: tc.shards}
+			if tc.shards != 0 && cfg.ShardsFor(len(body)-n*28) < 2 {
+				t.Fatalf("shards forced to %d resolves to %d: this row runs the "+
+					"serial fallback", tc.shards, cfg.ShardsFor(len(body)-n*28))
+			}
+			ts := bulkServerCfg(t, func(s *Server) { s.setIngestShardsForTest(tc.shards) })
+			items, errs, status := postBulk(t, ts, body)
+			if status != http.StatusOK {
+				t.Fatalf("status %d", status)
+			}
+			if len(items) != n {
+				t.Fatalf("%d items, want %d", len(items), n)
+			}
+			if !errs {
+				t.Fatal("errors = false though a document was rejected")
+			}
+			failed := make([]int, 0, 8)
+			for i, it := range items {
+				if it.Status >= 300 {
+					failed = append(failed, i)
+				}
+			}
+			if len(failed) != 1 || failed[0] != bad {
+				shown := failed
+				if len(shown) > 8 {
+					shown = shown[:8]
+				}
+				t.Fatalf("%d of %d items report a failure (first few at %v), want exactly one at %d.\n"+
+					"Every item but one names a document that is ON DISK. A 4xx is permanent "+
+					"to Beats, Logstash and Fluentd: they will not re-send, so the client's "+
+					"record of a stored document becomes `failed` forever.",
+					len(failed), len(items), shown, bad)
+			}
+			if items[bad].Status/100 != 4 {
+				t.Errorf("the rejected document is reported %d %q, want a 4xx",
+					items[bad].Status, items[bad].ErrTy)
+			}
+
+			// THE STORE IS THE OTHER HALF OF THE ASSERTION. Without it a build
+			// that stored nothing and reported one failure would pass every
+			// line above.
+			resp, err := http.Post(ts+"/_count", "application/json", strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cnt struct{ Count int }
+			json.NewDecoder(resp.Body).Decode(&cnt)
+			resp.Body.Close()
+			if cnt.Count != n-1 {
+				t.Errorf("the store holds %d rows, want %d", cnt.Count, n-1)
+			}
+		})
+	}
+}
+
+// THE ATTRIBUTION BOUND MUST COVER THE ACTION CAP, or a body a client can
+// send outruns the positions and the per-item statuses stop being computable.
+//
+// `ingest.MaxRejectedAt` was 65,536 against an action cap of 1<<20, and the
+// gap was not theoretical: a 5,254,000-byte body -- inside the 64 MiB request
+// limit, an ordinary shipper batch -- with 70,000 `index` actions of which
+// 66,000 carried an unstorable `_time` crossed it and every one of the 70,000
+// items came back 429 `es_rejected_execution_exception` over 4,000 stored rows.
+// The two constants live in two packages, so nothing but this holds them
+// together.
+//
+// TWO-SIDED, BECAUSE A RAISE COSTS MEMORY AND NOTHING ELSE MEASURES IT.
+// This read `MaxRejectedAt < esBulkMaxActions` while entry 134 described the
+// invariant as "an exact fit: MaxRejectedAt == esBulkMaxActions == 1<<20".
+// `ingest.MaxRejectedAt = 1<<24` compiles and was GREEN at 32 CPUs and under
+// `taskset -c 0-3` -- the prose said fit and the gate said floor.
+//
+// `>=` is the safety-relevant direction: below the action cap a `_bulk` batch
+// stops being attributable per item (see the doc on MaxRejectedAt). But
+// `/insert/journald` has no action cap at all -- its positions are bounded
+// only by the body limit -- so the bound is what stops one upload from
+// recording a position per entry. Measured, a 67,108,864-byte journald body
+// (the default MaxBodyBytes) of 24-byte rejecting entries:
+//
+//	MaxRejectedAt   entries    recorded    int32     rejectedTruncated
+//	1<<20           2,796,202  1,048,576   4.00 MiB  true
+//	1<<24           2,796,202  2,796,202  10.67 MiB  false
+//
+// 2.67x the live list on a route the action cap does not reach, which is the
+// half of the trade the one-sided form could not see.
+func TestTheAttributionBoundCoversTheActionCap(t *testing.T) {
+	if ingest.MaxRejectedAt < esBulkMaxActions {
+		t.Fatalf("ingest.MaxRejectedAt is %d and a _bulk may carry %d actions: a batch "+
+			"with more than %d rejected documents cannot be attributed, and the items "+
+			"array is then a status per document that no server can stand behind",
+			ingest.MaxRejectedAt, esBulkMaxActions, ingest.MaxRejectedAt)
+	}
+	if ingest.MaxRejectedAt > esBulkMaxActions {
+		// BOTH WAYS ROUND, because this arm fires on two different edits and
+		// the message used to answer only one of them. It trips when
+		// MaxRejectedAt is RAISED and equally when esBulkMaxActions is
+		// LOWERED, and a reader who just lowered the action cap was told to
+		// "raise the action cap first" -- an argument about the change they
+		// did not make. Lowering the cap is the correct fix for a different
+		// problem (a _bulk body that is too large to answer per item), and the
+		// answer to it is to lower MaxRejectedAt with it, not to put the cap
+		// back.
+		t.Fatalf("ingest.MaxRejectedAt is %d against an action cap of %d. Nothing "+
+			"/_bulk accepts needs the extra %d positions, and /insert/journald -- which "+
+			"has no action cap -- then records one position per rejecting entry up to "+
+			"the body limit: at MaxBodyBytes a 24-byte-entry body records %d of them "+
+			"(%.2f MiB of int32) instead of %d (%.2f MiB). If MaxRejectedAt was RAISED, "+
+			"raise the action cap with it or price the extra list against MaxBodyBytes; "+
+			"if esBulkMaxActions was LOWERED, lower MaxRejectedAt to match -- the two "+
+			"are one number and this gate is what keeps them one.",
+			ingest.MaxRejectedAt, esBulkMaxActions, ingest.MaxRejectedAt-esBulkMaxActions,
+			min(ingest.MaxRejectedAt, (64<<20)/24), float64(min(ingest.MaxRejectedAt, (64<<20)/24))*4/(1<<20),
+			esBulkMaxActions, float64(esBulkMaxActions)*4/(1<<20))
+	}
+}
+
+// A 429 ON A DOCUMENT THAT CAN NEVER BE STORED IS A PIPELINE THAT NEVER DRAINS.
+//
+// This is the measurement that reopened round 18's own finding. 70,000 `index`
+// actions, 66,000 of them carrying `"_time":"9999-01-01T00:00:00Z"`, one
+// 5,254,000-byte body:
+//
+//	HTTP 200  errors=true
+//	items                 70000
+//	byStatus              map[429:70000]
+//	byType                map[es_rejected_execution_exception:70000]
+//	rows on disk           4000
+//
+// 429 is the one 4xx that is NOT permanent: Beats, Logstash and Fluentd all
+// back off and re-send it. 66,000 of those documents are refused identically
+// forever by ErrTimeOutOfRange, so the batch never drains -- the exact
+// sentence that made 500 wrong -- and the 4,000 that landed are re-sent into
+// an append-only store on every pass.
+//
+// The trigger was `ingest.MaxRejectedAt` being smaller than the action cap.
+// With that closed the positions survive, and the answer is per item.
+func TestABulkPastTheOldAttributionBoundIsStillAnsweredPerItem(t *testing.T) {
+	const (
+		n   = 70000
+		bad = 66000 // over the old 65,536 bound, under the 1<<20 action cap
+	)
+	var sb strings.Builder
+	sb.Grow(n * 72)
+	docBytes := 0
+	for i := 0; i < n; i++ {
+		sb.WriteString(`{"index":{"_index":"logs"}}` + "\n")
+		doc := `{"_time":"2026-06-01T12:00:00Z","level":"info"}` + "\n"
+		if i < bad {
+			doc = `{"_time":"9999-01-01T00:00:00Z","level":"far"}` + "\n"
+		}
+		sb.WriteString(doc)
+		docBytes += len(doc)
+	}
+	body := sb.String()
+
+	// THE SIZE IS A DOCUMENTED NUMBER, SO IT IS CHECKED HERE. Five other
+	// places quote this body's length as measured on this tree -- result.go,
+	// esbulk.go, this file twice and docs/lld/ingest.md, all from
+	// docs/wrong.md entry 133 -- and every one of them said 4,966,000 while
+	// the fixture below produces 70000*28 + 66000*47 + 4000*48. Nobody counts
+	// a number in prose; this is where it can be counted.
+	const wantBody = 70000*28 + 66000*47 + 4000*48 // 5,254,000
+	if len(body) != wantBody {
+		t.Fatalf("the fixture is %d bytes and every document that describes it says %d. "+
+			"Fix the number in result.go, esbulk.go, this file's two comments and "+
+			"docs/lld/ingest.md, or fix the fixture.", len(body), wantBody)
+	}
+
+	// BOTH SHARD COUNTS, AND THE GUARD ASKS THE FUNCTION.
+	//
+	// This ran `bulkServer(t)` -- no shard override -- behind a guard that
+	// read `len(body) < ingest.MinParallelBytes` and, when it passed, said
+	// "the parallel path is not exercised" as though it had established that.
+	// It had not, three times over:
+	//
+	//   - `ParallelConfig.ShardsFor` needs `Shards >= 2` as well, and the
+	//     derived value is runtime.NumCPU()/3 -- 1 on a four-core host, and 0
+	//     shards means the SERIAL fallback.
+	//   - The parallel branch is keyed on len(DOCS), the concatenated document
+	//     lines, not len(body): the action lines are 1,960,000 of this body's
+	//     bytes and never reach the ingester.
+	//   - The message asserted the conclusion the guard did not check, so the
+	//     failure it would print was a claim rather than a measurement.
+	//
+	// Measured with `base += pr.Accepted + pr.Rejected` mutated to `base += 0`
+	// in mergeShardResults: this gate RED at 32 CPUs and GREEN under
+	// `taskset -c 0-3`. The rebase of 66,000 positions is what a four-core CI
+	// stopped covering.
+	for _, tc := range []struct {
+		name   string
+		shards int
+	}{
+		{"the derived shard count", 0},
+		{"shards forced to 4", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := ingest.ParallelConfig{Shards: tc.shards}
+			if tc.shards != 0 && cfg.ShardsFor(docBytes) < 2 {
+				t.Fatalf("shards forced to %d resolves to %d over %d document bytes: "+
+					"this row runs the serial fallback and asserts nothing about the "+
+					"ordinal rebase", tc.shards, cfg.ShardsFor(docBytes), docBytes)
+			}
+			ts := bulkServerCfg(t, func(s *Server) { s.setIngestShardsForTest(tc.shards) })
+			items, errs, status := postBulk(t, ts, body)
+			if status != http.StatusOK {
+				t.Fatalf("status %d, want 200 with per-item statuses", status)
+			}
+			if !errs || len(items) != n {
+				t.Fatalf("errors=%v with %d items, want true and %d", errs, len(items), n)
+			}
+			byStatus := map[int]int{}
+			firstWrong := -1
+			for i, it := range items {
+				byStatus[it.Status]++
+				want4xx := i < bad
+				if (it.Status >= 300) != want4xx && firstWrong < 0 {
+					firstWrong = i
+				}
+				if it.Status == http.StatusTooManyRequests && firstWrong < 0 {
+					firstWrong = i
+				}
+			}
+			if byStatus[http.StatusTooManyRequests] > 0 {
+				t.Errorf("%d items are 429 es_rejected_execution_exception. 429 is retryable to "+
+					"every shipper and these documents can never be stored: the pipeline never "+
+					"drains, and each pass re-sends the %d documents that DID land into an "+
+					"append-only store.", byStatus[http.StatusTooManyRequests], n-bad)
+			}
+			if firstWrong >= 0 {
+				t.Fatalf("item %d is %d %q; items 0..%d must be 4xx and %d..%d must be 2xx. byStatus=%v",
+					firstWrong, items[firstWrong].Status, items[firstWrong].ErrTy, bad-1, bad, n-1, byStatus)
+			}
+
+			resp, err := http.Post(ts+"/_count", "application/json", strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cnt struct{ Count int }
+			json.NewDecoder(resp.Body).Decode(&cnt)
+			resp.Body.Close()
+			if cnt.Count != n-bad {
+				t.Errorf("the store holds %d rows, want %d", cnt.Count, n-bad)
+			}
+		})
+	}
+}
+
+// AND THE BRANCH THAT CANNOT PLACE A REJECTION IS COVERED, at the one level
+// where it can be reached deliberately.
+//
+// `markBulkRejects` cannot place a rejection when the ingester's positions do
+// not account for the rejections -- a truncated position list, or an ordinal
+// that indexes nothing. Nothing in the repository reached those lines through
+// a request: every _bulk test in the tree sends positions that are exact, so
+// reverting the whole branch compiled and left `go test ./...` green.
+//
+// THE ANSWER IS NO LONGER A PER-ITEM STATUS. It was 429
+// `es_rejected_execution_exception`, on the reasoning that a retryable 4xx
+// over-reports without losing anything -- and 429 is the one 4xx that is not
+// permanent, so it hands a permanently-unstorable document a transience it
+// does not have and re-sends every stored document in the batch on every pass.
+// See TestABulkPastTheOldAttributionBoundIsStillAnsweredPerItem for that
+// measured at 70,000 items.
+//
+// What is left: with EVERY candidate rejected the positions are not needed and
+// all of them are a permanent 400; with a mix, no per-item status is true, so
+// none is written and the caller answers a request-level error.
+func TestAnUnattributableBulkRejectionIsNotWrittenAsAnItemStatus(t *testing.T) {
+	mk := func() []bulkOp {
+		ops := make([]bulkOp, 5)
+		for i := range ops {
+			ops[i] = bulkOp{op: "index", doc: []byte(`{"a":1}`), status: 201}
+		}
+		return ops
+	}
+	untouched := func(t *testing.T, ops []bulkOp) {
+		t.Helper()
+		for i, o := range ops {
+			if o.status != 201 || o.errType != "" {
+				t.Fatalf("item %d was stamped %d %q. Four of these five documents are "+
+					"stored and one can never be: no per-item status is true about "+
+					"both, so none may be written.", i, o.status, o.errType)
+			}
+		}
+	}
+
+	t.Run("positions truncated, a mix", func(t *testing.T) {
+		ops := mk()
+		if markBulkRejects(ops, 1, nil, true) {
+			t.Fatal("reported the items usable with 1 of 5 rejected and no positions")
+		}
+		untouched(t, ops)
+	})
+
+	t.Run("an ordinal that indexes nothing", func(t *testing.T) {
+		ops := mk()
+		// 99 is past the end of the candidate list: the positions are wrong,
+		// so none of them may be trusted.
+		if markBulkRejects(ops, 1, []int32{99}, false) {
+			t.Fatal("reported the items usable with an ordinal that indexes nothing")
+		}
+		untouched(t, ops)
+	})
+
+	// EVERY CANDIDATE REJECTED NEEDS NO POSITIONS: there is no stored document
+	// among them to mislabel, so the permanent 400 is exact for all of them.
+	t.Run("every candidate rejected, positions unknown", func(t *testing.T) {
+		ops := mk()
+		if !markBulkRejects(ops, 5, nil, true) {
+			t.Fatal("refused to answer a batch in which every document was rejected")
+		}
+		for i, o := range ops {
+			if o.status != 400 || o.errType != "document_parsing_exception" {
+				t.Fatalf("item %d is %d %q, want a permanent 400", i, o.status, o.errType)
+			}
+		}
+	})
+
+	// THE CONTROL: with the positions known, exactly the named item fails, and
+	// it fails PERMANENTLY -- that document can never be stored however many
+	// times it is sent.
+	t.Run("positions known (control)", func(t *testing.T) {
+		ops := mk()
+		if !markBulkRejects(ops, 1, []int32{3}, false) {
+			t.Fatal("refused a batch whose positions are exact")
+		}
+		for i, o := range ops {
+			want := 201
+			if i == 3 {
+				want = 400
+			}
+			if o.status != want {
+				t.Fatalf("item %d is %d %q, want %d", i, o.status, o.errType, want)
+			}
+		}
+		if ops[3].errType != "document_parsing_exception" {
+			t.Errorf("the placed rejection is %q", ops[3].errType)
+		}
+	})
 }

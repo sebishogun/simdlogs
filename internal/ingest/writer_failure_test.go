@@ -882,7 +882,7 @@ func TestParallelAggregationSeesEveryShard(t *testing.T) {
 // docs/wrong.md said the fix "was verified by reverting it".
 //
 // This drives the serial branch, which is the one round 4 fixed and the one
-// every host with fewer than six cores takes: cfg.shards() returns 0 below two
+// every host with fewer than six cores takes: cfg.ShardsFor() returns 0 below two
 // shards, and the wrapper then synthesizes a ParallelWriteError around one
 // writer's error. Dropping Partial there made As replace an accurate inner
 // answer with a worse one.

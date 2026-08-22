@@ -3,8 +3,11 @@ package ingest
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
+
+	"github.com/sebishogun/simdlogs/internal/query"
 )
 
 // systemd journal export conformance.
@@ -260,4 +263,152 @@ func TestJournaldFieldNameMapping(t *testing.T) {
 	if _, ok := got["_realtime_timestamp"]; ok {
 		t.Error("__REALTIME_TIMESTAMP was stored as a field as well as consumed")
 	}
+}
+
+// ONE RECORD IS ONE COUNT, and a truncated field used to make it two.
+//
+// The `default` branch of the field scan -- a name that ends at EOF with
+// neither '=' nor a newline -- called `res.Reject(ordinal)` and then `emit()`,
+// and emit rejects the SAME ordinal again through either of its two refusal
+// branches. 29 bytes reach it. `make fuzz` runs this shape through
+// `oneEnvelope`, whose "rejected positions are not increasing" check is the
+// one that fires, and on the wire /insert/journald answered
+// `{"accepted":0,"rejected":2}` for a ONE-record upload.
+//
+// The rows below are the three ways into emit's refusal branches plus the one
+// where the entry had storable fields, which double-counted in the other
+// direction: Accepted=1 AND Rejected=1 for the same record.
+func TestJournaldATruncatedFieldRejectsTheEntryOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name, body         string
+		accepted, rejected int
+	}{
+		{
+			"a timestamp and a truncated field",
+			jfield("__REALTIME_TIMESTAMP", "1") + "ORPHAN",
+			0, 1,
+		},
+		{
+			"storable fields and a truncated field",
+			jfield("__REALTIME_TIMESTAMP", "1") + jfield("MESSAGE", "x") + "ORPHAN",
+			0, 1,
+		},
+		{
+			"an out-of-range timestamp and a truncated field",
+			jfield("__REALTIME_TIMESTAMP", "99999999999999999999") + "ORPHAN",
+			0, 1,
+		},
+		{
+			"no timestamp and a truncated field",
+			jfield("MESSAGE", "x") + "ORPHAN",
+			0, 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, res, err := jRows(t, tc.body)
+			if err == nil {
+				t.Fatal("a truncated upload answered success")
+			}
+			if res.Accepted != tc.accepted || res.Rejected != tc.rejected {
+				t.Errorf("accepted %d rejected %d, want %d and %d: this upload holds ONE record",
+					res.Accepted, res.Rejected, tc.accepted, tc.rejected)
+			}
+			if len(res.RejectedAt) != res.Rejected {
+				t.Errorf("RejectedAt %v against Rejected %d", res.RejectedAt, res.Rejected)
+			}
+			// The envelope invariant `make fuzz` enforces: strictly increasing.
+			prev := int32(-1)
+			for _, at := range res.RejectedAt {
+				if at <= prev {
+					t.Fatalf("rejected positions are not increasing: %v", res.RejectedAt)
+				}
+				prev = at
+			}
+			if res.Accepted != len(rows) {
+				t.Errorf("reported %d accepted and stored %d rows", res.Accepted, len(rows))
+			}
+		})
+	}
+}
+
+// A SIGNED __REALTIME_TIMESTAMP IS THE CLIENT'S TIMESTAMP, NOT A MISSING ONE.
+//
+// The byte scan that replaced ParseInt tested every byte for '0'..'9', so `-1`
+// and `+5` -- both of which ParseInt read -- became "not a decimal count",
+// which is the one branch that falls back to the RECEIVER'S CLOCK. The entry
+// was then stored at ingest time under a 202 with no rejection and no warning:
+// a fabricated instant, which is exactly what the range arm was added to stop.
+func TestJournaldASignedTimestampIsNotStampedWithTheReceiversClock(t *testing.T) {
+	const clock = int64(1_700_000_000_000_000_000) // the fallback, far from any row below
+	at := func(t *testing.T, body string) (int64, Result, error) {
+		t.Helper()
+		st := openTestStore(t)
+		w := NewWriter(st)
+		res, err := IngestJournaldOpts(w, []byte(body), func() int64 { return clock }, nil)
+		w.Close()
+		q, perr := query.ParseLogsQL("*")
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		q.From, q.To, q.MatAll = math.MinInt64, int64(1)<<62, true
+		rows := query.RunPipeline(st, q)
+		if len(rows) != 1 {
+			return 0, res, err
+		}
+		return rows[0].Time, res, err
+	}
+
+	for _, tc := range []struct {
+		name, ts string
+		wantNs   int64
+	}{
+		{"a negative microsecond count", "-1", -1000},
+		{"an explicit plus", "+5", 5000},
+		{"unsigned, the control", "5", 5000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ns, res, err := at(t, jfield("__REALTIME_TIMESTAMP", tc.ts)+jfield("MESSAGE", "m")+"\n")
+			if err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if res.Accepted != 1 {
+				t.Fatalf("accepted %d, want 1", res.Accepted)
+			}
+			if ns == clock {
+				t.Fatalf("__REALTIME_TIMESTAMP=%s was stamped with the receiver's clock; "+
+					"the client sent a timestamp and the store recorded an instant nobody sent", tc.ts)
+			}
+			if ns != tc.wantNs {
+				t.Errorf("__REALTIME_TIMESTAMP=%s stored %d ns, want %d", tc.ts, ns, tc.wantNs)
+			}
+		})
+	}
+
+	// A signed value too large to convert is REFUSED, not fallen back on --
+	// the same treatment the unsigned arm gives 2^63.
+	t.Run("a negative count past the domain", func(t *testing.T) {
+		_, res, err := at(t, jfield("__REALTIME_TIMESTAMP", "-99999999999999999999")+
+			jfield("MESSAGE", "m")+"\n")
+		if err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if res.Accepted != 0 || res.Rejected != 1 {
+			t.Fatalf("accepted %d rejected %d, want 0 and 1", res.Accepted, res.Rejected)
+		}
+	})
+
+	// A bare sign is not a count: that IS the fall-back case, and it must stay
+	// one rather than becoming a rejection.
+	t.Run("a bare sign is not a timestamp", func(t *testing.T) {
+		ns, res, err := at(t, jfield("__REALTIME_TIMESTAMP", "-")+jfield("MESSAGE", "m")+"\n")
+		if err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		if res.Accepted != 1 || res.Rejected != 0 {
+			t.Fatalf("accepted %d rejected %d, want 1 and 0", res.Accepted, res.Rejected)
+		}
+		if ns != clock {
+			t.Errorf("stored %d, want the receiver's clock %d", ns, clock)
+		}
+	})
 }

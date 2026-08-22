@@ -206,7 +206,14 @@ func (s *Server) ingestBody(w http.ResponseWriter, r *http.Request, status int,
 	// dropped the counts exactly as before.
 	if res.Rejected > 0 {
 		if status == http.StatusNoContent {
-			w.Header().Set("X-Simdlogs-Accepted", strconv.Itoa(res.Accepted))
+			// hdrAccepted, not a second spelling of it. This literal and
+			// the constant in middleware.go are the same header on one
+			// dispatch: writeIngestErr's `w.Header().Set(hdrAccepted, ...)`
+			// sits after `if spec.format == errJSON { ... return }` and its
+			// only production caller passes ndjsonSpec(), so the constant's
+			// one use is unreachable and THIS is the line that reaches the
+			// wire. Renaming the constant moved nothing until now.
+			w.Header().Set(hdrAccepted, strconv.Itoa(res.Accepted))
 			w.Header().Set("X-Simdlogs-Rejected", strconv.Itoa(res.Rejected))
 			if ws := warningStrings(res.Warnings); len(ws) > 0 {
 				w.Header().Set("X-Simdlogs-Warning", ws[0])
