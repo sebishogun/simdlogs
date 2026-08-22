@@ -157,8 +157,11 @@ func mergeableAggs(aggs []Agg) bool {
 // merging them produces a number that looks like a latency and is not one. The
 // fix is a mergeable sketch (t-digest or DDSketch) with a documented error
 // bound; until that exists and is tested against the exact single-node answer,
-// the router REFUSES rather than returning a plausible wrong percentile.
-// Silently wrong latency numbers are how capacity decisions get made badly.
+// the router does not merge them at all -- it fetches the rows and computes the
+// quantile once, which is exact and moves every matching row. This string is
+// what a caller is told when an aggregate CANNOT be answered that way either,
+// which today means only a pushed-down one. Silently wrong latency numbers are
+// how capacity decisions get made badly.
 func NonMergeableReason(aggs []Agg) string {
 	for i := range aggs {
 		switch aggs[i].Kind {
@@ -238,35 +241,70 @@ func PlanDistributed(pipes []Pipe) Plan {
 			continue
 		}
 		plan.CoordinatorPipes = append(plan.CoordinatorPipes, pipes[i:]...)
-		plan.Reject = rejectReason(plan.CoordinatorPipes)
+		plan.Reject = rejectReason(plan.ShardPipes)
 		return plan
 	}
-	plan.Reject = rejectReason(plan.CoordinatorPipes)
+	plan.Reject = rejectReason(plan.ShardPipes)
 	return plan
 }
 
 // rejectReason explains why a pipeline cannot be answered across shards, or ""
 // when it can.
 //
-// It scans EVERY coordinator pipe, not only the one at the split point. The
-// check used to fire only when a stats pipe happened to be first past the
-// split, so the same aggregate was refused in one pipe order and answered in
-// another:
+// It reads the SHARD half of the plan, because that is the only half where a
+// non-mergeable aggregate is wrong.
 //
-//   - | stats avg(n) a              400, "average of averages"
+// The rule is about WHERE the aggregate runs, not which aggregate it is. A
+// shard computing a quantile of its own rows and a coordinator combining those
+// quantiles gives a number that is not the cluster's quantile -- the median of
+// medians is not the median. A coordinator computing that same quantile ONCE
+// over every shard's merged rows gives exactly what a single node gives, from
+// the same rows through the same pipe, and there is nothing left to merge.
+//
+// It used to read the coordinator half, and so refused the second case as if
+// it were the first. That was over-strict against the planner as it exists:
+// PlanDistributed splits at the first non-row-local pipe and a StatsPipe is
+// never row-local, so no stats pipe has ever been pushed to a shard -- every
+// aggregate already ran at the coordinator over merged rows, and the refusal
+// was declining to return an answer this code had computed correctly. Measured
+// on two shards holding 2500 rows each: with the refusal lifted, avg,
+// quantile, uniq, count_uniq and histogram were byte-identical to the single
+// node's, grouped and ungrouped.
+//
+// The check stays rather than being deleted because the pushdown is what may
+// change. The day a mergeable partial state goes on the wire, a StatsPipe
+// appears in ShardPipes and this refuses the aggregates that cannot survive
+// the trip -- which is the condition it was always trying to name.
+//
+// It scans every pipe of that half, not only the one at the split point. The
+// check once fired only when a stats pipe happened to be first past the split,
+// so one pipe order was refused and another answered:
+//
+//   - | stats avg(n) a                 400, "average of averages"
 //   - | sort by (n) | stats avg(n) a   200, {"a":"14.5"}
 //
-// Both run the aggregate once, at the coordinator, over the merged rows -- so
-// the second answer was correct and the first refusal was over-strict. That
-// inconsistency is worse than either policy: whichever a client tried first
-// became the one they believed.
+// Whichever a client tried first became the one they believed.
+// PROVABLY ALWAYS "" as the planner stands, and kept for that reason rather
+// than in spite of it.
 //
-// The refusal is kept rather than dropped because it is not always
-// over-strict: an aggregate the coordinator computes over merged rows is fine,
-// and one a shard computes and the coordinator sums is not. Which of those
-// happens is decided by the pushdown, and the pushdown is what may change.
-func rejectReason(coord []Pipe) string {
-	for _, p := range coord {
+// `ClassifyPipe` returns PipeMergeableAggregate or PipeCoordinatorOnly for a
+// *StatsPipe and never PipeRowLocal; `PlanDistributed` appends to ShardPipes
+// only for PipeRowLocal. So no StatsPipe can be in `shard` and the loop cannot
+// return non-"". Everything that branches on it -- `Plan.OK`, `Distributable`,
+// the 400 in cluster_plan.go -- is dead, and two tests in distributed_test.go
+// assert a tautology.
+//
+// It stays because it is the check that becomes live the moment a stats pipe
+// becomes push-downable, which is a change somebody will make: a shard
+// computing a quantile of its own rows and a coordinator combining those
+// quantiles is a wrong number, and this is where that gets refused. Deleting
+// it would remove the guard along with the dead branch.
+//
+// What is NOT acceptable is a test that asserts it returns "" and calls that
+// coverage. See `TestRejectReasonIsUnreachableByConstruction`, which asserts
+// the REASON it is unreachable and fails if the classifier changes.
+func rejectReason(shard []Pipe) string {
+	for _, p := range shard {
 		sp, ok := p.(*StatsPipe)
 		if !ok {
 			continue

@@ -111,11 +111,29 @@ aggregation counts each shard as a separate series. Every number was
 individually correct and the answer was wrong. Identical label sets merge and
 points at a timestamp sum.
 
-> **Additive statistics only.** Summing shards is correct for counts and
-> wrong for averages, quantiles and distinct counts. `stats_query_range` over a
-> cluster is meaningful only for additive aggregates; a non-additive one merged
-> this way returns a confident wrong number, and this is stated rather than
-> papered over by summing something that must not be summed.
+> **Two ways to answer, chosen per query.** Summing shards is correct for
+> counts and wrong for averages, quantiles and distinct counts. A non-additive
+> aggregate is therefore not merged at all: the router asks the shards for the
+> rows and runs the aggregate once, over the merged set, which is what a single
+> node does with the same rows. Additive aggregates keep the cheap merge — one
+> number per group per shard — **unless a pipe follows the aggregate, or a
+> non-row-local pipe precedes it**. `* | sort by (n) | stats count() c` takes
+> the exact path with nothing after its aggregate at all, because the sort
+> leaves something other than a stats pipe at the head of the coordinator half.
+> Any
+> `| limit`, `| offset`, `| sort`, `| top` or `| uniq` after a stats pipe also
+> takes the exact path, because the federated path sends the whole query to
+> every shard and each applies that pipe to its own groups: measured,
+> `| stats by (_msg) count() c | limit 2` gave node 2 series and cluster 6, and
+> `| offset 25` gave node 5 and cluster none, all at HTTP 200 (docs/wrong.md
+> entry 114). A cluster therefore DOES get slower for those shapes, which
+> merged correctly before. The exact path costs every matching row on the
+> wire, and that is the price of an exact quantile without a sketch.
+>
+> This was a REFUSAL until 2026-08-16: `avg`, `quantile`, `uniq`,
+> `count_uniq` and `histogram` were 400 on all three stats surfaces. The
+> refusal was right about the merge and wrong about the alternative. See
+> docs/wrong.md entry 106.
 
 **Elasticsearch `_search`.** Hits were concatenated and returned whole, so
 `size: 10` across three shards returned thirty documents — an ES client that
@@ -179,28 +197,47 @@ oldest-first, so a pipe that reads position — `offset`, `limit` without a sort
 `tail` — must see the same order it would see on one node. The bare-select path
 keeps newest-first, because there `limit` means "the newest N".
 
-### Refused rather than answered
+### Not merged — computed once, over the rows
 
-An aggregate with no mergeable partial state is a 400 carrying the reason, not
-a number:
+An aggregate with no mergeable partial state is **not merged**. The router asks
+the shards for the rows and runs the aggregate once, here, which is what a
+single node does with the same rows:
 
-| Aggregate | Why | What to do instead |
+| Aggregate | Why it cannot be merged | How it is answered |
 |---|---|---|
-| `quantile()` | a quantile of a union is not any function of the shards' quantiles — the median of medians is not the median | needs a mergeable sketch (t-digest, DDSketch) with a documented error bound; not in this build |
-| `avg()` | averaging averages is wrong whenever shards hold different row counts: 10, 20, 30 over 1, 1 and 1000 rows averages to 20 where the true mean is 29.97 | `sum()` and `count()`, which do merge |
-| `uniq()`, `count_uniq()` | summing per-shard distinct counts double-counts every value on more than one shard | needs an HLL sketch on the wire |
-| `histogram()`, `rate()` | no merge in this build; `rate` would need each shard's window coverage | — |
+| `quantile()` | a quantile of a union is not any function of the shards' quantiles — the median of medians is not the median | exactly, over the merged rows |
+| `avg()` | averaging averages is wrong whenever shards hold different row counts: 10, 20, 30 over 1, 1 and 1000 rows averages to 20 where the true mean is 29.97 | exactly, over the merged rows |
+| `uniq()`, `count_uniq()` | summing per-shard distinct counts double-counts every value on more than one shard | exactly, over the merged rows |
+| `histogram()`, `rate()` | no partial state; `rate` would need each shard's window coverage | exactly, over the merged rows |
 
-A wrong percentile looks exactly like a latency, and capacity decisions get
-made from it. Refusing is the answer until a sketch exists and is tested
-against the exact single-node result.
+This was a **400 until 2026-08-16**, on the reasoning that a wrong percentile
+looks exactly like a latency and capacity decisions get made from it. That
+reasoning was right about the merge and wrong about the alternative: the
+planner never pushed a stats pipe to a shard, so the aggregate already ran at
+the coordinator over every shard's rows, and the refusal was declining to
+return an answer this code had computed correctly. Measured byte-identical to
+a single node's on two shards holding 2500 rows each. See docs/wrong.md entry
+106.
+
+The cost is that every matching row crosses the network instead of one number
+per group, which is the price of an exact quantile without a sketch. Additive
+aggregates keep the cheap merge **when nothing follows the aggregate and
+nothing non-row-local precedes it**; either forces the exact path for
+correctness (see above). So the choice is per query, on THREE conditions rather
+than one — the aggregate itself, a pipe before, a pipe after. A mergeable
+sketch
+(t-digest, DDSketch) with a documented error bound would make `quantile` cheap
+as well as right, and is still not in this build.
 
 ### The test that would have caught it
 
 `TestSingleNodeAndClusterAgree` (`internal/api/cluster_differential_test.go`)
 ingests one corpus into a single node and the same corpus split across three
 real storage nodes behind a real router, then asserts the answers are identical
-for fifteen pipe shapes. With the planner disabled, ten of the fifteen fail.
+for every pipe shape in its table — which has grown from fifteen to 26 as
+aggregates moved from refused to answered (the digit is machine-checked
+against the table by `TestTheLLDsDifferentialCountIsTheTables`). With the
+planner disabled, ten of the original fifteen fail.
 
 The fixture itself needed a fix: `level` was `i%3` and the shard was also `i%3`,
 so each level lived entirely on one shard and per-shard aggregation happened to
@@ -219,8 +256,11 @@ nothing. `{"facets":[]}` and `{"count":0}` are indistinguishable from a cluster
 that genuinely holds no matching data, so nothing reports a problem and a
 dashboard shows an empty panel.
 
-Counting `len(s.backends) > 0` branches finds the handlers that DO federate —
-14 of 46. It cannot find the ones nobody remembered.
+Counting `len(s.backendList()) > 0` branches finds the handlers that DO
+federate — 18 branches across 47 routes. It cannot find the ones nobody
+remembered. (Both numbers are read from the source by
+`TestTheFederationBranchCountIsTheSource`: the sentence said "14 of 46" while
+the paragraph above it said 47, and nothing compared them.)
 `TestNoRouterReadSilentlyReadsTheEmptyLocalStore` sends the same request to a
 router and to a storage node holding the data, and fails when the storage node
 answers with something and the router answers with nothing. It found three:
@@ -235,8 +275,9 @@ Three companion tests close the gaps a single comparison leaves:
   would put rows where no read ever looks — reads fan out. "Kept nothing" is
   observed by removing the backends and asking the same process again.
 - `TestARefusedSurfaceSaysSo` requires a refused surface to answer an error
-  with the reason. All four answer 501; the test accepts any 4xx/5xx, so the
-  specific code is a convention rather than a gate. Never 200-and-empty, which a client reads as "the cluster holds
+  with the reason. Three remain -- `/select/logsql/tail`, `/select/vector` and
+  `/admin/backup`; the test accepts any 4xx/5xx, so the specific code is a
+  convention rather than a gate. Never 200-and-empty, which a client reads as "the cluster holds
   nothing".
 
 Two of the fixtures had to be repaired before they measured anything: the hits
@@ -427,7 +468,7 @@ HTTP 200.
 | `/select/logsql/hits` | `federatedHits` decodes the dense series shape the backend actually answers (`{"hits":[{"fields":..,"timestamps":[..],"values":[..],"total":N}]}`) and merges by label set, summing buckets per timestamp. Fixed in 8.4; it previously decoded the older object shape and answered one bogus zero bucket for any non-empty store. | works |
 | `/select/logsql/stats_query` (plain, no `by=` param) | `federatedVector` decodes the Prometheus instant-vector envelope the backend actually answers and sums values per metric label set. Fixed in 8.6; it previously decoded a `{"count":N}` field no backend emits, so the router answered `{"count":0}` for every query against every cluster. | works |
 | `/select/logsql/stats_query` (`by=` param) | The backend's `by=` extension answers `{"stats":[{value,hits}]}`, which `federatedStatsQuery` decodes and sums per value. | works |
-| `/select/logsql/stats_query_range` | `federatedMatrix`: each shard's series concatenated (shards hold disjoint groups, so a series is one shard's); decodes the backend's `{"data":{"result":[...]}}` envelope. | works |
+| `/select/logsql/stats_query_range` | `federatedMatrix`: each shard's series concatenated (shards hold disjoint groups, so a series is one shard's); decodes the backend's `{"data":{"result":[...]}}` envelope. **Bucket ceiling**: an explicit window over 10,000 buckets is a 413 whose body is byte-identical to the node's (309 bytes), computed with an overflow-safe width so `?start=-4700000000000000000` cannot wrap into a small one — the node answered 200 with a 2,500,061-byte body before that. The step rule is `/hits`' own (`hitsStepNs`), not `parseStepNs`: the latter gave node 200 / cluster 413 for `?step=1`. | works |
 | `/select/logsql/field_values`, `stream_field_values`, `field_names`, `stream_field_names` | All four route to `federatedValueCounts` (key `"values"`): backends answer `{"values":[...]}` and hits are SUMMED per value, sorted by count desc then value. (`federatedStrings` exists in `cluster.go` but is not wired to any route.) | works |
 | `/select/logsql/streams` | Routes to `federatedValueCounts`, which reads the `{"values":[...]}` envelope the backend actually answers. Fixed in 8.4; the router previously looked for a `"streams"` key that no backend emits and answered an empty list however many streams the shards held. | works |
 | `/select/logsql/stream_ids` | Same path and same 8.4 fix (the key was `"stream_ids"` against the same `{"values":[...]}` envelope). | works |
@@ -435,7 +476,9 @@ HTTP 200.
 | `/select/sql` | `federatedSQL`: federated when the parsed pipeline is entirely row-local, refused with the reason otherwise. Added in 8.6; it previously queried the router's empty store. | partial by design |
 | `/select/logsql/tail` | Refused (501). A cluster tail is a long-lived stream from every shard merged by arrival time, and the merge has no completeness signal — a shard that stops answering drops out with nothing to say so. It previously tailed the router's empty store and streamed forever without ever yielding a row. | refused |
 | `/select/vector` | Refused (501). k-NN across shards needs each shard's top k merged by distance; one shard's neighbours, or a concatenation, answer a different question. | refused |
-| `/admin/backup`, `/admin/acknowledge-degraded` | Refused (501). A router's backup of its own empty store restores as an empty cluster, and acknowledging degradation here clears nothing on the shards that are degraded. Coordinated forms are task 8.7. | refused |
+| `/admin/backup` | Refused (501). A router's backup of its own empty store restores as an empty cluster. The coordinated form is task 8.7. | refused |
+| `/admin/acknowledge-degraded` | `federatedAcknowledgeDegraded`: forwarded to every shard, counts summed, per-shard outcome listed. A shard that could not be reached makes it 503 saying PARTIALLY acknowledged and naming what is unchanged — a write's refusal, not a read's, because the reachable shards have already acknowledged by the time an unreachable one is found. | works |
+| `/admin/storage/quarantine` | `federatedQuarantine`: every shard's listing, grouped BY SHARD because a group id is only unique within a store. Goes through `fanOutChecked`, so a shard that cannot be asked makes it 503 with the opt-in, and 206 under `allow_partial_response=1`. | works |
 | `/_search` | `federatedESSearch`: hits merged, `hits.total` summed, `relation: "eq"`. | works |
 | `/_count` | `federatedESCount`: counts summed. | works |
 
@@ -522,8 +565,14 @@ Every route is now classified and the classification is checked against the mux
 (see "The route surface"), so this list is derived rather than remembered.
 
 **Refused with 501**, because they cannot be answered correctly across shards
-in this build: `/select/logsql/tail`, `/select/vector`, `/admin/backup`,
-`/admin/acknowledge-degraded`.
+in this build: `/select/logsql/tail`, `/select/vector`, `/admin/backup`.
+
+`/admin/acknowledge-degraded` and `/admin/storage/quarantine` were on that list
+until 2026-08-16 and now federate. Both refusals were right that the router's
+LOCAL store cannot answer -- it holds no data, so every local answer is a
+confident nothing -- and wrong that there was nothing else to do: the router is
+the only node that knows the whole shard list, and an operator asking a
+cluster's admin endpoint is asking about the cluster.
 
 **Router-local by design** — the answer is about this process, not the data:
 `/metrics`, `/alerts`, `/flags`, `/health`, `/-/healthy`, `/-/ready`, `/vmui`,
@@ -539,8 +588,14 @@ the same file that said the right thing four hundred lines earlier.
 
 ## Failure behavior
 
-- A downed replica: reads skip to the next in the shard; if all fail, that
-  shard contributes nothing (a partial answer, not an error).
+- A downed replica: reads skip to the next in the shard. If ALL replicas of a
+  shard fail, the read is REFUSED -- `fanOutChecked` enforces completeness and
+  answers 503 -- unless the caller asked for a partial answer with
+  `allow_partial_response=1`, which answers 206 with `X-Simdlogs-Partial` and
+  the shard counts. This bullet described the missing shard as contributing
+  nothing and called that a success rather than a failure, which was the
+  behaviour before the completeness rule and is the opposite of the default
+  now: a silently short answer is exactly what that rule exists to stop.
 - A write with all replicas of the chosen shard unreachable: 502
   `all replicas unreachable`.
 - Reads tolerate it by construction; writes are synchronous to every replica
@@ -655,8 +710,12 @@ state on the wire. That is correct and slower than it could be. Pushing one
 down means putting a partial state on the wire, and a partial state that is
 subtly wrong is a number nobody can spot.
 
-There is still no merge for avg/quantile/distinct stats — those are refused with
-the reason. Repair reconciles replicas of a shard and does not move data between
+There is still no cheap MERGE for avg/quantile/distinct stats — they are
+answered exactly instead, by fetching the window's rows and aggregating once at
+the coordinator, which is correct and moves every matching row. A mergeable
+sketch (t-digest or DDSketch) with a documented error bound would make
+`quantile` cheap as well as right; until then the choice is two-way and the
+expensive branch is the correct one. Repair reconciles replicas of a shard and does not move data between
 shards, so it cannot help a rebalance. A restore of a cluster backup is validated
 here but performed by the operator per shard; there is no single restore command
 that unpacks a cluster archive. Those are roadmap items with measurable exits,

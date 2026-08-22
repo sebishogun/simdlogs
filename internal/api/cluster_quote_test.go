@@ -8,48 +8,73 @@ import (
 	"github.com/sebishogun/simdlogs/internal/query"
 )
 
-// The text split must agree with the parse, or nothing may be pushed down.
+// WHERE THE TEXT SPLIT AND THE PARSE DISAGREE, exactly.
 //
 // pipeSegments walks the query text with its own idea of quoting and nesting;
 // the lexer has a different one. `'` is the clearest case -- the walker treats
 // it as a quote and the lexer does not -- so a filter containing an apostrophe
-// made the walker swallow every following `|` and return ONE segment. planQuery
-// then shipped the caller's whole string to every shard and re-applied the
-// coordinator half on top, which is per-shard aggregation: the exact defect
-// this planner exists to remove, answering one believable number instead of
-// three obvious ones.
+// makes the walker swallow every following `|` and return ONE segment.
+// planQuery must then push nothing down, which the next test checks; what THIS
+// one pins is which queries land in which case, because that is the input the
+// refusal is decided from.
 //
-// This asserts the invariant directly rather than through a cluster round trip.
-// A round-trip test only sees the defect when the filter MATCHES rows -- the
-// first version of this test used `don't`, which matches nothing in the corpus,
-// so both sides returned zero rows and it passed with the guard deleted.
-func TestTheTextSplitAgreesWithTheParse(t *testing.T) {
-	for _, q := range []string{
-		`*`,
-		`* | stats count() c`,
-		`don't | stats count() c`,
-		`level:err' | stats count() c`,
-		`_msg:a] | stats count() c`,
-		`_msg:it's | fields _msg | limit 3`,
-		`_msg:"a|b" | limit 1`,
-		`_msg:~"x|y" | stats count() n`,
-		`* | filter level:=error | sort by (_time) | limit 5`,
-		`a) | limit 1`,
-		`a} | limit 1`,
-		"a` | limit 1",
+// EVERY ROW ASSERTS. This test was called TestTheTextSplitAgreesWithTheParse
+// and could not fail: the agreement it was named for was a `t.Logf`, and a
+// query that did not parse was a `t.Skip` -- two of the twelve rows skipping on
+// every run, forever, green. A gate whose only two outcomes are "log" and
+// "skip" is a gate that has retired itself; docs/wrong.md entries 79, 117, 118,
+// 123 and 128 record five more of this shape, and this one sat in the file
+// written to catch the planner defect it is named after.
+//
+// The three outcomes are spelled out per row, so a query that changes case --
+// which is a change in what the planner will do with it -- is red here.
+func TestWhichQueriesSplitTheWayTheyParse(t *testing.T) {
+	const (
+		agrees      = "the split matches the parse"
+		disagrees   = "the split does NOT match the parse, so the planner must refuse"
+		unparseable = "the lexer rejects it before any of this matters"
+	)
+	for _, tc := range []struct{ q, want string }{
+		{`*`, agrees},
+		{`* | stats count() c`, agrees},
+		{`_msg:"a|b" | limit 1`, agrees},
+		{`_msg:~"x|y" | stats count() n`, agrees},
+		{`* | filter level:=error | sort by (_time) | limit 5`, agrees},
+		// The apostrophe family: the walker quotes on `'` and the lexer does
+		// not, so everything after it is swallowed into one segment.
+		{`don't | stats count() c`, disagrees},
+		{`level:err' | stats count() c`, disagrees},
+		{`_msg:it's | fields _msg | limit 3`, disagrees},
+		// An unbalanced bracket, and a backtick, do the same through the
+		// walker's nesting rules.
+		{`_msg:a] | stats count() c`, disagrees},
+		{"a` | limit 1", disagrees},
+		// Rejected by the lexer. These USED TO SKIP, which is why the two of
+		// them are named here: a query that stops parsing becomes a 400 and
+		// leaves this file, and nothing would have said so.
+		{`a) | limit 1`, unparseable},
+		{`a} | limit 1`, unparseable},
 	} {
-		t.Run(q, func(t *testing.T) {
-			parsed, err := query.ParseLogsQL(q)
+		t.Run(tc.q, func(t *testing.T) {
+			parsed, err := query.ParseLogsQL(tc.q)
 			if err != nil {
-				t.Skipf("does not parse: %v", err)
+				if tc.want != unparseable {
+					t.Fatalf("does not parse (%v), and this row says %q", err, tc.want)
+				}
+				return
 			}
-			segs := pipeSegments(q)
+			if tc.want == unparseable {
+				t.Fatalf("parses into %d pipes, and this row says it does not parse",
+					len(parsed.Pipes))
+			}
+			segs := pipeSegments(tc.q)
+			got := agrees
 			if len(segs) != len(parsed.Pipes)+1 {
-				// Not a failure of the SPLIT -- it is allowed to disagree.
-				// What must hold is that planQuery notices and pushes nothing
-				// down, which the next test checks.
-				t.Logf("split disagrees: %d segments for %d pipes (the planner "+
-					"must fall back)", len(segs), len(parsed.Pipes))
+				got = disagrees
+			}
+			if got != tc.want {
+				t.Fatalf("%d segments for %d pipes: %s\nthis row says: %s",
+					len(segs), len(parsed.Pipes), got, tc.want)
 			}
 		})
 	}

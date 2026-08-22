@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -22,8 +23,38 @@ import (
 // AND across predicates, with equality and substring the two the storage
 // footer can skip on.
 type Query struct {
-	From, To    int64
-	Now         int64    // request time (nanos) for relative _time filters; 0 => fall back to To
+	From, To int64
+	// ToSet says the caller RESOLVED To, as against leaving it at its zero
+	// value.
+	//
+	// Zero is a real instant -- the epoch -- and `To == 0` was the marker for
+	// "no end" in two places at once: parseRequest, which turned it into
+	// 1<<62, and resolveTimePreds, which lets a `_time:` filter widen past it.
+	// So `?end=0`, or any spelling of 1970-01-01T00:00:00Z, meant the epoch
+	// for a bare query and "no end" for one carrying an absolute `_time:`
+	// filter -- one binary reading one parameter two ways, at HTTP 200:
+	//
+	//	/select/logsql/query?end=0&query=*                          0 rows
+	//	/select/logsql/query?end=0&query=_time:[2026-06-01,...]     30 rows
+	//
+	// A caller that never sets To leaves this false and keeps the old
+	// behaviour, which is what every programmatic constructor wants.
+	ToSet bool
+	Now   int64 // request time (nanos) for relative _time filters; see NowSet
+	// NowSet separates "the caller set Now to zero" from "the caller never set
+	// Now", which the zero value alone cannot.
+	//
+	// The same collision as ToSet, one field over. With Now unset the fallback
+	// is To, and To's own unset form on some paths is the 1<<62 sentinel, so
+	// `Now=0, To=1<<62` resolved `_time:5m` to
+	// [4611685718427387904, 4611686018427387904] -- a five-minute window in the
+	// year 2116, silently. Every handler sets Now today (parseRequest, both
+	// stats entry points, alerts, logrules), so no route reaches it; it is one
+	// programmatic caller away, which is what the window defect was before
+	// somebody wrote that caller.
+	//
+	// Use SetNow.
+	NowSet      bool
 	Preds       []Pred   // implicit-AND predicates (programmatic callers, ES planner)
 	Filter      *Expr    // boolean filter tree from LogsQL; takes precedence when set
 	Pipes       []Pipe   // LogsQL pipe chain (stats/sort/limit/fields), applied after the filter
@@ -1067,44 +1098,175 @@ func Hits(s Store, q *Query, step int64, by string) []HitsSeries {
 	if q.exceeded(0) {
 		return nil
 	}
+	// THE SCAN READS WHOLE BUCKETS; THE WALK STILL STOPS AT THE REQUESTED
+	// `to`. A bucket is [k*step, (k+1)*step) whatever the request's start and
+	// end fall on, so the first and last buckets count the instants a caller
+	// did not name -- which is what the reference does on BOTH range surfaces,
+	// asked rather than reasoned about. Measured, `internal/bench/victoria-logs`
+	// against six rows at 00:15, 00:45, 01:15, 01:45, 02:15 and 02:45 on
+	// 2026-06-01Z, `start=00:30Z&end=02:30Z&step=1h`:
+	//
+	//	                  VictoriaLogs                   simdlogs, before
+	//	/hits             00:00,01:00,02:00 = 2,2,2      the same three = 1,2,1
+	//	                  total 6                        total 4
+	//
+	// The scan window was the request's own [from,to), so the two edge buckets
+	// were partial: the count under a floored label was not the count of the
+	// bucket that label names. `/select/logsql/query` over the same window
+	// still answers four rows -- the point query is not widened, and neither
+	// is it in the reference.
+	sq := *q
+	sq.SetWindow(BucketSpan(q.From, q.To, step))
 	if by == "" {
-		return []HitsSeries{fillHits(Histogram(s, q, step), q, step, map[string]string{})}
+		return []HitsSeries{fillHits(Histogram(s, &sq, step), q, step, map[string]string{})}
 	}
 	// Split by a field: one series per distinct value. Each value is counted
 	// with its own predicate so the per-bucket work stays in the bitset path.
 	out := make([]HitsSeries, 0, 8)
-	for _, vc := range StatsByField(s, q, by) {
-		sub := *q
+	for _, vc := range StatsByField(s, &sq, by) {
+		sub := sq
 		sub.Preds = append(append([]Pred{}, q.Preds...), Pred{Kind: Eq, Field: by, Value: vc.Value})
-		hs := fillHits(Histogram(s, &sub, step), &sub, step, map[string]string{by: vc.Value})
+		// The buckets come from the widened scan; the WALK comes from the
+		// caller's window, which is why the two arguments are different
+		// queries.
+		walk := *q
+		walk.Preds = sub.Preds
+		hs := fillHits(Histogram(s, &sub, step), &walk, step, map[string]string{by: vc.Value})
 		out = append(out, hs)
 	}
 	return out
 }
 
+// BucketSpan is the instants a floored bucket walk over [from,to) at `step`
+// covers: `from` floored to a multiple of step, and the END of the last bucket
+// the walk emits, which is past `to` whenever `to` is not itself a multiple.
+//
+// IT IS THE SCAN WINDOW, NOT THE WALK. The walk still runs `bs < to` and so
+// emits the same buckets it always did; this is how far the data behind them
+// reaches. Both range surfaces use it, which is what makes them agree with
+// each other -- and with the reference, which widens both.
+//
+// A non-positive step or an empty window has no buckets and no widening.
+func BucketSpan(from, to, step int64) (int64, int64) {
+	if step <= 0 || to <= from {
+		return from, to
+	}
+	lo := alignDown(from, step)
+	// The last bucket the walk emits starts at the greatest multiple of step
+	// strictly below `to`; to > from means to-1 does not underflow.
+	last := alignDown(to-1, step)
+	hi := last + step
+	if hi < last {
+		// The last bucket in the domain runs off the top: MaxInt64 is the
+		// widest the scan can be asked for and the walk stops there anyway.
+		hi = math.MaxInt64
+	}
+	if hi < to {
+		// alignDown clamped at the bottom of the domain (see its note): the
+		// bucket that holds `to-1` starts after it, so there is nothing to
+		// widen and the caller's own bound is the honest one.
+		hi = to
+	}
+	return lo, hi
+}
+
 // fillHits turns the sparse bucket map into the dense, ascending series the
 // hits API returns.
+//
+// THE COUNT IS THE WINDOW'S EXACT WIDTH AND THE WALK STOPS AT `to`.
+//
+// It was `n := int((to - start + step - 1) / step)` with `if n < 0 || n >
+// maxHitsBuckets { n = maxHitsBuckets }`, and both halves of that failed over a
+// saturated window -- which `?end=9999-01-01` produces, because the far bound
+// is outside the int64-nanosecond domain and saturates to MaxInt64 (entry
+// 129/130). The addition then runs past MaxInt64 and comes back either
+// negative or small-positive, and the two wraps gave two different wrong
+// answers under HTTP 200, measured at `step=8760h` (one year, an ordinary
+// dashboard step) on a two-row store:
+//
+//	?start=1970-01-01&end=9999-01-01    100000 buckets   the true count is 293
+//	?start=1000-01-01&end=9999-01-01         0 buckets   ...and 0 rows totalled
+//
+// The first is the negative wrap being read as "no buckets" and replaced by
+// THIS package's 100,000 -- a ceiling ten times the HTTP one, which is the one
+// `internal/api`'s 413 enforces and the one the caller was told about. The
+// second is the same addition wrapping back positive and small.
+//
+// `start + int64(i)*step` wrapped as well, so past bucket 292 the timestamps
+// ran off MaxInt64 and came back at the far-past end: a series documented
+// "dense, ascending and gap-free" that was none of the three. The walk carries
+// `t` and stops when the next step would leave the window or leave the domain,
+// which is the shape StatsQueryRange's bucket walk already uses for the same
+// reason.
+//
+// RangeWidthNs is exact for any to >= from whatever the signs (two's
+// complement), so the count no longer depends on the window fitting in an
+// int64.
 func fillHits(buckets map[int64]int, q *Query, step int64, fields map[string]string) HitsSeries {
 	from, to := q.From, q.To
 	if to <= from {
 		return HitsSeries{Fields: fields}
 	}
-	start := from - from%step
-	n := int((to - start + step - 1) / step)
-	if n < 0 || n > maxHitsBuckets {
-		n = maxHitsBuckets
+	// Aligned to a multiple of step, the same way histoGroup keys a row.
+	//
+	// AND THE SAME WAY THE OTHER RANGE SURFACE DOES IT. `StatsQueryRange`
+	// below and `exactMatrix` in internal/api used to walk
+	// `for bs := from; bs < to`, anchored on the request's own start, so one
+	// window and one step gave a different bucket count, different labels and
+	// different per-bucket values on the two routes. That was pinned as a
+	// Prometheus convention without asking `internal/bench/victoria-logs`,
+	// which is in this repository and floors BOTH. Both walks are this one
+	// now; see the note on `BucketSpan` above and
+	// TestTheTwoRangeSurfacesAgreeOnBuckets.
+	//
+	// The first bucket can still begin before the requested `start` -- that is
+	// what flooring means, and `boundRangeBuckets` leaves an explicit
+	// start/end alone so nothing re-aligns downstream.
+	start := alignDown(from, step)
+	n := 0
+	if w := RangeWidthNs(start, to); w > 0 {
+		ustep := uint64(step) // step > 0: Hits normalises a non-positive one
+		nb := w / ustep
+		if w%ustep != 0 {
+			nb++
+		}
+		if nb > maxHitsBuckets {
+			nb = maxHitsBuckets
+		}
+		n = int(nb)
 	}
 	hs := HitsSeries{
 		Fields:     fields,
 		Timestamps: make([]int64, 0, n),
 		Values:     make([]int, 0, n),
 	}
-	for i := 0; i < n; i++ {
-		t := start + int64(i)*step
+	for t := start; t < to && len(hs.Timestamps) < n; {
 		c := buckets[t]
 		hs.Timestamps = append(hs.Timestamps, t)
 		hs.Values = append(hs.Values, c)
 		hs.Total += c
+		next := t + step
+		if next <= t {
+			// Past MaxInt64: that was the last bucket in the domain.
+			//
+			// KEEP THIS, AND NOT FOR THE REASON THE RECORD FIRST GAVE.
+			// Entry 132 said reverting the walk to `start + int64(i)*step`
+			// reddened nothing because "the multiply has no value left to
+			// overflow on". It has: on `?start=1000-01-01&end=9999-01-01
+			// &step=8760h` (start = -9208512000000000000, n = 585) the
+			// multiply overflows for every i >= 293 -- `int64(293)*8760h` is
+			// -9206696073709551616 against a true 9240048000000000000, 292 of
+			// the 585 -- and the series is right anyway because Go's signed
+			// arithmetic is MODULAR, so the second wrap in `start + i*step`
+			// cancels the first whenever the true sum is representable, which
+			// the exact `n` guarantees. That makes the old walk unkillable by
+			// mutation, not correct by construction: it is one arithmetic
+			// identity away from wrong. This costs one compare per bucket and
+			// is the only thing between a future change to `n` and the wrapped
+			// series entry 132 measured.
+			break
+		}
+		t = next
 	}
 	return hs
 }
@@ -1171,8 +1333,55 @@ func histoGroup(g *storage.Reader, q *Query, step int64, out map[int64]int) {
 	tp, ts := groupTimestamps(g, lo, hi)
 	defer releaseTs(tp)
 	sel.ForEach(func(i int) {
-		out[ts[i-lo]/step*step]++
+		out[alignDown(ts[i-lo], step)]++
 	})
+}
+
+// alignDown snaps an instant down to a multiple of step: the bucket it belongs
+// to.
+//
+// IT FLOORS RATHER THAN TRUNCATING TOWARD ZERO, AND THE DIFFERENCE IS A LOST
+// COUNT. This was `ts/step*step` here and `from - from%step` in fillHits, both
+// of which truncate toward zero, so the bucket keyed 0 spanned (-step, +step)
+// -- rows on BOTH sides of the epoch -- while every other bucket spanned
+// [k*step, (k+1)*step). A window that ends before the epoch never reaches key
+// 0, because the walk stops at `to`. Measured on two rows inside one
+// pre-epoch window, both at HTTP 200:
+//
+//	/select/logsql/hits?query=*&start=1969-12-31T00:00:00Z
+//	    &end=1969-12-31T23:59:00Z&step=1h    24 buckets, TOTAL 1
+//	/select/logsql/query, the same window                  2 rows
+//
+// The row at -1800e9 keyed to bucket 0, the walk ran `t < to` with
+// `to = -60e9`, and the count vanished from Timestamps, Values AND Total. Entry
+// 132 recorded these two sites as truncating "the same way, so no count is
+// lost to a mismatch"; they do truncate the same way and a count is lost
+// anyway, because the mismatch is not between the two sites -- it is between
+// the key and the window.
+//
+// Post-epoch instants are unchanged: for t >= 0 the floor and the truncation
+// are the same value, which is every window a deployment actually queries.
+//
+// THE BOTTOM OF THE DOMAIN HAS NO ALIGNED BUCKET, and that corner is reachable
+// from a default window: `defaultWindowFrom` is MinInt64, and MinInt64 is not
+// a multiple of any ordinary step, so its floor is below the domain. Both
+// callers clamp to the smallest multiple of step int64 can hold, so both agree
+// on one key for the whole partial bucket at the bottom and no count is lost
+// there either. A row that near 1677-09-21T00:12:43Z is keyed to a bucket that
+// starts after it, which is the only alternative to keying it to a bucket that
+// does not exist.
+func alignDown(t, step int64) int64 {
+	r := t % step
+	if r < 0 {
+		r += step
+	}
+	if t-r > t {
+		// The subtraction fell below MinInt64 and wrapped. MinInt64/step
+		// truncates toward zero, so this is the smallest representable
+		// multiple of step.
+		return math.MinInt64 / step * step
+	}
+	return t - r
 }
 
 // matchBitset builds the selection for a group: time window AND every
@@ -1196,14 +1405,35 @@ func matchBitset(g *storage.Reader, q *Query) *Bitset {
 		sel.And(evalExpr(g, q.Filter, n))
 		return sel
 	}
+	// ONE DISPATCH, `leafBitset`'s. This loop used to be a second copy of it,
+	// and the copy was missing a case:
+	//
+	//	if isTimePred(p.Kind) { return timePredBitset(g, p, n) }
+	//
+	// `_time` is a ColTimestamp, not a ColDict, so `DictIndices` returns nil
+	// for it and `predBitsetCol` matched nothing. `ParseLogsQL` puts a bare
+	// `_time:` filter in `q.Preds` rather than `q.Filter`, so the copy without
+	// the case is the one that ran, and every surface reading through this
+	// answered EMPTY for a query whose filter matches every row:
+	//
+	//	/select/logsql/hits            values [0,0,0]   control [10,10,10]
+	//	/select/logsql/field_values    []               3 values
+	//	/select/logsql/field_names     []               the full list
+	//	/select/logsql/facets          only _time       all fields
+	//	/select/logsql/streams         []               1
+	//	/select/logsql/stats_query     result: []       c=30
+	//	| top 2 by (level)             empty            2 rows
+	//	| uniq by (level)              empty            3 rows
+	//
+	// all at HTTP 200, and `query.Count` with them -- which is what an alert
+	// rule evaluates, so a rule whose query carries a `_time:` filter never
+	// fired. The same filter with no stats pipe returned all 30 rows, because
+	// that path goes through `leafBitset`.
+	//
+	// Calling it rather than adding the missing case: a second copy of a
+	// dispatch is a case waiting to be missed again.
 	for i := range q.Preds {
-		p := &q.Preds[i]
-		if p.Kind == Eq {
-			sel.And(eqPredBitset(g, p, n))
-			continue
-		}
-		idx, dict := g.DictIndices(p.Field)
-		sel.And(predBitsetCol(g, p, idx, dict, n))
+		sel.And(leafBitset(g, &q.Preds[i], n))
 	}
 	return sel
 }
@@ -1270,4 +1500,31 @@ func boolsAsBytes(s []bool) []byte {
 		return nil
 	}
 	return unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), len(s))
+}
+
+// SetWindow resolves a query's window and MARKS it resolved.
+//
+// The three assignments belong together and were made separately in five
+// places. Two of them missed `ToSet`, and the miss is not inert: with it false
+// the narrowing in `resolveTimePreds` stops being narrowing-only and lets an
+// absolute `_time:` filter widen the window past the end the caller asked for.
+// A stats_query over [12:00:00, 12:00:10] with `_time:[12:00:00, 12:00:30]`
+// answered 30 rows instead of 10, and a three-bucket range came back
+// [30, 20, 10] where every bucket holds 10 -- buckets that are not buckets,
+// at HTTP 200.
+//
+// So there is one way to set a window now. A caller that genuinely means "no
+// end I know of" leaves the fields alone and gets the old behaviour, which is
+// what a programmatic constructor with a `_time:` filter and no window wants.
+func (q *Query) SetWindow(from, to int64) {
+	q.From, q.To, q.ToSet = from, to, true
+}
+
+// SetNow records the request time relative _time filters resolve against.
+//
+// The setter exists so the flag cannot be forgotten, which is the whole
+// failure mode NowSet is there to prevent -- and the reason SetWindow exists
+// for the pair beside it.
+func (q *Query) SetNow(now int64) {
+	q.Now, q.NowSet = now, true
 }

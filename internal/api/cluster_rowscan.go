@@ -173,7 +173,9 @@ func jsonLineToRow(line []byte) query.Row {
 
 		if key == "_time" && row.NoTime {
 			if t, err := time.Parse(time.RFC3339Nano, val); err == nil {
-				row.Time, row.NoTime = t.UnixNano(), false
+				// satNanos: a peer's `_time` past 2262 or before 1678 wraps to
+				// the opposite end of time, and this value orders the merge.
+				row.Time, row.NoTime = satNanos(t), false
 				// KEPT AS A FIELD TOO, not consumed.
 				//
 				// `continue` dropped it, and for `stats by (_time)` that is

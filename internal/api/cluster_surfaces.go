@@ -194,11 +194,14 @@ type vectorSeries struct {
 // shards held. A confident zero.
 //
 // Values sum per metric label set, which is correct for exactly the aggregates
-// PlanDistributed calls mergeable. A query whose aggregate is not one of those
-// is refused here for the same reason it is refused there: summing shard
-// quantiles produces a number that looks like a latency and is not one.
+// PlanDistributed calls mergeable. An aggregate that is not one of those is not
+// merged at all -- summing shard quantiles produces a number that looks like a
+// latency and is not one -- so it takes the exact path instead: the shards
+// return rows and the aggregate runs once here, which is what a single node
+// does. See cluster_stats_exact.go.
 func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
-	if !s.rejectNonMergeableStats(w, r) {
+	if needsExactStats(r.FormValue("query")) {
+		s.exactVector(w, r)
 		return
 	}
 	bodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/stats_query", nil)
@@ -335,37 +338,6 @@ func (s *Server) federatedVector(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// rejectNonMergeableStats refuses a stats query whose aggregate has no
-// mergeable partial state, and reports whether the caller may continue.
-//
-// The same rule the LogsQL planner applies, at the endpoints that take a stats
-// query directly. Without it these two endpoints would sum what must not be
-// summed while /select/logsql/query refused the identical aggregate -- the same
-// query answered two ways by one binary.
-func (s *Server) rejectNonMergeableStats(w http.ResponseWriter, r *http.Request) bool {
-	raw := r.FormValue("query")
-	if raw == "" {
-		return true
-	}
-	q, err := query.ParseLogsQL(raw)
-	if err != nil {
-		return true // the shards will reject it with the parse error
-	}
-	for _, p := range q.Pipes {
-		sp, isStats := p.(*query.StatsPipe)
-		if !isStats {
-			continue
-		}
-		if why := query.NonMergeableReason(sp.Aggs); why != "" {
-			s.writeErr(w, r, readSpec(), http.StatusBadRequest, fmt.Sprintf(
-				"simdlogs: this query cannot be answered correctly across shards. %s. "+
-					"Run it against a single storage node, or rewrite it", why))
-			return false
-		}
-	}
-	return true
-}
-
 // federatedSQL answers a SQL select for the cluster, or refuses.
 //
 // SQL parses to the same Query as LogsQL, so the same classification applies:
@@ -387,7 +359,23 @@ func (s *Server) federatedSQL(w http.ResponseWriter, r *http.Request) {
 	}
 	plan := query.PlanDistributed(q.Pipes)
 	if len(plan.CoordinatorPipes) > 0 {
-		reason := plan.Reject
+		// The reason comes from the AGGREGATE, not from plan.Reject.
+		//
+		// plan.Reject now reports a non-mergeable aggregate on a SHARD, and
+		// PlanDistributed never puts one there -- so reading it here was a
+		// dead branch that always fell through to the generic sentence. A SQL
+		// caller asking for an average got "it aggregates, orders or limits
+		// across the whole result set" where the LogsQL caller gets "avg() is
+		// not merged as an average of averages. Use sum() and count()".
+		reason := ""
+		for _, p := range plan.CoordinatorPipes {
+			if sp, is := p.(*query.StatsPipe); is {
+				if why := query.NonMergeableReason(sp.Aggs); why != "" {
+					reason = why
+					break
+				}
+			}
+		}
 		if reason == "" {
 			reason = "it aggregates, orders or limits across the whole result set, " +
 				"which cannot be done shard by shard"

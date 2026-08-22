@@ -53,6 +53,12 @@ type surfaceRoute struct {
 	// Without it the storage node answers empty too and the comparison proves
 	// nothing -- the subtest skips and reads as covered.
 	needsStream bool
+	// records is how many log records this route's body carries, so the
+	// forwarding assertion can check the rows ARRIVED rather than only that
+	// the router kept none. Zero means the body carries none and no forwarding
+	// assertion built on it can fire -- which was true of both OTLP rows until
+	// they were given a real record.
+	records int
 	// write marks an ingest route. Writes are checked by
 	// TestARouterForwardsWritesAndStoresNothing, not by comparing read answers.
 	// Marked explicitly: they used to fall out of the read test because their
@@ -84,8 +90,15 @@ func surfaceRoutes() []surfaceRoute {
 		{path: "/select/logsql/streams", method: "GET", query: q, kind: federated},
 		{path: "/select/logsql/stream_ids", method: "GET", query: q, kind: federated},
 		{path: "/select/logsql/stats_query", method: "GET", query: q + "%20%7C%20stats%20count%28%29%20c", kind: federated},
+		// With an EXPLICIT window covering the corpus (June 2026), for the
+		// reason golden_api_test.go gives: both range endpoints now narrow an
+		// unspecified window to the last few hundred steps, so with no window
+		// the NODE answers empty about a June corpus, the empty-answer skip
+		// fires, and this row silently retires. A skip that fires on every run
+		// is a subtest that no longer exists.
 		{path: "/select/logsql/stats_query_range", method: "GET",
-			query: q + "%20%7C%20stats%20count%28%29%20c&step=1h", kind: federated},
+			query: q + "%20%7C%20stats%20count%28%29%20c&step=1h" +
+				"&start=2026-06-01T00:00:00Z&end=2026-06-02T00:00:00Z", kind: federated},
 		{path: "/_search", method: "POST", body: `{"query":{"match_all":{}}}`,
 			ctype: "application/json", kind: federated},
 		{path: "/_count", method: "POST", body: `{"query":{"match_all":{}}}`,
@@ -104,33 +117,34 @@ func surfaceRoutes() []surfaceRoute {
 
 		// Writes: forwarded to the shards, not stored here.
 		{path: "/insert/jsonline", method: "POST", body: "{\"_msg\":\"x\"}\n",
-			ctype: "application/x-ndjson", kind: federated, write: true},
+			ctype: "application/x-ndjson", kind: federated, write: true, records: 1},
 		{path: "/insert/logfmt", method: "POST", body: "_msg=x\n",
-			ctype: "text/plain", kind: federated, write: true},
+			ctype: "text/plain", kind: federated, write: true, records: 1},
 		{path: "/insert/elasticsearch/_bulk", method: "POST",
-			body: "{\"create\":{}}\n{\"_msg\":\"x\"}\n", ctype: "application/x-ndjson", kind: federated, write: true},
+			body: "{\"create\":{}}\n{\"_msg\":\"x\"}\n", ctype: "application/x-ndjson", kind: federated, write: true, records: 1},
 		{path: "/_bulk", method: "POST", body: "{\"create\":{}}\n{\"_msg\":\"x\"}\n",
-			ctype: "application/x-ndjson", kind: federated, write: true},
+			ctype: "application/x-ndjson", kind: federated, write: true, records: 1},
 		{path: "/insert/loki/api/v1/push", method: "POST",
 			body:  `{"streams":[{"stream":{"a":"b"},"values":[["1700000000000000000","x"]]}]}`,
-			ctype: "application/json", kind: federated, write: true},
+			ctype: "application/json", kind: federated, write: true, records: 1},
 		{path: "/loki/api/v1/push", method: "POST",
 			body:  `{"streams":[{"stream":{"a":"b"},"values":[["1700000000000000000","x"]]}]}`,
-			ctype: "application/json", kind: federated, write: true},
+			ctype: "application/json", kind: federated, write: true, records: 1},
 		{path: "/insert/datadog/api/v2/logs", method: "POST",
-			body: `[{"message":"x"}]`, ctype: "application/json", kind: federated, write: true},
+			body: `[{"message":"x"}]`, ctype: "application/json", kind: federated, write: true, records: 1},
 		{path: "/api/v2/logs", method: "POST", body: `[{"message":"x"}]`,
-			ctype: "application/json", kind: federated, write: true},
+			ctype: "application/json", kind: federated, write: true, records: 1},
 		{path: "/insert/opentelemetry/v1/logs", method: "POST",
-			body: `{"resourceLogs":[]}`, ctype: "application/json", kind: federated, write: true},
-		{path: "/v1/logs", method: "POST", body: `{"resourceLogs":[]}`,
-			ctype: "application/json", kind: federated, write: true},
+			body:  `{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1700000000000000000","body":{"stringValue":"x"}}]}]}]}`,
+			ctype: "application/json", kind: federated, write: true, records: 1},
+		{path: "/v1/logs", method: "POST", body: `{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1700000000000000000","body":{"stringValue":"x"}}]}]}]}`,
+			ctype: "application/json", kind: federated, write: true, records: 1},
 		{path: "/insert/journald", method: "POST", body: "MESSAGE=x\n",
-			ctype: "application/vnd.fdo.journal", kind: federated, write: true},
+			ctype: "application/vnd.fdo.journal", kind: federated, write: true, records: 1},
 		{path: "/insert/syslog", method: "POST", body: "<13>1 - - - - - - x\n",
-			ctype: "text/plain", kind: federated, write: true},
+			ctype: "text/plain", kind: federated, write: true, records: 1},
 		{path: "/v1/input", method: "POST", body: "{\"_msg\":\"x\"}\n",
-			ctype: "application/x-ndjson", kind: federated, write: true},
+			ctype: "application/x-ndjson", kind: federated, write: true, records: 1},
 		{path: "/insert/datadog/api/v1/validate", method: "GET", kind: routerLocal,
 			why: "a credential check; it answers about this process's auth config"},
 
@@ -174,12 +188,16 @@ func surfaceRoutes() []surfaceRoute {
 		{path: "/admin/backup", method: "POST", kind: refused,
 			why: "a router's backup of its own empty store would restore as an " +
 				"empty cluster; the coordinated form is task 8.7"},
-		{path: "/admin/acknowledge-degraded", method: "POST", kind: refused,
-			why: "acknowledging degradation on the router clears nothing on the " +
-				"shards that are actually degraded"},
-		{path: "/admin/storage/quarantine", method: "GET", kind: refused,
-			why: "a router's own store quarantines nothing, so an empty list " +
-				"there reads as `nothing is wrong` about shards it never asked"},
+		// These two were refused for the same reason -- the router's own store
+		// is empty, so a local answer is a confident nothing -- and both are
+		// now forwarded to the shards, which is where the answer lives. A
+		// shard that cannot be asked makes the answer 503 and is named in it;
+		// see cluster_admin_surfaces.go.
+		// records:0 -- an admin action is a write in the ROUTING sense and
+		// carries no log records, so there is nothing for the arrival
+		// assertion to count.
+		{path: "/admin/acknowledge-degraded", method: "POST", kind: federated, write: true},
+		{path: "/admin/storage/quarantine", method: "GET", kind: federated},
 	}
 }
 
@@ -453,6 +471,28 @@ func TestEveryWriteRouteForwardsToTheShards(t *testing.T) {
 				t.Fatalf("the router refused the write: %d %.200s", code, body)
 			}
 
+			// THE ROWS ARRIVED AT THE SHARD. Asserted before the router's own
+			// store is checked, because "the router kept nothing" is satisfied
+			// by a handler that answered 200 and forwarded nowhere -- the rows
+			// are then in neither place and every assertion below passes.
+			//
+			// Skipped for a body that carries no records: two OTLP rows post
+			// `{"resourceLogs":[]}`, so no forwarding assertion built on them
+			// can fire either way, and saying so is better than a check that
+			// looks like one.
+			if rt.records > 0 {
+				sCode, sRows, sRaw := queryRows(t, shard, "*")
+				if sCode != 200 {
+					t.Fatalf("reading the shard: %d %.200s", sCode, sRaw)
+				}
+				if len(sRows) != rt.records {
+					t.Fatalf("the shard holds %d rows, the write carried %d. A "+
+						"router that answers 2xx and forwards nowhere passes "+
+						"every other check here: %.300s",
+						len(sRows), rt.records, sRaw)
+				}
+			}
+
 			// Now it is not a router. Whatever it answers comes from its own
 			// store, and its own store must be empty.
 			srv.SetBackends(nil)
@@ -554,11 +594,31 @@ func TestTheQuarantineListingSaysNothingRatherThanNull(t *testing.T) {
 		t.Errorf("the body carries no count: %q", body)
 	}
 
-	// A router refuses.
+	// A router answers for its SHARDS, and says so explicitly.
+	//
+	// This used to require a refusal, because the router answered from its own
+	// empty store and "nothing is quarantined" was indistinguishable from
+	// "nobody asked". What replaces the refusal is not a 200 with an empty
+	// list: it is a 200 whose body states which shards were asked and whether
+	// the answer is complete, so the empty case is still distinguishable from
+	// the unasked one.
 	ts := router(t, node.URL)
-	code, _, body = getJSONFrom(t, ts, "/admin/storage/quarantine")
-	if code == http.StatusOK {
-		t.Errorf("a router answered 200 for its own empty store: %q -- that reads "+
-			"as `nothing is wrong` about shards it never asked", body)
+	resp, err := http.Get(ts.URL + "/admin/storage/quarantine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	body = string(raw)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("a router answered %d with its one shard up: %q", resp.StatusCode, body)
+	}
+	if hdr := resp.Header.Get(HdrComplete); hdr != "true" {
+		t.Errorf("the router's answer does not carry %s=true, so an empty list "+
+			"still cannot be told from shards it never asked: %q",
+			HdrComplete, hdr)
+	}
+	if !strings.Contains(body, `"shards":[`) {
+		t.Errorf("the router's answer does not name the shards it asked: %q", body)
 	}
 }

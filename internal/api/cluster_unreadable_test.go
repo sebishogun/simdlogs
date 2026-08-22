@@ -57,6 +57,7 @@ var mergeDecodeEndpoints = []struct {
 	{"facets", "/select/logsql/facets?query=*", "GET", "", "federatedFacets"},
 	{"es_count", "/_count", "POST", `{"query":{"match_all":{}}}`, "federatedESCount"},
 	{"es_search", "/_search", "POST", `{"query":{"match_all":{}}}`, "federatedESSearch"},
+	{"quarantine", "/admin/storage/quarantine", "GET", "", "federatedQuarantine"},
 }
 
 // Every function that calls mergeDecode is exercised by the table above.

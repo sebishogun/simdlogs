@@ -87,17 +87,38 @@ cluster-wide.
 
 ### ES
 
-`/_search`, `/_count` — a log-relevant Query DSL subset: `bool`
-(`must`/`filter`), `term`, and timestamp `range`. Range on a
-time field feeds the group skip directly. `_bulk` on the ingest side; the
-response gives per-document `{"create":{"status":201}}` items (the shape ES
-clients parse to decide retry).
+`/_search`, `/_count` — a log-relevant Query DSL subset. `esClause`
+(`internal/api/es.go`) names every field a client may send and the decoder is
+strict, so anything not named is a 400 rather than a filter dropped on the
+floor. What `esToQuery` walks and applies: `bool` (`must`, `filter`,
+`must_not`, `should`, `minimum_should_match` 0 or 1), `term`, `terms`,
+`match`, `prefix`, `exists`, `match_all`, and `range` on `@timestamp`/`_time`.
+A range in positive conjunctive position becomes the scan window and feeds the
+group skip directly; under `must_not`/`should` it becomes an ordinary time
+predicate, because the window is an AND and cannot express a negation or a
+union. A range on any other field is a 400, not a dropped filter. `_bulk` on
+the ingest side; the response gives one item per action, in order, keyed by
+that action's own name — `{"index":{…,"status":201}}` for a stored document,
+`{"create":{…}}` for a create (the shape ES clients parse to decide retry).
 
 Not implemented (documented, not accidental): `_msearch`, the complete Query
-DSL, and ES aggregation-response compatibility. `exists` is decoded but
-ignored — `esToQuery` walks `Bool`, `Term`, and time `Range` only
-(`internal/api/es.go`), so an exists-only search matches the whole window;
-recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
+DSL, ES aggregation-response compatibility, scoring, and analyzed-text
+semantics — `match` on this store is term equality, because there are no
+analyzed text fields for it to mean anything else on. A
+`minimum_should_match` that needs a counting operator ("2 of 3") is a 400
+naming the value, and so is every spelling but the JSON integer: ES also takes
+`"1"`, `"75%"` and `2<-25%`, which the strict decoder refuses.
+
+This section described the opposite of the code for several rounds: it listed
+`exists` among the clauses this surface decodes and then throws away, said an
+`exists`-only search therefore returns the whole window, said `terms` was
+absent, and cited `docs/wrong.md` entry 37 for all of it. Every part of that
+was true when entry 37 was written and none of it is true now — `exists` is
+NOT (field == "") and `terms` is an `In` set, both applied.
+README.md carried the same `exists` claim and was corrected one round earlier
+while this file was not, which is why
+`TestTheStatedFactsAboutTheCodeAreTrueOfTheCode` reads this document as well as
+that one: the gate could only see the copy it had been pointed at.
 
 ## Query parameters
 
@@ -108,10 +129,21 @@ recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
   with the entire store.
 - `start`/`end` — unix seconds/ms/us/ns inferred from magnitude (VL's rule:
   seconds below 1e11, ms below 1e14, us below 1e17, else ns), or RFC3339
-  (nano, second, minute, day, month, year granularities). `end` defaults to
-  `1<<62` (open future).
+  (nano, second, minute, day, month, year granularities). **Both defaults are
+  named constants** (`defaultWindowFrom`, `defaultWindowTo` in `server.go`) and
+  the Elasticsearch surface reads the same two: `start` defaults to
+  `math.MinInt64` (open past) and `end` to `1<<62` (open future). `start`'s
+  default was the EPOCH and only this bullet's silence about it kept that
+  invisible — the ES window already began at `MinInt64`, so one binary answered
+  1 row to `/select/logsql/query?query=*` and 3 to `/_search {"match_all":{}}`
+  on a store holding 1900, 1969 and 2026, and `/_search` takes no `start`/`end`
+  so a client could not bring the two onto one window. `docs/wrong.md` 131 and
+  132. A row stamped after 2116 is still outside the `end` default, which is the
+  same shape at the other end and is not fixed.
 - `limit` — the most RECENT n, newest first (`LastN`); deliberately not the
-  `| limit N` pipe (first n). The reference draws the same distinction;
+  `| limit N` pipe (first n). The reference draws the same distinction.
+  IGNORED on `/select/logsql/tail`, which has no last row to count back from
+  — see "Live tail";
   conflating them returned the oldest rows to a client asking for the tail.
 - `step` (hits/range), `field`/`fields` (hits split, one field), `fields_limit`
   (busiest N series, the rest folded into one unlabelled "other"), `time`
@@ -151,7 +183,15 @@ recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
   every stats row before.
 - `hits` returns dense, ascending, gap-free timestamp/value arrays per series
   (a client indexes the two arrays together), buckets aligned to step
-  multiples — the alignment the reference uses.
+  multiples — the alignment the reference uses, and the one `histoGroup` keys
+  the counts with (`ts/step*step`), so a series timestamp and a bucket key are
+  the same number. All three adjectives were false over a saturated window
+  until round 19: `fillHits` derived its bucket count with an int64
+  subtraction that wraps, so `?start=1970-01-01&end=9999-01-01&step=8760h`
+  rendered 100,000 buckets whose timestamps ran off `MaxInt64` and came back
+  at the far-past end, and the same wrap in the other direction answered a
+  structurally valid EMPTY histogram. The count is `RangeWidthNs` now and the
+  walk stops at `to`.
 - ES `_search` returns the ES envelope with `hits.total.relation: "eq"`.
 
 ## Bounds and errors
@@ -160,8 +200,19 @@ recorded as `docs/wrong.md` entry 37. `terms` is not supported either.
   unlimited, which is what it used to mean. A bare (no-pipe) select over the cap errors with an
   explicit message (never silently truncates); `MaxRows` keeps the parallel
   scan, `Limit` would force the serial path. Pipes' input is never bounded.
-- `maxHitsBuckets = 100K` caps a hits response (a one-second step over a year
-  cannot be asked to allocate 31M buckets).
+- **Two constants are named `maxHitsBuckets`**, in different packages, and they
+  hold different numbers. `internal/query`'s is **100K** — the engine's own
+  ceiling on `query.Hits`, so a one-second step over a year cannot be asked to
+  allocate 31M buckets (`query.md`). `internal/api`'s is **10,000**, the HTTP
+  response ceiling, and it is the one a caller meets: an explicit window over it
+  is a 413 (see the histogram section below). This line quoted the first
+  number against the second constant.
+  The **"one a caller meets"** half was itself false until round 19, through
+  the coarse-step path: `?end=9999-01-01&step=8760h` passed the 413 at 292
+  buckets and then rendered `internal/query`'s 100,000, because `fillHits` read
+  its own wrapped count as "no buckets" and substituted its package's ceiling.
+  `TestAHistogramOverASaturatedWindowRendersTheBucketsItPromised` holds the
+  route to the 10,000 at any step, with or without a window.
 - Malformed queries, SQL outside the subset, and invalid stats are 400s.
   Panics anywhere become 500s without taking the server down.
 - `ReadHeaderTimeout = 10 s` (slowloris). Graceful shutdown: drain (15 s),
@@ -569,9 +620,69 @@ here. It was decoded and never read before, so `exists` matched every document.
 
 A **non-time `range` is refused with 400**, not ignored; the comment that said
 "Phase 7" documented the gap for a reader of the file and for nobody sending
-the query. `minimum_should_match` is refused unless it is 1. A time range still
-becomes the window, which is what makes an ES time filter as cheap as a LogsQL
-one.
+the query.
+
+**`minimum_should_match` defaults to 0 beside a `must` or `filter` and to 1
+otherwise**, which is Elasticsearch's rule: `should` next to `must` is
+OPTIONAL. It was ANDed in unconditionally, which is Kibana's own shape — the
+filter pills go in `filter` and the search bar goes in `should` — so anything
+typed into the search bar emptied the dashboard, and an explicit
+`"minimum_should_match": 0` was a 400 for the exact value ES defaults to. Both
+0 and 1 are answered; a value needing a counting operator ("at least 2 of 5")
+is still a 400 naming it, because an AND/OR/NOT tree cannot express it without
+enumerating the combinations. A `should` arm is still PARSED when
+`minimum_should_match` is 0 and it will be discarded, so an unsupported clause
+under an optional arm is refused rather than accepted by accident.
+
+**A clause that translates to "no filter" means something under `must_not` and
+`should`.** `{"match_all":{}}`, `{}` and `{"bool":{}}` all match every
+document, so under `must_not` the negation matches NONE and under `should` the
+union with it matches EVERY document. Those arms used to be dropped, which
+means the opposite: `must_not: [{"match_all":{}}]` is Elasticsearch's canonical
+"match nothing" and Kibana emits it whenever a negated filter pill empties out,
+and it answered every document in the index at 200.
+
+A time range on `@timestamp`/`_time` narrows the scan window — what makes an
+ES time filter as cheap as a LogsQL one — **when it sits in positive
+conjunctive position** (top level, `must`, `filter`). Under `must_not` or
+`should` it becomes an ordinary time predicate instead, because the window is
+an AND over the whole query: lifting a negated range applied it un-negated,
+and lifting two `should` alternatives intersected a union — both measured as
+wrong answers at HTTP 200 (docs/wrong.md, the entry closing 124). Bounds
+combine by intersection: `gte` beside `gt` applies both, and a second range
+clause on the same field narrows rather than overwrites.
+
+**Every bound value is parsed or the query is a 400 naming it** — never a
+bound dropped, which until entry 124 was the fate of every spelling but
+RFC3339. Accepted: RFC3339 with or without fractional seconds; a zoneless
+datetime, date, month or year (completed by `time_zone`, default UTC); bare
+epoch numbers and numeric strings with the unit inferred from magnitude
+exactly as the HTTP `start`/`end` params infer it (`unixToNanos`) unless a
+`format` names the unit; `format` (`||`-separated) covering `epoch_millis`,
+`epoch_second` and the `date_optional_time`/`date_time`/`date` families —
+Grafana's ES datasource stamps `"format":"epoch_millis"` on every time range,
+and the strict decoder used to answer 400 `unknown field "format"` to all of
+it; and `now`-anchored date math (`now-5m`, `now+1d-1h`, calendar-aware
+`M`/`y`). Refused with the reason: date-math rounding (`/d`), `||` anchors,
+unknown `format` or `time_zone` names, and a range object with no bound at
+all. `TestESTimeRangeSpellingsAllApplyTheBound` drives every accepted
+spelling with a far-future case AND a far-past control, so a bound that
+refuses everything cannot pass as one that works.
+
+A STRING is tried against the date layouts BEFORE the epoch rule, which is
+ES's own order for a date field (`strict_date_optional_time||epoch_millis`):
+`{"gte":"2030"}` is the year 2030, not 2030 seconds since the epoch. The 10-
+and 13-digit epoch spellings are unaffected, because a 4-digit-year layout
+rejects their extra digits.
+
+**Every bound SATURATES on the int64-nanosecond domain** (1677-09-21 through
+2262-04-11) rather than wrapping. An instant past the domain behaves as the
+infinity it stands for — `gte 9999-01-01` matches nothing and `lte 9999-01-01`
+matches everything — and the same rule covers the HTTP `start`/`end` params and
+the LogsQL `_time:` filter, from one definition (`query.SatNanos`,
+`query.SatAdd`, `query.SatScale`). A wrapped bound is not a near miss: it turns
+a far-future lower bound into a far-past one, so a filter meaning "nothing"
+answers everything.
 
 `hits.total.value` is the number of **matching** documents. It was `len(rows)`
 after `size` had been pushed into the scan as a `Limit`, so `size=10` over a
@@ -637,8 +748,65 @@ after the cursor and runs the LogsQL filter over only the new groups
 first payload; `X-Accel-Buffering: no` keeps proxies from buffering. The
 connection lives until the client disconnects.
 
-`tail` is not federated: in router mode it tails the router's local store
-(empty when nothing was written locally).
+**Pipes.** `tail` runs the ROW-LOCAL pipes of its query and REFUSES the rest
+with 400. A row-local pipe is a function of one row, so it behaves the same on
+a stream as on a batch; `query.ClassifyPipe` decides which those are, and
+there are 22: `fields`, `rename`, `delete`, `copy`, `filter`, `format`,
+`extract`, `extract_regexp`, `math`, `len`, `hash`, `unpack_json`,
+`unpack_logfmt`, `unpack_syslog`, `unpack_words`, `replace`, `decolorize`,
+`pack_json`/`pack_logfmt`, `drop_empty_fields`, `json_array_len`,
+`collapse_nums` and `unroll`.
+
+The other 17 are refused, and the 400 names the pipe and gives one of three
+reasons. The message is chosen per pipe on the STREAMING axis, not from the
+distribution class: `ClassifyPipe` splits `| stats` by whether a COORDINATOR
+can merge its partial states, and a live tail has no coordinator, so that split
+must not reach the message. The buckets below are the measured answers of
+`nonStreamingPipe` over every pipe type in the language, and each bullet opens
+with the exact text of the reason the endpoint sends
+(`internal/api/tail_refusal_test.go` asserts them one by one, and requires every
+refused pipe to be named under its own reason here and under no other):
+
+- **It is computed over the whole result set, and a tail's input never ends, so
+  there is no point at which its answer is final.** `| stats` (every aggregate
+  — `count()` and `avg()` alike), `| sort`, `| uniq`, `| top`, `| rank`, and the
+  introspection pipes `| field_values`, `| field_names`, `| facets`,
+  `| blocks_count`, `| block_stats`.
+- **A tail re-runs its pipeline once per poll**, over just the rows that
+  arrived since the last one, so it would apply to each poll's rows rather than
+  to the stream: `| limit`, `| offset`, `| tail`, `| sample`. These are not
+  "needs the whole result set" pipes — `LimitPipe.apply` is `rows[:N]` and
+  `OffsetPipe.apply` is `rows[N:]`, prefix operations a stream could carry.
+  Their distribution classes do not say it either, and the four do not even
+  share one: `| limit`, `| offset` and `| tail` are `PipeGlobalOrder` because a
+  shard's first N is not the cluster's first N, while `| sample` is
+  `PipeCoordinatorOnly` because a shard sampling its own rows gives a stratified
+  sample of the cluster rather than a sample of the cluster. Both are sharding
+  properties, and neither has anything to say about streaming; what stops all
+  four here is the poll.
+- **It needs a second result set** — a subquery's rows, or the rows around a
+  match — and a tail has only the rows that have arrived: `| join`, `| union`,
+  `| stream_context`.
+
+The name in the message is the LogsQL token, so it can be pasted back into a
+query. It used to be the Go type lowered, which spelled five of them as tokens
+the language does not have (`streamcontext`, `fieldvalues`, `fieldnames`,
+`blockscount`, `blockstats`).
+
+It previously discarded every pipe, silently, at 200: `* | filter level:error`
+delivered `level=info` rows and `* | fields _msg` returned whole records.
+
+**`limit` is ignored.** A tail has no last row to count back from, so both row
+caps are cleared. It previously cleared `Limit` and kept `LastN` -- which is the
+field `limit=` sets -- so a tail with `limit=N` delivered N rows PER POLL and
+dropped the rest, for as long as it stayed open.
+
+**`tail` is not federated.** In router mode it answers 501 rather than tailing
+the router's own store: a cluster tail is a long-lived stream from every shard
+merged by arrival time, and that merge has no completeness signal -- a shard
+that stops answering drops out with nothing to say so. (This section previously
+said it tailed the router's local store, "empty when nothing was written
+locally", which `docs/lld/cluster.md` had already corrected.)
 
 ## Request admission
 

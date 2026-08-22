@@ -91,8 +91,15 @@ func goldenRoutes() []surfaceRoute {
 		{path: "/select/logsql/stream_ids", method: "GET", query: q},
 		{path: "/select/logsql/stats_query", method: "GET",
 			query: q + "%20%7C%20stats%20count%28%29%20c"},
+		// With an EXPLICIT window, as /select/logsql/hits above has always
+		// had. Both range endpoints now narrow an unspecified window to the
+		// last few hundred steps rather than running from the epoch, so a
+		// fixture with no window records "the corpus is older than the default
+		// range" -- a shape that says nothing about the contract. The contract
+		// worth freezing is the one a caller who names a range gets.
 		{path: "/select/logsql/stats_query_range", method: "GET",
-			query: q + "%20%7C%20stats%20count%28%29%20c&step=1h"},
+			query: q + "%20%7C%20stats%20count%28%29%20c&step=1h" +
+				"&start=2026-06-01T00:00:00Z&end=2026-06-02T00:00:00Z"},
 		{path: "/_search", method: "POST", body: `{"query":{"match_all":{}}}`,
 			ctype: "application/json"},
 		{path: "/_count", method: "POST", body: `{"query":{"match_all":{}}}`,

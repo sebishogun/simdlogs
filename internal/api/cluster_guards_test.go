@@ -1,10 +1,8 @@
 package api
 
 import (
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/sebishogun/simdlogs/internal/storage"
@@ -98,31 +96,4 @@ func TestOnlyTheFirstTimeFieldIsLifted(t *testing.T) {
 			"override it, or two shards emitting the same malformed row order it "+
 			"differently", row.Time, want)
 	}
-}
-
-// A refusal names the aggregate a client can act on.
-//
-// rejectNonMergeableStats was deletable from both stats surfaces with the suite
-// green -- nothing asserted that /select/logsql/stats_query refuses a quantile.
-// TestEveryStatsSurfaceRefusesTheSameAggregates now covers the statuses; this
-// adds the part a client reads.
-func TestARefusedAggregateNamesItselfAndTheAlternative(t *testing.T) {
-	parts := corpus(2)
-	cluster := router(t, realShard(t, parts[0]).URL, realShard(t, parts[1]).URL)
-
-	for _, tc := range []struct{ q, mentions string }{
-		{`* | stats avg(n) a`, "sum()"},
-		{`* | stats quantile(0.5, n) p`, "sketch"},
-		{`* | stats count_uniq(user) u`, "HLL"},
-	} {
-		t.Run(tc.q, func(t *testing.T) {
-			_, body := chaosGet(t, cluster.URL+"/select/logsql/stats_query?query="+
-				urlEscape(tc.q))
-			if !strings.Contains(body, tc.mentions) {
-				t.Errorf("the refusal does not tell the caller what to do instead "+
-					"(expected %q): %.250s", tc.mentions, body)
-			}
-		})
-	}
-	_ = fmt.Sprint
 }

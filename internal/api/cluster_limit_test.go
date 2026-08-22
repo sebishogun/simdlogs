@@ -75,6 +75,19 @@ func TestTheEndpointLimitIsTheClustersNotEachShards(t *testing.T) {
 				t.Fatalf("%d rows on one node, %d across three, at limit %d",
 					len(sRows), len(cRows), tc.limit)
 			}
+			// THE ROWS, not only how many. A count comparison passes when the
+			// cluster returns the right NUMBER of the wrong rows -- five rows
+			// where the node's five are different five -- which is verbatim the
+			// defect cluster_order_test.go's header documents. The node's
+			// answer is the reference, so the multiset has to match it.
+			if len(sRows) == 0 {
+				t.Fatalf("the node returned no rows at limit %d, so this "+
+					"compares two empty answers", tc.limit)
+			}
+			if !equalSets(sortedCopy(sRows), sortedCopy(cRows)) {
+				t.Errorf("same row COUNT, different rows, at limit %d:\n"+
+					"  node:    %v\n  cluster: %v", tc.limit, sRows, cRows)
+			}
 		})
 	}
 }

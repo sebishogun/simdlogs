@@ -130,20 +130,64 @@ func TestABareFilterNeedsNoCoordinatorWork(t *testing.T) {
 	}
 }
 
-// A quantile is refused rather than answered. A quantile of a union is not any
-// function of the shards' quantiles, so merging them produces a number that
-// looks like a latency and is not one.
-func TestAQuantileQueryIsRejected(t *testing.T) {
+// A quantile is PLANNED for the coordinator, not refused.
+//
+// It used to be refused, and the reason given was true of the wrong thing: a
+// quantile of a union is not any function of the shards' quantiles, so MERGING
+// per-shard quantiles produces a number that looks like a latency and is not
+// one. The planner does not merge them. A StatsPipe is never row-local, so it
+// lands past the split point and runs once at the coordinator over the merged
+// rows -- the same rows, through the same pipe, as a single node.
+//
+// The pipe must be at the COORDINATOR, not merely unrefused: this fails if a
+// later pushdown puts it on the shards without also restoring the refusal.
+func TestAQuantileIsPlannedForTheCoordinator(t *testing.T) {
 	q, err := ParseLogsQL(`* | stats quantile(0.99, duration) p99`)
 	if err != nil {
 		t.Skipf("this build does not parse quantile: %v", err)
 	}
 	plan := PlanDistributed(q.Pipes)
-	if plan.Reject == "" {
-		t.Fatal("a quantile across shards was accepted; the median of medians is not the median")
+	if plan.Reject != "" {
+		t.Fatalf("a quantile the coordinator computes over merged rows was refused: %s",
+			plan.Reject)
 	}
-	if !strings.Contains(plan.Reject, "sketch") {
-		t.Errorf("the refusal does not say what would fix it: %s", plan.Reject)
+	if len(plan.ShardPipes) != 0 {
+		t.Fatalf("the stats pipe was pushed to the shards (%d of them); a shard-computed "+
+			"quantile cannot be merged and the refusal has to come back with the "+
+			"pushdown", len(plan.ShardPipes))
+	}
+	if len(plan.CoordinatorPipes) != 1 {
+		t.Fatalf("the stats pipe is not at the coordinator: %+v", plan)
+	}
+}
+
+// The refusal fires for a stats pipe on a SHARD, which is the case it names.
+//
+// Nothing reaches it through PlanDistributed today, and that is the point: the
+// rule is "where does this aggregate run", so it is tested where it is decided
+// rather than through a request that cannot produce it. Without this, a
+// pushdown could land and the refusal it needs would be dead code that still
+// compiles.
+func TestARefusalStillFiresForAShardSideAggregate(t *testing.T) {
+	q, err := ParseLogsQL(`* | stats quantile(0.99, duration) p99`)
+	if err != nil {
+		t.Skipf("this build does not parse quantile: %v", err)
+	}
+	why := rejectReason(q.Pipes) // as if the planner had pushed it down
+	if why == "" {
+		t.Fatal("a quantile computed on a shard and merged here was accepted; " +
+			"the median of medians is not the median")
+	}
+	if !strings.Contains(why, "sketch") {
+		t.Errorf("the refusal does not say what would fix it: %s", why)
+	}
+	// And an additive aggregate is still fine on a shard.
+	sum, err := ParseLogsQL(`* | stats sum(n) s`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if why := rejectReason(sum.Pipes); why != "" {
+		t.Errorf("a sum has a mergeable partial state and was refused: %s", why)
 	}
 }
 
@@ -181,5 +225,75 @@ func TestAProjectionThatDropsTimeStaysAtTheCoordinator(t *testing.T) {
 					len(plan.CoordinatorPipes), tc.wantCoord)
 			}
 		})
+	}
+}
+
+// `rejectReason` is unreachable BY CONSTRUCTION, and this asserts the
+// construction rather than the result.
+//
+// Two existing tests assert `Distributable(...) == (true, "")` for queries
+// including non-mergeable aggregates, which reads as coverage of the refusal
+// and is a tautology: `rejectReason` reads `ShardPipes`, `PlanDistributed`
+// appends to `ShardPipes` only for `PipeRowLocal`, and `ClassifyPipe` never
+// returns `PipeRowLocal` for a `*StatsPipe`. So no StatsPipe can be in the
+// slice `rejectReason` walks, and "" is the only answer it has.
+//
+// A test that asserts the answer passes forever and says nothing. This asserts
+// the two facts the answer rests on, so the day a stats pipe becomes
+// push-downable -- which is the change that makes the refusal live, and a
+// wrong quantile if it is not there -- this fails and names what changed.
+func TestRejectReasonIsUnreachableByConstruction(t *testing.T) {
+	// FACT ONE: ClassifyPipe never calls a StatsPipe row-local. If it did, a
+	// non-mergeable aggregate would be pushed to the shards and the
+	// coordinator would combine per-shard quantiles -- the median of medians.
+	// Parsed rather than hand-built, so the Agg shape cannot drift out from
+	// under the assertion.
+	for _, q := range []string{
+		`* | stats count() c`,
+		`* | stats sum(n) s`,
+		`* | stats avg(n) a`,
+		`* | stats quantile(0.5, n) p`,
+		`* | stats uniq(user) u`,
+		`* | stats count_uniq(user) cu`,
+	} {
+		pq, err := ParseLogsQL(q)
+		if err != nil {
+			t.Fatalf("parse %q: %v", q, err)
+		}
+		for _, p := range pq.Pipes {
+			sp, ok := p.(*StatsPipe)
+			if !ok {
+				continue
+			}
+			if got := ClassifyPipe(sp); got == PipeRowLocal {
+				t.Errorf("ClassifyPipe(%q's stats pipe) = PipeRowLocal. A stats "+
+					"pipe in ShardPipes makes rejectReason live -- and until it "+
+					"is wired to a caller, it makes a non-mergeable aggregate "+
+					"merge wrongly instead of being refused", q)
+			}
+		}
+	}
+
+	// FACT TWO: PlanDistributed puts nothing but row-local pipes in ShardPipes.
+	for _, q := range []string{
+		`* | stats quantile(0.5, n) p`,
+		`* | stats uniq(user) u`,
+		`* | filter level:error | stats avg(n) a`,
+		`* | sort by (n) | stats count() c`,
+	} {
+		pq, err := ParseLogsQL(q)
+		if err != nil {
+			t.Fatalf("parse %q: %v", q, err)
+		}
+		plan := PlanDistributed(pq.Pipes)
+		for i, p := range plan.ShardPipes {
+			if _, isStats := p.(*StatsPipe); isStats {
+				t.Errorf("%q put a StatsPipe at ShardPipes[%d]; rejectReason "+
+					"is now reachable and every branch on it is now live", q, i)
+			}
+			if ClassifyPipe(p) != PipeRowLocal {
+				t.Errorf("%q put a non-row-local pipe at ShardPipes[%d]", q, i)
+			}
+		}
 	}
 }

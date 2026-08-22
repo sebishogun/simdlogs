@@ -28,6 +28,16 @@ import (
 
 const chaosTimeout = 8 * time.Second
 
+// chaosReadCap is how much of a response chaosGet keeps.
+//
+// Named because any test asserting a body is SMALLER than some size has to
+// know this number: a larger body arrives truncated to exactly the cap, so
+// `len(body) > chaosReadCap` is unreachable by construction and
+// `>= chaosReadCap` is the form that means "the response was at least this
+// big". One test carried the unreachable form for a round, and went red on a
+// real defect only because the truncated JSON failed to parse.
+const chaosReadCap = 1 << 20
+
 func chaosGet(t *testing.T, target string) (int, string) {
 	t.Helper()
 	cl := &http.Client{Timeout: chaosTimeout}
@@ -36,7 +46,7 @@ func chaosGet(t *testing.T, target string) (int, string) {
 		t.Fatalf("GET %s: %v", target, err)
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, chaosReadCap))
 	return resp.StatusCode, string(b)
 }
 

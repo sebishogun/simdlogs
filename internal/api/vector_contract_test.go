@@ -7,11 +7,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/sebishogun/simdlogs/internal/config"
+	"github.com/sebishogun/simdlogs/internal/ingest"
 )
 
 // Vector search end to end: a record with an embedding goes in through the
@@ -328,4 +330,108 @@ func TestABadVectorConfigurationRefusesToStart(t *testing.T) {
 		t.Fatalf("a valid spec was refused: %v", err)
 	}
 	srv.Close()
+}
+
+// vectorServerShards is vectorServer with the parallel ingest shard count
+// forced, and it hands back the *Server so the branch can be ASKED rather
+// than assumed. shards == 0 leaves the derived count alone.
+func vectorServerShards(t *testing.T, spec string, shards int) *httptest.Server {
+	t.Helper()
+	c := config.Config{Dir: t.TempDir(), Limits: config.DefaultLimits()}
+	c.VectorFields = spec
+	srv, err := NewServerConfig(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shards > 0 {
+		srv.setIngestShardsForTest(shards)
+	}
+	t.Cleanup(func() { srv.Close() })
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// A body over MinParallelBytes keeps its embeddings.
+//
+// IT DID NOT. ParallelConfig carried five of the tenant writer's six settings
+// and VectorFields was the sixth, so every temporary shard writer -- and the
+// serial fallback inside IngestJSONLinesParallelResult, which builds one the
+// same way -- ran with an empty vector set. IngestJSONLinesOpts asks
+// `w.VectorFields()` once per body and its `simdjson.Array` arm returns early
+// for a field that is not configured, so the array was skipped and the row was
+// stored without it: text-queryable, and invisible to the one search it was
+// ingested for. Measured on the built binary with -vector-fields=emb:4, one
+// server, two uploads:
+//
+//	body           rows     /select/vector k=6
+//	105 B          3        all 3 returned, ranked
+//	1,052,693 B    27,277   0 returned
+//
+// HTTP 200 both times, {"ingested":27277,"skipped":0}. That is the reject arm
+// of this same file's vector branch calling itself worse than a rejection --
+// except nothing was rejected and nothing was reported.
+//
+// BOTH ROWS RUN AT BOTH CORE COUNTS. The forced row is the concurrent branch;
+// the derived row is whatever this machine does, which at four cores is the
+// serial fallback -- and the fallback builds its writer through the same
+// cfg.apply, so the defect is not core-count-dependent and neither is the
+// gate. The branch each row is on is printed, not assumed.
+func TestALargeBodyKeepsItsEmbeddings(t *testing.T) {
+	const dim = 4
+	// Over MinParallelBytes, one needle pointing at [1,0,0,0] and filler
+	// pointing away from it, so a search for the needle direction can only
+	// rank the needle first if the large body's vectors were stored.
+	var body strings.Builder
+	body.WriteString(vecLine("needle", []float32{1, 0, 0, 0}))
+	for i := 0; body.Len() < ingest.MinParallelBytes+(1<<16); i++ {
+		body.WriteString(vecLine(fmt.Sprintf("filler-%d", i), []float32{0, 0, 0, 1}))
+	}
+	payload := body.String()
+	if len(payload) < ingest.MinParallelBytes {
+		t.Fatalf("body %d bytes is under MinParallelBytes %d", len(payload), ingest.MinParallelBytes)
+	}
+
+	run := func(t *testing.T, shards int) {
+		t.Helper()
+		// Ask which branch this row is on rather than describing it: the
+		// condition has two halves and a guard that checks one of them is the
+		// fault entry 134 and entry 135 are both about.
+		got := ingest.ParallelConfig{Shards: shards}.ShardsFor(len(payload))
+		if got == 0 {
+			t.Logf("shards=%d -> serial fallback (NumCPU=%d); the fallback builds "+
+				"its writer through the same cfg.apply", shards, runtime.NumCPU())
+		} else {
+			t.Logf("shards=%d -> %d shard writers", shards, got)
+		}
+
+		ts := vectorServerShards(t, "emb:4", shards)
+		code, res := postJSON(t, ts, payload)
+		if code/100 != 2 {
+			t.Fatalf("ingest %d: %v", code, res)
+		}
+		ing, _ := res["ingested"].(float64)
+		if int(ing) != strings.Count(payload, "\n") {
+			t.Fatalf("ingested %v of %d lines: %v", res["ingested"], strings.Count(payload, "\n"), res)
+		}
+
+		const k = 6
+		code, msgs, raw := searchVec(t, ts, "emb", []float32{1, 0, 0, 0}, k)
+		if code != 200 {
+			t.Fatalf("%d: %s", code, raw)
+		}
+		if len(msgs) != k {
+			t.Fatalf("/select/vector returned %d rows of %v ingested, want %d. "+
+				"The large body's embeddings were dropped: the rows are on disk and "+
+				"text-queryable, and invisible to the search they were ingested for.",
+				len(msgs), res["ingested"], k)
+		}
+		if msgs[0] != "needle" {
+			t.Fatalf("best match = %q, want needle: the large body's vectors are not "+
+				"the ones being ranked", msgs[0])
+		}
+	}
+
+	t.Run("shards forced to 4", func(t *testing.T) { run(t, 4) })
+	t.Run("the derived shard count", func(t *testing.T) { run(t, 0) })
 }

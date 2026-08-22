@@ -63,7 +63,7 @@ func (p *StreamContextPipe) run(s Store, parent *Query, matches []Row) []Row {
 	// The whole window, unfiltered: a neighbour is by definition a row the
 	// query did NOT match, so the context scan cannot carry the parent's
 	// filter.
-	ctxQ := &Query{From: parent.From, To: parent.To, Now: parent.Now,
+	ctxQ := &Query{From: parent.From, To: parent.To, ToSet: parent.ToSet, Now: parent.Now, NowSet: parent.NowSet,
 		Filter: &Expr{Op: OpAnd}, MatAll: true}
 	applyBudget(ctxQ, parent)
 	// Its OWN stop reason, then translated. applyBudget shares the parent's so
@@ -250,8 +250,18 @@ func (p *UnionPipe) run(s Store, parent *Query, rows []Row) []Row {
 // deadline was already spent. The route still answered 504 -- the outer scan
 // sets Stopped -- so the unbounded work was invisible from outside.
 func runSub(s Store, parent *Query, sub *Query) []Row {
-	q := *sub // copy so the parsed template is not mutated by run
-	q.From, q.To, q.Now = parent.From, parent.To, parent.Now
+	// CloneResolvable, not `*sub`. The comment here said "copy so the parsed
+	// template is not mutated by run", and a `*sub` does not do that: Preds is
+	// a slice and Filter is a tree of pointers, so both are shared, and
+	// resolveTimePred writes T1/T2/Rel through them. The same shallow copy on
+	// the tail path was a stream that delivered nothing (entry 118).
+	//
+	// Not reachable today -- every path re-parses per execution, so there is no
+	// template that outlives one run -- which is exactly what was true of the
+	// tail's copy until something re-ran the query.
+	q := *sub.CloneResolvable()
+	q.SetWindow(parent.From, parent.To)
+	q.ToSet, q.Now, q.NowSet = parent.ToSet, parent.Now, parent.NowSet
 	// Whole records, by the same rule the top-level select uses: a chain that
 	// does not PROJECT still emits whole rows, so the scan has to materialize
 	// every column for it.

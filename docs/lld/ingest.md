@@ -320,6 +320,91 @@ Records without a parseable `_time` get `tenant.fallbackTS()`: wall clock plus
 an atomic monotonic bump, so concurrent shards never collide. Missing clocks
 never reject a line.
 
+**A timestamp that PARSES and cannot be STORED is a third case, and it refuses
+the record.** int64 nanoseconds since the epoch reach 1677-09-21 through
+2262-04-11 and `time.Parse` accepts any year, so a row stamped `9999-01-01`
+used to wrap to an unrelated instant: accepted at HTTP 200, counted as
+ingested, written, and outside every window a query can name. Measured on four
+rows through `/insert/jsonline` — one normal, year 9999, year 3000, year 1000 —
+`{"ingested":4,"skipped":0}` and `query=*` answering ONE row.
+
+Refused rather than clamped, and the asymmetry with the query side is
+deliberate. A query BOUND is a comparison, so an instant past the domain
+saturates to the infinity it means. A row's `_time` is a fact: clamping
+9999-01-01 to 2262-04-11 files the row under an instant the client never sent,
+where a query for 2262 returns it and a retention pass for 2262 deletes it.
+`ErrTimeOutOfRange` is the reason, and the rule holds for **every** protocol
+that carries a timestamp — jsonline, logfmt, Loki (both encodings, including
+the protobuf `seconds`/`nanos` pair whose product overflows), OTLP (both
+encodings), Datadog (whose millisecond number overflows the scale), journald
+(whose `__REALTIME_TIMESTAMP` is an unsigned microsecond count, so half its
+domain is past `int64`), Elasticsearch `_bulk`, and syslog on **both**
+transports. Syslog was the stated exception, with the reason "a datagram has no
+client to report a per-record rejection to": true of the UDP listener, false of
+`/insert/syslog`, which is an HTTP request with a client on the other end — and
+the wrong trade on the datagram too, because stamping a year-9999 line `now` is
+the same fabrication. Both transports refuse and count.
+
+**What a client is told is less than `Result` carries, and it differs by
+route.** The parser records the rejection in `Result.Rejected`, its zero-based
+batch position in `Result.RejectedAt`, and a `Warning` whose `Ordinal` field
+holds that position. Only some of that reaches the wire:
+
+| route | what a rejection looks like on the wire |
+| --- | --- |
+| `/insert/jsonline`, `/insert/logfmt` | `{"ingested":N,"skipped":M}` — a count, no position, no reason |
+| `/insert/journald`, `/api/v2/logs` | `{"accepted":N,"rejected":M,"warnings":[...]}` — messages only; `warningStrings` renders `Warning.Msg` and drops `Warning.Ordinal` |
+| `/loki/api/v1/push`, `/insert/syslog` | 204 with `X-Simdlogs-Accepted` / `X-Simdlogs-Rejected`, and the FIRST warning in `X-Simdlogs-Warning` |
+| `/v1/logs` | an OTLP `partialSuccess` with `rejectedLogRecords` and an `error_message` |
+| `/insert/elasticsearch/_bulk` | one item per action, positional: the rejected document's own item at 400 `document_parsing_exception`, and only it. `ingest.MaxRejectedAt` is the `_bulk` action cap (1&nbsp;<<&nbsp;20), so no body this route accepts can outrun the positions; if they cannot be placed anyway the whole request is a 500 and NO items array is written, because a mix of stored and unstorable documents has no per-item status that is true |
+
+`_bulk` is the only route that answers per record, which is why it is the only
+one that needs `RejectedAt` — and it needs it on the parallel path too, which
+threw the positions away and reported every document in a sharded batch as
+failed.
+
+**A partial-ingest error body renders at most 65,536 positions, and says when
+it cut the list.** `writeIngestErr` is what a route with a JSON error body
+answers when the parse failed part way and some records are durable
+(`/insert/journald` is the one that reaches it today). It carries `accepted`,
+`rejected` and `rejectedAt` — and `rejectedAt` is bounded by
+`maxRenderedRejectedAt` (1&nbsp;<<&nbsp;16), which is what
+`ingest.MaxRejectedAt` used to be, with `rejectedTruncated: true` on the body
+whenever the list was cut. That bound is the reason raising the ATTRIBUTION
+bound to the action cap did not grow any response: attribution needs a million
+positions, a human-and-shipper-readable error body does not. Measured on
+`/insert/journald`:
+
+| entries refused | status | body bytes | `rejected` | `rejectedAt` | `rejectedTruncated` |
+| --- | --- | --- | --- | --- | --- |
+| 3 | 400 | 126 | 4 | 4 | absent |
+| 65,536 | 400 | 382,257 | 65,537 | 65,536 | true |
+| 131,072 | 400 | 382,258 | 131,073 | 65,536 | true |
+
+Without the bound the third row is 806,529 bytes and a body at the attribution
+cap is 7,277,653. `TestTheRenderedRejectedPositionsAreBounded` holds it.
+An ingest that stored NOTHING keeps the plain `{"error":...,"status":...}`
+shape and reports neither count nor position; see `docs/compatibility.md`.
+
+**`Warning.Ordinal` has no reader on any wire.** Every row above either drops
+it (`warningStrings` renders `Warning.Msg` alone) or carries no warnings at
+all, so `mergeShardResults`' rebase of it is unobservable from any surface
+this build serves. It is rebased anyway, and gated in
+`TestMergeShardResultsRebasesEveryPosition`, because the first reader added
+will otherwise get a plausible number measured from the wrong origin — which
+is the failure `WarnAt` exists to have stopped.
+
+**The 429 that was here was wrong, and it was reachable.** The residual branch
+used to mark every candidate 429 `es_rejected_execution_exception` on the
+reasoning that a retryable 4xx over-reports without losing anything. 429 is
+the one 4xx that is NOT permanent: it inherits the 5xx's retry property and
+keeps none of the 4xx's, so it hands a permanently-unstorable document a
+transience it does not have. `maxRejectedAt` was 65,536 against an action cap
+of 1&nbsp;<<&nbsp;20, and a 5,254,000-byte body — inside the 64 MiB request
+limit — of 70,000 `index` actions with 66,000 unstorable `_time` values
+reached it: 70,000 items at 429 over 4,000 stored rows, a pipeline that never
+drains and 4,000 duplicates per retry pass. See `docs/wrong.md` entry 133.
+
 ## Writer and flush pipeline
 
 `internal/ingest/writer.go`.
@@ -368,11 +453,25 @@ fallback, cfg ParallelConfig, opts) (ingested, skipped int, err error)`:
   newline, and each chunk parses through its own `NewWriterWorkers(store, 2)`
   writer over the shared store (`AppendGroup` is concurrency-safe). Total
   goroutines stay near the core count rather than oversubscribing.
-- **`ParallelConfig` carries the deployment writer settings** — `Compact` and
-  `StreamFields` — because the shard writers are built here rather than handed
-  in. A setting not repeated onto them changes the stored schema for large
-  bodies only: `Compact` was copied and `StreamFields` was not, so the same
-  records grew a `_stream` column under the small-body path and none here.
+- **`ParallelConfig` carries the deployment writer settings** — `Compact`,
+  `StreamFields`, `MaxLineBytes`, `Limits` and `VectorFields` — because the
+  shard writers are built here rather than handed in. A setting not repeated
+  onto them changes the stored schema for large bodies only, and the same
+  omission shipped three times: `Compact` was copied and `StreamFields` was
+  not, so the same records grew a `_stream` column under the small-body path
+  and none here; then `Limits`, so a large body got no field, name or value
+  cap and a forgeable `.error`; then `VectorFields`, so a large body's
+  embeddings were dropped and its rows were invisible to `/select/vector` at
+  HTTP 200.
+- **The list is no longer kept by hand.** `Writer.ShardSettings` reads the
+  settings off the configured tenant writer and `parallelCfg` adds only
+  `Shards`, so there is no second enumeration to drift; `apply` stamps them
+  onto each shard writer. `TestShardSettingsRoundTripEveryField` walks
+  `ParallelConfig` by reflection — a field forgotten in `ShardSettings` comes
+  back zero, a field forgotten in `apply` comes back unequal.
+  `MaxDecompressedBytes` is deliberately out: it is read only in `lokipb.go`,
+  before any shard writer exists, and the Loki protobuf route has no sharded
+  branch.
 - **`Shards` overrides the derived count**, which is `NumCPU/3` and so below
   the 2-shard minimum on anything with fewer than six cores. Tests set it so
   the concurrent branch actually runs; without it they exercise the serial

@@ -3,6 +3,7 @@ package query
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // Fuzzing the query languages.
@@ -146,11 +147,85 @@ func FuzzResolveWindow(f *testing.F) {
 			t.Fatalf("%q: resolving twice moved the window from [%d,%d] to [%d,%d]",
 				s, from1, to1, q.From, q.To)
 		}
-		// And a resolved window must not have lost its bound entirely: a query
-		// that named an upper bound and resolved to "no upper bound" would scan
-		// past what it asked for.
-		if strings.Contains(s, "_time:<") && to1 == 0 && from1 == 0 {
-			t.Fatalf("%q named an upper bound and resolved to an unbounded window", s)
-		}
+		// The "a named upper bound survives resolution" invariant is NOT here.
+		//
+		// It was, as `strings.Contains(s, "_time:<")`, and it has been red on a
+		// cached corpus entry ever since the fuzzer found `0_time:<0` -- a
+		// predicate on a field NAMED `0_time`, which names no time bound and
+		// correctly resolves to no window. Anchoring the match so the field has
+		// to be exactly `_time` fixed that one and the fuzzer immediately
+		// produced `#_time:<0`, a comment. It will keep producing them: quoted
+		// strings, regexes, pipe arguments.
+		//
+		// The invariant needs to know whether the CALLER named a time bound,
+		// and the only thing that knows is the parser. Re-deriving it from the
+		// input text is what failed twice, so it moved to
+		// TestATimeUpperBoundSurvivesResolution below, which names its queries
+		// and does not have to guess.
+		//
+		// What stays here is idempotence, which is fuzzable without inferring
+		// intent from the string.
 	})
+}
+
+// A named _time bound survives ResolveWindow.
+//
+// A table, not a fuzz invariant: whether a query names a time bound is a fact
+// about the PARSE, and the fuzz body only has the input text. Two attempts to
+// recover it from the text were both wrong -- `0_time:<0` is a field called
+// `0_time`, `#_time:<0` is a comment -- and each left a release gate red on a
+// query the engine handles correctly.
+//
+// Named queries cannot have that problem, and they say exactly which shapes
+// are covered rather than implying all of them.
+func TestATimeUpperBoundSurvivesResolution(t *testing.T) {
+	// A bare date is a whole DAY, so the two comparisons land on opposite
+	// edges of it: `<2026-01-01` is everything before that day begins, and
+	// `>2025-01-01` is everything after it ends -- 2025-01-02, not 2025-01-01.
+	// Asserting the naive instant fails, and the engine is the one that is
+	// right; this test learned it by asserting the wrong number first.
+	jan2026 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+	jan2ndOf2025 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC).UnixNano()
+	for _, tc := range []struct {
+		q                string
+		bounded          bool
+		wantFrom, wantTo int64
+	}{
+		{q: `_time:<2026-01-01`, bounded: true, wantTo: jan2026},
+		{q: `_time:>2025-01-01 _time:<2026-01-01`, bounded: true,
+			wantFrom: jan2ndOf2025, wantTo: jan2026},
+		{q: `_time:>2025-01-01`, bounded: true, wantFrom: jan2ndOf2025},
+		{q: `* | stats count() c`, bounded: false},
+		// The shapes that used to redden the gate: a field whose name ENDS in
+		// _time, and a comment. Neither names a time bound.
+		{q: `0_time:<0`, bounded: false},
+		{q: `event_time:<7`, bounded: false},
+		{q: `#_time:<0`, bounded: false},
+	} {
+		t.Run(tc.q, func(t *testing.T) {
+			q, err := ParseLogsQL(tc.q)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			ResolveWindow(q)
+			got := q.From != 0 || q.To != 0
+			if got != tc.bounded {
+				t.Fatalf("resolved to [%d,%d]; bounded=%v, want %v",
+					q.From, q.To, got, tc.bounded)
+			}
+			// The INSTANT, not merely the presence of one.
+			//
+			// "bounded" alone passes on a bound that resolved to the wrong
+			// time, which is the failure that matters: a window naming
+			// 2026-01-01 and resolving to 2025-01-01 is bounded and wrong.
+			if tc.wantTo != 0 && q.To != tc.wantTo {
+				t.Errorf("To = %d, want %d (%s)", q.To, tc.wantTo,
+					time.Unix(0, tc.wantTo).UTC())
+			}
+			if tc.wantFrom != 0 && q.From != tc.wantFrom {
+				t.Errorf("From = %d, want %d (%s)", q.From, tc.wantFrom,
+					time.Unix(0, tc.wantFrom).UTC())
+			}
+		})
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/query"
@@ -35,10 +36,11 @@ import (
 // merge, and which are cheapest where the data already is. Everything from the
 // first non-row-local pipe onward is applied ONCE, here, over the merged rows.
 //
-// A query whose aggregate has no mergeable partial state is refused with the
-// reason, not answered. See query.NonMergeableReason: the important case is
-// quantiles, where a median of medians is not a median and the wrong answer
-// still looks like a latency.
+// A query whose aggregate has no mergeable partial state is answered EXACTLY
+// -- the shards return rows and the aggregate runs once here -- not merged.
+// See query.NonMergeableReason: the important case is quantiles, where a
+// median of medians is not a median and the wrong answer still looks like a
+// latency.
 
 // planQuery splits the request's query and returns the string to send to the
 // shards plus the pipes to apply here.
@@ -53,7 +55,23 @@ import (
 // is cut text and then CHECK the cut against the parse -- one segment per pipe
 // plus the head -- refusing when they disagree. That is a weaker guarantee than
 // the comment promised and it is the one the code makes.
-func (s *Server) planQuery(w http.ResponseWriter, r *http.Request) (shardQuery string, coord []query.Pipe, ok bool) {
+// all is the WHOLE parsed pipeline, returned alongside the coordinator half.
+//
+// The bound decision needs it. limitBoundsOutput asks "does the endpoint's
+// `limit` bound this query's output", and the answer is a property of the
+// pipeline the CALLER wrote, not of whatever suffix ends up at the
+// coordinator: with a row-local prefix pushed to the shards, that suffix
+// BEGINS with the aggregate, and a predicate reading its first pipe concludes
+// "leading aggregate, the bound does not apply" for a query whose aggregate is
+// not leading at all. planQuery has always used q.Pipes here and mergeRows had
+// only the suffix, so the two disagreed. Measured, 30 rows over two shards,
+// `&limit=5`:
+//
+//	query                                node        cluster
+//	| fields n, _time | stats avg(n) a   {"a":"27"}  {"a":"14.5"}
+//	| math n * 2 as m | stats avg(m) a   {"a":"54"}  {"a":"29"}
+//	| rename n as k   | stats count() c  {"c":"5"}   {"c":"30"}
+func (s *Server) planQuery(w http.ResponseWriter, r *http.Request) (shardQuery string, coord, all []query.Pipe, ok bool) {
 	// A MISSING query is refused, exactly as a single node refuses it.
 	//
 	// This defaulted to `*`, and parseRequest's own comment says why that is
@@ -72,12 +90,12 @@ func (s *Server) planQuery(w http.ResponseWriter, r *http.Request) (shardQuery s
 	raw := r.FormValue("query")
 	if strings.TrimSpace(raw) == "" {
 		s.writeErr(w, r, readSpec(), http.StatusBadRequest, errMissingQuery.Error())
-		return "", nil, false
+		return "", nil, nil, false
 	}
 	q, err := query.ParseLogsQL(raw)
 	if err != nil {
 		s.writeErr(w, r, readSpec(), http.StatusBadRequest, err.Error())
-		return "", nil, false
+		return "", nil, nil, false
 	}
 	plan := query.PlanDistributed(q.Pipes)
 	if plan.Reject != "" {
@@ -87,7 +105,7 @@ func (s *Server) planQuery(w http.ResponseWriter, r *http.Request) (shardQuery s
 		s.writeErr(w, r, readSpec(), http.StatusBadRequest, fmt.Sprintf(
 			"simdlogs: this query cannot be answered correctly across shards. %s. "+
 				"Run it against a single storage node, or rewrite it", plan.Reject))
-		return "", nil, false
+		return "", nil, nil, false
 	}
 
 	// The shard query is the filter plus the first N pipe segments, where N is
@@ -146,7 +164,7 @@ func (s *Server) planQuery(w http.ResponseWriter, r *http.Request) (shardQuery s
 				"the pipes are ("+strconv.Itoa(len(segs))+" text segments for "+
 				strconv.Itoa(len(q.Pipes))+" parsed pipes). Quote the value, or run "+
 				"this against a single storage node")
-		return "", nil, false
+		return "", nil, nil, false
 	}
 
 	shardQuery = segs[0]
@@ -187,9 +205,9 @@ func (s *Server) planQuery(w http.ResponseWriter, r *http.Request) (shardQuery s
 		shardQuery += " | " + segs[i]
 	}
 	if push < len(plan.ShardPipes) {
-		return shardQuery, q.Pipes, true
+		return shardQuery, q.Pipes, q.Pipes, true
 	}
-	return shardQuery, plan.CoordinatorPipes, true
+	return shardQuery, plan.CoordinatorPipes, q.Pipes, true
 }
 
 // pipeSegments splits a query's text into its top-level pipe segments, with
@@ -297,6 +315,59 @@ func shardQueryURL(r *http.Request, shardQuery string, coordPipes []query.Pipe) 
 func (s *Server) applyCoordinatorPipes(
 	r *http.Request, rows []query.Row, pipes []query.Pipe,
 ) ([]query.Row, error) {
+	// THE WINDOW THE SHARDS SCANNED, not the one the request named.
+	//
+	// Two things had to be undone to get here. The first was a normalization
+	// of `to == 0` to 1<<62, which existed to match what `parseRequest` did
+	// with the same value; that was a compensating error for two readers
+	// disagreeing about `end=0`, and it went when the disagreement did
+	// (server.go, `endGiven`).
+	//
+	// The second is this: `timeWindow` is the REQUEST's window, and a query
+	// carrying an absolute `_time:` filter is scanned over the intersection.
+	// The shards run the whole query and narrow; this only applies the pipes,
+	// so it has to be told. `rate()` is a count divided by the window's
+	// seconds, and the two differ by whatever the filter cut out:
+	//
+	//	query=_time:[..12:00:00Z, ..12:00:30Z] | stats rate() r
+	//	  node    0.967741935483871
+	//	  router  0.000000006505213034913027
+	//
+	// 30 seconds of rows over the 146 years `to` defaults to, at HTTP 200.
+	from, to := timeWindow(r)
+	from, to = query.ResolvedWindow(r.FormValue("query"), from, to, time.Now().UnixNano())
+	return s.applyCoordinatorPipesIn(r, rows, pipes, from, to)
+}
+
+// applyCoordinatorPipesIn is applyCoordinatorPipes over an explicit window.
+//
+// A range query needs it: each bucket is its own window, and rate() over a
+// bucket divides by the BUCKET's seconds, not the request's. Passing the whole
+// request window for every bucket would divide each bucket's count by the full
+// range and answer a rate 30 times too small on a default 30-bucket graph.
+func (s *Server) applyCoordinatorPipesIn(
+	r *http.Request, rows []query.Row, pipes []query.Pipe, from, to int64,
+) ([]query.Row, error) {
+	return s.applyCoordinatorPipesBudgeted(r, rows, pipes, from, to, nil)
+}
+
+// applyCoordinatorPipesBudgeted is applyCoordinatorPipesIn with a budget the
+// caller owns.
+//
+// It exists because a range query calls this once PER BUCKET, and
+// applyQueryBudget stamps `Deadline = time.Now() + MaxQueryDuration` every time
+// it runs. Thirty buckets meant thirty fresh deadlines, so -search.maxDuration
+// bounded one bucket rather than the request -- on the one path that holds
+// every matching row of the cluster in memory while it works. The single node
+// does not do this: statsQueryRange builds one budget Query and copies its
+// fixed deadline onto each bucket.
+//
+// A nil budget means "stamp a fresh one", which is what every single-shot
+// caller wants.
+func (s *Server) applyCoordinatorPipesBudgeted(
+	r *http.Request, rows []query.Row, pipes []query.Pipe, from, to int64,
+	budget *query.Query,
+) ([]query.Row, error) {
 	// Neither flag, and that is deliberate now rather than incidental.
 	//
 	// This used to set MatAll: true. ApplyPipes reads neither flag -- it runs
@@ -306,11 +377,32 @@ func (s *Server) applyCoordinatorPipes(
 	// reads as "synthesize _stream/_stream_id onto every row". The coordinator
 	// writes with withStream=false so nothing happened, and the day that
 	// changes an inert true would put the pair back on merged stats rows.
+	//
+	// The WINDOW is carried onto it, and that is not cosmetic. ApplyPipes
+	// stamps every stats pipe with rangeSec = (To-From)/1e9, and a Query built
+	// with neither field stamps ZERO -- which formatAgg reads as "no window"
+	// and answers "0" for rate() and rate_sum(). A router answered
+	// `* | stats rate() r` with {"r":"0"} at HTTP 200 over a store doing 5000
+	// rows an hour, where the node behind it answered 1.3888.
+	//
+	// It stayed invisible because rate() was REFUSED before it could reach
+	// here. That is the pattern worth naming: a gate returning 400 for a case
+	// the code beneath it gets wrong reads as policy and is a defect with a lid
+	// on it. Removing the refusal without this would have shipped the zero.
 	q := &query.Query{Pipes: pipes}
+	q.From, q.To = from, to
 	// The returned flag is not read: applyQueryBudget binds the query, so
 	// every stop() records a reason and q.StopErr() below is the whole signal.
 	// It was assigned to `_` with no explanation, which reads as a hole.
-	s.applyQueryBudget(r, q)
+	if budget != nil {
+		q.Deadline, q.MaxBytes, q.Stopped = budget.Deadline, budget.MaxBytes, budget.Stopped
+		q.Bind(r.Context(), query.Limits{
+			MaxGroupKeys: s.limits.MaxGroupKeys,
+			MaxPipeRows:  s.limits.MaxPipeRows,
+		})
+	} else {
+		s.applyQueryBudget(r, q)
+	}
 	out := query.ApplyPipes(q, rows)
 	if err := q.StopErr(); err != nil {
 		return nil, err
@@ -357,12 +449,64 @@ func endpointLimit(r *http.Request) int {
 // coordinator has no scan -- so the predicate is written here with the
 // measurements above as its test. If a pipe is added whose reduction is not
 // stats or uniq, this is the list that needs it.
+//
+// # Only the LEADING pipe bypasses the bound
+//
+// This used to scan the whole pipeline and return false if a stats or uniq pipe
+// appeared anywhere. That is right for the five shapes above, and every one of
+// them has the aggregate FIRST -- which is the case where a node's runStats
+// runs its own scan and never sees LastN. Put anything in front of it and the
+// scan is an ordinary bounded one: LastN takes the newest n rows and the
+// aggregate runs over those n.
+//
+// So the router was leaving the merged set unbounded for a query the node
+// bounds, and computing the aggregate over every row instead of the newest n.
+// Measured, 30 rows over two shards, `&limit=5`:
+//
+//	query                            node       cluster before
+//	| sort by (n) | stats avg(n) a   {"a":"27"}  {"a":"14.5"}
+//	| limit 5 | stats avg(n) a       {"a":"27"}  {"a":"2"}
+//	| sort by (n) | stats count() c  {"c":"5"}   {"c":"30"}
+//
+// The count row was already wrong before the exact-stats path existed; the avg
+// row is one the router used to refuse, so lifting the refusal turned a 400
+// into a plausible number. Both come from the same predicate.
 func limitBoundsOutput(pipes []query.Pipe) bool {
-	for _, p := range pipes {
-		switch p.(type) {
-		case *query.StatsPipe, *query.UniqPipe:
-			return false
-		}
+	if len(pipes) == 0 {
+		return true
+	}
+	// This is RunPipeline's leading dispatch (query/pipes.go), case for case,
+	// INCLUDING the conditions on the cases that have them.
+	//
+	// A leading pipe that runs its own scan never sees LastN, so the endpoint's
+	// bound does not shape its output and must not be pushed down. Two earlier
+	// versions of this predicate got the LIST wrong in one direction and then
+	// the CONDITIONS wrong in the other:
+	//
+	//	| top 2 by (level) | stats count() c            node 2, cluster 1
+	//	| top 2 by (level, user) | ... , ?limit=1       node 1 row, cluster 2
+	//
+	// The first is `top` missing from the list. The second is `top` in the list
+	// unconditionally: `runTopFast` and `runUniqFast` decline a multi-field
+	// tuple (`len(p.By) != 1` -- a tuple is not a single dictionary), the
+	// dispatch falls through to `Run`, and LastN bounds the scan exactly as it
+	// does for any other pipe. So for those two the answer is the fast path's
+	// own condition, not the type.
+	//
+	// The five introspection pipes are here because they run their own scan
+	// too. `ClassifyPipe` makes them coordinator-only and the router refuses
+	// them 400 with a reason, so today they cannot reach this -- but "safe
+	// because something else refuses it" is exactly the arrangement that made
+	// the first row above appear the moment a refusal was lifted.
+	switch p := pipes[0].(type) {
+	case *query.StatsPipe,
+		*query.FieldValuesPipe, *query.FieldNamesPipe, *query.FacetsPipe,
+		*query.BlocksCountPipe, *query.BlockStatsPipe:
+		return false
+	case *query.TopPipe:
+		return len(p.By) != 1
+	case *query.UniqPipe:
+		return len(p.By) != 1
 	}
 	return true
 }

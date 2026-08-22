@@ -39,6 +39,30 @@ comparisons, and the time predicates (range, day-range, week-range) plus
 `range(a, b)` excludes both ends, `range[a, b]` includes them (measured
 against VictoriaLogs).
 
+**Absolute `_time` bounds SATURATE on the int64-nanosecond domain**
+(1677-09-21 through 2262-04-11), from the same definitions the ES and HTTP time
+parsers use: `query.SatNanos`, `query.SatAdd`, `query.SatScale`. `parseAbsTime`
+returns the FIRST nanosecond of the interval a value's precision names and the
+first nanosecond AFTER it, rather than the start and the interval's width, so
+the four call sites have no addition left to overflow — `2262-01-01` is
+representable and the end of the year it names is not, which was a second
+overflow with no first one. `_time:[2000-01-01, 9999-01-01]`, the idiom for
+"from here, no upper bound", answered NOTHING before this. Relative bounds
+saturate too: `parseDurationNs` multiplies a count the caller wrote by a unit
+this file chooses, and `resolveTimePred` subtracts the product from `now`.
+
+**One per-row predicate evaluator**, `predMatchesRow` (filter.go), over a
+`rowSource` that is either a decoded `Row` (the pipe evaluators, which have a
+timestamp) or a field-lookup function (the columnar stats scan, which has
+neither a Row nor `_time` as a dictionary column). It was written twice, and
+each copy was missing what the other had: no time case in one, and no
+RangeNum/LenRange/StringRange/IContains/Seq/IPv4Range/StreamIDEq/field-compare
+in the other — so `| filter n:range(1, 10)` answered zero rows at 200 where the
+identical top-level predicate answered correctly. The source is passed by
+value, so the pipe path builds no closure and allocates nothing per row. A
+source with no timestamp reports NO MATCH for a time predicate rather than
+zero, because zero is 1970 and would file every stats row there.
+
 Pipes (`pipes.go`, `pipes_more.go`, `pipes_introspect.go`,
 `pipes_vlparity.go`): `stats` (count, sum, avg, min, max, uniq, count_uniq,
 count_uniq_hash, quantile, values, uniq_values, sum_len, count_empty,
@@ -107,7 +131,13 @@ materializes the matched rows. `runCountFast`, `runTopFast`, `runUniqFast`
 `Count`, `Histogram`, `Hits` (engine.go) skip materialization entirely —
 group-skip, predicate bitsets, popcount. `Hits` buckets into
 step-aligned buckets, empty buckets present with zero counts (a graph needs
-the gap drawn), capped at `maxHitsBuckets = 100K`.
+the gap drawn), capped at `maxHitsBuckets = 100K`. The count is
+`RangeWidthNs(start, to)` divided by the step and the walk stops at `to`: an
+int64 `to - start + step - 1` wraps over a saturated window and gave two
+different wrong answers under HTTP 200 — 100,000 buckets whose timestamps ran
+off `MaxInt64`, and zero buckets for a window holding rows. The 100K here is a
+library bound and not the one an HTTP caller meets; `internal/api`'s 10,000 is,
+and it was reachable past through that wrap (`docs/wrong.md` 132).
 
 ## Cancellation and budgets (`executor.go`)
 
@@ -339,9 +369,19 @@ consume query slots, and a tail must not be exempt either, being the
 longest-lived read the server has. It *was* exempt, on a `!spec.stream` clause
 justified by the argument for exempting writes.
 
-Writes are never refused by it: an ingest request does not hold memory for the
-length of a scan, and dropping data an agent cannot re-send is a worse failure
-than a slow query.
+Writes are never refused by it -- but NOT for the reason this paragraph used to
+give. It read "an ingest request does not hold memory for the length of a
+scan", and that sentence was removed from `middleware.go` because it is false
+and because it had already been used a second time, to exempt live tails, where
+it is the opposite of true. Measured: one `/_bulk` holds **9.1-9.5x the body
+live** and churns ~26x, ~2 800 B per action, so one request at `MaxBodyBytes`
+is ~600 MiB and a gzipped one bounded by `MaxDecompressed` is ~4.8 GiB. At
+`MaxConcurrentWrite` = 32 that is 18 GiB uncompressed and 144 GiB gzipped.
+
+The real reason is the one that survives measurement: **dropping data an agent
+cannot re-send is a worse failure than a slow query.** The memory cost is
+priced, not denied, and `TestTheIngestMemoryCeilingIsPriced` pins the three
+defaults it is the product of.
 
 | Outcome | Error | Status |
 | --- | --- | --- |

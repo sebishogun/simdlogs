@@ -107,10 +107,18 @@ func TestTheFacetLimitTruncatesValuesNotFields(t *testing.T) {
 		t.Fatalf("limit=2 kept %d of 3 fields; it truncates VALUES, not fields: %s",
 			len(facets), raw)
 	}
+	// `!= 2`, not `> 2`. The fixture gives every field more than two distinct
+	// values, so limit=2 keeps exactly two -- and a `>` check passed an answer
+	// truncated to ONE or NONE, which is the same silent row loss this file is
+	// named for, in the direction nobody looked.
 	for _, f := range facets {
 		m := f.(map[string]any)
-		if vals, _ := m["values"].([]any); len(vals) > 2 {
-			t.Errorf("field %v kept %d values under limit=2", m["field_name"], len(vals))
+		vals, _ := m["values"].([]any)
+		if len(vals) != 2 {
+			t.Errorf("field %v kept %d values under limit=2, want exactly 2. "+
+				"More than two is the limit not applying; FEWER is the answer "+
+				"truncated past what was asked for, and a `> 2` check saw only "+
+				"the first", m["field_name"], len(vals))
 		}
 	}
 }

@@ -27,6 +27,74 @@ regenerated with `SIMDLOGS_WRITE_GOLDEN=1`, which is a decision that the
 contract changed — doing it to make a red build green is how a breaking change
 ships.
 
+### Range buckets
+
+One convention for where a bucket STARTS and how far it REACHES, on both range
+surfaces, and it is the reference's.
+
+**The `step` parameter itself is still parsed by two different functions**, and
+they disagree. `/select/logsql/hits` uses `hitsStepNs` (`internal/api/server.go`);
+`/select/logsql/stats_query_range` uses `parseStepNs`. Measured on one node,
+one window `start=2026-06-01T00:30:00Z end=02:30:00Z`:
+
+| `step=` | `/hits` | `/stats_query_range` |
+|---|---|---|
+| `1800` | 120 buckets @ 1 min | 4 points @ 1800 s |
+| *(absent)* | 120 buckets @ 1 min | @ 240 s (window/30) |
+| `0s` | @ 1 min | @ 240 s |
+| `-5m` | @ 1 min | @ 240 s |
+
+Pre-existing at HEAD, and not covered by `TestTheTwoRangeSurfacesAgreeOnBuckets`
+(one window, `step=1h`) or `TestRangeSurfaceCompat` (`1m`, `2m`, `90s` -- all
+Go-parseable, all identical under both parsers). Unifying the two parsers is
+its own change.
+
+Also unmatched against the reference: `step=1d`/`1w`/`1y`, where VictoriaLogs
+returns one wide bucket and this server returns 120 one-minute buckets with a
+different total, both at 200; and `1800`, `abc`, `0`, `-1h` and empty, where
+VictoriaLogs answers **400** and this server answers 200. Both pre-existing.
+
+| Surface | Bucket starts | Bucket covers | Function |
+|---|---|---|---|
+| `/select/logsql/hits` | floored to a multiple of `step` | `[k*step, (k+1)*step)` | `query.fillHits` via `alignDown`, scan window from `query.BucketSpan` |
+| `/select/logsql/stats_query_range` | floored to a multiple of `step` | `[k*step, (k+1)*step)` | `query.StatsQueryRange`, and `exactMatrix` on a router |
+
+A bucket is a whole step whatever `start` and `end` fall on, so the first
+bucket can begin **before** the requested `start` and the last can end
+**after** the requested `end`. Both surfaces walk `bs < end`, so the bucket
+COUNT is still the caller's.
+
+This is measured against `internal/bench/victoria-logs`, not inferred. Six rows
+at 00:15, 00:45, 01:15, 01:45, 02:15 and 02:45 on 2026-06-01Z over
+`start=00:30Z&end=02:30Z&step=1h`, both binaries:
+
+| Surface | VictoriaLogs | simdlogs |
+|---|---|---|
+| `/hits` | 00:00Z, 01:00Z, 02:00Z = 2, 2, 2, total 6 | identical |
+| `stats_query_range` | 00:00Z, 01:00Z, 02:00Z = 2, 2, 2 | identical |
+
+The `total` on `/hits` is **6**, which is more than the four rows inside
+`[start, end)`: the two edge buckets count instants the caller did not name.
+That is the reference's answer. The point query is not widened —
+`/select/logsql/query` over the same window returns those four rows on both
+engines.
+
+`stats_query_range` omits a bucket in which a series has no rows, the
+Prometheus matrix convention; `/hits` is dense and reports `0`. That is the one
+remaining shape difference between the two surfaces and it is the reference's
+too.
+
+An explicit `start`/`end` is left untouched by `boundRangeBuckets`, so nothing
+re-aligns downstream. Pinned by `TestTheTwoRangeSurfacesAgreeOnBuckets` (node,
+both surfaces) and `TestTheRouterAndNodeAgreeOnRangeBuckets` (router against
+node, through `exactMatrix`); either walk moving is a wire change.
+
+An earlier build had the two surfaces disagreeing: `stats_query_range` anchored on the
+request's own `start` and both surfaces clamped their edge buckets to
+`[start, end)`. The same window gave a different bucket count, different labels
+and different per-bucket values on the two routes, and neither matched the
+reference. See `docs/wrong.md` entry 136.
+
 ### Error envelopes
 
 Two of them, deliberately:

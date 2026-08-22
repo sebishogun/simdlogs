@@ -89,9 +89,8 @@ func (r *logRule) eval(s *Server) {
 		return
 	}
 	// The WINDOW, not all history.
-	q.To = now.UnixNano()
-	q.From = now.Add(-r.spec.Window.D()).UnixNano()
-	q.Now = q.To
+	q.SetWindow(now.Add(-r.spec.Window.D()).UnixNano(), now.UnixNano())
+	q.SetNow(q.To)
 
 	st, err := s.ruleStore(r.spec.Tenant)
 	if err != nil {

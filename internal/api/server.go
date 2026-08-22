@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -50,6 +51,17 @@ type Server struct {
 	lastSyslogRefusal int64
 	strmFlds          []string
 	compact           bool // compact mode default for new tenants (flate dict)
+	// ingestShards overrides the parallel ingest shard count. Zero derives it
+	// from the core count, which is what a server does in production.
+	//
+	// IT EXISTS BECAUSE THE DERIVED VALUE IS runtime.NumCPU()/3, so the
+	// concurrent branch is UNREACHABLE on any host with fewer than six cores
+	// -- every stock CI runner among them. ParallelConfig.Shards' own doc
+	// comment says so and nothing in this package set it, so every test that
+	// covered the sharded ingest path passed by running the serial fallback
+	// instead: `base += 0` in mergeShardResults, which reports the WRONG
+	// DOCUMENT in a _bulk response, was green under `taskset -c 0-3`.
+	ingestShards int
 	// corruptionPolicy is what a tenant store does with an unreadable group.
 	// The zero value is storage.CorruptionFail, so a server configured with
 	// nothing refuses to open a damaged tenant rather than serving it short.
@@ -554,19 +566,35 @@ func (s *Server) queryStoppedErr(w http.ResponseWriter, r *http.Request, stopped
 }
 
 // parallelCfg is the deployment writer configuration the temporary shard
-// writers of a large ingest must inherit. It reads the same two settings the
-// persistent per-tenant writer is built with (tenant), so a large body and a
-// small one produce the same schema. Copying only Compact here is what made
-// _stream appear under the small-body path and vanish under the parallel one.
-func (s *Server) parallelCfg() ingest.ParallelConfig {
+// writers of a large ingest must inherit. It is READ OFF THE TENANT WRITER,
+// which is the writer a body under MinParallelBytes is ingested on, so the
+// two paths cannot store the same records under different rules.
+//
+// IT USED TO ENUMERATE THE SETTINGS AGAIN, and the enumeration drifted three
+// times against the one in tenant(): Compact copied and StreamFields
+// forgotten (a _stream column on small bodies only), then Limits (no field,
+// name or value cap and a forgeable ".error" on large ones), then
+// VectorFields (every embedding on a body over MinParallelBytes dropped, at
+// HTTP 200). Three instances of one class is a design signal; the list is
+// gone rather than lengthened. Shards is the only thing added here, because
+// it is a property of this server's test configuration and not of the writer.
+func (s *Server) parallelCfg(w *ingest.Writer) ingest.ParallelConfig {
+	cfg := w.ShardSettings()
+	s.mu.Lock()
+	cfg.Shards = s.ingestShards
+	s.mu.Unlock()
+	return cfg
+}
+
+// setIngestShardsForTest forces the parallel ingest shard count.
+//
+// ForTest by name, the way routeCountForTest is: a helper only tests call
+// should say so. It is what makes the sharded ingest branch reachable from
+// this package at all -- see Server.ingestShards.
+func (s *Server) setIngestShardsForTest(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return ingest.ParallelConfig{
-		Compact:      s.compact,
-		StreamFields: append([]string(nil), s.strmFlds...),
-		MaxLineBytes: s.limits.MaxLineBytes,
-		Limits:       s.recordLimits(),
-	}
+	s.ingestShards = n
 }
 
 // failIngest reports a partially or wholly failed ingest. The durable rows
@@ -838,7 +866,7 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 	var ing, skip int
 	if len(body) >= ingest.MinParallelBytes {
 		var werr error
-		ing, skip, werr = ingest.IngestJSONLinesParallelCfg(tn.store, body, fallback, s.parallelCfg(), &opts)
+		ing, skip, werr = ingest.IngestJSONLinesParallelCfg(tn.store, body, fallback, s.parallelCfg(tn.w), &opts)
 		if werr != nil {
 			// Some or all of the rows were parsed but did not reach the
 			// store. Answering with a count alone is the silent data loss
@@ -1296,9 +1324,62 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	q.From, q.To = 0, int64(1)<<62 // live: match every timestamp in the new groups
-	q.Pipes = nil                  // tail streams raw records; a stats/sort pipe would never terminate
-	q.Limit = 0
+	// Live: match every timestamp in the new groups. The lower end is
+	// defaultWindowFrom and not 0 for the same reason every other window's is
+	// -- a row a client stamps before 1970 is storable, and 0 would drop it
+	// from the stream while `?start=1000-01-01` reached it on every other route.
+	q.From, q.To = defaultWindowFrom, defaultWindowTo
+	// ROW-LOCAL PIPES STREAM; THE REST ARE REFUSED. Neither is dropped.
+	//
+	// This was `q.Pipes = nil`, with the comment "a stats/sort pipe would never
+	// terminate". True of stats and sort -- and it threw away every OTHER pipe
+	// along with them, silently, at 200. Measured, four rows of which two are
+	// level=info:
+	//
+	//	tail?query=*                       4 of 4
+	//	tail?query=* | filter level:error  4 of 4   (both info rows delivered)
+	//	tail?query=* | fields _msg         full records, every field present
+	//
+	// Someone tailing only errors got everything, and nothing said so.
+	//
+	// A row-local pipe is a function of ONE row, so it runs on a stream exactly
+	// as it runs on a batch. `ClassifyPipe` already names that set for the
+	// distributed planner and the question here is the same one, so the set is
+	// read from there rather than restated -- a pipe added to the language gets
+	// classified once.
+	//
+	// The rest are REFUSED rather than ignored: `| stats` on a tail has no
+	// answer, because its input never ends, and a 400 saying so is the only
+	// response that does not misreport what ran.
+	//
+	// "cannot run here" rather than "has no answer here", because the second is
+	// not true of every refused pipe: `| limit 2` HAS an answer per poll, and
+	// it is the wrong one. Overstating the refusal is the same fault as giving
+	// it the wrong reason, one clause earlier.
+	if bad, why := nonStreamingPipe(q.Pipes); bad != "" {
+		http.Error(w, "a live tail streams rows as they arrive, so `"+bad+
+			"` cannot run here: "+why+". Row-local pipes -- filter, fields, "+
+			"rename, delete, copy, math, format, unpack and the rest -- do work "+
+			"on a tail.", 400)
+		return
+	}
+	// BOTH ROW CAPS, because `limit=` sets LastN and not Limit.
+	//
+	// A tail has no last row to count back from, so every cap has to go. This
+	// cleared `Limit` only -- three lines below the comment in `parseRequest`
+	// that says which field `limit=` writes -- and `LastN` survived to bound
+	// EVERY POLL. Not the stream once: each poll re-ran the query and kept N,
+	// so a tail delivered N rows per poll and dropped the rest, silently, at
+	// 200, for as long as it stayed open. Measured, five rows ingested after
+	// the stream opened:
+	//
+	//	tail?query=*            5 of 5
+	//	tail?query=*&limit=1    1 of 5
+	//	tail?query=*&limit=2    2 of 5
+	//
+	// A rule applied to the wrong field, which is the shape this repo keeps
+	// hitting.
+	q.Limit, q.LastN = 0, 0
 	q.MatAll = true // whole records, like the batch select
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1339,14 +1420,19 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 	// whole store, and MaxConcurrentTail (64 by default) was the only bound
 	// on how many did it at once. tailSpec drops the deadline for the
 	// STREAM, which is right; this part is not the stream.
-	backlog := *q
+	// CloneResolvable, not `*q`. A shallow copy shares the Preds backing array
+	// and the Filter tree, and RunPipeline resolves a relative `_time:` in
+	// place -- so the backlog's resolve froze the LIVE query's window at the
+	// request instant and the stream delivered nothing afterwards, forever, at
+	// 200 with the connection open.
+	backlog := q.CloneResolvable()
 	backlog.From = time.Now().Add(-offset).UnixNano()
-	backlog.To = int64(1) << 62
-	backlogStopped := s.applyQueryBudget(r, &backlog)
+	backlog.To = defaultWindowTo
+	backlogStopped := s.applyQueryBudget(r, backlog)
 	if n := s.maxRows; n > 0 && backlog.MaxRows == 0 {
 		backlog.MaxRows = n
 	}
-	replayed := query.RunPipeline(store, &backlog)
+	replayed := query.RunPipeline(store, backlog)
 	for _, row := range replayed {
 		buf = appendRowJSON(buf[:0], row, backlog.MatAll)
 		bw.Write(buf)
@@ -1403,8 +1489,20 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 			readers := snap.Groups
 			if len(readers) > 0 {
 				cursor = nc
-				for _, row := range query.RunPipeline(readerStore(readers), q) {
-					buf = appendRowJSON(buf[:0], row, q.MatAll)
+				// A FRESH RESOLVE PER POLL, against a fresh `now`.
+				//
+				// `_time:5m` on a tail means the last five minutes
+				// CONTINUOUSLY, so the window has to move with the stream.
+				// Reusing one `q` cannot do that even with the backlog fixed:
+				// resolveTimePreds is idempotent, so the first poll would
+				// freeze the window and every later poll would filter against
+				// an instant already past. The clone is a slice copy and a
+				// small tree per poll, on a path that polls at the tick
+				// interval and then decodes and encodes rows.
+				live := q.CloneResolvable()
+				live.SetNow(time.Now().UnixNano())
+				for _, row := range query.RunPipeline(readerStore(readers), live) {
+					buf = appendRowJSON(buf[:0], row, live.MatAll)
 					bw.Write(buf)
 				}
 				bw.Flush()
@@ -1432,7 +1530,40 @@ func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	q.From, q.To = timeWindow(r)
+	// SetWindow, not a bare assignment to From and To.
+	//
+	// The narrowing rule reads `!q.ToSet` as "the caller resolved no upper
+	// bound, so take the filter's end" -- and SQL can express one: `WHERE
+	// _time <= X` becomes a TimeRange pred. Assigning To without the flag made
+	// the filter WIDEN past the request's `end`: 30 rows here against 10 for
+	// the same window on `/select/logsql/query`, one binary, one `end`, two
+	// answers. `federatedSQL` forwards this to the shards, so every one of
+	// them widened the same way. The clause this replaced (`q.To == 0`) never
+	// fired for a real `end`, which is why the site survived the round that
+	// introduced the rule.
+	q.SetWindow(timeWindow(r))
+	// AND THE `now` THAT A RELATIVE FILTER RESOLVES AGAINST, which SetWindow
+	// does not supply and this route did not set.
+	//
+	// `SetWindow` marks the window RESOLVED (`ToSet`), and `resolveTimePreds`
+	// reads that as permission to use `q.To` as `now` when no explicit now was
+	// given. With no `end` in the request `timeWindow` returns `To = 1<<62` --
+	// a sentinel meaning "no upper bound", not an instant -- so every relative
+	// `_time` filter here resolved against the year 2116 and matched nothing.
+	// Measured, same fixture, HTTP 200 throughout:
+	//
+	//	SELECT * FROM logs WHERE _time > '5m'                   0 rows
+	//	SELECT * FROM logs WHERE _time > '5m'   (&end= given)   1 row
+	//	_time:5m on /select/logsql/query                        1 row
+	//
+	// The `end=`-given row is what names the cause: supply a real end and the
+	// answer is right, because `To` is then an instant rather than a sentinel.
+	// `federatedSQL` forwards this query to every shard, so a cluster answered
+	// 0 exactly as a node did and no differential test could see it.
+	//
+	// `parseRequest` has always done this for the LogsQL routes. Adding
+	// `SetWindow` here without it is what made the To rung reachable at all.
+	q.SetNow(time.Now().UnixNano())
 	if len(q.Pipes) == 0 || !query.PipesProject(q.Pipes) {
 		q.MatAll = true
 		// The same row cap the LogsQL select gets. SQL had none at all: a
@@ -1496,7 +1627,7 @@ func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
 		body.Field = "emb"
 	}
 	from, to := timeWindowURL(r) // the body is the document; see timeWindowURL
-	vq := &query.Query{From: from, To: to}
+	vq := &query.Query{From: from, To: to, ToSet: true}
 	vStopped := s.applyQueryBudget(r, vq)
 	rows := query.VectorSearch(s.tn(r).store, from, to, body.Field, body.Vector, body.K,
 		vq, query.VectorLimits{
@@ -1545,12 +1676,7 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	step := int64(60_000_000_000) // 1 minute default
-	if v := r.FormValue("step"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			step = int64(d)
-		}
-	}
+	step := hitsStepNs(r)
 	// `field` (repeatable in the reference, one here) splits the histogram into
 	// a series per value, which is how a dashboard draws a stacked graph.
 	by := r.FormValue("field")
@@ -1570,22 +1696,27 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 	// answering an unstated question with a 413 breaks every client that was
 	// getting away with it. An EXPLICIT range too wide for its step is a
 	// refusal, because that one was asked for.
-	explicit := r.FormValue("start") != "" || r.FormValue("end") != ""
-	if step > 0 {
-		if !explicit && (q.To-q.From)/step > maxHitsBuckets {
-			q.To = time.Now().UnixNano()
-			q.From = q.To - step*defaultHitsBuckets
-		}
-		if n := (q.To - q.From) / step; n > maxHitsBuckets {
-			s.writeErr(w, r, readSpec(), http.StatusRequestEntityTooLarge, fmt.Sprintf(
-				"simdlogs: %d buckets requested (window %s at step %s); the maximum is %d. "+
-					"Narrow the time range or increase the step -- the response is dense, "+
-					"so its size is the window divided by the step and does not depend on "+
-					"how much data matched",
-				n, time.Duration(q.To-q.From), time.Duration(step), maxHitsBuckets))
-			return
-		}
+	// ONE CEILING, `boundRangeBuckets`'s. This used to be a second copy of it,
+	// and the copy computed `(q.To - q.From) / step` raw. `to - from` is int64
+	// nanoseconds, so `?start=-4700000000000000000` against the default `to`
+	// of 1<<62 WRAPS NEGATIVE: neither the narrowing nor the 413 fired, and
+	// this endpoint answered 200 with a body over a megabyte, clamped only by
+	// `fillHits`'s own separate limit further down.
+	//
+	// The overflow fix landed in `boundRangeBuckets` when the router grew a
+	// ceiling for this route, and that function's own comment said folding the
+	// two copies "is worth doing and is not this change". Changing one of two
+	// copies is how they came to disagree:
+	//
+	//	/select/logsql/hits?query=*&start=-4700000000000000000
+	//	  node    200, >1 MB body      cluster 413
+	//
+	// so it is this change now.
+	bf, bt, okBound := s.boundRangeBuckets(w, r, q.From, q.To, step)
+	if !okBound {
+		return
 	}
+	q.SetWindow(bf, bt)
 	stopped := s.applyQueryBudget(r, q)
 	series := query.Hits(s.tn(r).store, q, step, by)
 	if s.queryStoppedErr(w, r, stopped, q) {
@@ -1633,20 +1764,57 @@ func parseRequest(r *http.Request) (*query.Query, error) {
 	if err != nil {
 		return nil, err
 	}
-	q.Now = time.Now().UnixNano() // request time, for relative _time:<dur> filters
+	q.SetNow(time.Now().UnixNano()) // request time, for relative _time:<dur> filters
+	// The zero value of q.From is the EPOCH, and the default lower bound is
+	// not the epoch -- see defaultWindowFrom for the measurement. Set before
+	// `start` is read so an explicit one still wins.
+	q.From = defaultWindowFrom
 	if v := r.FormValue("start"); v != "" {
 		if n, ok := parseTimeParam(v); ok {
 			q.From = n
 		}
 	}
+	// `end` GIVEN and `end` absent are different things, and a zero cannot tell
+	// them apart.
+	//
+	// This used to read a zero To as "no end", which is right for the default
+	// -- q.To starts at zero -- and wrong for `end=0`, or `end=` any spelling
+	// of the epoch, which names an instant. `timeWindow` never had the
+	// collision: it starts To at 1<<62 and only overwrites it when the
+	// parameter is there. So the router and the shards read the same request
+	// two ways, and the shard's way was "your whole retention".
+	//
+	// Measured, 2 shards x 15 rows against 1 node x 30,
+	// `stats_query?start=-1&end=0&query=*|stats avg(n) a`: node `result: []`,
+	// cluster `{"a":"14.5"}`, both 200. The router resolved [-1, 0), found it
+	// non-empty, forwarded it, and every shard answered from everything it had.
+	// `rate()` came back 30000000000 against the node's zero rows.
+	//
+	// A FLAG rather than starting To at 1<<62.
+	//
+	// The first version of this said pre-seeding would clobber a To already
+	// set by a `_time:` filter, naming a function `narrowWindow` that does not
+	// exist in this repository. The real one is `resolveTimePreds`
+	// (query/time_filter.go) and it runs at EXECUTION time, after this returns
+	// -- so at this line To is only ever the zero value or what `end` set, and
+	// pre-seeding would have been narrowed rather than clobbered. The reason
+	// given was false in both halves.
+	//
+	// The flag stays because it says what it means: To is 1<<62 here because
+	// nobody named an end, and `q.ToSet` is what tells the narrowing that.
+	endGiven := false
 	if v := r.FormValue("end"); v != "" {
 		if n, ok := parseTimeParam(v); ok {
-			q.To = n
+			q.To, endGiven = n, true
 		}
 	}
-	if q.To == 0 {
-		q.To = int64(1) << 62
+	if q.To == 0 && !endGiven {
+		q.To = defaultWindowTo
 	}
+	// RESOLVED either way: an explicit end, or the sentinel standing for "no
+	// end". Both are decisions this function made, and marking them tells
+	// resolveTimePreds not to let a `_time:` filter widen past them.
+	q.ToSet = true
 	if v := r.FormValue("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			// The endpoint's `limit` is the most RECENT n, newest first -- what a
@@ -1662,19 +1830,35 @@ func parseRequest(r *http.Request) (*query.Query, error) {
 // parseTimeParam accepts a unix-nanoseconds integer or an RFC3339 string
 // (the format VictoriaLogs uses), returning nanoseconds. Accepting both
 // lets the head-to-head hand both engines the identical window string.
+//
+// ALL THREE BRANCHES SATURATE. docs/wrong.md entry 129 fixed the first one
+// (`unixToNanos`) and left the other two, so one request answered correctly
+// spelled as an integer and wrongly spelled as a float or as a date:
+//
+//	?start=13000000000     0 rows      (entry 129)
+//	?start=13000000000.5   every row   (int64 of an out-of-range float64)
+//	?start=3000-01-01      every row   (UnixNano wrapped into 1918)
+//	?start=1000-01-01      no rows     (pre-1678 wraps POSITIVE)
+//
+// Each is a bound in the far future or the far past reading as its opposite,
+// at HTTP 200.
 func parseTimeParam(v string) (int64, bool) {
 	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 		return unixToNanos(n), true
 	}
 	if f, err := strconv.ParseFloat(v, 64); err == nil { // seconds with a fractional part
-		return int64(f * 1e9), true
+		// ParseFloat also accepts "NaN" and "Inf". An infinity IS the bound it
+		// saturates to; a NaN names no instant at all and is reported
+		// unreadable rather than converted, because int64(NaN) is MinInt64 on
+		// amd64 -- "the beginning of time" for a value that is not a time.
+		return satFloatNanos(f)
 	}
 	for _, layout := range []string{
 		time.RFC3339Nano, time.RFC3339,
 		"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02", "2006-01", "2006",
 	} {
 		if t, err := time.Parse(layout, v); err == nil {
-			return t.UnixNano(), true
+			return satNanos(t), true
 		}
 	}
 	return 0, false
@@ -1686,16 +1870,25 @@ func parseTimeParam(v string) (int64, bool) {
 // timestamp is misread. Reading every bare integer as nanoseconds -- which this
 // did -- put a Grafana datasource's epoch-seconds window in 1970 and answered
 // every query empty.
+// The multiplications SATURATE instead of wrapping. Each branch admits
+// values whose product exceeds int64 -- seconds up to 1e11 against a cap of
+// 9.2e9, millis up to 1e14 against 9.2e12, micros up to 1e17 against 9.2e15
+// -- and the wrapped product is a NEGATIVE From, which matches everything.
+// Measured: `?start=13000000000` (epoch seconds, year 2381) answered all 30
+// rows of a store at HTTP 200, where the instant is in the future and the
+// answer is none; the millis and micros branches wrapped identically. A
+// saturated bound behaves as +infinity, which is what an instant beyond
+// representable time means for a comparison.
 func unixToNanos(n int64) int64 {
 	switch {
 	case n < 0:
 		return n
 	case n < 1e11:
-		return n * int64(time.Second)
+		return satScale(n, int64(time.Second))
 	case n < 1e14:
-		return n * int64(time.Millisecond)
+		return satScale(n, int64(time.Millisecond))
 	case n < 1e17:
-		return n * int64(time.Microsecond)
+		return satScale(n, int64(time.Microsecond))
 	default:
 		return n
 	}
@@ -1803,12 +1996,16 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 			to = n
 		}
 	}
-	if to == int64(1)<<62 {
-		to = time.Now().UnixNano()
+	// ONE clock read for the whole handler: the sentinel resolution, the
+	// relative-filter `now` and the sample stamp are the same instant or they
+	// are three answers to one request.
+	nowNs := time.Now().UnixNano()
+	if to == defaultWindowTo {
+		to = nowNs
 	}
-	sq := &query.Query{From: from, To: to}
+	sq := &query.Query{From: from, To: to, ToSet: true}
 	stopped := s.applyQueryBudget(r, sq)
-	samples, err := query.StatsQueryInstant(s.tn(r).store, r.FormValue("query"), from, to, time.Now().UnixNano(), sq)
+	samples, err := query.StatsQueryInstant(s.tn(r).store, r.FormValue("query"), from, to, nowNs, sq)
 	if s.queryStoppedErr(w, r, stopped, sq) {
 		return
 	}
@@ -1840,10 +2037,11 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result := make([]map[string]any, 0, len(samples))
+	at := instantStamp(to, nowNs)
 	for _, sm := range samples {
 		result = append(result, map[string]any{
 			"metric": sm.Metric,
-			"value":  [2]any{to / 1e9, sm.Value},
+			"value":  [2]any{at, sm.Value},
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1995,6 +2193,112 @@ func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request
 	writeValues(w, limitValues(vals, r))
 }
 
+// boundRangeBuckets applies the hits endpoint's bucket ceiling to a stats range
+// query, and reports whether the caller may continue.
+//
+// /select/logsql/stats_query_range had NO such bound. Its loop is
+// `for bs := from; bs < to; bs += step`, and with no `end` the window runs to
+// 1<<62 -- so `?step=1m` with no time range is about 77 million iterations,
+// each one a full scan of the store. A single node did not answer; it spun. A
+// ROUTER doing the same holds every matching row of the cluster in memory
+// while it spins, which is how the exact-stats path turned a hung node into a
+// hung node plus a hung router.
+//
+// THE RULE: an UNSPECIFIED window is narrowed to the last defaultHitsBuckets
+// steps, because a caller who named no range did not ask for all of history;
+// an EXPLICIT range too wide for its step is a 413, because that one was asked
+// for. selectHits calls THIS function -- there is one copy. Two earlier
+// versions of this paragraph were each false in the opposite direction: the
+// first said the rule was "shared with selectHits" while selectHits carried an
+// inline copy, and the second still said "selectHits still carries its own
+// inline copy ... folding hits into this function is worth doing and is not
+// this change" after the round that folded it. A justification outliving its
+// condition, twice, about the same nine lines.
+//
+// AND THIS IS THE CEILING A CALLER MEETS. `internal/query` has a second
+// constant of the same name holding 100,000 -- the engine's own bound on
+// `query.Hits` -- and it was reachable straight through this one: `fillHits`
+// derived its own bucket count with an int64 subtraction that wraps over a
+// saturated window, read the wrap as "no buckets", and substituted its 100,000.
+// `?start=1970-01-01&end=9999-01-01&step=8760h` passed this 413 honestly at 292
+// buckets and then rendered 100,000, whose timestamps ran off MaxInt64. The
+// engine counts with the exact width now, so nothing gets past this line and
+// then grows.
+//
+// What IS shared is the range pair: statsQueryRange and the router's
+// exactMatrix and federatedMatrix all call this one, so they cannot apply
+// DIFFERENT CEILINGS. That is narrower than "cannot answer differently", which
+// an earlier version of this comment claimed and which is not true of them: an
+// unspecified window has the node and each shard resolving their own `now`, so
+// their bucket starts differ by whatever the clock read between the calls. The
+// router closes that for itself by resolving the window once and writing it
+// onto the shard request; a node asked directly still resolves its own.
+func (s *Server) boundRangeBuckets(
+	w http.ResponseWriter, r *http.Request, from, to, step int64,
+) (int64, int64, bool) {
+	// A NON-POSITIVE STEP IS NORMALISED HERE, NOT SKIPPED.
+	//
+	// This function opened `if step <= 0 { return from, to, true }` -- one line
+	// above the overflow-safe width written for exactly this class -- so a step
+	// of zero DISABLED the ceiling. Reaching zero took one request:
+	// `?start=1000-01-01&end=9999-01-01` saturates to [MinInt64, MaxInt64],
+	// `to - from` wrapped to -1, and `parseStepNs`'s "1/30th of the range"
+	// default came out 0. The scan then normalised the same 0 to a
+	// ONE-NANOSECOND step and walked the whole int64 domain. Measured on the
+	// tree: no answer after 20s, one core pegged, and the router forwards the
+	// same window to every shard.
+	//
+	// `parseStepNs` no longer returns a non-positive step, so this is defence
+	// in depth rather than the fix -- but it must normalise to THE SAME step
+	// the scan will use (`query.RangeStepNs`), because a ceiling computed from
+	// one step and a walk taken at another is a ceiling on a different request.
+	// That is the mistake `hitsStepNs` exists to record.
+	if step <= 0 {
+		step = query.RangeStepNs(from, to)
+	}
+	// The width is EXACT and cannot overflow.
+	//
+	// It was an int64 subtraction with a `1<<62` fallback for the wrap:
+	// `?start=-4700000000000000000` against the default `to` of 1<<62 wraps
+	// negative, so `(to-from)/step` came out negative, neither the narrowing
+	// nor the 413 fired, and both the node and the router iterated about 1.5e8
+	// times -- the router holding every fetched row. `query.RangeWidthNs` is
+	// the same guard with the true number instead of a stand-in: two's
+	// complement gives the exact width in uint64 for any to >= from, and
+	// to <= from means no buckets at all, which is 0 and not a wrap.
+	width := query.RangeWidthNs
+	ustep := uint64(step) // step > 0 by the normalisation above
+	explicit := r.FormValue("start") != "" || r.FormValue("end") != ""
+	if !explicit && width(from, to)/ustep > maxHitsBuckets {
+		to = time.Now().UnixNano()
+		from = to - satScale(step, defaultHitsBuckets)
+	}
+	if n := width(from, to) / ustep; n > maxHitsBuckets {
+		s.writeErr(w, r, readSpec(), http.StatusRequestEntityTooLarge, fmt.Sprintf(
+			"simdlogs: %d buckets requested (window %s at step %s); the maximum is %d. "+
+				"Narrow the time range or increase the step -- a range response is one "+
+				"bucket per step across the whole window, so its size is the window "+
+				"divided by the step and does not depend on how much data matched",
+			n, durationOf(width(from, to)), time.Duration(step), maxHitsBuckets))
+		return from, to, false
+	}
+	return from, to, true
+}
+
+// durationOf renders an exact nanosecond width as a Duration, saturating.
+//
+// A window's width is a uint64 (see query.RangeWidthNs) and a Duration is an
+// int64, so the widest window this build can express -- [MinInt64, MaxInt64],
+// which `?start=1000-01-01&end=9999-01-01` resolves to -- does not fit. It is
+// only ever rendered into a refusal message, and 2562047h47m16s is the right
+// thing to print there: the number the operator has to narrow.
+func durationOf(ns uint64) time.Duration {
+	if ns > math.MaxInt64 {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(ns)
+}
+
 // statsQueryRange buckets a stats query over the time range and returns a
 // Prometheus-style matrix: one series per group-by tuple, a point per step.
 func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
@@ -2022,7 +2326,11 @@ func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	from, to := timeWindow(r)
 	step := parseStepNs(r.FormValue("step"), from, to)
-	rq := &query.Query{From: from, To: to}
+	from, to, ok := s.boundRangeBuckets(w, r, from, to, step)
+	if !ok {
+		return
+	}
+	rq := &query.Query{From: from, To: to, ToSet: true}
 	rStopped := s.applyQueryBudget(r, rq)
 	series, err := query.StatsQueryRange(s.tn(r).store, r.FormValue("query"), from, to, step, time.Now().UnixNano(), rq)
 	if s.queryStopped(w, r, rStopped) {
@@ -2050,18 +2358,68 @@ func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
 
 // parseStepNs reads the `step` param (a duration like "5m" or bare seconds),
 // defaulting to 1/30th of the range so a graph gets ~30 points.
+// hitsStepNs is /select/logsql/hits's OWN step rule, which is not
+// parseStepNs's.
+//
+// One minute unless `step` parses as a POSITIVE Go duration. No bare-integer
+// seconds, no window-derived default, and a zero or negative duration is
+// ignored rather than passed on.
+//
+// Extracted because the router grew a bucket ceiling for this endpoint and
+// reached for `parseStepNs`, which is the OTHER rule. Two parsers for one
+// parameter, and the ceiling then refused what the node answers:
+//
+//	/select/logsql/hits?step=1&start=<t>&end=<t+24h>&query=*
+//	  node    200   1440 one-minute buckets  (ParseDuration("1") fails)
+//	  cluster 413   "86400 buckets requested ... at step 1s"
+//	?step=5   node 200, cluster 413 at step 5s
+//
+// A ceiling computed from a step the endpoint will not use is a ceiling on a
+// different request. Whether this rule or parseStepNs's is the better one is a
+// separate question; what matters here is that the ceiling and the scan agree.
+func hitsStepNs(r *http.Request) int64 {
+	step := int64(time.Minute)
+	if v := r.FormValue("step"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			step = int64(d)
+		}
+	}
+	return step
+}
+
+// IT NEVER RETURNS A STEP OF ZERO OR LESS, and that is the load-bearing
+// property rather than the ~30 points.
+//
+// It did, three ways, and all three reached `boundRangeBuckets`' `step <= 0`
+// early return and so ran the range scan with NO bucket ceiling:
+//
+//	?start=1000-01-01&end=9999-01-01   (to-from)/30 wraps: the window
+//	                                    saturates to [MinInt64, MaxInt64] and
+//	                                    the int64 subtraction is -1
+//	?step=0s                            ParseDuration succeeds, d == 0
+//	?step=-1s                           ParseDuration succeeds, d < 0
+//
+// each of which then became a ONE-NANOSECOND step in the scan and an infinite
+// walk of the int64 domain, from an unauthenticated GET. The width is exact
+// now (`query.RangeWidthNs`) and a step that is not positive falls back to the
+// window-derived default instead of being passed on. A bare integer saturates
+// rather than wrapping: `?step=99999999999` seconds is 3.1e21 nanoseconds, and
+// the raw multiply landed on an arbitrary small positive.
 func parseStepNs(s string, from, to int64) int64 {
 	if s == "" {
-		if to > from {
-			return (to - from) / 30
-		}
-		return int64(time.Minute)
+		return query.RangeStepNs(from, to)
 	}
 	if d, err := time.ParseDuration(s); err == nil {
-		return int64(d)
+		if d > 0 {
+			return int64(d)
+		}
+		return query.RangeStepNs(from, to)
 	}
 	if n, err := strconv.Atoi(s); err == nil {
-		return int64(n) * int64(time.Second)
+		if v := satScale(int64(n), int64(time.Second)); v > 0 {
+			return v
+		}
+		return query.RangeStepNs(from, to)
 	}
 	return int64(time.Minute)
 }
@@ -2084,7 +2442,7 @@ func parseStepNs(s string, from, to int64) int64 {
 // while answering 204.
 func timeWindowURL(r *http.Request) (int64, int64) {
 	q := r.URL.Query()
-	from, to := int64(0), int64(1)<<62
+	from, to := defaultWindowFrom, defaultWindowTo
 	if v := q.Get("start"); v != "" {
 		if n, ok := parseTimeParam(v); ok {
 			from = n
@@ -2098,8 +2456,83 @@ func timeWindowURL(r *http.Request) (int64, int64) {
 	return from, to
 }
 
+// defaultWindowFrom and defaultWindowTo are the window a request that names no
+// `start` and no `end` gets. ONE definition, because two surfaces reading the
+// same store must not disagree about what "no window" means.
+//
+// THE LOWER DEFAULT WAS THE EPOCH AND THE ES SURFACE'S WAS NOT.
+// `esToQuery` starts its window at MinInt64 -- entry 131 moved it there,
+// because the lift is `if from > q.From` and a zero From could only ever be
+// raised, so an ES `range` naming a far-past `gte` left the window starting at
+// 1970 and the rows this store holds between 1677-09-21 and the epoch were
+// unreachable through /_search by any query at all. The LogsQL and SQL side
+// kept the 0. Measured on a node holding 1900, 1969 and 2026 -- all three
+// ingest at `{"ingested":3,"skipped":0}` -- with NO query string on any
+// request:
+//
+//	/select/logsql/query?query=*                     1
+//	/select/logsql/query?query=_time:[1900-01-01, 2100-01-01]
+//	                                                 1   its own stated
+//	                                                     lower bound, clipped
+//	                                                     by an unstated default
+//	/select/sql?query=SELECT * FROM logs             1
+//	/_search {"match_all":{}}                        3
+//	/_count  {"match_all":{}}                        3
+//
+// One binary, one store, two answers, and no parameter a client can send to
+// bring them together: `/_search` reads its window from the body and ignores
+// `?start`/`?end` entirely, so the two surfaces could not even be compared on
+// one window. Entry 131 recorded the epoch default as FOUND AND NOT FIXED,
+// which is what this is.
+//
+// MinInt64 rather than lowering the ES surface to 0: the upper default is
+// already an "everything above" sentinel (1<<62, the year 2116), so the
+// epoch was the asymmetric end, and a bound the caller DID state must not be
+// clipped by one it did not.
+const (
+	defaultWindowFrom = int64(math.MinInt64)
+	defaultWindowTo   = int64(1) << 62
+)
+
+// instantStamp is the unix-SECOND timestamp a Prometheus-shaped vector sample
+// carries: the instant the query was evaluated at, which is the end of the
+// window.
+//
+// A SATURATED END IS NOT AN INSTANT. `?end=9999-01-01` resolves to MaxInt64 --
+// the +infinity that a bound past the int64-nanosecond domain means, which is
+// entry 129/130's saturation working as designed -- and `to / 1e9` renders
+// that as 9223372036, the last second the domain can express
+// (2262-04-11T23:47:16Z). A Prometheus-shaped client plots the point 236 years
+// into the future for a query about rows stamped now. Measured on a three-row
+// store, `/select/logsql/stats_query?query=*+|+stats+count()+c` under
+// `start=1000-01-01&end=9999-01-01`:
+//
+//	{"status":"success","data":{"resultType":"vector","result":[
+//	  {"metric":{"__name__":"c"},"value":[9223372036,"3"]}]}}
+//
+// The count is right and the instant is a fabrication.
+//
+// THE SCAN WINDOW IS NOT TOUCHED. A client that asked for everything up to
+// year 9999 gets everything, rows stamped in the future included; only the
+// REPORTED instant falls back to the request time, which is exactly what the
+// `defaultWindowTo` sentinel already resolves to one line above each caller
+// and for the same reason -- neither value is an instant. An `end` inside the
+// domain is left alone even when it is in the future, because a Prometheus
+// instant query at `time=<future>` does return that timestamp.
+//
+// One definition for the two handlers that stamp a vector -- `statsQuery` on a
+// node and `exactVector` on a router -- because a node and the router in front
+// of it stamping the same request differently is the shape this file already
+// records under "one dispatch, two copies".
+func instantStamp(to, now int64) int64 {
+	if to == math.MaxInt64 {
+		return now / 1e9
+	}
+	return to / 1e9
+}
+
 func timeWindow(r *http.Request) (int64, int64) {
-	from, to := int64(0), int64(1)<<62
+	from, to := defaultWindowFrom, defaultWindowTo
 	if v := r.FormValue("start"); v != "" {
 		if n, ok := parseTimeParam(v); ok {
 			from = n
@@ -2281,9 +2714,13 @@ func (s *Server) degradedLocked(key string, h storage.Health) {
 // quarantines anything, so an empty list there reads as "nothing is wrong"
 // about shards this node has not asked.
 func (s *Server) listQuarantined(w http.ResponseWriter, r *http.Request) {
-	if s.refuseInRouterMode(w, r, "listing quarantined groups",
-		"a router's own store holds no data and quarantines nothing, so this "+
-			"would answer an empty list about shards it never asked") {
+	// A ROUTER ASKS ITS SHARDS. This used to answer 501 because a router's own
+	// store quarantines nothing and an empty list there reads as "nothing is
+	// wrong" about shards it never asked. Asking them is the fix; see
+	// cluster_admin_surfaces.go for what an unanswerable shard does to the
+	// status.
+	if len(s.backendList()) > 0 {
+		s.federatedQuarantine(w, r)
 		return
 	}
 	recs, err := s.tn(r).store.Quarantined()
@@ -2311,10 +2748,12 @@ func (s *Server) listQuarantined(w http.ResponseWriter, r *http.Request) {
 // tenants it accepted and what is still degraded, so the operator sees what
 // they just took responsibility for rather than a bare 200.
 func (s *Server) acknowledgeDegraded(w http.ResponseWriter, r *http.Request) {
-	if s.refuseInRouterMode(w, r, "acknowledging a degraded store",
-		"the router's own store is empty and never degrades; acknowledging here "+
-			"clears nothing on the shards that are actually degraded, and would "+
-			"report success for an operation that did nothing") {
+	// FORWARDED to every shard. This used to answer 501 because acknowledging
+	// on a router clears nothing on the shards that are actually degraded; the
+	// fix is to acknowledge on the shards, and to refuse to call it done when
+	// one of them did not answer.
+	if len(s.backendList()) > 0 {
+		s.federatedAcknowledgeDegraded(w, r)
 		return
 	}
 	if r.Method != http.MethodPost && r.Method != http.MethodPut {
@@ -2619,4 +3058,136 @@ func (s *Server) SetDirRereadIntervalForTest(d time.Duration) {
 	s.mu.Lock()
 	s.dirRereadEvery = d
 	s.mu.Unlock()
+}
+
+// The three reasons a pipe cannot run on a live tail, on the STREAMING axis.
+//
+// The mechanism behind all three is one fact about the handler: it calls
+// `query.RunPipeline` once PER POLL, over only the groups that arrived since
+// the last one. What differs is what that costs the caller, which is what a
+// caller can act on.
+const (
+	// The answer is a function of the whole result set: an aggregate, an
+	// ordering, a de-duplication, a count of values or blocks.
+	whyNeverFinal = "it is computed over the whole result set, and a tail's " +
+		"input never ends, so there is no point at which its answer is final"
+
+	// The pipe slices a result set. `LimitPipe.apply` is `rows[:N]` and
+	// `OffsetPipe.apply` is `rows[N:]` -- prefix operations that a stream could
+	// carry; what stops them is that each poll is its own result set.
+	whyPerPoll = "a tail re-runs its pipeline once per poll, over just the " +
+		"rows that arrived since the last one, so it would apply to each " +
+		"poll's rows rather than to the stream"
+
+	// The pipe reaches outside the rows it was given.
+	whySecondSet = "it needs a second result set -- a subquery's rows, or the " +
+		"rows around a match -- and a tail has only the rows that have arrived"
+
+	// A pipe added to the language and not named in tailRefusal. Refused,
+	// because the alternative is running it per poll and reporting the result
+	// as though it were the stream's.
+	whyNoStreamingForm = "this build has no streaming form for it, so it is " +
+		"refused rather than run over each poll's rows"
+)
+
+// nonStreamingPipe returns the LogsQL name of the first pipe that cannot run on
+// a live tail and the reason it cannot, or "", "" if every pipe can.
+//
+// WHICH pipes are refused is the distributed planner's question: a PipeRowLocal
+// pipe is a function of one row, so it works the same on a stream as on a
+// batch. Asking `ClassifyPipe` rather than listing the types again means a pipe
+// added to the language is gated in one place.
+//
+// WHY a pipe is refused is NOT that question, and taking the message from the
+// class got it wrong twice:
+//
+//   - `| limit 2` and `| offset 2` were told the query "needs the whole result
+//     set and the input never ends". `LimitPipe.apply` is `return rows[:p.N]`
+//     and `OffsetPipe.apply` is `return rows[p.N:]`; docs/lld/api.md calls
+//     `| limit N` "(first n)". They are PipeGlobalOrder because a shard's first
+//     N is not the cluster's first N -- a SHARDING property. What stops them
+//     here is that the tail runs the pipeline once per poll, so `| limit 2`
+//     would bound each poll rather than the stream (docs/wrong.md 121).
+//   - `| stats count() c` was told its input never ends while
+//     `| stats avg(d) a` was told it "runs once over a merged result set",
+//     because `ClassifyPipe` splits *StatsPipe on `mergeableAggs` -- whether a
+//     COORDINATOR can combine partial states. On a live tail there is no
+//     coordinator and no merge, so both are refused for the identical reason,
+//     and naming a cluster to a single-node operator is a message they cannot
+//     act on.
+//
+// So the class decides refusal and `tailRefusal` decides the message.
+func nonStreamingPipe(pipes []query.Pipe) (name, why string) {
+	for _, p := range pipes {
+		if query.ClassifyPipe(p) != query.PipeRowLocal {
+			return tailRefusal(p)
+		}
+	}
+	return "", ""
+}
+
+// tailRefusal names a pipe the way the language spells it, and says why a tail
+// cannot run it.
+//
+// THE NAME IS THE LogsQL TOKEN, not the Go type lowered. This used to be
+// `strings.ToLower(strings.TrimSuffix(typeName, "Pipe"))`, which is right for
+// eleven of the seventeen and wrong for the rest: `stream_context` came back as
+// `streamcontext`, `field_values` as `fieldvalues`, `field_names` as
+// `fieldnames`, `blocks_count` as `blockscount` and `block_stats` as
+// `blockstats`. A refusal that names a token the language does not have cannot
+// be pasted back into a query, which is the one thing a caller wants to do with
+// it.
+//
+// The default is unreachable for the language as it stands, and
+// TestEveryPipeInTheLanguageHasATailRefusal is what keeps it that way: it takes
+// the pipe set from the query package's source and requires a case here for
+// each, so a pipe added to the language cannot silently arrive as a lowered Go
+// type name with a generic reason.
+func tailRefusal(p query.Pipe) (name, why string) {
+	switch p.(type) {
+	// Computed over the whole result set.
+	case *query.StatsPipe:
+		return "stats", whyNeverFinal
+	case *query.SortPipe:
+		return "sort", whyNeverFinal
+	case *query.UniqPipe:
+		return "uniq", whyNeverFinal
+	case *query.TopPipe:
+		return "top", whyNeverFinal
+	case *query.RankPipe:
+		return "rank", whyNeverFinal
+	case *query.FieldValuesPipe:
+		return "field_values", whyNeverFinal
+	case *query.FieldNamesPipe:
+		return "field_names", whyNeverFinal
+	case *query.FacetsPipe:
+		return "facets", whyNeverFinal
+	case *query.BlocksCountPipe:
+		return "blocks_count", whyNeverFinal
+	case *query.BlockStatsPipe:
+		return "block_stats", whyNeverFinal
+
+	// Slices of a result set, and each poll is its own result set.
+	case *query.LimitPipe:
+		return "limit", whyPerPoll
+	case *query.OffsetPipe:
+		return "offset", whyPerPoll
+	case *query.TailPipe:
+		return "tail", whyPerPoll
+	case *query.SamplePipe:
+		return "sample", whyPerPoll
+
+	// Reaches outside the rows it was given.
+	case *query.JoinPipe:
+		return "join", whySecondSet
+	case *query.UnionPipe:
+		return "union", whySecondSet
+	case *query.StreamContextPipe:
+		return "stream_context", whySecondSet
+	}
+	n := fmt.Sprintf("%T", p)
+	if i := strings.LastIndex(n, "."); i >= 0 {
+		n = n[i+1:]
+	}
+	return strings.ToLower(strings.TrimSuffix(n, "Pipe")), whyNoStreamingForm
 }

@@ -5,7 +5,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -82,11 +87,21 @@ func queryRows(t *testing.T, ts *httptest.Server, q string) (int, []string, stri
 	return resp.StatusCode, lines, string(b)
 }
 
-func urlEscape(s string) string {
-	r := strings.NewReplacer(" ", "%20", "|", "%7C", "(", "%28", ")", "%29",
-		",", "%2C", "*", "%2A", ":", "%3A", "=", "%3D", "\"", "%22", ">", "%3E")
-	return r.Replace(s)
-}
+// urlEscape is `url.QueryEscape`, and nothing else.
+//
+// It used to be a `strings.NewReplacer` over ten characters, which left `+`,
+// `%`, `&` and `#` alone -- so a test query containing one of those measured a
+// DIFFERENT query than the one written in the source. Measured through both:
+//
+//	query=* | math "n + 1" as m             400 `math: unexpected "1"` vs 200
+//	query=* | extract_regexp "(?P<n>[0-9]+)"    200 both ways, two regexps
+//
+// The `+` decodes as a space, so the first query reached the parser as
+// `math "n  1" as m` and the second ran `[0-9]` where the source says `[0-9]+`.
+// Nothing in the suite was red, because no query in it carried one of the four
+// -- a property of today's table rather than of the helper, and the next test
+// to write `+` would have debugged the server instead.
+func urlEscape(s string) string { return url.QueryEscape(s) }
 
 // Every committed pipe: the cluster's answer equals the single node's.
 func TestSingleNodeAndClusterAgree(t *testing.T) {
@@ -116,6 +131,19 @@ func TestSingleNodeAndClusterAgree(t *testing.T) {
 		`* | stats by (level) count() c`,
 		`* | stats sum(n) s`,
 		`* | stats min(n) lo, max(n) hi`,
+		// The five that were refused across shards until the router learned to
+		// aggregate merged rows instead of merging aggregates.
+		`* | stats avg(n) a`,
+		`* | stats quantile(0.5, n) p50`,
+		`* | stats quantile(0.9, n) p90`,
+		`* | stats uniq(user) u`,
+		`* | stats count_uniq(user) cu`,
+		`* | stats histogram(n) h`,
+		`* | stats rate() r`,
+		`* | stats by (level) avg(n) a`,
+		`* | stats by (level) quantile(0.5, n) p50`,
+		`* | stats by (user) count_uniq(level) cu`,
+		`* | sort by (n) | stats avg(n) a`,
 		`* | fields level | sort by (level) | limit 4`,
 	} {
 		t.Run(q, func(t *testing.T) {
@@ -133,6 +161,18 @@ func TestSingleNodeAndClusterAgree(t *testing.T) {
 			if !strings.Contains(q, "sort") {
 				sort.Strings(gotS)
 				sort.Strings(gotC)
+			}
+			// THE NODE MUST HAVE PRODUCED ROWS. Without this, zero rows on
+			// both sides compares 0 == 0, the loop below never runs, and the
+			// whole table passes -- a differential suite green against a
+			// binary that answers nothing. (An earlier version of this
+			// comment counted "all 27 queries"; the table held 26. A number
+			// nothing checks is a number that is wrong.) The guard already
+			// existed three files over, in cluster_stats_refusal_test.go.
+			if len(gotS) == 0 {
+				t.Fatalf("the single node returned no rows for %q, so this "+
+					"compares two empty answers and the cluster half is "+
+					"unchecked", q)
 			}
 			if len(gotS) != len(gotC) {
 				t.Fatalf("%d rows on one node, %d across three:\nsingle: %v\ncluster: %v",
@@ -190,9 +230,16 @@ func TestTheThreeShapesThatWereSilentlyWrong(t *testing.T) {
 	})
 }
 
-// A query that cannot be answered correctly across shards is refused with the
-// reason, not answered with a plausible number.
-func TestANonMergeableQueryIsRefusedByTheRouter(t *testing.T) {
+// A non-mergeable aggregate is ANSWERED by the router, exactly.
+//
+// This asserted a 400. The aggregate cannot be merged from per-shard outputs --
+// that part was and is true -- but the router does not merge it: it asks the
+// shards for rows and runs the aggregate once, the way the single node this
+// compares against does. So the assertion becomes the number rather than the
+// status.
+func TestANonMergeableQueryIsAnsweredExactly(t *testing.T) {
+	all := corpus(1)
+	single := realShard(t, all[0])
 	parts := corpus(2)
 	cluster := router(t, realShard(t, parts[0]).URL, realShard(t, parts[1]).URL)
 
@@ -201,13 +248,94 @@ func TestANonMergeableQueryIsRefusedByTheRouter(t *testing.T) {
 		`* | stats count_uniq(user) u`,
 	} {
 		t.Run(q, func(t *testing.T) {
-			code, _, raw := queryRows(t, cluster, q)
-			if code != http.StatusBadRequest {
-				t.Fatalf("%q returned %d, want 400: %.300s", q, code, raw)
+			codeS, rowsS, rawS := queryRows(t, single, q)
+			if codeS != http.StatusOK {
+				t.Fatalf("the single node refused %q: %d %.200s", q, codeS, rawS)
 			}
-			if !strings.Contains(raw, "shards") {
-				t.Errorf("the refusal does not explain itself: %.300s", raw)
+			codeC, rowsC, rawC := queryRows(t, cluster, q)
+			if codeC != http.StatusOK {
+				t.Fatalf("%q returned %d across shards, want the node's 200: %.300s",
+					q, codeC, rawC)
+			}
+			if !equalSets(sortedCopy(rowsS), sortedCopy(rowsC)) {
+				t.Fatalf("cluster and single node disagree on %q:\n  single:  %v\n"+
+					"  cluster: %v", q, rowsS, rowsC)
 			}
 		})
+	}
+}
+
+// The LLD's count of the differential table is the table's real length.
+//
+// `docs/lld/cluster.md` says the table "has grown from fifteen to 26". The
+// fifteen is history and stays prose; the 26 is a live count of the table in
+// TestSingleNodeAndClusterAgree and rots on the commit that adds a query --
+// which is exactly how this file's own guard comment came to say "all 27
+// queries" over a table of 26. The count is read from the test's SOURCE, so
+// there is no second list to fall out of step, and from the DOCUMENT, so a
+// constant here and a number there cannot disagree.
+func TestTheLLDsDifferentialCountIsTheTables(t *testing.T) {
+	src, err := os.ReadFile("cluster_differential_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := strings.Index(string(src), "func TestSingleNodeAndClusterAgree")
+	if fn < 0 {
+		t.Fatal("TestSingleNodeAndClusterAgree is not in this file any more; " +
+			"point this gate at wherever its table went")
+	}
+	rest := string(src)[fn:]
+	open := strings.Index(rest, "range []string{")
+	if open < 0 {
+		t.Fatal("the query table is no longer a `range []string{` literal")
+	}
+	rest = rest[open:]
+	closing := strings.Index(rest, "\n\t} {")
+	if closing < 0 {
+		t.Fatal("cannot find the end of the query table")
+	}
+	table := rest[:closing]
+
+	// COUNTED BY ROW, not by backticks/2.
+	//
+	// It was `strings.Count(table, "`+'"`"'+`") / 2`, which is a count of
+	// RAW-STRING literals rather than of queries: a row written as an ordinary
+	// double-quoted Go string -- the natural spelling for a query containing a
+	// backtick -- counted as ZERO, so adding one made the gate demand that the
+	// document's number go DOWN. Every non-blank, non-comment line in the table
+	// must be exactly one query literal ending in a comma, and a line that is
+	// not is a failure rather than a silent miscount.
+	got := 0
+	for _, line := range strings.Split(table, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "range ") {
+			continue
+		}
+		if !strings.HasSuffix(line, ",") || (line[0] != '`' && line[0] != '"') {
+			t.Fatalf("the table row %q is not a single quoted query ending in "+
+				"a comma. This gate counts rows; a row it cannot recognise is "+
+				"a row it would silently not count", line)
+		}
+		got++
+	}
+	if got == 0 {
+		t.Fatal("counted no queries in the table, which is the shape of a gate " +
+			"that has lost its table rather than a table that is empty")
+	}
+
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "lld", "cluster.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`grown from fifteen to (\d+)`).FindStringSubmatch(string(doc))
+	if m == nil {
+		t.Fatal("docs/lld/cluster.md no longer says how large the differential " +
+			"table has grown; if the sentence was reworded, update this gate in " +
+			"the same commit")
+	}
+	want, _ := strconv.Atoi(m[1])
+	if got != want {
+		t.Fatalf("docs/lld/cluster.md says the differential table holds %d pipe "+
+			"shapes; TestSingleNodeAndClusterAgree's table holds %d", want, got)
 	}
 }

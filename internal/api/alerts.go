@@ -66,9 +66,8 @@ func (a *alertRule) eval(s *Server) {
 		a.fail(now, err)
 		return
 	}
-	q.To = now.UnixNano()
-	q.From = now.Add(-a.spec.Window.D()).UnixNano()
-	q.Now = q.To
+	q.SetWindow(now.Add(-a.spec.Window.D()).UnixNano(), now.UnixNano())
+	q.SetNow(q.To)
 
 	st, err := s.ruleStore(a.spec.Tenant)
 	if err != nil {

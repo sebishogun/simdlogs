@@ -123,7 +123,7 @@ func accSample(e *statEntry, aggs []Agg, valOf func(j int) string, valOf2 func(j
 	for j := range aggs {
 		a := &aggs[j]
 		sl := &e.slots[j]
-		if a.If != nil && !exprMatchesRow(a.If, getField) {
+		if a.If != nil && !exprMatchesRow(a.If, lookupOf(getField)) {
 			continue // conditional aggregate: this row does not qualify for agg j
 		}
 		if a.Kind == AggCount || a.Kind == AggRate {
@@ -1469,37 +1469,8 @@ func matchRow(r Row, e *Expr) bool {
 	case OpNot:
 		return !matchRow(r, e.Child)
 	default: // OpLeaf
-		return matchPredRow(r, &e.Pred)
+		return predMatchesRow(&e.Pred, rowOf(r))
 	}
-}
-
-func matchPredRow(r Row, p *Pred) bool {
-	v := rowField(r, p.Field)
-	switch p.Kind {
-	case Eq:
-		return v == p.Value
-	case Contains:
-		return strings.Contains(v, p.Value)
-	case Prefix:
-		return strings.HasPrefix(v, p.Value)
-	case In:
-		for _, x := range p.Values {
-			if x == v {
-				return true
-			}
-		}
-		return false
-	case Regexp:
-		re := p.regex()
-		return re != nil && re.MatchString(v)
-	case Lt, Le, Gt, Ge:
-		f, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			return false
-		}
-		return cmpNum(f, p.Kind, p.Num)
-	}
-	return false
 }
 
 func (p *DeletePipe) apply(rows []Row) []Row {

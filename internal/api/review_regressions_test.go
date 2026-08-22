@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sebishogun/simdlogs/internal/config"
+	"github.com/sebishogun/simdlogs/internal/ingest"
 	"github.com/sebishogun/simdlogs/internal/query"
 )
 
@@ -947,26 +948,31 @@ func TestControlFieldNamesAreNotStorable(t *testing.T) {
 // no field cap, no name or value cap, and no control-name drop -- which
 // made the tail's {".error": ...} sentinel forgeable again for any body
 // over 1 MiB.
+// BOTH SHARD COUNTS, AND THE GUARD ASKS THE FUNCTION. This test ran
+// `NewServerConfig` with no shard override behind the comment "Over
+// MinParallelBytes so the parallel path is taken" -- a sentence about a
+// condition it had not established. `ParallelConfig.ShardsFor` needs
+// `Shards >= 2` as well, derived as runtime.NumCPU()/3, so on a four-core host
+// this 2,097,312-byte body took the SERIAL fallback and asserted the limits on
+// the persistent writer that was never in doubt.
+//
+// Measured with the SHARDED `cfg.apply(w)` deleted from
+// IngestJSONLinesParallelResult and the serial one left alone -- the exact
+// mutation entry 134 used for TestLargeAndSmallIngestAgreeOnSchema:
+//
+//	                                        32 CPUs  taskset -c 0-3
+//	before this fix                           RED      GREEN
+//	after, both rows                          RED      RED
+//
+// What a four-core CI stopped covering is the paragraph above: a body over
+// 1 MiB on /insert/jsonline with no field cap, no name or value cap and a
+// forgeable `.error` control name.
 func TestParallelIngestAppliesRecordLimits(t *testing.T) {
 	t.Parallel()
-	c := config.Default()
-	c.Dir = t.TempDir()
-	c.Limits = config.TestLimits()
-	c.Limits.MaxBodyBytes = 64 << 20
-	c.Limits.MaxDecompressed = 64 << 20
-	c.Limits.MaxLineBytes = 0
-	c.Limits.MaxFieldsPerRecord = 4
-	c.Limits.MaxFieldNameBytes = 8
-	c.Limits.MaxFieldValueBytes = 16
-	srv, err := NewServerConfig(c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Close()
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
 
-	// Over MinParallelBytes so the parallel path is taken.
+	// Over MinParallelBytes so the parallel path is taken. /insert/jsonline
+	// keys on len(body) (server.go), so this builder IS the quantity the
+	// branch reads -- unlike /_bulk, which keys on the document bytes alone.
 	var sb strings.Builder
 	longName := strings.Repeat("n", 64)
 	bigVal := strings.Repeat("v", 512)
@@ -974,37 +980,77 @@ func TestParallelIngestAppliesRecordLimits(t *testing.T) {
 		fmt.Fprintf(&sb, `{"_time":%d,".error":"forged",%q:"x","big":%q,"a":"1","b":"2","c":"3","d":"4"}`+"\n",
 			1700000000000000000+int64(i), longName, bigVal)
 	}
-	resp := do(t, ts, http.MethodPost, "/insert/jsonline", "", nil, sb.String())
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status %d", resp.StatusCode)
-	}
-	if err := srv.def.w.Flush(); err != nil {
-		t.Fatal(err)
+	body := sb.String()
+	if len(body) < ingest.MinParallelBytes {
+		t.Fatalf("the fixture is %d bytes, under MinParallelBytes %d", len(body), ingest.MinParallelBytes)
 	}
 
-	rows := query.Run(srv.def.store, &query.Query{From: 0, To: int64(1) << 62, MatAll: true})
-	if len(rows) == 0 {
-		t.Fatal("nothing stored")
-	}
-	for _, r := range rows {
-		payload := 0
-		for _, f := range r.Fields {
-			switch {
-			case f.Key == ".error":
-				t.Fatal("the parallel path stored a control field name")
-			case len(f.Key) > 8 && f.Key != "_time" && f.Key != "_msg" && f.Key != "_stream" && f.Key != "_stream_id":
-				t.Fatalf("stored a %d-byte field name; the cap is 8", len(f.Key))
-			case f.Key == "big" && len(f.Value) > 16:
-				t.Fatalf("stored a %d-byte value; the cap is 16", len(f.Value))
+	for _, tc := range []struct {
+		name   string
+		shards int
+	}{
+		{"the derived shard count", 0},
+		{"shards forced to 4", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := ingest.ParallelConfig{Shards: tc.shards}
+			if tc.shards != 0 && cfg.ShardsFor(len(body)) < 2 {
+				t.Fatalf("shards forced to %d resolves to %d over %d bytes: this row runs "+
+					"the serial fallback and the per-shard writers are never built",
+					tc.shards, cfg.ShardsFor(len(body)), len(body))
 			}
-			if f.Key != "_time" && f.Key != "_stream" && f.Key != "_stream_id" {
-				payload++
+			c := config.Default()
+			c.Dir = t.TempDir()
+			c.Limits = config.TestLimits()
+			c.Limits.MaxBodyBytes = 64 << 20
+			c.Limits.MaxDecompressed = 64 << 20
+			c.Limits.MaxLineBytes = 0
+			c.Limits.MaxFieldsPerRecord = 4
+			c.Limits.MaxFieldNameBytes = 8
+			c.Limits.MaxFieldValueBytes = 16
+			srv, err := NewServerConfig(c)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		if payload > 4 {
-			t.Fatalf("%d payload fields stored; the cap is 4", payload)
-		}
+			defer srv.Close()
+			srv.setIngestShardsForTest(tc.shards)
+			ts := httptest.NewServer(srv.Handler())
+			defer ts.Close()
+
+			resp := do(t, ts, http.MethodPost, "/insert/jsonline", "", nil, body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d", resp.StatusCode)
+			}
+			if err := srv.def.w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+
+			rows := query.Run(srv.def.store, &query.Query{From: 0, To: int64(1) << 62, MatAll: true})
+			if len(rows) == 0 {
+				t.Fatal("nothing stored")
+			}
+			for _, r := range rows {
+				payload := 0
+				for _, f := range r.Fields {
+					switch {
+					case f.Key == ".error":
+						t.Fatal("the parallel path stored a control field name")
+					case len(f.Key) > 8 && f.Key != "_time" && f.Key != "_msg" && f.Key != "_stream" && f.Key != "_stream_id":
+						t.Fatalf("stored a %d-byte field name; the cap is 8", len(f.Key))
+					case f.Key == "big" && len(f.Value) > 16:
+						t.Fatalf("stored a %d-byte value; the cap is 16", len(f.Value))
+					}
+					if f.Key != "_time" && f.Key != "_stream" && f.Key != "_stream_id" {
+						payload++
+					}
+				}
+				if payload > 4 {
+					t.Fatalf("%d payload fields stored; the cap is 4", payload)
+				}
+			}
+		})
 	}
 }
 
@@ -1061,5 +1107,71 @@ func TestRouterMatchesSingleNodeOnShapeAndOrdering(t *testing.T) {
 		if single != routed {
 			t.Errorf("%s: single-node=%d router=%d", c.name, single, routed)
 		}
+	}
+}
+
+// THE INGEST MEMORY CEILING IS A PRODUCT OF THREE DEFAULTS, AND NOTHING SAID
+// WHAT IT COMES TO.
+//
+// Writes are exempt from per-tenant admission; the class semaphore bounds the
+// COUNT of concurrent ingests and says nothing about what each one costs. The
+// exemption was argued from "an ingest request does not hold memory for the
+// length of a scan" -- a sentence that was also used to exempt live tails,
+// where it is the opposite of true and had to be undone. Priced here so the
+// third use of it is not another guess.
+//
+// Measured on this tree, `/_bulk` of `index` actions with a four-field
+// document, peak `HeapInuse` sampled every 2 ms during the request and
+// `TotalAlloc` taken across it, four body sizes:
+//
+//	body      actions    peak heap-in-use    totalAlloc     per action
+//	  8 MiB    77,060      89.5 MiB (11.2x)    205.1 MiB     2,791 B
+//	 16 MiB   153,529     149.2 MiB ( 9.3x)    407.5 MiB     2,783 B
+//	 32 MiB   306,049     292.1 MiB ( 9.1x)    826.3 MiB     2,831 B
+//	 60 MiB   572,959     572.5 MiB ( 9.5x)  1,565.1 MiB     2,864 B
+//
+// Linear at about 9.3x the body live and 26x churned. So one request at
+// MaxBodyBytes is ~600 MiB live, and a GZIPPED body is bounded by
+// MaxDecompressed instead -- 512 MiB, eight times the wire limit -- which is
+// ~4.8 GiB live for one request. Times MaxConcurrentWrite.
+//
+// NOT FIXED IN THE ROUND THAT MEASURED IT, and the reason is that every lever
+// is a change somebody notices: lowering MaxConcurrentWrite or admitting
+// writes per tenant at MaxQueriesPerTenant both halve ingest concurrency for
+// the single-tenant deployments that are the majority, and a byte budget
+// across in-flight ingests is a new limit, a new metric and an admission
+// redesign. What this gate does instead is make the ceiling impossible to
+// RAISE silently: the three numbers it is made of are pinned together with the
+// measured amplification, so an edit to any of them has to price the result.
+func TestTheIngestMemoryCeilingIsPriced(t *testing.T) {
+	l := config.DefaultLimits()
+	// The amplification measured above, rounded DOWN, so the pinned ceiling is
+	// not an overstatement.
+	const liveBytesPerBodyByte = 9
+
+	if l.MaxConcurrentWrite != 32 || l.MaxBodyBytes != 64<<20 || l.MaxDecompressed != 512<<20 {
+		t.Fatalf("the defaults moved: MaxConcurrentWrite=%d MaxBodyBytes=%d "+
+			"MaxDecompressed=%d, were 32, %d and %d. These three multiply into the "+
+			"peak heap one ingest surface can hold, because writes are exempt from "+
+			"per-tenant admission and the class semaphore counts requests rather "+
+			"than bytes. At %dx amplification the ceiling was %.1f GiB uncompressed "+
+			"and %.1f GiB gzipped; re-price it and move this gate with it, or bound "+
+			"the bytes in flight instead of the count.",
+			l.MaxConcurrentWrite, l.MaxBodyBytes, l.MaxDecompressed, 64<<20, 512<<20,
+			liveBytesPerBodyByte,
+			float64(32)*float64(64<<20)*liveBytesPerBodyByte/(1<<30),
+			float64(32)*float64(512<<20)*liveBytesPerBodyByte/(1<<30))
+	}
+
+	// And the two ceilings themselves, so the numbers in the message above are
+	// derived here rather than copied from prose.
+	plain := int64(l.MaxConcurrentWrite) * l.MaxBodyBytes * liveBytesPerBodyByte
+	gzipped := int64(l.MaxConcurrentWrite) * l.MaxDecompressed * liveBytesPerBodyByte
+	t.Logf("ingest peak-heap ceiling at the defaults: %.1f GiB uncompressed, %.1f GiB gzipped",
+		float64(plain)/(1<<30), float64(gzipped)/(1<<30))
+	if l.MaxDecompressed <= l.MaxBodyBytes {
+		t.Errorf("MaxDecompressed %d is not above MaxBodyBytes %d; the gzipped ceiling "+
+			"above is then wrong in the safe direction and this gate should be simplified",
+			l.MaxDecompressed, l.MaxBodyBytes)
 	}
 }

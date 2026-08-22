@@ -158,6 +158,25 @@ func TestEveryFederatedReadCarriesALargeQuery(t *testing.T) {
 			if err != nil {
 				t.Fatalf("route query %q does not parse: %v", rt.query, err)
 			}
+			// A route with NO query language has no query to carry.
+			//
+			// Checked AFTER the JSON-body routes below would have skipped: the
+			// Elasticsearch pair carries its selector in a document and has an
+			// empty rt.query for that reason, not because it takes no query.
+			//
+			// Skipped by name rather than by a bare empty-string test, because
+			// an empty rt.query on a route that DOES take a form query is the
+			// hole this gate exists to close -- it would sail through with
+			// nothing to assert.
+			if rt.query == "" && rt.body == "" {
+				if !strings.HasPrefix(rt.path, "/admin/") {
+					t.Fatalf("%s is a federated read whose classification carries no "+
+						"query and no body, so this gate would assert nothing about "+
+						"it. Give it the parameters it is really called with", rt.path)
+				}
+				t.Skipf("%s takes no query language, so there is no large query "+
+					"for the fan-out to carry", rt.path)
+			}
 
 			// The large input in the route's OWN query language.
 			//
@@ -285,9 +304,16 @@ func TestTheRouterPlanStillWinsOverALargeForm(t *testing.T) {
 	if gotQ != q {
 		t.Errorf("the shard was asked %d bytes, the caller sent %d", len(gotQ), len(q))
 	}
-	if gotLimit == "3" {
-		t.Errorf("the shard received the caller's limit=3 in place of the router's "+
-			"plan: shard-local top-3s merged into a wrong answer. limit=%q", gotLimit)
+	// `!= "0"`, not `== "3"`. The router's plan sets limit=0 so the coordinator
+	// can merge; the assertion this replaces only refused the caller's exact
+	// value, so a limit DROPPED entirely -- `gotLimit == ""` -- passed and
+	// produced the same shard-local merge the test exists to prevent. Asserting
+	// what the plan requires, rather than one way of violating it.
+	if gotLimit != "0" {
+		t.Errorf("the shard was asked with limit=%q; the router's plan sets "+
+			"limit=0 so the coordinator merges. Anything else -- the caller's "+
+			"3, or no limit at all -- gives shard-local top-Ns merged into a "+
+			"wrong answer", gotLimit)
 	}
 }
 

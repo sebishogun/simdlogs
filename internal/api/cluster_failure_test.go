@@ -30,6 +30,14 @@ var federatedEndpoints = []struct {
 	{"hits", "/select/logsql/hits?query=*&step=1m&start=1&end=2", "GET", ""},
 	{"stats_query", "/select/logsql/stats_query?query=*+%7C+stats+count%28%29+n", "GET", ""},
 	{"stats_query_range", "/select/logsql/stats_query_range?query=*+%7C+stats+count%28%29+n&step=1m", "GET", ""},
+	// The same two surfaces with a NON-mergeable aggregate, which is a
+	// different code path: count() takes the merge branch, avg() takes the
+	// exact one (fan out rows, aggregate here). Every completeness rule in
+	// this file was asserted only against the merge branch, so the exact
+	// branch's use of the writer fanOutChecked hands back -- the thing that
+	// lowers the completeness header -- was covered by nothing.
+	{"stats_query_exact", "/select/logsql/stats_query?query=*+%7C+stats+avg%28n%29+a", "GET", ""},
+	{"stats_query_range_exact", "/select/logsql/stats_query_range?query=*+%7C+stats+avg%28n%29+a&step=1m", "GET", ""},
 	{"field_names", "/select/logsql/field_names?query=*", "GET", ""},
 	{"field_values", "/select/logsql/field_values?query=*&field=level", "GET", ""},
 	{"streams", "/select/logsql/streams?query=*", "GET", ""},
@@ -44,6 +52,16 @@ var federatedEndpoints = []struct {
 	{"stream_ids", "/select/logsql/stream_ids?query=*", "GET", ""},
 	{"stream_field_names", "/select/logsql/stream_field_names?query=*", "GET", ""},
 	{"stream_field_values", "/select/logsql/stream_field_values?query=*&field=level", "GET", ""},
+	// The ADMIN listing that federates. It takes no query language, so the
+	// large-query gate skips it by name; the completeness rule is the one
+	// every read obeys and it belongs here, because a quarantine listing that
+	// drops an unreachable shard reads as "nothing is wrong" about it.
+	//
+	// /admin/acknowledge-degraded is NOT here: it is a write. It mutates every
+	// shard it reaches, so a read's refusal text -- "this answer would have
+	// been missing data ... so it is refused" -- would be false of it. Its own
+	// refusal names which shards accepted; see cluster_admin_surfaces.go.
+	{"quarantine", "/admin/storage/quarantine", "GET", ""},
 }
 
 // goodShard answers every read with a plausible empty-but-valid body and a
@@ -63,6 +81,8 @@ func goodShard(t *testing.T) *httptest.Server {
 			w.Write([]byte(`{"hits":{"total":{"value":0},"hits":[]}}`))
 		case strings.Contains(r.URL.Path, "facets"):
 			w.Write([]byte(`{"facets":[]}`))
+		case strings.Contains(r.URL.Path, "quarantine"):
+			w.Write([]byte(`{"count":0,"groups":[]}`))
 		case strings.Contains(r.URL.Path, "field_names"),
 			strings.Contains(r.URL.Path, "field_values"),
 			strings.Contains(r.URL.Path, "stream_ids"),
