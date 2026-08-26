@@ -325,13 +325,39 @@ behaviour leaves its justification behind".
 changes that were then reverted. A finding that cost a measurement belongs
 there whether or not any code changed — the entry is the deliverable.
 
+## Production task management
+
+- **Local authority.** `docs/roadmap.md` is the canonical roadmap;
+  `docs/release-readiness.md` is the only staging area (the sole new ledger);
+  `docs/wrong.md` is the only record of rejections. The family index in
+  `github.com/sebishogun/simd`
+  (`docs/plans/2026-08-24-simd-family-production-readiness.md`) is a link
+  collection and never overrides local truth. Historical plans are preserved:
+  `docs/plans/2026-08-13-simdlogs-production.md` is the completed
+  implementation record and is not edited;
+  `docs/plans/2026-08-13-simd-family-production-documentation.md` is the
+  superseded family-documentation record, superseded by the GO_SIMD index.
+- **One task ID at a time.** Work is executed one task at a time, identified
+  by its ID from the ledger (`LOGS-V1-01`..`LOGS-V1-08`, `LOGS-IO-01`). A
+  session touching implementation work names its task ID in its first message;
+  a session without a task ID touches no implementation files.
+- **Seven states; rejection is terminal.** open, staged, in-progress,
+  blocked, evidence-complete, shipped, rejected. A transition is an edit in
+  the ledger (and the changelog or `docs/wrong.md` for `shipped` or
+  `rejected`). `rejected` is terminal without a reopen condition recorded in
+  `docs/wrong.md`; a `docs/wrong.md` entry requires a measurement.
+- **Timed bare gates.** Before any commit: the gate set from
+  `docs/verification.md`, run bare (no `tail` without `pipefail`), with
+  explicit timeouts; a hung test binary is a leak alarm, not a retry
+  candidate.
+
 ## Roadmap
 
-`docs/roadmap.md` is the only place planned work lives, with measurable
-exits and no promises; `docs/plans/2026-08-13-simdlogs-production.md` is the
-task-by-task plan that executes it. Do not add a feature "for the roadmap"
-and ship it in the same commit — roadmap work lands on its own branch,
-tests-first, each task as a commit. A stage is done only when its exits pass.
+`docs/roadmap.md` is the canonical future direction, with measurable exits and
+no promises. `docs/release-readiness.md` owns current task IDs and states;
+`docs/plans/2026-08-13-simdlogs-production.md` is the completed historical
+implementation record. Do not add a feature merely for roadmap parity. A stage
+is done only when its exits pass.
 
 ## Toolchain
 

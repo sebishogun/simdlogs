@@ -555,9 +555,10 @@ backend answers for the same tenant.
 
 The merge for `select` is exact: rows are independent, so
 concatenate-sort-limit is the correct distributed answer. Do not generalize
-from it: the four broken rows above are stale-envelope defects, not design
-limits, and until they are fixed the only correct statement is that **no
-router-mode merge beyond `select` (and the working rows above) is verified**.
+from it: the four stale-envelope defects were fixed in 8.4/8.6, and their
+shared-values, hits, stats-range, and ES answers are fixture-tested in
+`internal/api/cluster_envelope_test.go`. The route table above is the current
+router-mode boundary.
 
 ## Not federated in router mode
 

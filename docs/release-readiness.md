@@ -78,3 +78,83 @@ Everything else the plan asks for is in the code, the tests and the history.
 The LICENSE (MIT, matching the other repositories in this family) is present,
 which it was not — and a tag without one cannot be fixed afterwards, because
 the Go module proxy caches versions immutably.
+
+## The v1 exit
+
+The v1 exit is the **full production exit**: phases 0-10 of
+`docs/plans/2026-08-13-simdlogs-production.md` complete (they are committed
+locally), including the static-cluster contract and release artifacts, plus
+the release gate set green. There is no phases-0-7 single-node exit in play
+for v1.
+
+## Task ledger
+
+The work recorded between this document and the v1 exit, one row per task.
+Every row is **open**. A status transition is an edit in this ledger, using
+the family vocabulary: open, staged, in-progress, blocked, evidence-complete,
+shipped, rejected (terminal without a reopen condition in `docs/wrong.md`).
+
+| ID | state | work | evidence | exit |
+|---|---|---|---|---|
+| `LOGS-V1-01` | open | Quiet benchmark provenance: re-measure the published tables under `requireQuiet`, with no skip and no `SIMDLOGS_BENCH_NOISY` override, with a machine/commit record | corrected tables with provenance | the standing blocker cleared |
+| `LOGS-V1-02` | open | Push and observed CI: the workflows have never been observed running; separate user push permission is required at operation time, so the task stops at the evidence checkpoint until that permission is given | observed CI result | CI observed |
+| `LOGS-V1-03` | open | Long fuzz and dev/release soak beyond the short runs that pass | completed runs with durations | soak/fuzz evidence complete |
+| `LOGS-V1-04` | open | Stale docs/comments corrective: the `es.go` package comment, the `scale_test.go` header comment, the duplicated entry-37 heading in `docs/wrong.md`, and the stale `Task B.2` / `Task G.1` references in `docs/roadmap.md`'s known-implementation-doc-defects section (task IDs the production plan's numeric scheme does not use) reconciled; a code/record task, never a source drive-by from a docs session | the diff plus green doc gates; historical record corrected by an addendum or unambiguous heading without renumbering later entries | stale items fixed and entry references unambiguous |
+| `LOGS-V1-05` | open | Bounded-ingest decision: taken with measurement - implemented, or rejected with a reopen condition in `docs/wrong.md` | the decision record | decision recorded |
+| `LOGS-V1-06` | open | End-to-end release rehearsal without tagging (`scripts/release-check.sh` is the artifact under test) | the rehearsal run | rehearsal green |
+| `LOGS-V1-07` | open | v1 preparation: the full production exit, phases 0-10 plus the release gate set green; commit, tag and publish operations stop at the evidence checkpoint until separately authorized | release gates green and release identity/docs agree | release evidence complete; operational v1 release only when separately authorized |
+| `LOGS-V1-08` | open | Workload-backed ecosystem decisions: the parity and ecosystem documents reconciled against concrete ingest, query, storage, recovery, and operations workloads from VictoriaLogs, Loki, Elasticsearch/OpenSearch, ClickHouse, and Vector; every material gap classified as a v1 blocker, post-v1 work, or rejected with evidence; no feature is added merely for parity | the decision record | decisions recorded |
+| `LOGS-IO-01` | open | Deferred, non-v1-blocking: queries are mmap-backed; durable ingest keeps file, directory, and manifest sync barriers. Instrument the ingest stages first; prototype an io_uring path only if explicit I/O waits are at least 30% of durable-ingest time; retain it only for a repeatable at least 20% end-to-end throughput or p99 gain while the durability and conformance gates stay green; without that evidence it stays deferred and no `docs/wrong.md` entry is written | the instrumented measurement or the deferred decision record | decision recorded with measurement |
+
+Historical plans are not part of this ledger and are not edited:
+`docs/plans/2026-08-13-simdlogs-production.md` is the completed implementation
+record, and `docs/plans/2026-08-13-simd-family-production-documentation.md` is
+the superseded historical family-documentation record, preserved unchanged -
+family coordination is superseded by the GO_SIMD index
+(`github.com/sebishogun/simd`,
+`docs/plans/2026-08-24-simd-family-production-readiness.md`).
+
+## Workload matrix
+
+The workloads the ecosystem decisions (`LOGS-V1-08`) are measured against,
+quoted from `docs/vl-parity.md`, the ecosystem documents, and this document's
+limitation list. The matrix names workloads, not numbers.
+
+| Axis | Workloads | Source |
+|---|---|---|
+| Ingest | jsonline, logfmt, ES `/_bulk`, Loki push (JSON and snappy-protobuf), syslog, journald, Datadog, OTLP (JSON and protobuf), vector field specs and values | `docs/verification.md` (ingest corpus), `docs/vl-parity.md` (ingestion protocols) |
+| Query | The machine-checked LogsQL parity corpus; selective scan-heavy queries; SQL over logs; semantic/vector search; the ES DSL subset | README parity table, `docs/vl-parity.md`, `docs/roadmap.md` (Stage 0) |
+| Storage | Retention and tiering; cold store (library-only interface); mmap reads; the writer emits v8 groups with v7 read compatibility; no incremental backup (RPO bounded by capture frequency) | `docs/lld/storage.md`, this document's limitation list |
+| Recovery | Crash/recovery/restart drills; backup/restore round trip; repair only within a shard; no single command restores a cluster archive | this document's limitation list, `docs/runbooks/` |
+| Ops | `/metrics`, `/flags`, `/health`, `/-/ready`; alerting rules; cluster route classification (federated / router-local / refused); non-mergeable aggregates across shards | `docs/lld/api.md`, `docs/lld/cluster.md` |
+
+**Oracles and peers.** VictoriaLogs is the parity oracle only where
+compatibility is promised (`docs/vl-parity.md`); Loki,
+Elasticsearch/OpenSearch, ClickHouse, and Vector are workload and performance
+peers, never behavioral oracles. A gap is a workload, an allocation, a
+dispatch, or a measured result - not a feature count.
+
+## Quiet-host protocol
+
+Publishable performance measurements required by `LOGS-V1-01`, the measured
+branch of `LOGS-V1-05`, `LOGS-V1-08`, and `LOGS-IO-01` run under the family
+quiet-host protocol. Fuzz, soak, CI observation and release rehearsal remain
+timed gates but do not consume a benchmark quiet window:
+
+- The primary agent coordinates the machine: no parallel agents, builds,
+  benchmarks, or other repository work during a window.
+- A fixed source state is measured - a clean revision, or an immutable record
+  of the exact dirty inputs; never a checkout that omits the candidate.
+- The one-minute load average stays below 1 before and throughout every
+  publishable run (`requireQuiet`); `SIMDLOGS_BENCH_NOISY` stays unset and the
+  evidence shows the benchmark executed rather than skipped.
+- Every wait is bounded and every command carries an explicit timeout.
+- Provenance is recorded beside each result: source identity, CPU model and
+  tier, Go version, kernel, logical CPU count, GOMAXPROCS, affinity, governor,
+  and the one-, five-, and fifteen-minute load averages. This is the
+  LOGS-V1-01 exit requirement; the current `machineFacts` output does not yet
+  emit every field.
+- A run contaminated by load, a competing workload, or a changed source state
+  is discarded and rerun only after the host is quiet again.
+- Services or settings paused for the window are restored afterwards, even
+  after a timeout or a failure.

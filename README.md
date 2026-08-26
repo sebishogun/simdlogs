@@ -5,12 +5,16 @@ ingest and LogsQL surfaces used by the repository's compatibility suite, adds
 an Elasticsearch-compatible search subset, and executes filters over columnar
 row groups with [simd.go](https://github.com/sebishogun/simd) kernels.
 
-It is built for selective queries and low-latency aggregations. That choice has
-a measured cost: its inverted indexes use more disk than VictoriaLogs — 110.08
+> **Historical footprint baseline, not a current claim.** The figures in this
+> paragraph come from the stamped tables below and predate LOGS-V1-01's
+> machine/commit provenance gate; they are being re-measured before release.
+
+It is built for selective queries and low-latency aggregations. That choice had
+a measured cost in the historical baseline: its inverted indexes used 110.08
 bytes per row on the realistic corpus, 2.05x VictoriaLogs, or 1.55x with
-cold-tier postings dropped. On a corpus built so every value is distinct the
-ratio reaches ~19x; that is the design's worst case, published with the [scale
-curve](docs/scale-curve.md), not a footprint to plan against.
+cold-tier postings dropped. On a corpus built so every value was distinct the
+ratio reached ~19x; that was the design's worst case, published with the
+[scale curve](docs/scale-curve.md), not a footprint to plan against.
 
 ## Run it
 
@@ -213,11 +217,15 @@ Values above 1 mean `simdlogs` is faster; all 20 rows are above 1 in both runs.
 > numbers have not been re-measured since. What is known about them is exactly
 > what the paragraph above says; what is not known is which machine and which
 > commit produced them.
-[`internal/bench/perops_test.go`](internal/bench/perops_test.go) fails the build
-if any row falls below 1. On the 3M-row harness ingest ran at 3.17M rec/s here
-and 0.49M rec/s in VictoriaLogs, and the selective window took 7.0 ms versus
-11.1 ms; the window figure was 20.6 ms before the bounded-decode change
-(`5419c80`). Disk on the realistic corpus is 110.08 bytes/row, down from 127.4.
+[`internal/bench/perops_test.go`](internal/bench/perops_test.go) fails the
+per-operation head-to-head run (`SIMDLOGS_OPS=1`) if any row falls below 1.
+The historical 3M-row harness reported 3.17M rec/s here and 0.49M rec/s in
+VictoriaLogs, but that ingest pair predates the corrected accept/queryable
+timing and is withdrawn pending LOGS-V1-01. That run also reported the
+selective window at 7.0 ms versus 11.1 ms; it was 20.6 ms before the
+bounded-decode change (`5419c80`).
+Disk on the 200k-row corpus was 110.08 bytes/row, down from 127.43
+(`docs/wrong.md` entry 33).
 VictoriaLogs still writes fewer bytes per row there; the paragraphs below give
 the magnitude.
 
@@ -309,8 +317,9 @@ as sound; the per-operation gate above is the quiet-machine measurement.
 
 Disk is the one axis VictoriaLogs wins, by 2.05x. That gap is the inverted
 index, which is also what produces the 463x groupby and 35x needle in the same
-table. Dropping postings in the cold tier measured 1.55x of VL on the 100k
-corpus, at the cost of a decode-and-scan for those groups — which is what
+table. Dropping postings in the cold tier measured a historical 1.55x of VL on
+the 100k corpus at the stamped build, pending LOGS-V1-01 remeasurement, at the
+cost of a decode-and-scan for those groups — which is what
 VictoriaLogs does for every query. Removing singleton postings entirely cut
 disk and made the needle 90x slower, so that change was reverted.
 

@@ -16,11 +16,10 @@ The suite covers storage round trips and backward-compatible posting formats,
 crash-safe append, retention, backup/restore, tenant isolation, ingest
 protocols, LogsQL parsing and execution, SQL/vector surfaces, Elasticsearch
 search, live tail, the replication/federation code paths, parser and regex
-panic-safety, and serial-versus-parallel query agreement. It does NOT cover
-router-merge ANSWER correctness: the `streams`/`stream_ids`/plain
-`stats_query`/`hits` merges are defective and untested today — the defects
-are documented in `docs/lld/cluster.md`, and fixture tests for them are
-planned, not shipped.
+panic-safety, serial-versus-parallel query agreement, and router-merge answer
+correctness. The shared-values, hits, stats-range, and ES merges are
+fixture-tested in `internal/api/cluster_envelope_test.go`, including
+cross-shard summation and post-merge limits.
 
 `gofmt -l .` is clean and is a release gate. It was blocked for a long time on
 pre-existing formatting in `internal/storage/group.go`, and the blocker
@@ -43,7 +42,7 @@ the measured -8.1%. They are a code task, not a docs task.
 `AGENTS.md` in full so Claude Code runs are self-contained, and its header
 declares AGENTS.md the source of truth (the headers agree on that). Any
 change to `AGENTS.md`'s body must be mirrored into `CLAUDE.md`'s embedded
-copy in the same commit, and `diff <(sed -n '/^# Working on simdlogs/,$p' AGENTS.md) <(sed -n '/^# Working on simdlogs/,$p' CLAUDE.md)` must be empty.
+copy in the same commit, and `diff <(sed -n '/^## The goals, in one breath/,$p' AGENTS.md) <(sed -n '/^## The goals, in one breath/,$p' CLAUDE.md)` must be empty.
 
 **Never pipe a gate through `tail`** (or anything else) without `pipefail`:
 the pipe reports the last command's status and the failure vanishes. This has
@@ -426,8 +425,8 @@ than left as a passing test that appears to cover it.
 ## Compatibility corpus
 
 The VictoriaLogs comparison is a report against the real binary, not a
-unit-test gate. The suites that drive it: `compat_test.go` (40/40 LogsQL on
-the committed corpus), `shapes_test.go` (wire-shape comparisons),
+unit-test gate. The suites that drive it: `compat_test.go` (the README's
+machine-checked LogsQL parity count), `shapes_test.go` (wire-shape comparisons),
 `apisurface_test.go` + `perops_test.go` (every query argument changes the
 answer, on both engines), `realistic_test.go` (15-field Zipfian footprint and
 query mix). The four findings of the API-surface work are in
