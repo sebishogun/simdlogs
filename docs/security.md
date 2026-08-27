@@ -83,7 +83,7 @@ what that cost before it was true).
 
 Nine ingest envelopes are fuzzed for panics, determinism, and the property that
 the reported accepted count equals the rows that landed
-(`.github/workflows/fuzz.yml`, 22 targets across four packages). `_bulk` --
+(`.github/workflows/fuzz.yml`, 23 targets across four packages). `_bulk` --
 reached from `/​_bulk` and `/insert/elasticsearch/_bulk` -- has no fuzz target;
 `FuzzESSearchBody` covers `_search`, which is a different parser.
 

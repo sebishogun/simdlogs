@@ -14,12 +14,12 @@ import (
 	"github.com/sebishogun/simdlogs/internal/query"
 )
 
-// The Elasticsearch search surface -- the feature VictoriaLogs does not
-// have, so ELK clients and Grafana's ES datasource work against this and
-// not against it. A log-relevant subset of the query DSL (bool/term/
-// terms/range/exists) maps onto the same planner; the time-range-to-
-// partition mapping is automatic because range on a time field feeds the
-// group skip.
+// The Elasticsearch search surface lets ELK clients and Grafana's ES
+// datasource query this store. The supported log-relevant DSL subset is bool
+// (must/filter/must_not/should), term, terms, range, exists, match, prefix and
+// match_all. The filtering clauses map onto the same planner; match_all is the
+// explicit no-filter case. A positive range on a time field also narrows the
+// scan window and feeds the group skip.
 type esQuery struct {
 	Query esClause `json:"query"`
 	Size  int      `json:"size"`

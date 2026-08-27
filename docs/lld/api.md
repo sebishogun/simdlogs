@@ -112,9 +112,10 @@ naming the value, and so is every spelling but the JSON integer: ES also takes
 This section described the opposite of the code for several rounds: it listed
 `exists` among the clauses this surface decodes and then throws away, said an
 `exists`-only search therefore returns the whole window, said `terms` was
-absent, and cited `docs/wrong.md` entry 37 for all of it. Every part of that
-was true when entry 37 was written and none of it is true now — `exists` is
-NOT (field == "") and `terms` is an `In` set, both applied.
+absent, and cited the unnumbered source-reading note immediately before
+`docs/wrong.md` entry 37 for all of it. Every part of that was true when the
+note was written and none of it is true now — `exists` is NOT (field == "")
+and `terms` is an `In` set, both applied.
 README.md carried the same `exists` claim and was corrected one round earlier
 while this file was not, which is why
 `TestTheStatedFactsAboutTheCodeAreTrueOfTheCode` reads this document as well as

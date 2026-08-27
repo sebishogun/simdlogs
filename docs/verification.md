@@ -32,11 +32,10 @@ this gate and say it is clean, which is true and is one sentence each; what
 they must not carry again is a BLOCKER, because a blocker is a state that
 changes and four copies of it will not change together.
 
-Stale source comments that contradict shipped code are known
-implementation-doc defects, listed in `docs/roadmap.md` ("Known
-implementation-doc defects"): `es.go`'s terms/range/exists comments,
-`scale_test.go`'s "no mmap yet", and the `-recompact-after` help's 17% vs
-the measured -8.1%. They are a code task, not a docs task.
+The source-comment defects formerly listed in `docs/roadmap.md` were
+reconciled by `LOGS-V1-04`. `TestResolvedDocumentationDefectsDoNotReturn`
+keeps the corrected Elasticsearch and scale-test comments, retired task IDs,
+and unique numbered headings in `docs/wrong.md` together.
 
 **AGENTS/CLAUDE body-sync check:** `CLAUDE.md` reproduces the body of
 `AGENTS.md` in full so Claude Code runs are self-contained, and its header
@@ -191,7 +190,7 @@ the tree looking like coverage while nothing executes it — so the job greps fo
 `func Fuzz`, fails if the pattern matches nothing, and prints the count it
 found.
 
-22 targets across four packages:
+23 targets across four packages:
 
 | Package | Covers |
 |---|---|

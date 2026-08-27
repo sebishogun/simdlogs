@@ -230,7 +230,7 @@ func paragraphFrom(doc, line string) string {
 //	cluster.md: a downed shard "contributes        fanOutChecked REFUSES: 503
 //	  nothing (a partial answer, not an error)"    unless the caller sets
 //	                                               allow_partial_response=1
-//	release-readiness: "22 targets"                23 `func Fuzz` in the tree
+//	active docs: "22 targets"                      23 `func Fuzz` in the tree
 //	cluster.md: "14 of 46"                         47, said correctly ten
 //	                                               lines above the wrong one
 //
@@ -271,6 +271,10 @@ func TestTheStatedFactsAboutTheCodeAreTrueOfTheCode(t *testing.T) {
 			"decoded but ignored",
 			"an exists-only search matches the whole window",
 			"changes no answer",
+		})
+		mustNotSay(t, "../../docs/architecture.md", "exists", []string{
+			"accepted on the wire but changes no answer",
+			"decoded, never mapped to a predicate",
 		})
 	})
 
@@ -327,22 +331,29 @@ func TestTheStatedFactsAboutTheCodeAreTrueOfTheCode(t *testing.T) {
 			[]string{"a partial answer, not an error"})
 	})
 
-	t.Run("the release document's fuzz-target count is the tree's", func(t *testing.T) {
+	t.Run("the documented fuzz-target counts are the tree's", func(t *testing.T) {
 		got := countFuncPrefix(t, "../..", "func Fuzz")
-		b, err := os.ReadFile("../../docs/release-readiness.md")
-		if err != nil {
-			t.Fatal(err)
-		}
-		re := regexp.MustCompile(`\((\d+) targets\)`)
-		m := re.FindStringSubmatch(string(b))
-		if m == nil {
-			t.Fatal("docs/release-readiness.md no longer states a fuzz-target count; " +
-				"this gate reads `(N targets)` and has nothing to check")
-		}
-		n, _ := strconv.Atoi(m[1])
-		if n != got {
-			t.Errorf("docs/release-readiness.md says %q and the tree has %d "+
-				"`func Fuzz` targets", m[0], got)
+		re := regexp.MustCompile(`\b(\d+) targets\b`)
+		for _, path := range []string{
+			"../../docs/release-readiness.md",
+			"../../docs/security.md",
+			"../../docs/verification.md",
+		} {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			matches := re.FindAllStringSubmatch(string(b), -1)
+			if len(matches) == 0 {
+				t.Errorf("%s no longer states a fuzz-target count in the form `N targets`", path)
+				continue
+			}
+			for _, m := range matches {
+				n, _ := strconv.Atoi(m[1])
+				if n != got {
+					t.Errorf("%s says %q and the tree has %d `func Fuzz` targets", path, m[0], got)
+				}
+			}
 		}
 	})
 }
@@ -467,8 +478,8 @@ func calledOutsideTests(t *testing.T, name string) bool {
 	return found
 }
 
-// countFuncPrefix counts declarations starting with prefix across every
-// .go file under root.
+// countFuncPrefix counts test declarations starting with prefix, matching the
+// workflow's discovery of fuzz targets from *_test.go files.
 func countFuncPrefix(t *testing.T, root, prefix string) int {
 	t.Helper()
 	n := 0
@@ -476,7 +487,7 @@ func countFuncPrefix(t *testing.T, root, prefix string) int {
 		if err != nil || d.IsDir() {
 			return err
 		}
-		if !strings.HasSuffix(path, ".go") {
+		if !strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		b, rerr := os.ReadFile(path)

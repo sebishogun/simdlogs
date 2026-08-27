@@ -56,6 +56,73 @@ func TestEveryTestNamedInTheDocsExists(t *testing.T) {
 	t.Logf("%d citations across the active documents, all declared", checked)
 }
 
+func TestResolvedDocumentationDefectsDoNotReturn(t *testing.T) {
+	read := func(path string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(repoRoot, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	t.Run("wrong record has unique numbered headings", func(t *testing.T) {
+		headings := regexp.MustCompile(`(?m)^## ([0-9]+)\.`).FindAllStringSubmatch(
+			read("docs/wrong.md"), -1)
+		seen := make(map[string]bool, len(headings))
+		for _, heading := range headings {
+			if seen[heading[1]] {
+				t.Errorf("docs/wrong.md repeats numbered heading %s", heading[1])
+			}
+			seen[heading[1]] = true
+		}
+	})
+
+	t.Run("retired plan task IDs stay retired", func(t *testing.T) {
+		roadmap := read("docs/roadmap.md")
+		for _, id := range []string{"Task B.2", "Task G.1"} {
+			if strings.Contains(roadmap, id) {
+				t.Errorf("docs/roadmap.md still cites nonexistent %s", id)
+			}
+		}
+	})
+
+	t.Run("historical record references are disambiguated", func(t *testing.T) {
+		wrong := read("docs/wrong.md")
+		const correction = "The `entry 37` references in entries 38-40 name the " +
+			"unnumbered review note immediately before entry 38"
+		if !strings.Contains(strings.Join(strings.Fields(wrong), " "), correction) {
+			t.Errorf("docs/wrong.md does not disambiguate the three historical entry-37 references")
+		}
+
+		storage := read("docs/lld/storage.md")
+		if strings.Contains(storage, "17%") {
+			t.Error("docs/lld/storage.md still contains the retired 17% help claim")
+		}
+	})
+
+	t.Run("source comments describe the shipped paths", func(t *testing.T) {
+		es := read("internal/api/es.go")
+		before, _, ok := strings.Cut(es, "type esQuery struct")
+		if !ok {
+			t.Fatal("internal/api/es.go no longer declares esQuery")
+		}
+		for _, clause := range []string{
+			"bool", "must", "filter", "must_not", "should", "term", "terms",
+			"range", "exists", "match", "prefix", "match_all",
+		} {
+			if !regexp.MustCompile(`\b` + clause + `\b`).MatchString(before) {
+				t.Errorf("internal/api/es.go header does not name supported %s clause", clause)
+			}
+		}
+
+		scale := read("internal/bench/scale_test.go")
+		if strings.Contains(scale, "there is no mmap yet") {
+			t.Error("internal/bench/scale_test.go still says there is no mmap")
+		}
+	})
+}
+
 // declaredTestNames is every Test/Fuzz/Benchmark function in the repository.
 func declaredTestNames(t *testing.T) map[string]bool {
 	t.Helper()

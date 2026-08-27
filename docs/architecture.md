@@ -46,11 +46,10 @@ What it is not (current, unambiguously):
 - **Not released.** There is no tag and no stable-version promise; the storage
   format and HTTP surface may change. Pin a commit to deploy.
 - **Not full Elasticsearch.** `/_search` and `/_count` cover a log-relevant
-  DSL subset: `bool` (`must`/`filter`), `term`, and timestamp `range`.
-  `exists` is accepted on the wire but changes no answer (decoded, never
-  mapped to a predicate — `docs/wrong.md` entry 37); `terms`, `_msearch`,
-  the complete Query DSL, and ES aggregation-response compatibility are out
-  of scope.
+  DSL subset: `bool` (`must`/`filter`/`must_not`/`should`), `term`, `terms`,
+  `match`, `prefix`, `exists`, `match_all`, and timestamp `range`. `_msearch`,
+  non-time ranges, the complete Query DSL, scoring, analyzed-text semantics,
+  and ES aggregation-response compatibility are out of scope.
 
 ## Components
 

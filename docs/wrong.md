@@ -1123,7 +1123,7 @@ measures:
     IngestParallel            162.6ms -> 145.9ms -10.3%
     Ingest                    685ms  -> 640ms     -6.6%
 
-## 37. Accepted `exists` changes no answer -- decoded, not shipped (source reading)
+## Unnumbered source-reading note before entry 37: accepted `exists` changes no answer
 
 `internal/api/es.go` decodes an `exists` clause (the `esClause.Exists` JSON
 field) but `esToQuery` never walks it: only `Bool`, `Term`, and time
@@ -1141,6 +1141,13 @@ implementation-doc defects (recorded in `docs/roadmap.md`); a future TDD
 task either implements exists as a real predicate or rejects the clause
 with an explicit error -- acceptance-without-effect is not a supported
 state.
+
+**Correction (2026-08-27).** This source-reading note was accidentally given
+the number 37; the actual entry 37 follows, and no later entries have been
+renumbered. The implementation subsequently mapped `terms`, `match`, `prefix`
+and `exists`, added strict refusal for unsupported clauses, and added contract
+tests that exercise the mappings. The original text above remains the record
+of the defect before that work landed.
 
 ## 37. The point-read threshold was a fraction when the cost is absolute
 
@@ -4127,6 +4134,12 @@ scratch slice is reused, and a row that introduces no column sorts nothing.
 property nobody executed. The fixture asserted an equality that held for a
 reason unrelated to the code under test, and the column order was never compared
 across two processes because a test only ever runs in one.
+
+**Reference correction (2026-08-27).** The `entry 37` references in entries
+38-40 name the unnumbered review note immediately before entry 38, not the
+numbered point-read entry 37. That note contains both the "claim that was
+written and never executed" shape and the "two-second hole" measurement. The
+original references remain above and below as part of the historical record.
 
 ## 39. Counting the handlers that federate cannot find the ones nobody wrote
 

@@ -143,31 +143,26 @@ Exits:
   headline) is rewritten from the fresh measurements — never from the
   historical tables.
 
-## Known implementation-doc defects (source comments; code task, not docs)
+## Resolved implementation-doc defects
 
-Stale source comments contradict the shipped code and are recorded here for
-a later code task that fixes the comments (no source edit comes from a docs
-session):
+`LOGS-V1-04` reconciled the stale source and record text previously tracked
+here:
 
-- `internal/api/es.go`: the package comment lists "terms/range/exists" as
-  part of the mapped DSL and the exists handler comment says exists clauses
-  "become predicates" — neither is true (see `docs/wrong.md` entry 37).
-- `internal/bench/scale_test.go`: the header comment says "there is no mmap
-  yet" — mmap shipped long ago; the test builds readers in RAM, but the
-  comment is stale.
-- ~~`cmd/simdlogs/main.go`: the `-recompact-after` help claims ~17% smaller
-  for flate-only recompaction~~ — FIXED. It says ~8%, matching the
-  `-recompact-drop-postings` help and the measured -8.1%
-  (`docs/wrong.md` tiering entry), and
+- `internal/api/es.go` names the full supported Elasticsearch clause subset;
+  the clauses it names are mapped and contract-tested.
+- `internal/bench/scale_test.go` describes the warmed mmap/page-cache regime
+  the test actually measures.
+- The source-reading note before `docs/wrong.md` entry 37 is explicitly
+  unnumbered; the real entry 37 and every later historical number are intact.
+- `cmd/simdlogs/main.go` says ~8% for both recompaction flags, matching the
+  measured -8.1%, and
   `TestTheRecompactionFlagsAgreeOnTheMeasuredFigure` holds the pair together.
-- `docs/wrong.md` entry 37 is likewise implementation-side work queued from
-  a documentation session. The gofmt blocker that sat beside it here is gone:
-  `gofmt -l .` is clean.
+- The active fuzzing documents agree with the source-discovered count of 23
+  targets, and the source-count gate reads each copy.
 
-The production plan maps them: `es.go`'s comment drift is owned by Task B.2
-(the exists work rewrites those comments and lands entry 37), and the
-scale-test comment and the recompact help are Task G.1 —
-see `docs/plans/2026-08-13-simdlogs-production.md`.
+The former lettered task references were not IDs in the production plan's
+numeric task scheme. The active ownership record is the `LOGS-V1-04` row in
+`docs/release-readiness.md`; the completed production plan remains historical.
 
 ## Stage 5 — Release
 

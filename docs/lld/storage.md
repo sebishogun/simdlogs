@@ -334,15 +334,13 @@ VictoriaLogs does for every query). The per-block codec flag makes the store
 hold both kinds at once; `needsRecompact` makes the pass idempotent across
 restarts with no marker file.
 
-The size figures in the flag help are not one truth — they disagree with
-each other and with the measurement. `docs/wrong.md`'s tiering entry
-measured flate-only at **-8.1%** (consistent with the "8% for flate alone"
-in the `-recompact-drop-postings` help), while the `-recompact-after` help
-claims **~17%** for the same flate-only operation; the measured full
-`-compact` mode (flate dict at flush time, not recompaction) is **~15%**
-smaller. Distinguish them: flate-only recompaction ~8%, full compact ~15%,
-and treat the help's 17% as an unmeasured source claim (a stale source
-comment, recorded in `docs/roadmap.md`).
+The size figures name different operations. `docs/wrong.md`'s tiering entry
+measured flate-only recompaction at **-8.1%**; both recompaction flag help
+strings round that to 8%. The measured full `-compact` mode (flate dict at
+flush time, not recompaction) is **~15%** smaller, while dropping postings as
+well as using flate is described as **35%** smaller total. Keep those shapes
+separate: flate-only recompaction ~8%, full compact ~15%, and flate plus no
+postings ~35%.
 
 The subtlety is mmap lifetime: a query started before a swap still holds the
 old reader, so a replaced mapping is retired and unmapped when its last reader

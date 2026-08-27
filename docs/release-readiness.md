@@ -90,16 +90,17 @@ for v1.
 ## Task ledger
 
 The work recorded between this document and the v1 exit, one row per task.
-Every row is **open**. A status transition is an edit in this ledger, using
-the family vocabulary: open, staged, in-progress, blocked, evidence-complete,
-shipped, rejected (terminal without a reopen condition in `docs/wrong.md`).
+Each row carries its current state. A status transition is an edit in this
+ledger, using the family vocabulary: open, staged, in-progress, blocked,
+evidence-complete, shipped, rejected (terminal without a reopen condition in
+`docs/wrong.md`).
 
 | ID | state | work | evidence | exit |
 |---|---|---|---|---|
 | `LOGS-V1-01` | open | Quiet benchmark provenance: re-measure the published tables under `requireQuiet`, with no skip and no `SIMDLOGS_BENCH_NOISY` override, with a machine/commit record | corrected tables with provenance | the standing blocker cleared |
 | `LOGS-V1-02` | open | Push and observed CI: the workflows have never been observed running; separate user push permission is required at operation time, so the task stops at the evidence checkpoint until that permission is given | observed CI result | CI observed |
 | `LOGS-V1-03` | open | Long fuzz and dev/release soak beyond the short runs that pass | completed runs with durations | soak/fuzz evidence complete |
-| `LOGS-V1-04` | open | Stale docs/comments corrective: the `es.go` package comment, the `scale_test.go` header comment, the duplicated entry-37 heading in `docs/wrong.md`, and the stale `Task B.2` / `Task G.1` references in `docs/roadmap.md`'s known-implementation-doc-defects section (task IDs the production plan's numeric scheme does not use) reconciled; a code/record task, never a source drive-by from a docs session | the diff plus green doc gates; historical record corrected by an addendum or unambiguous heading without renumbering later entries | stale items fixed and entry references unambiguous |
+| `LOGS-V1-04` | evidence-complete | Stale docs/comments corrective: the `es.go` package comment, the `scale_test.go` header comment, the duplicated entry-37 heading in `docs/wrong.md`, and the stale `Task B.2` / `Task G.1` references in `docs/roadmap.md`'s known-implementation-doc-defects section (task IDs the production plan's numeric scheme does not use) reconciled; a code/record task, never a source drive-by from a docs session | dated historical corrections; `TestResolvedDocumentationDefectsDoNotReturn` and `TestTheStatedFactsAboutTheCodeAreTrueOfTheCode`; `go test`, `go test -race`, `go test -tags purego`, `go vet`, gofmt and diff gates green on 2026-08-27 | stale items fixed and entry references unambiguous |
 | `LOGS-V1-05` | open | Bounded-ingest decision: taken with measurement - implemented, or rejected with a reopen condition in `docs/wrong.md` | the decision record | decision recorded |
 | `LOGS-V1-06` | open | End-to-end release rehearsal without tagging (`scripts/release-check.sh` is the artifact under test) | the rehearsal run | rehearsal green |
 | `LOGS-V1-07` | open | v1 preparation: the full production exit, phases 0-10 plus the release gate set green; commit, tag and publish operations stop at the evidence checkpoint until separately authorized | release gates green and release identity/docs agree | release evidence complete; operational v1 release only when separately authorized |
