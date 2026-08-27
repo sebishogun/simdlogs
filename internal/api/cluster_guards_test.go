@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -54,7 +55,7 @@ func TestAnUnauthorizedShardIsNotRetriedAcrossReplicas(t *testing.T) {
 	}
 }
 
-// A group with no rows is refused by AdoptGroup.
+// A group with no rows is refused by streamed adoption.
 //
 // Nothing tested it, so the check was deletable. A zero-row group is not a
 // harmless no-op: it occupies a manifest record and a file, and repair would
@@ -70,7 +71,7 @@ func TestAdoptRefusesAZeroRowGroup(t *testing.T) {
 	empty := (&storage.Group{Rows: 0, Columns: []storage.Column{
 		{Name: "_time", Type: storage.ColTimestamp, Ts: nil},
 	}}).Marshal()
-	ok, err := st.AdoptGroup(storage.DigestForTest(empty), empty)
+	ok, _, err := st.AdoptGroupStream(storage.DigestForTest(empty), bytes.NewReader(empty), nil)
 	if err == nil && ok {
 		t.Fatal("adopted a group with no rows")
 	}

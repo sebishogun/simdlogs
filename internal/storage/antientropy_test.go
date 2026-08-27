@@ -1,12 +1,35 @@
 package storage
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 )
+
+// GroupBytes is the buffered adapter used by tests and fuzzers whose fixtures
+// are deliberately small. Production streams through OpenGroupBytes.
+func (s *Store) GroupBytes(digest string) ([]byte, error) {
+	f, err := s.OpenGroupBytes(digest)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+// AdoptGroup is the buffered test adapter for AdoptGroupStream.
+func (s *Store) AdoptGroup(digest string, blob []byte) (bool, error) {
+	adopted, _, err := s.AdoptGroupStream(digest, bytes.NewReader(blob), nil)
+	return adopted, err
+}
 
 func aeStore(t *testing.T) *Store {
 	t.Helper()
@@ -402,6 +425,330 @@ func TestConcurrentAdoptsOfOneGroupLeaveOneCopy(t *testing.T) {
 			}
 			if adopted.Load() != 1 {
 				t.Errorf("%d callers were told they adopted it, want exactly 1", adopted.Load())
+			}
+		})
+	}
+}
+
+// AdoptGroupStream validates exactly what AdoptGroup validates, while the
+// bytes stream in from a reader: a peer's group may be a gigabyte, so the
+// adopt path must not buffer it -- and must not become a second, looser
+// implementation of the validation. Every refusal below leaves the store
+// empty, and every acceptance is a real commit.
+func TestAdoptGroupStreamValidatesWhatItIsGiven(t *testing.T) {
+	src := aeStore(t)
+	if _, err := src.AppendGroup(aeGroup("W", 3, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	ds, err := src.GroupDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := src.GroupBytes(ds[0].Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("commits a valid group from a reader", func(t *testing.T) {
+		dst := aeStore(t)
+		ok, size, err := dst.AdoptGroupStream(ds[0].Digest, bytes.NewReader(blob), nil)
+		if err != nil || !ok {
+			t.Fatalf("adopt: %v %v", ok, err)
+		}
+		if size != int64(len(blob)) {
+			t.Errorf("size %d, want the group's %d", size, len(blob))
+		}
+		if got := dst.TotalRows(); got != 3 {
+			t.Fatalf("%d rows, want the group's 3", got)
+		}
+	})
+
+	t.Run("is idempotent", func(t *testing.T) {
+		dst := aeStore(t)
+		if _, _, err := dst.AdoptGroupStream(ds[0].Digest, bytes.NewReader(blob), nil); err != nil {
+			t.Fatal(err)
+		}
+		again, _, err := dst.AdoptGroupStream(ds[0].Digest, bytes.NewReader(blob), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again {
+			t.Fatal("the second adopt reported a copy; repair would duplicate on retry")
+		}
+		if got := dst.TotalRows(); got != 3 {
+			t.Fatalf("%d rows after adopting the same group twice, want 3", got)
+		}
+	})
+
+	t.Run("refuses bytes that do not match the digest", func(t *testing.T) {
+		dst := aeStore(t)
+		tampered := append([]byte(nil), blob...)
+		tampered[len(tampered)/2] ^= 0xff
+		ok, _, err := dst.AdoptGroupStream(ds[0].Digest, bytes.NewReader(tampered), nil)
+		if err == nil || ok {
+			t.Fatalf("adopted tampered bytes: %v %v", ok, err)
+		}
+		if !strings.Contains(err.Error(), "hash") {
+			t.Errorf("the refusal does not say why: %v", err)
+		}
+		if got := dst.TotalRows(); got != 0 {
+			t.Fatalf("%d rows landed from a refused adoption", got)
+		}
+	})
+
+	t.Run("refuses bytes that are not a group at all", func(t *testing.T) {
+		dst := aeStore(t)
+		junk := []byte("this is not a group")
+		ok, _, err := dst.AdoptGroupStream(digestBytes(junk), bytes.NewReader(junk), nil)
+		if err == nil || ok {
+			t.Fatalf("adopted junk: %v %v", ok, err)
+		}
+		if got := dst.TotalRows(); got != 0 {
+			t.Fatalf("%d rows landed from a refused adoption", got)
+		}
+	})
+
+	t.Run("refuses a zero-row group", func(t *testing.T) {
+		dst := aeStore(t)
+		empty := (&Group{Rows: 0, Columns: []Column{
+			{Name: "_time", Type: ColTimestamp, Ts: nil},
+		}}).Marshal()
+		ok, _, err := dst.AdoptGroupStream(digestBytes(empty), bytes.NewReader(empty), nil)
+		if err == nil || ok {
+			t.Fatalf("adopted a group with no rows: %v %v", ok, err)
+		}
+		if n := dst.TotalRows(); n != 0 {
+			t.Fatalf("%d rows landed from a refused adoption", n)
+		}
+	})
+
+	t.Run("honours the caller's refusal", func(t *testing.T) {
+		dst := aeStore(t)
+		refuse := func(g *Reader) error {
+			if g.TimeMax > 1000 { // the group's rows end at 1002
+				return io.ErrUnexpectedEOF // any error; it must pass through
+			}
+			return nil
+		}
+		ok, _, err := dst.AdoptGroupStream(ds[0].Digest, bytes.NewReader(blob), refuse)
+		if err == nil || ok {
+			t.Fatalf("adopted a group the caller refused: %v %v", ok, err)
+		}
+		if err != io.ErrUnexpectedEOF {
+			t.Errorf("the refusal error did not pass through unchanged: %v", err)
+		}
+		if got := dst.TotalRows(); got != 0 {
+			t.Fatalf("%d rows landed from a refused adoption", got)
+		}
+		// The SAME bytes with a permissive refusal commit normally, so the
+		// refusal is the group's veto, not a defect in the stream.
+		ok, _, err = dst.AdoptGroupStream(ds[0].Digest, bytes.NewReader(blob), nil)
+		if err != nil || !ok {
+			t.Fatalf("adopt after a refused one: %v %v", ok, err)
+		}
+	})
+}
+
+// A streamed adoption and a buffered one of the same group land in stores
+// that answer identically: AdoptGroup is AdoptGroupStream over a buffer, so
+// the two paths must not diverge.
+func TestStreamAndBufferedAdoptOfOneGroupAgree(t *testing.T) {
+	src := aeStore(t)
+	if _, err := src.AppendGroup(aeGroup("W", 5, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	ds, err := src.GroupDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := src.GroupBytes(ds[0].Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buffered := aeStore(t)
+	streamed := aeStore(t)
+	if _, err := buffered.AdoptGroup(ds[0].Digest, blob); err != nil {
+		t.Fatal(err)
+	}
+	if ok, size, err := streamed.AdoptGroupStream(ds[0].Digest, bytes.NewReader(blob), nil); err != nil || !ok {
+		t.Fatalf("streamed adopt: %v %v", ok, err)
+	} else if size != int64(len(blob)) {
+		t.Errorf("streamed size %d, want %d", size, len(blob))
+	}
+	for _, st := range []*Store{buffered, streamed} {
+		got, err := st.GroupDigests()
+		if err != nil || len(got) != 1 {
+			t.Fatalf("store holds %d groups: %v", len(got), err)
+		}
+		if got[0].Digest != ds[0].Digest || got[0].Rows != 5 {
+			t.Errorf("store holds %+v, want the adopted group", got[0])
+		}
+		if n := st.TotalRows(); n != 5 {
+			t.Errorf("store holds %d rows, want 5", n)
+		}
+	}
+}
+
+// Recompact rewrites a group's bytes in place under the same id, so the
+// digest cache must not keep reporting the OLD bytes' digest: an inventory
+// that names a digest the file no longer has sends peers to fetch a group
+// that cannot be served, and a fetch of the old digest then refuses the very
+// bytes that used to answer it.
+func TestRecompactRefreshesTheDigestCache(t *testing.T) {
+	s := aeStore(t)
+	if _, err := s.AppendGroup(crashGroupN(0, crashRecompactRows)); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.GroupDigests()
+	if err != nil || len(before) != 1 {
+		t.Fatalf("inventory before recompact: %v %v", before, err)
+	}
+	groups, beforeBytes, afterBytes, err := s.Recompact(int64(1)<<62, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groups != 1 {
+		t.Fatalf("recompacted %d groups, want 1 -- the fixture does not qualify", groups)
+	}
+	if beforeBytes <= afterBytes {
+		t.Fatalf("flate did not shrink the group (%d -> %d bytes); the fixture does "+
+			"not qualify for recompaction", beforeBytes, afterBytes)
+	}
+
+	after, err := s.GroupDigests()
+	if err != nil || len(after) != 1 {
+		t.Fatalf("inventory after recompact: %v %v", after, err)
+	}
+	if after[0].Digest == before[0].Digest {
+		t.Fatal("the inventory still reports the OLD digest after the bytes changed; " +
+			"peers would be sent to fetch a group that no longer exists")
+	}
+	// The inventory must name the file's CURRENT bytes, not a stale cache.
+	path := filepath.Join(s.dir, fmt.Sprintf("group-%d.bin", after[0].ID))
+	if fresh, err := fileDigest(path); err != nil {
+		t.Fatal(err)
+	} else if after[0].Digest != fresh {
+		t.Fatalf("inventory reports %s but the file's current bytes hash to %s",
+			after[0].Digest, fresh)
+	}
+	blob, err := s.GroupBytes(after[0].Digest)
+	if err != nil {
+		t.Fatalf("the new digest cannot be fetched: %v", err)
+	}
+	if digestBytes(blob) != after[0].Digest {
+		t.Fatal("the fetched bytes do not hash to the digest that named them")
+	}
+	if _, err := s.GroupBytes(before[0].Digest); err == nil {
+		t.Fatal("the OLD digest is still served for a group whose bytes changed; " +
+			"a repair could copy content under a name it does not have")
+	}
+}
+
+// A refused adoption leaves no file behind -- not a final group file and not
+// the staged temp file. Validation happens before the bytes take their final
+// name, so a refusal cannot leave a record-less group-*.bin that only a human
+// can reclaim after a crash (the in-process half; the crash half is
+// TestRefusedAdoptNeverReachesTheRename).
+func TestRefusedAdoptLeavesNoFilesBehind(t *testing.T) {
+	src := aeStore(t)
+	if _, err := src.AppendGroup(aeGroup("W", 3, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	ds, err := src.GroupDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := src.GroupBytes(ds[0].Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dst := aeStore(t)
+	t.Run("the caller's refusal", func(t *testing.T) {
+		refuse := func(*Reader) error { return io.ErrUnexpectedEOF }
+		if _, _, err := dst.AdoptGroupStream(ds[0].Digest, bytes.NewReader(blob), refuse); err == nil {
+			t.Fatal("a refused adoption succeeded")
+		}
+	})
+	t.Run("junk", func(t *testing.T) {
+		junk := []byte("this is not a group")
+		if _, _, err := dst.AdoptGroupStream(digestBytes(junk), bytes.NewReader(junk), nil); err == nil {
+			t.Fatal("a junk adoption succeeded")
+		}
+	})
+
+	ents, err := os.ReadDir(dst.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var final, tmp []string
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "group-") && strings.HasSuffix(e.Name(), ".bin") {
+			final = append(final, e.Name())
+		}
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			tmp = append(tmp, e.Name())
+		}
+	}
+	if len(final) != 0 || len(tmp) != 0 {
+		t.Fatalf("refused adoptions left %d final files (%v) and %d temp files (%v)",
+			len(final), final, len(tmp), tmp)
+	}
+}
+
+// Every durable-write step of the streaming adopt is fault-injectable, and an
+// error at any of them leaves the store exactly as it was: no rows, no final
+// group file, no staged temp file. The crash half of the same steps is the
+// matrix's TestCrashDuringAdoptLeavesTheShardConsistent; this is the
+// error-handling half, where every defer runs.
+func TestAdoptStreamFaultsLeaveTheStoreClean(t *testing.T) {
+	src := aeStore(t)
+	if _, err := src.AppendGroup(aeGroup("W", 3, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	ds, err := src.GroupDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := src.GroupBytes(ds[0].Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// faultManifestSync is deliberately absent: it fires AFTER the manifest
+	// record is durable and applied, so an injected error there is a lie --
+	// the commit happened, and the file must STAY or a reopen finds a
+	// committed group with no bytes. It is crash-only in production, and its
+	// semantics are pinned by TestInjectedManifestFaultKeepsMemoryAndDiskAgreeing.
+	points := []faultPoint{faultCreate, faultWrite, faultSync, faultClose,
+		faultRename, faultDirOpen, faultDirSync, faultManifestWrite}
+	for _, fp := range points {
+		t.Run(faultPointName[fp], func(t *testing.T) {
+			dst := aeStore(t)
+			restore := setFaultHook(func(p faultPoint) error {
+				if p == fp {
+					return errors.New("injected")
+				}
+				return nil
+			})
+			defer restore()
+
+			ok, _, err := dst.AdoptGroupStream(ds[0].Digest, bytes.NewReader(blob), nil)
+			if err == nil || ok {
+				t.Fatalf("adopt succeeded past %s: %v %v", faultPointName[fp], ok, err)
+			}
+			if n := dst.TotalRows(); n != 0 {
+				t.Fatalf("%d rows landed from an adoption that failed at %s", n, faultPointName[fp])
+			}
+			ents, err := os.ReadDir(dst.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range ents {
+				if strings.HasPrefix(e.Name(), "group-") {
+					t.Errorf("%s left %s behind", faultPointName[fp], e.Name())
+				}
 			}
 		})
 	}

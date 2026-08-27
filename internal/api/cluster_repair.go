@@ -54,25 +54,32 @@ import (
 //
 // # Bounded
 //
-// A pass copies at most maxRepairGroups groups and maxRepairBytes bytes. A
-// shard that has been down for a day can differ by more data than the cluster
-// can move in one pass without starving live traffic, and an unbounded repair
-// is a self-inflicted outage. A bounded pass converges over several runs, and
-// reports what it left, so "still diverging" is visible rather than inferred.
+// A pass copies at most maxRepairGroups groups and has a maxRepairBytes
+// accounting budget. Actual transferred bytes are charged after each group;
+// a peer that understates its inventory can admit one final group past the
+// budget, but each group is independently capped at maxRepairBytes, so the hard
+// byte ceiling is at most twice the budget. A shard that has been down for a
+// day can differ by more data than the cluster should move in one pass without
+// starving live traffic. The pass reports what it left, so "still diverging"
+// is visible rather than inferred.
 
 // Repair bounds.
 //
 // Deliberately small: repair competes with live reads and writes for the same
-// disks and the same network. These are per pass and per shard -- an operator
-// who wants faster convergence runs more passes, which is a decision made with
-// the previous pass's report in hand rather than in advance.
+// disks and the same network. The group count and accounting budget are
+// cluster-wide per pass; maxRepairBytes is also the hard ceiling for one group
+// transfer. An operator who wants faster convergence runs more passes, which
+// is a decision made with the previous pass's report in hand rather than in
+// advance.
 const (
 	maxRepairGroups = 64
 	maxRepairBytes  = 1 << 30 // 1 GiB
-	// repairFetchTimeout bounds one group transfer. A peer that accepts the
-	// connection and stalls would otherwise hold a repair pass open for as long
-	// as it cared to.
-	repairFetchTimeout = 60 * time.Second
+	// repairTransferTimeout bounds ONE HOP of a group transfer: the fetch and
+	// the adopt each get their own deadline. A peer that accepts the
+	// connection and stalls would otherwise hold a repair pass open for as
+	// long as it cared to -- and one context covering both hops let a slow
+	// fetch eat the adopt's share of the time.
+	repairTransferTimeout = 60 * time.Second
 )
 
 // Internal repair endpoints. Under /internal/ so they are recognisably not
@@ -138,7 +145,7 @@ func (s *Server) serveReplicaGroup(w http.ResponseWriter, r *http.Request) {
 	// FROM THE URL, never r.FormValue.
 	//
 	// FormValue parses the BODY for a form-encoded content type, and this
-	// handler's POST branch reads that same body with io.ReadAll -- so the
+	// handler's POST branch consumes that same body as the group -- so the
 	// digest lookup ate the group it was about to adopt. protocols.go states
 	// the rule for the ingest routes ("Read from the URL, never r.FormValue")
 	// after a line-protocol write stored nothing while answering 204; this is
@@ -159,48 +166,53 @@ func (s *Server) serveReplicaGroup(w http.ResponseWriter, r *http.Request) {
 	tn := s.tn(r)
 	switch r.Method {
 	case http.MethodGet:
-		b, err := tn.store.GroupBytes(digest)
+		// Streamed, not buffered: a repaired group may be a gigabyte, and the
+		// router spools what it fetches, so reading the whole file into memory
+		// here would hold it twice.
+		f, err := tn.store.OpenGroupBytes(digest)
 		if err != nil {
 			s.writeErr(w, r, adminSpec(), http.StatusNotFound, err.Error())
 			return
 		}
+		defer f.Close()
 		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write(b)
+		io.Copy(w, f)
 	case http.MethodPost, http.MethodPut:
-		// Bounded: the body is another machine's, and an unbounded read here is
-		// an allocation driven by a peer.
-		b, err := io.ReadAll(io.LimitReader(r.Body, maxRepairBytes+1))
-		if err != nil {
-			s.writeErr(w, r, adminSpec(), http.StatusBadRequest, err.Error())
-			return
-		}
-		if int64(len(b)) > maxRepairBytes {
-			s.writeErr(w, r, adminSpec(), http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("simdlogs: a repaired group may not exceed %d bytes", maxRepairBytes))
-			return
-		}
-		// Refused if this node's retention would delete it on the next sweep.
-		//
-		// Absent is absent: anti-entropy cannot tell a group that was never
-		// received from one that was deliberately dropped, so a peer holding
-		// data past this node's horizon offers it back on every pass. The
-		// horizon belongs to this node, so this node is the only one that can
-		// say no.
-		if maxAge := s.retentionMaxAge.Load(); maxAge > 0 {
-			if g, gerr := storage.ReadGroup(b); gerr == nil {
+		// Bounded by the MaxBytesReader replicaGroupSpec installed, and
+		// streamed rather than buffered: the body is another machine's, a
+		// repaired group may be a gigabyte, and an unbounded in-memory read
+		// here is an allocation driven by a peer.
+		adopted, _, err := tn.store.AdoptGroupStream(digest, r.Body, func(g *storage.Reader) error {
+			// Refused if this node's retention would delete it on the next
+			// sweep.
+			//
+			// Absent is absent: anti-entropy cannot tell a group that was never
+			// received from one that was deliberately dropped, so a peer holding
+			// data past this node's horizon offers it back on every pass. The
+			// horizon belongs to this node, so this node is the only one that can
+			// say no.
+			if maxAge := s.retentionMaxAge.Load(); maxAge > 0 {
 				cutoff := time.Now().Add(-time.Duration(maxAge)).UnixNano()
 				if g.TimeMax < cutoff {
-					s.writeErr(w, r, adminSpec(), http.StatusConflict, fmt.Sprintf(
-						"simdlogs: refusing a group whose newest row (%d) is older "+
-							"than this node's retention horizon (%d). It was deleted "+
-							"here deliberately, and adopting it would resurrect rows "+
-							"retention removed",
-						g.TimeMax, cutoff))
-					return
+					return fmt.Errorf("%w: its newest row (%d) is older than this "+
+						"node's retention horizon (%d). It was deleted here "+
+						"deliberately, and adopting it would resurrect rows "+
+						"retention removed",
+						errRetentionRefused, g.TimeMax, cutoff)
 				}
 			}
+			return nil
+		})
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			s.writeErr(w, r, adminSpec(), http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("simdlogs: a repaired group may not exceed %d bytes", s.replicaGroupLimit))
+			return
 		}
-		adopted, err := tn.store.AdoptGroup(digest, b)
+		if errors.Is(err, errRetentionRefused) {
+			s.writeErr(w, r, adminSpec(), http.StatusConflict, err.Error())
+			return
+		}
 		if err != nil {
 			// A refusal here is the validation doing its job: bytes that do not
 			// hash to what was asked for, or do not parse as a group.
@@ -663,19 +675,39 @@ func (s *Server) askReplicaState(r *http.Request, shard, replica int, u string) 
 // receiver hashes what it is given against the digest the router asked for, so
 // a source that returns the wrong group is caught by the destination rather
 // than trusted by it.
+//
+// The bytes are spooled to a temp file at the fetch and streamed from it at
+// the adopt, so neither hop buffers the group in this router's memory.
 func (s *Server) copyGroup(r *http.Request, src, dst, digest string) (int64, error) {
-	// Bounded: a peer that accepts the connection and then stalls would hold
-	// the whole repair pass open for as long as it cared to.
-	ctx, cancel := context.WithTimeout(r.Context(), repairFetchTimeout)
-	defer cancel()
-	fetch := r.Clone(ctx)
-	fetch.URL.RawQuery = url.Values{"digest": {digest}}.Encode()
+	query := url.Values{"digest": {digest}}.Encode()
 
-	got := s.peers.do(fetch, 0, 0, src, http.MethodGet, pathReplicaGroup, nil, "")
+	// Each hop gets its OWN deadline, so a fetch that stalls cannot eat the
+	// adopt's share of one shared context -- the adopt is the hop that
+	// validates. A peer that accepts the connection and then stalls would
+	// otherwise hold the whole repair pass open for as long as it cared to.
+	fetchCtx, cancelFetch := context.WithTimeout(r.Context(), repairTransferTimeout)
+	fetch := r.Clone(fetchCtx)
+	fetch.URL.RawQuery = query
+
+	// SPOOLED, not buffered, and bounded by maxRepairBytes rather than by the
+	// peer client's in-memory response ceiling. A group may be a gigabyte, and
+	// do()'s 256 MiB ceiling is why groups in (256 MiB, maxRepairBytes] could
+	// never be repaired: the answer was discarded as malformed before the
+	// destination ever saw it. A group past maxRepairBytes is refused here
+	// with the same bound the destination enforces when adopting.
+	f, size, got, cleanup := s.peers.spool(fetch, 0, 0, src, pathReplicaGroup, query, maxRepairBytes)
+	cancelFetch()
+	defer cleanup()
 	if !got.OK() {
 		return 0, fmt.Errorf("fetching from %s: %s: %v", src, got.Class, got.Err)
 	}
-	put := s.peers.do(fetch, 0, 0, dst, http.MethodPost, pathReplicaGroup, got.Body, "")
+	// The adopt streams the spooled file back out; the bytes never sit in
+	// this router's memory. The destination still hashes everything it is
+	// given against the digest, which is the validation the comment above
+	// promises. A clone of the FETCH request carries the digest query.
+	putCtx, cancelPut := context.WithTimeout(r.Context(), repairTransferTimeout)
+	put := s.peers.doReader(fetch.Clone(putCtx), 0, 0, dst, http.MethodPost, pathReplicaGroup, f, "application/octet-stream")
+	cancelPut()
 	if !put.OK() {
 		return 0, fmt.Errorf("adopting at %s: %s: %v", dst, put.Class, put.Err)
 	}
@@ -697,12 +729,20 @@ func (s *Server) copyGroup(r *http.Request, src, dst, digest string) (int64, err
 	}
 	// What CROSSED THE WIRE, which is the only number this router observed
 	// itself. Everything else here is the peer's word.
-	return int64(len(got.Body)), nil
+	return size, nil
 }
 
 // errAlreadyHeld is a copy the destination declined because it already had the
 // group. Not an error to report and not a copy to count.
 var errAlreadyHeld = errors.New("the destination already held this group")
+
+// errRetentionRefused is an adoption this node refused because the group's
+// newest row is older than its retention horizon. The horizon belongs to the
+// receiver, so the receiver is the only participant that can say no -- and
+// unlike errAlreadyHeld it IS an error: a group nobody may adopt is work every
+// pass will attempt and none can finish.
+var errRetentionRefused = errors.New(
+	"simdlogs: refusing a group this node's retention horizon has already deleted")
 
 // clusterTenant authorizes the tenant a cluster-scope admin request names, and
 // stamps the RESOLVED tenant back onto the request.

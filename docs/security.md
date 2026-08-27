@@ -79,7 +79,7 @@ what that cost before it was true).
 | Peer response size | `TestAnOversizedPeerResponseIsDiscarded` — discarded, not truncated. A shard BACKUP bypasses this ceiling deliberately by spooling to a temp file, since a backup is as large as the shard |
 | Concurrent queries, per tenant | `TestPerTenantAdmissionRefusesOnlyTheTenantAtItsLimit` |
 | Tenant count | `TestTenantCountIsBounded` |
-| Repair transfer, per pass | 64 groups / 1 GiB, cluster-wide per pass, reported when it stops short. **No test covers the bound itself** — `complete` is only asserted on the unreachable-replica path |
+| Repair transfer | 64 groups and a 1 GiB accounting budget cluster-wide per pass; 2 GiB hard ceiling if a peer understates the final group; 1 GiB hard ceiling per group. Exact fetch and adopt ceilings are covered by `TestSpoolBoundIsExact` and `TestTheAdoptBoundIsExact`; aggregate pass exhaustion is not covered end to end |
 
 Nine ingest envelopes are fuzzed for panics, determinism, and the property that
 the reported accepted count equals the rows that landed

@@ -78,6 +78,65 @@ func TestFullDiskRefusesWritesAndKeepsReading(t *testing.T) {
 	}
 }
 
+func TestARejectedWriteIDIsNotCommitted(t *testing.T) {
+	post := func(t *testing.T, s *Server, id, body string) *http.Response {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/insert/jsonline", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-ndjson")
+		req.Header.Set(HdrWriteID, id)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		return rec.Result()
+	}
+
+	t.Run("storage refusal", func(t *testing.T) {
+		restore := storage.SetDiskUsageForTest(func(string) (storage.DiskUsage, error) {
+			return storage.DiskUsage{Total: 1 << 30, Free: 0}, nil
+		})
+		defer restore()
+
+		c := config.Config{
+			Dir:     t.TempDir(),
+			Limits:  config.DefaultLimits(),
+			Storage: config.Storage{ReserveWarnBytes: 1000, ReserveRejectBytes: 100},
+		}
+		s, err := NewServerConfig(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+
+		const id = "aaaabbbbccccdddd"
+		resp := post(t, s, id, `{"_msg":"refused"}`+"\n")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusInsufficientStorage {
+			t.Fatalf("status %d, want 507", resp.StatusCode)
+		}
+		if s.def.store.CommittedWrite(storage.WriteID(id)) {
+			t.Fatal("a storage-refused write id was committed")
+		}
+	})
+
+	t.Run("parse failure", func(t *testing.T) {
+		s := newWriteFailServer(t)
+		const id = "1111222233334444"
+		req := httptest.NewRequest(http.MethodPost, "/insert/opentelemetry/v1/logs",
+			strings.NewReader("{"))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(HdrWriteID, id)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		resp := rec.Result()
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status %d, want 400", resp.StatusCode)
+		}
+		if s.def.store.CommittedWrite(storage.WriteID(id)) {
+			t.Fatal("a rejected payload's write id was committed")
+		}
+	})
+}
+
 // Readiness degrades at the WARN level, while writes are still accepted. A
 // probe that only went red once writes failed would report the outage rather
 // than give anyone a chance to prevent it.

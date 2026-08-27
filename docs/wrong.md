@@ -11202,5 +11202,33 @@ counts.
   surfaces, it is the Prometheus matrix convention, and the reference does the
   same thing -- so it is documented in docs/compatibility.md rather than
   unified.
+
+## 137. An eight-byte local was one heap object per protobuf varint
+
+2026-08-27, during the pre-publication review. `eachField` decoded every
+wire-type-0 protobuf value, re-encoded it into a local `[8]byte`, and passed a
+slice of that local through the callback. The callback itself did not escape;
+the payload did. Escape analysis reported `moved to heap: buf`, and the
+disassembly put `runtime.newobject` in the varint arm.
+
+The isolated walk over 64 varint fields measured the cost directly:
+
+```
+shape                         ns/op    B/op    allocs/op
+8-byte callback image         579.1     512       64
+raw encoded varint bytes      145.7       0        0
+```
+
+Passing the bytes already present in the message removes both the re-encode and
+the escaping object. The seven consumers decode those validated bytes with an
+inline `uvarint` loop. `TestEachFieldVarintZeroAlloc` gates the allocation
+count; `TestEachFieldHandsRawVarintBytes` gates the callback contract; the
+OTLP/Loki conformance tests gate the signed casts.
+
+Reviewing those casts found a separate schema error beside the allocation:
+`Resource.dropped_attributes_count` is `uint32`, but the hand-written decoder
+kept an arbitrary wire varint as `uint64`. A value of `2^32+7` was stored as
+`4294967303`; a generated protobuf decoder retains the low 32 bits and returns
+`7`. The field now has the schema's type, with an overflow regression test.
 - `M12` (`Reject`'s bound `>=` -> `>`) and `M16` remain unkilled and remain not
   observable, for the reason entry 134 gives.

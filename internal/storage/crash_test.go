@@ -469,6 +469,160 @@ func TestRewritePhaseCoverageIsComplete(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// The same matrix against the ADOPT path, which stages a peer's bytes itself
+// instead of going through writeFileAtomic.
+//
+// Its contract is the rewrite paths' (visibility-neutral: every acknowledged
+// batch present exactly once, nothing partial, nothing duplicated) plus one
+// clause of its own: the adopted group must be either FULLY committed or FULLY
+// absent. A crash mid-adopt that leaves a partial or doubled group is a
+// defect wherever it lands.
+//
+// All nine phases are reachable for a VALID group. Unlike the rewrite paths
+// this lane also reaches the two manifest-record phases, because the adopt
+// ends in the same manifest commit the append path makes.
+var adoptPhases = []string{
+	"temp-create", "partial-write", "file-sync", "file-close",
+	"rename", "dir-open", "dir-sync", "manifest-append", "manifest-sync",
+}
+
+func TestCrashDuringAdoptLeavesTheShardConsistent(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("the matrix SIGKILLs a child process; not portable to %s", runtime.GOOS)
+	}
+	perBatch := crashBatchRows
+	for _, phase := range adoptPhases {
+		t.Run(phase, func(t *testing.T) {
+			dir := t.TempDir()
+			acked, crashed := runCrashChildOp(t, dir, phase, crashOpAdopt)
+			if !crashed {
+				t.Fatalf("the child did not crash at %q during adopt; the phase is "+
+					"unreachable and this subtest proves nothing", phase)
+			}
+			if len(acked) != crashBatches {
+				t.Fatalf("the child acknowledged %d batches before %s, want %d: the "+
+					"crash landed in the SETUP, not in the adoption", len(acked), phase, crashBatches)
+			}
+
+			logLeftoverTempFiles(t, dir)
+			st := reopenStore(t, dir)
+			defer st.Close()
+
+			got := storedBatches(t, st)
+			for b := 0; b < crashBatches; b++ {
+				switch n := count(got, b); {
+				case n == 0:
+					t.Errorf("batch %d is GONE after a crash at %q during adopt", b, phase)
+				case n < 0:
+					t.Errorf("batch %d is PARTIAL after a crash at %q during adopt", b, phase)
+				case n > 1:
+					t.Errorf("batch %d appears %d times after a crash at %q during adopt: "+
+						"a retry would duplicate rows", b, n, phase)
+				}
+			}
+			// The adopted group is batch 99: either fully committed or fully
+			// absent, never partial and never doubled.
+			switch n := countOf(got, 99, perBatch); {
+			case n == 0, n == 1:
+				// fully absent or fully committed
+			case n < 0:
+				t.Errorf("the adopted group is PARTIAL after a crash at %q: a torn "+
+					"group was adopted", phase)
+			default:
+				t.Errorf("the adopted group appears %d times after a crash at %q", n, phase)
+			}
+			assertNoDuplicateRows(t, st)
+		})
+	}
+}
+
+// A REFUSED adoption may not reach the rename, let alone the manifest record:
+// the refusal happens while the bytes still carry the .tmp name, so a crash
+// cannot leave a record-less group-*.bin file behind. The four staging phases
+// are reachable -- the bytes are being written before the refusal is known --
+// and a crash there leaves only a .tmp file, which the next open ignores.
+//
+// dir-open and dir-sync are exercised by BOTH the rename and the refusal's
+// own removal (discardUncommitted syncs the directory after removing the
+// staged file), so they cannot distinguish the two paths and are not listed
+// here; the rename is the load-bearing boundary, and the two manifest phases
+// prove the refusal never reaches the commit.
+func TestRefusedAdoptNeverReachesTheRename(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("the matrix SIGKILLs a child process; not portable to %s", runtime.GOOS)
+	}
+	check := func(t *testing.T, phase string, wantCrash bool) {
+		t.Helper()
+		dir := t.TempDir()
+		acked, crashed := runCrashChildOp(t, dir, phase, crashOpAdoptRefused)
+		if crashed != wantCrash {
+			t.Fatalf("a refused adoption crashed at %q (crashed=%v); want %v. "+
+				"Refused bytes must never reach %s",
+				phase, crashed, wantCrash, phase)
+		}
+		if len(acked) != crashBatches {
+			t.Fatalf("the child acknowledged %d batches, want %d", len(acked), crashBatches)
+		}
+		st := reopenStore(t, dir)
+		defer st.Close()
+		got := storedBatches(t, st)
+		for b := 0; b < crashBatches; b++ {
+			if n := count(got, b); n != 1 {
+				t.Errorf("batch %d present %d times, want 1", b, n)
+			}
+		}
+		if n := count(got, 99); n != 0 {
+			t.Errorf("a refused adoption stored rows (batch 99 present %d times)", n)
+		}
+	}
+
+	t.Run("staging phases are reachable", func(t *testing.T) {
+		for _, phase := range []string{"temp-create", "partial-write", "file-sync", "file-close"} {
+			t.Run(phase, func(t *testing.T) { check(t, phase, true) })
+		}
+	})
+	t.Run("no refused bytes reach the final name", func(t *testing.T) {
+		for _, phase := range []string{"rename", "manifest-append", "manifest-sync"} {
+			t.Run(phase, func(t *testing.T) { check(t, phase, false) })
+		}
+	})
+}
+
+// The append-loop markers buffering and post-ack are not reachable from the
+// adopt path: the child's setup loop runs with the hook unarmed, and the
+// adoption itself has no such step. Same guard the rewrite paths get, so an
+// adopt change that grew an AppendGroup step cannot slip past the matrix.
+func TestAdoptDoesNotReachAppendOnlyPhases(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("the matrix SIGKILLs a child process; not portable to %s", runtime.GOOS)
+	}
+	for _, phase := range []string{"buffering", "post-ack"} {
+		t.Run(phase, func(t *testing.T) {
+			dir := t.TempDir()
+			acked, crashed := runCrashChildOp(t, dir, phase, crashOpAdopt)
+			if crashed {
+				t.Errorf("the adopt path now reaches %q. It is an AppendGroup marker; "+
+					"the adopt has no such step and the phases table is missing one.", phase)
+			}
+			if len(acked) != crashBatches {
+				t.Fatalf("the child acknowledged %d batches, want %d", len(acked), crashBatches)
+			}
+			st := reopenStore(t, dir)
+			defer st.Close()
+			got := storedBatches(t, st)
+			for b := 0; b < crashBatches; b++ {
+				if n := count(got, b); n != 1 {
+					t.Errorf("batch %d present %d times, want 1", b, n)
+				}
+			}
+			if n := count(got, 99); n != 1 {
+				t.Errorf("the adopted group is present %d times after a clean run, want 1", n)
+			}
+		})
+	}
+}
+
 // The recompact fixture must actually BE recompacted. Recompact skips any
 // group whose flate rewrite is not smaller, and it skips any group with no LZ4
 // block at all -- so a fixture that stops qualifying makes every recompact

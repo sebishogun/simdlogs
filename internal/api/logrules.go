@@ -92,10 +92,13 @@ func (r *logRule) eval(s *Server) {
 	q.SetWindow(now.Add(-r.spec.Window.D()).UnixNano(), now.UnixNano())
 	q.SetNow(q.To)
 
-	st, err := s.ruleStore(r.spec.Tenant)
+	st, held, err := s.ruleStore(r.spec.Tenant)
 	if err != nil {
 		r.fail(now, err)
 		return
+	}
+	if held != nil {
+		defer held.inFlight.Add(-1)
 	}
 
 	// Through the same budget every other read obeys. A rule is the one query
@@ -162,10 +165,11 @@ func (r *logRule) fail(now time.Time, err error) {
 const ruleEvalTimeout = 30 * time.Second
 
 // ruleStore resolves the tenant a rule runs against. Empty is the default
-// tenant, which is what every rule was hard-wired to.
-func (s *Server) ruleStore(tenant string) (*storage.Store, error) {
+// tenant, which is what every rule was hard-wired to. A non-nil held tenant is
+// already marked in flight and must be released after the query finishes.
+func (s *Server) ruleStore(tenant string) (*storage.Store, *tenant, error) {
 	if tenant == "" {
-		return s.def.store, nil
+		return s.def.store, nil, nil
 	}
 	acct, proj, _ := strings.Cut(tenant, ":")
 	if proj == "" {
@@ -173,9 +177,9 @@ func (s *Server) ruleStore(tenant string) (*storage.Store, error) {
 	}
 	tn, err := s.tenant(acct, proj)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return tn.store, nil
+	return tn.store, tn, nil
 }
 
 // writeRuleMetrics appends each rule's series, plus the rule's own health.

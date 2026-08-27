@@ -354,18 +354,22 @@ signal, not an injected error: an injected error unwinds every defer — the tem
 file is removed, the manifest truncated back to a record boundary — which tests
 the *error handling*. Only a kill shows what is actually on disk.
 
-Three matrices, over the four callers of the durable write that they cover —
-`AppendGroup`, `manifest.compact`, `Store.Recompact` and `Store.CompactGroups`.
-The third is compaction's own, thirteen phases, and it exists because
+Four matrices, over the five callers of the durable write that they cover —
+`AppendGroup`, `manifest.compact`, `Store.Recompact`, `Store.CompactGroups` and
+`Store.AdoptGroupStream`. The third is compaction's own, thirteen phases, and it exists because
 compaction's commit is a TRANSACTION rather than an append: its record adds the
 output and removes the inputs together, and only a kill can show whether that
-is one record. Measured against a build that splits it in two, the rest of the
+is one record. The fourth is peer adoption's nine-phase streamed commit, whose
+new group must be either fully committed or fully absent. Measured against a
+build that splits group compaction into two manifest records, the rest of the
 suite stays green and every batch appears twice.
 
 | Matrix | Phases | Contract |
 |---|---|---|
 | `TestCrashRecoveryMatrix` — `AppendGroup` | 11: `buffering`, `temp-create`, `partial-write`, `file-sync`, `file-close`, `rename`, `dir-open`, `dir-sync`, `manifest-append`, `manifest-sync`, `post-ack` | no partial group adopted; every acknowledged batch present exactly once; no uncommitted batch visible; no duplicate rows |
 | `TestCrashDuringRewriteIsVisibilityNeutral` — `manifest.compact` and `Store.Recompact` | the 7 `writeFileAtomic` phases | **visibility-neutral at every phase**: all batches present, each exactly once, no partial group, no duplicate rows |
+| `TestCrashDuringGroupCompactionIsVisibilityNeutral` — `Store.CompactGroups` | 13: the 7 `writeFileAtomic` phases, `manifest-append`, `manifest-sync`, `compact-write`, `compact-written`, `compact-commit`, `compact-unlink` | all acknowledged batches remain visible exactly once; the output and removed inputs become visible as one transaction |
+| `TestCrashDuringAdoptLeavesTheShardConsistent` — `Store.AdoptGroupStream` | 9: `temp-create`, `partial-write`, `file-sync`, `file-close`, `rename`, `dir-open`, `dir-sync`, `manifest-append`, `manifest-sync` | existing batches remain visible exactly once; the adopted group is either fully committed or fully absent, never partial or duplicated |
 
 The rewrite matrix has no per-phase expectation table on purpose. Neither
 operation adds or removes a row — compaction folds the record log to one record
@@ -373,7 +377,7 @@ naming the same groups, and recompaction re-encodes a group file under the same
 path and ID with **no manifest record at all**, so the rename is the whole
 commit. A crash that changes what is readable is a defect wherever it lands.
 
-Two tests exist to stop the matrix going vacuously green:
+Four tests exist to stop the matrices going vacuously green:
 
 - `TestRewritePhaseCoverageIsComplete` runs the four `AppendGroup`-only phases
   against both rewrite paths and fails if one becomes reachable — that would
@@ -385,8 +389,12 @@ Two tests exist to stop the matrix going vacuously green:
   qualifying for recompaction. `Recompact` skips any group whose flate rewrite
   is not smaller, so a too-small fixture makes every recompact subtest pass
   without the code under test writing a byte.
+- `TestRefusedAdoptNeverReachesTheRename` proves a refusal can reach all four
+  staging phases but never the final name or manifest commit.
+- `TestAdoptDoesNotReachAppendOnlyPhases` proves adoption does not silently gain
+  an append-only phase missing from its matrix.
 
-**What is not in the matrix.** Eight paths write durably or commit; four are
+**What is not in the matrix.** Nine paths write durably or commit; five are
 covered. `Store.Promote` (`cold.go`) is structurally identical to
 `AppendGroup` — write the group, then commit an add. `Store.Demote` and
 retention's `dropGroups` commit a REMOVE and then unlink, which is the

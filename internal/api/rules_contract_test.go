@@ -167,6 +167,50 @@ func TestARuleReportsItsOwnHealth(t *testing.T) {
 	}
 }
 
+func TestTenantQualifiedRulesReleaseTheirTenant(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		add  func(*Server) error
+	}{
+		{
+			name: "metric",
+			add: func(s *Server) error {
+				return s.AddMetricRule(config.MetricRule{
+					Name: "tenant_metric", Query: "*", Tenant: "12:34",
+					Window: config.Duration(time.Minute), Interval: config.Duration(time.Hour),
+				})
+			},
+		},
+		{
+			name: "alert",
+			add: func(s *Server) error {
+				return s.AddAlertRule(config.AlertRule{
+					Name: "tenant_alert", Query: "*", Tenant: "12:34", Op: ">", Threshold: 0,
+					Window: config.Duration(time.Minute), Interval: config.Duration(time.Hour),
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := ruleServer(t)
+			if err := tc.add(s); err != nil {
+				t.Fatal(err)
+			}
+			s.mu.Lock()
+			tn := s.tenants["12:34"]
+			s.mu.Unlock()
+			if tn == nil {
+				t.Fatal("the tenant-qualified rule did not resolve its tenant")
+			}
+			if got := tn.inFlight.Load(); got != 0 {
+				// Let the server cleanup finish promptly on the failing version.
+				tn.inFlight.Add(-got)
+				t.Fatalf("tenant in-flight count after evaluation = %d, want 0", got)
+			}
+		})
+	}
+}
+
 // A rule's series are capped, and a capped rule says so.
 func TestAMetricRuleCapsItsCardinality(t *testing.T) {
 	srv, ts := ruleServer(t)

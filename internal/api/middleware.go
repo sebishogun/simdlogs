@@ -613,10 +613,14 @@ func adminSpec() routeSpec {
 //
 // The handler's own ceiling still applies; this only stops a limit meant for
 // client uploads from deciding what one node may hand another.
-func replicaGroupSpec() routeSpec {
+//
+// The ceiling reads the server's replicaGroupLimit field, which defaults to
+// maxRepairBytes; a test shrinks the field to exercise the boundary without a
+// gigabyte fixture.
+func (s *Server) replicaGroupSpec() routeSpec {
 	sp := adminSpec()
-	sp.limit = func() int64 { return maxRepairBytes }
-	sp.form = false // the adopt POST's body IS the group, read with io.ReadAll
+	sp.limit = func() int64 { return s.replicaGroupLimit }
+	sp.form = false // the adopt POST's body IS the group, streamed into the store
 	return sp
 }
 

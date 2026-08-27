@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -299,5 +302,196 @@ func TestAStorageNodeRefusesAnUnknownProtocol(t *testing.T) {
 	}
 	if resp.Header.Get(HdrErrorClass) != string(PeerVersionMismatch) {
 		t.Errorf("the refusal is not classed: %q", resp.Header.Get(HdrErrorClass))
+	}
+}
+
+// spool discards a response past its bound as malformed, the way do discards
+// one past maxBody -- the bound that makes a REPAIR fetch safe: a group past
+// maxRepairBytes is refused at the fetch, with the file discarded, rather
+// than half-moved.
+func TestSpoolRefusesAResponsePastItsBound(t *testing.T) {
+	const bound = 1 << 20
+	peer := fakePeer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(w.Header(), 0, 0, true, 0, false, "gen-test", "")
+		w.Write(make([]byte, 2*bound))
+	})
+
+	c := newClusterClient(nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	f, n, resp, cleanup := c.spool(req, 0, 0, peer.URL, "/x", "", bound)
+	cleanup()
+
+	if resp.Class != PeerMalformed {
+		t.Fatalf("class %q, want malformed: %v", resp.Class, resp.Err)
+	}
+	if !strings.Contains(resp.Err.Error(), "exceeds") {
+		t.Errorf("the refusal does not say why: %v", resp.Err)
+	}
+	if f != nil {
+		t.Error("a discarded response left a file behind")
+	}
+	if n > bound {
+		t.Errorf("read %d bytes past the %d-byte bound", n, bound)
+	}
+
+	// The same response under the same bound at zero is accepted and read
+	// whole -- the bound is what the caller chooses, not what the transport
+	// imposes.
+	f, n, resp, cleanup = c.spool(req, 0, 0, peer.URL, "/x", "", 0)
+	cleanup()
+	if !resp.OK() || f == nil {
+		t.Fatalf("unbounded spool: %s", resp)
+	}
+	if n != 2*bound {
+		t.Errorf("unbounded spool read %d bytes, want %d", n, 2*bound)
+	}
+}
+
+// spool creates its temp file in the client's configured directory, not the
+// process temp dir -- which is often tmpfs, the one place a gigabyte repair
+// transfer must not land -- and leaves nothing named behind in either place.
+func TestSpoolUsesTheConfiguredDirectory(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the fd-name check reads /proc/self/fd")
+	}
+	dir := t.TempDir()
+	peer := fakePeer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(w.Header(), 0, 0, true, 0, false, "gen-test", "")
+		w.Write(make([]byte, 4096))
+	})
+	c := newClusterClient(nil)
+	c.spoolDir = dir
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	f, n, resp, cleanup := c.spool(req, 0, 0, peer.URL, "/x", "", 0)
+	defer cleanup()
+	if !resp.OK() || f == nil {
+		t.Fatalf("spool: %s", resp)
+	}
+	if n != 4096 {
+		t.Fatalf("spooled %d bytes, want 4096", n)
+	}
+	// The file is unlinked, but its fd still names the place it was created.
+	link, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+	if err != nil {
+		t.Skipf("cannot readlink /proc/self/fd: %v", err)
+	}
+	if !strings.Contains(link, dir) {
+		t.Errorf("the spool file was created at %q, want it under the configured %q", link, dir)
+	}
+	// Nothing named may remain in this test's isolated spool directory.
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "simdlogs-spool-") {
+			t.Errorf("a spool left %q behind in %s", e.Name(), dir)
+		}
+	}
+}
+
+// A spoolDir that cannot host a temp file is a loud failure, not a silent
+// fallback to the process temp dir: the point of the directory is that the
+// file is on the configured filesystem, and falling back would put it back on
+// whichever one the process temp dir happens to be.
+func TestSpoolRefusesAnUnusableConfiguredDirectory(t *testing.T) {
+	peer := fakePeer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(w.Header(), 0, 0, true, 0, false, "gen-test", "")
+		w.Write(make([]byte, 64))
+	})
+	notADir := filepath.Join(t.TempDir(), "a-file")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := newClusterClient(nil)
+	c.spoolDir = notADir
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	f, _, resp, cleanup := c.spool(req, 0, 0, peer.URL, "/x", "", 0)
+	cleanup()
+	if resp.Class != PeerUnavailable {
+		t.Fatalf("class %q, want unavailable: %v", resp.Class, resp.Err)
+	}
+	if f != nil {
+		t.Error("a failed spool returned a file")
+	}
+}
+
+// The spool bound is exact: a response of exactly maxBytes passes, one byte
+// more is refused.
+func TestSpoolBoundIsExact(t *testing.T) {
+	const bound = 1 << 20
+	for _, n := range []int64{bound, bound + 1} {
+		peer := fakePeer(t, func(w http.ResponseWriter, r *http.Request) {
+			writeEnvelope(w.Header(), 0, 0, true, 0, false, "gen-test", "")
+			w.Write(make([]byte, n))
+		})
+		c := newClusterClient(nil)
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		f, got, resp, cleanup := c.spool(req, 0, 0, peer.URL, "/x", "", bound)
+		cleanup()
+		if n == bound {
+			if !resp.OK() || f == nil {
+				t.Fatalf("a response of exactly the bound was refused: %s", resp)
+			}
+			if got != bound {
+				t.Errorf("read %d bytes, want the %d served", got, bound)
+			}
+		} else if resp.Class != PeerMalformed || f != nil {
+			t.Fatalf("a response one byte over the bound: class %q, file %v (%v)",
+				resp.Class, f != nil, resp.Err)
+		}
+	}
+}
+
+// spool classifies a refusal exactly as doReader does: 401/403 is the
+// router's credential, 429/503 is load, 5xx is an unavailable peer, and a 4xx
+// carries the peer's own words. The repair fetch must not collapse a source's
+// 404 -- "this digest is no longer on disk, and here is why" -- into a
+// bodyless "HTTP 404".
+func TestSpoolClassifiesRefusalsLikeDoReader(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		body        string
+		wantClass   PeerErrorClass
+		wantInError string
+	}{
+		{"unauthorized", http.StatusUnauthorized, "nope", PeerUnauthorized, ""},
+		{"forbidden", http.StatusForbidden, "nope", PeerUnauthorized, ""},
+		{"overloaded", http.StatusTooManyRequests, "slow down", PeerOverloaded, ""},
+		{"unavailable", http.StatusServiceUnavailable, "draining", PeerOverloaded, ""},
+		{"server error", http.StatusInternalServerError, "boom", PeerUnavailable, ""},
+		{"refused with a diagnostic body", http.StatusNotFound,
+			"storage: group 3 changed while being read", PeerRejected, "changed while being read"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			peer := fakePeer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+				w.WriteHeader(tc.status)
+				w.Write([]byte(tc.body))
+			})
+			c := newClusterClient(nil)
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+			f, _, spooled, cleanup := c.spool(req, 0, 0, peer.URL, "/x", "", 1<<20)
+			cleanup()
+			if spooled.Class != tc.wantClass {
+				t.Fatalf("spool class %q, want %q: %v", spooled.Class, tc.wantClass, spooled.Err)
+			}
+			if tc.wantInError != "" && !strings.Contains(spooled.Err.Error(), tc.wantInError) {
+				t.Errorf("the refusal does not carry the peer's words: %v", spooled.Err)
+			}
+			if f != nil {
+				t.Error("a refused response left a spool file")
+			}
+
+			read := c.doReader(req, 0, 0, peer.URL, http.MethodGet, "/x", nil, "")
+			if read.Class != spooled.Class {
+				t.Errorf("doReader class %q differs from spool's %q on the same response",
+					read.Class, spooled.Class)
+			}
+		})
 	}
 }

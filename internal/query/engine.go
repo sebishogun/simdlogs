@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -98,6 +99,10 @@ type Query struct {
 	// rows that had never carried them. Two meanings in one flag; this is the
 	// half that is only about what the scan reads.
 	MatCols bool
+	// regexReady says every programmatic Regexp predicate has been compiled
+	// before a parallel scan starts. Query is already mutable and is not safe
+	// for concurrent executions by its caller.
+	regexReady bool
 
 	// Cancellation and the reason a scan stopped.
 	//
@@ -255,19 +260,55 @@ func numInRange(f float64, p *Pred) bool {
 // (Field2) per row, rather than this field's values against a constant.
 func isFieldCmp(k PredKind) bool { return k >= EqField && k <= GeField }
 
-// regex compiles the predicate's pattern once, tolerating an invalid pattern
-// (which then matches nothing) so a malformed user regex is never a panic --
-// the parser also validates it up front for a clean 400, this is the guard for
-// programmatic callers that set Value directly.
+type cachedRegexp struct{ re *regexp.Regexp }
+
+var programmaticRegexps sync.Map // pattern string -> cachedRegexp
+
+// regex returns the predicate's compiled pattern. Parsed queries carry one
+// already; the cache is the race-free fallback for programmatic predicates
+// used without the normal pre-scan preparation. Invalid patterns match
+// nothing, preserving the old guard for callers that construct Pred directly.
 func (p *Pred) regex() *regexp.Regexp {
-	if p.re == nil {
-		re, err := regexp.Compile(p.Value)
-		if err != nil {
-			return nil
-		}
-		p.re = re
+	if p.re != nil {
+		return p.re
 	}
-	return p.re
+	if cached, ok := programmaticRegexps.Load(p.Value); ok {
+		return cached.(cachedRegexp).re
+	}
+	re, _ := regexp.Compile(p.Value)
+	actual, _ := programmaticRegexps.LoadOrStore(p.Value, cachedRegexp{re: re})
+	return actual.(cachedRegexp).re
+}
+
+// prepareRegexps moves the cache lookup out of every value comparison and,
+// critically, finishes all writes to Pred before parallel workers read it.
+func (q *Query) prepareRegexps() {
+	if q.regexReady {
+		return
+	}
+	for i := range q.Preds {
+		if q.Preds[i].Kind == Regexp && q.Preds[i].re == nil {
+			q.Preds[i].re = q.Preds[i].regex()
+		}
+	}
+	prepareExprRegexps(q.Filter)
+	q.regexReady = true
+}
+
+func prepareExprRegexps(e *Expr) {
+	if e == nil {
+		return
+	}
+	if e.Op == OpLeaf {
+		if e.Pred.Kind == Regexp && e.Pred.re == nil {
+			e.Pred.re = e.Pred.regex()
+		}
+		return
+	}
+	prepareExprRegexps(e.Child)
+	for _, kid := range e.Kids {
+		prepareExprRegexps(kid)
+	}
 }
 
 // Pred is one field predicate. Fields ordered large-to-small (pointers and
@@ -561,6 +602,7 @@ func sortByTimeDesc(rows []Row) {
 // prunes on the AND-of-equality leaves only (an OR branch or a non-equality
 // leaf could still match, so those never reject).
 func groupCanMatch(g *storage.Reader, q *Query) bool {
+	q.prepareRegexps()
 	if q.Filter != nil {
 		return exprCanMatch(g, q.Filter)
 	}

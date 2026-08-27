@@ -376,6 +376,13 @@ func (p *lqlParser) parseStreamSelector() (*Expr, error) {
 			return nil, err
 		}
 		leaf := &Expr{Op: OpLeaf, Pred: Pred{Field: label.val, Value: val}}
+		if op.val == "=~" || op.val == "!~" {
+			re, err := regexp.Compile(val)
+			if err != nil {
+				return nil, fmt.Errorf("simdlogs: invalid regex %q: %w", val, err)
+			}
+			leaf.Pred.re = re
+		}
 		switch op.val {
 		case "=":
 			leaf.Pred.Kind = Eq

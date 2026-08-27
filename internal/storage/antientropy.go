@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -65,10 +66,13 @@ type GroupDigest struct {
 //
 // A group file is IMMUTABLE once sealed, so its digest is a property of its id
 // for as long as the group exists -- which makes caching it exact rather than a
-// heuristic that needs invalidating on change.
+// heuristic that needs invalidating on change. The one exception is
+// recompaction, which rewrites a group's bytes in place under the same id;
+// invalidateDigest drops the entry at the rewrite's install, so the cache's
+// premise holds again immediately after.
 //
-// Without it, every lookup walked and hashed the store: GroupBytes for one
-// group cost O(store), and a repair pass paid that per group at both ends.
+// Without it, serving one group walked and hashed the store: one fetch cost
+// O(store), and a repair pass paid that per group at both ends.
 // Measured at 9.7x for 10x the groups before, 4.0x with the walk stopping at
 // the first match, and flat with the cache.
 //
@@ -95,6 +99,16 @@ func (s *Store) groupDigestCached(id uint64) (string, error) {
 	s.digestByID[id] = d
 	s.digestMu.Unlock()
 	return d, nil
+}
+
+// invalidateDigest drops the cached digest for one id, so the next inventory
+// or fetch re-hashes the file. Called when a group's bytes change under the
+// same id (recompaction) -- the one thing the cache's "immutable once sealed"
+// premise does not cover.
+func (s *Store) invalidateDigest(id uint64) {
+	s.digestMu.Lock()
+	delete(s.digestByID, id)
+	s.digestMu.Unlock()
 }
 
 // GroupDigests lists every group this store holds, by content.
@@ -144,18 +158,19 @@ func (s *Store) GroupDigests() ([]GroupDigest, error) {
 	return out, nil
 }
 
-// GroupBytes returns one group's file bytes, addressed by content.
+// OpenGroupBytes returns one group's file for streaming to a peer, verified
+// against its digest first.
 //
-// By digest rather than by id, so a caller that asked for a specific group
-// cannot be handed a different one: between the inventory and the fetch, a
-// compaction can retire the group that held that id and a later write can reuse
-// nothing -- ids are never reused -- but the group can be gone, and answering
-// "here is id 7" for a different group would silently copy the wrong rows.
-func (s *Store) GroupBytes(digest string) ([]byte, error) {
-	// The store is walked, not INVENTORIED. GroupDigests reads and hashes every
-	// group file, so serving one group cost O(store) -- measured at 9.7x for
-	// 10x the groups -- and a repair pass paid it per group at both ends. Here
-	// the walk stops at the first match and hashes only what it reads.
+// A repaired group may be a gigabyte, and the router spools what it fetches to
+// its own disk, so buffering the same bytes again here serves no one: the file
+// is hashed in one pass and returned for a second.
+//
+// The two passes are the limit of what a streaming answer can verify: the
+// bytes SERVED are not the bytes HASHED, and a change between the passes
+// means the file changed underneath an immutable group -- corruption. The
+// receiver hashes everything it is given against the digest it asked for, so
+// a change here is caught there rather than trusted.
+func (s *Store) OpenGroupBytes(digest string) (*os.File, error) {
 	snap, _, err := s.SnapshotAllWithSeq()
 	if err != nil {
 		return nil, err
@@ -167,83 +182,125 @@ func (s *Store) GroupBytes(digest string) ([]byte, error) {
 		if err != nil || d != digest {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(s.dir, fmt.Sprintf("group-%d.bin", id)))
-		if err != nil {
+		path := filepath.Join(s.dir, fmt.Sprintf("group-%d.bin", id))
+		if got, err := fileDigest(path); err != nil {
 			return nil, err
-		}
-		// Re-hashed: the cache says these bytes had this digest, and this read
-		// is a different moment. For an immutable group a mismatch means the
-		// file changed underneath, which is corruption.
-		if got := digestBytes(b); got != digest {
+		} else if got != digest {
 			return nil, fmt.Errorf(
 				"storage: group %d changed while being read (%s, wanted %s)",
 				id, got, digest)
 		}
-		// The bytes returned are the bytes that were hashed, in one read --
-		// there is no window in which the file could change between the two.
-		return b, nil
+		return os.Open(path)
 	}
 	return nil, fmt.Errorf("storage: no group with digest %s", digest)
 }
 
-// AdoptGroup takes a group's bytes from a peer and commits them here.
+// AdoptGroupStream validates and commits a group streamed from a peer. A
+// repaired group may be a gigabyte, so the bytes land on disk once, hashed on
+// the way in, and the digest check and parse happen before anything is
+// committed.
 //
-// It is the repair half of anti-entropy, and it is deliberately narrow:
+// It never deletes or replaces, and commits under a fresh local id. A store
+// that already has the digest is left alone, making repair idempotent.
 //
-//   - The bytes are VALIDATED before anything is committed -- parsed as a
-//     group, with the digest checked against what the caller asked for. A peer
-//     that is compromised, buggy or on another format version cannot write
-//     arbitrary bytes into this store's directory.
-//   - It never deletes and never replaces. Repair only ever adds, so no repair
-//     can destroy the last good copy of anything. A store that already has this
-//     digest is left alone and reports it, which also makes repair idempotent
-//     and safe to retry.
-//   - The group is committed under a FRESH local id, because the peer's id is
-//     meaningful only on the peer.
-func (s *Store) AdoptGroup(digest string, blob []byte) (adopted bool, err error) {
-	if got := digestBytes(blob); got != digest {
-		return false, fmt.Errorf(
-			"storage: refusing a group whose bytes hash to %s, not the %s that was asked for",
-			got, digest)
-	}
-	// Parsed before it is written: a blob that is not a group must not reach
-	// the directory, where the next open would find it.
-	g, err := ReadGroup(blob)
-	if err != nil {
-		return false, fmt.Errorf("storage: refusing a group that does not parse: %w", err)
-	}
-	if g.Rows <= 0 {
-		return false, fmt.Errorf("storage: refusing a group with %d rows", g.Rows)
-	}
-
-	// THE CHECK AND THE APPEND ARE ONE STEP.
-	//
-	// Held across both, because between them is where the duplicate lands: the
-	// two used to take s.mu separately, so concurrent adopts of one group all
-	// saw it absent and all appended. The destination is the only participant
-	// that can see it already holds the group -- a router deciding what is
-	// missing is reading a state another router may already be changing, which
-	// is why the router's own latch cannot close this.
+// refuse, when non-nil, is the caller's chance to veto the group between its
+// validation and its commit (the server refuses groups its retention horizon
+// has already deleted). Its error is returned unchanged, and the staged file
+// is discarded rather than committed.
+func (s *Store) AdoptGroupStream(digest string, r io.Reader, refuse func(*Reader) error) (adopted bool, size int64, err error) {
+	// THE CHECK AND THE APPEND ARE ONE STEP: the lock spans
+	// the "do I have this?" and the commit, so a second adopt of one digest
+	// landing while this one streams sees the first and does nothing. It is
+	// held across the stream deliberately: a second router copying the same
+	// group must wait for the first to commit, not stage its own copy.
 	s.adoptMu.Lock()
 	defer s.adoptMu.Unlock()
 
 	if s.hasDigest(digest) {
-		return false, nil // already here; repair is idempotent
+		return false, 0, nil // already here; repair is idempotent
 	}
 	// The same budget a client write faces.
 	//
-	// AdoptGroup reached appendBlob directly and never called CheckWrite, and
+	// The old buffered adoption reached appendBlob directly and never called CheckWrite, and
 	// the admin route wrapper does not apply checkStorage the way the ingest
 	// one does -- so a store refusing client writes with "disk space below the
 	// reserve" accepted repaired groups. The reserve exists so the store can
 	// still compact and record a retention removal; repair spent it.
 	if err := s.CheckWrite(); err != nil {
-		return false, fmt.Errorf("storage: refusing a repaired group: %w", err)
+		return false, 0, fmt.Errorf("storage: refusing a repaired group: %w", err)
 	}
-	if err := s.appendRawGroup(blob); err != nil {
-		return false, err
+
+	s.mu.Lock()
+	id := s.nextID
+	s.nextID++
+	s.mu.Unlock()
+
+	// Staged beside the final name, leaving the same residue a crashed
+	// writeFileAtomic leaves: a *.tmp file OpenStore ignores. The final name
+	// is NOT used until every validation has passed -- see the commit below.
+	final := filepath.Join(s.dir, fmt.Sprintf("group-%d.bin", id))
+	tmp := final + ".tmp"
+	if err := fault(faultCreate); err != nil {
+		return false, 0, err
 	}
-	return true, nil
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, DataFileMode)
+	if err != nil {
+		return false, 0, err
+	}
+	h := sha256.New()
+	if err := fault(faultWrite); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return false, 0, err
+	}
+	n, err := io.Copy(io.MultiWriter(f, h), r)
+	// Fsynced only when the copy succeeded: syncing a partial file that is
+	// about to be deleted is wasted IO, and a copy failure is the failure
+	// that matters.
+	if err == nil {
+		if ferr := fault(faultSync); ferr != nil {
+			err = ferr
+		} else if ferr = f.Sync(); ferr != nil {
+			err = ferr
+		}
+	}
+	// Closed either way -- a handle must not leak on the error path.
+	if cerr := fault(faultClose); cerr != nil {
+		err = cerr
+	}
+	if cerr := f.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return false, n, err
+	}
+	size = n
+	// Hashed against the digest that was asked for -- a peer
+	// that returns the wrong group is caught here rather than committed.
+	if got := hex.EncodeToString(h.Sum(nil)); got != digest {
+		os.Remove(tmp)
+		return false, size, fmt.Errorf(
+			"storage: refusing a group whose bytes hash to %s, not the %s that was asked for",
+			got, digest)
+	}
+	// The parse, the pre-commit checks, the rename and the manifest record
+	// are the shared commit, in that order: every refusal (unparseable, zero
+	// rows, the caller's) happens while the bytes still carry the .tmp name,
+	// so refused input can never leave a group-*.bin file behind -- not in
+	// process and not after a crash.
+	if _, err := s.commitGroupFile(tmp, final, id, size, "", func(g *Reader) error {
+		if g.Rows <= 0 {
+			return fmt.Errorf("storage: refusing a group with %d rows", g.Rows)
+		}
+		if refuse != nil {
+			return refuse(g)
+		}
+		return nil
+	}); err != nil {
+		return false, size, err
+	}
+	return true, size, nil
 }
 
 // hasDigest reports whether this store already holds a group with these bytes,
@@ -268,12 +325,21 @@ func (s *Store) hasDigest(digest string) bool {
 }
 
 // fileDigest hashes a file's bytes.
+//
+// Streamed rather than read whole: GroupDigests and OpenGroupBytes both hash
+// every group's file, and a group may be a gigabyte, which is not a slice
+// worth allocating to sum.
 func fileDigest(path string) (string, error) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	return digestBytes(b), nil
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func digestBytes(b []byte) string {

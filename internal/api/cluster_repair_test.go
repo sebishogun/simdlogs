@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"github.com/sebishogun/simdlogs/internal/storage"
 	"io"
@@ -566,5 +567,223 @@ func TestASelfOverlappingReplicaIsReportedThroughTheHandler(t *testing.T) {
 	}
 	if len(rep.Errors) == 0 {
 		t.Error("nothing in Errors names the replica an operator has to look at")
+	}
+}
+
+// A group above the peer client's in-memory response ceiling is still copied.
+//
+// copyGroup fetched through peers.do, whose maxBody ceiling (256 MiB in
+// production) discards any larger answer as malformed -- so a group in
+// (256 MiB, maxRepairBytes] could never be repaired, and a replica holding it
+// stayed short forever. That ceiling bounds QUERY answers, which a router
+// controls through limits it set; a group transfer is bounded by
+// maxRepairBytes instead, and the regression is that repair never consults
+// the in-memory ceiling at all.
+//
+// The fixture shrinks the CEILING rather than building a 300 MiB group: a
+// group above ANY shrinkable ceiling must still cross, which is the same
+// property at a size a test can afford.
+func TestRepairCopiesAGroupAboveThePeerResponseCeiling(t *testing.T) {
+	const ceiling = 256 << 10 // the router's in-memory peer cap, shrunk
+	const rows = storage.MaxRows
+
+	// One store holding a single group above the ceiling, written directly so
+	// no ingest flush limits decide the fixture's shape.
+	dir := t.TempDir()
+	st, err := storage.OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AppendGroup(repairFixtureGroup(rows)); err != nil {
+		t.Fatal(err)
+	}
+	ds, err := st.GroupDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture must actually be above the ceiling, or the test asserts
+	// nothing: the timestamp column delta+varints away to nothing, so the size
+	// is checked against the FILE, not guessed from the rows.
+	if len(ds) != 1 || ds[0].Bytes <= ceiling {
+		t.Fatalf("fixture group is %d bytes, want one group above the %d-byte "+
+			"ceiling; the test would pass without ever crossing the cap",
+			ds[0].Bytes, ceiling)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Node 0 serves that store; node 1 starts empty. The rest is the ordinary
+	// two-replica fixture.
+	node0 := serverOverStore(t, dir)
+	node1 := realShard(t, nil)
+
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	srv.SetBackends([]string{node0.URL, node1.URL})
+	srv.SetReplicas(2) // one shard, two replicas
+	// THE REGRESSION: the router's peer client refuses responses past this
+	// ceiling, and the group above it used to be unrepairable through that
+	// path. The ceiling is deliberately below the group.
+	srv.peers.maxBody = ceiling
+	router := httptest.NewServer(srv.Handler())
+	t.Cleanup(router.Close)
+
+	if got := rowCount(t, node0); got != rows {
+		t.Fatalf("node 0 serves %d rows, want %d -- the fixture is not what "+
+			"the test thinks it is", got, rows)
+	}
+
+	rep := runRepair(t, router)
+	if !rep.Complete {
+		t.Fatalf("the pass reported itself incomplete: %+v", rep)
+	}
+	if rep.Copied != 1 {
+		t.Fatalf("copied %d groups, want the 1 the empty replica was missing: %+v",
+			rep.Copied, rep)
+	}
+	if got := rowCount(t, node1); got != rows {
+		t.Fatalf("replica 1 holds %d rows after repair, want %d -- the group "+
+			"did not cross", got, rows)
+	}
+}
+
+// repairFixtureGroup builds one group of rows rows: a timestamp column plus a
+// single-value message column and a dense vector column. The vector is what
+// keeps the fixture above any small ceiling -- it is dense float32 and does
+// not delta-encode -- so the group's size is not an accident of varint luck.
+func repairFixtureGroup(rows int) *storage.Group {
+	ts := make([]int64, rows)
+	vals := make([]string, rows)
+	vec := make([]float32, rows)
+	for i := range ts {
+		ts[i] = 1780315200000000000 + int64(i) // 2026-06-01T12:00:00Z + i ns
+		vals[i] = "big"
+		vec[i] = float32(i)
+	}
+	d := storage.BuildDict(vals)
+	return &storage.Group{Rows: rows, Columns: []storage.Column{
+		{Name: "_time", Type: storage.ColTimestamp, Ts: ts},
+		{Name: "_msg", Type: storage.ColDict, Dict: &d},
+		{Name: "vec", Type: storage.ColVector, Vec: vec, Dim: 1},
+	}}
+}
+
+// The digest query must reach BOTH hops of a copy: the fetch names what the
+// source must serve, and the adopt names what the body must hash to. Dropping
+// it on either hop turns the transfer into a refusal. The two hops also carry
+// independent timeouts now, so the adopt cannot inherit a deadline the fetch
+// already ate.
+func TestCopyGroupCarriesTheDigestQueryOnBothHops(t *testing.T) {
+	var srcQuery, dstQuery string
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srcQuery = r.URL.RawQuery
+		writeEnvelope(w.Header(), 0, 0, true, 0, false, "gen-test", "")
+		w.Write([]byte("group bytes"))
+	}))
+	t.Cleanup(src.Close)
+	dst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dstQuery = r.URL.RawQuery
+		writeEnvelope(w.Header(), 0, 0, true, 0, false, "gen-test", "")
+		json.NewEncoder(w).Encode(map[string]any{"adopted": true, "digest": "deadbeef"})
+	}))
+	t.Cleanup(dst.Close)
+
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/cluster/repair", nil)
+	moved, err := srv.copyGroup(req, src.URL, dst.URL, "deadbeef")
+	if err != nil {
+		t.Fatalf("copyGroup: %v", err)
+	}
+	if moved != int64(len("group bytes")) {
+		t.Errorf("moved %d bytes, want the %d the source served", moved, len("group bytes"))
+	}
+	if srcQuery != "digest=deadbeef" {
+		t.Errorf("the fetch asked for %q, want digest=deadbeef", srcQuery)
+	}
+	if dstQuery != "digest=deadbeef" {
+		t.Errorf("the adopt named %q, want digest=deadbeef", dstQuery)
+	}
+}
+
+// The adopt body bound is exact: a group of exactly replicaGroupLimit bytes is
+// adopted, and one byte more is refused with 413. The limit is shrinkable so
+// the boundary is exercised without a gigabyte fixture.
+func TestTheAdoptBoundIsExact(t *testing.T) {
+	// A real group, small.
+	dir := t.TempDir()
+	st, err := storage.OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AppendGroup(repairFixtureGroup(8)); err != nil {
+		t.Fatal(err)
+	}
+	ds, err := st.GroupDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := st.OpenGroupBytes(ds[0].Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := io.ReadAll(f)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	// The shrinkable limit: the route's ceiling is this, not maxRepairBytes.
+	srv.replicaGroupLimit = int64(len(blob))
+	node := httptest.NewServer(srv.Handler())
+	t.Cleanup(node.Close)
+
+	post := func(body []byte, digest string) (int, string) {
+		t.Helper()
+		resp, err := http.Post(node.URL+pathReplicaGroup+"?digest="+digest,
+			"application/octet-stream", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+
+	// Exactly at the limit: accepted.
+	code, body := post(blob, storage.DigestForTest(blob))
+	if code != 200 {
+		t.Fatalf("a group of exactly the limit answered %d: %.300s", code, body)
+	}
+	if !strings.Contains(body, `"adopted":true`) {
+		t.Errorf("the exact-limit group was not adopted: %.300s", body)
+	}
+
+	// One byte past the limit: refused, and refused BEFORE the body is read.
+	padded := append(blob, 'x')
+	code, body = post(padded, storage.DigestForTest(padded))
+	if code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a group one byte over the limit answered %d, want 413: %.300s", code, body)
+	}
+	if got := rowCount(t, node); got != 8 {
+		t.Errorf("the refused body left %d rows, want the 8 the exact-limit group stored", got)
 	}
 }

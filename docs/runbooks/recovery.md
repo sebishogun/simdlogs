@@ -52,7 +52,12 @@ redundancy.
          http://router:9428/admin/cluster/repair | jq .
 
 4. Repeat until `copied` is 0 and `complete` is true. Each pass is bounded at
-   64 groups and 1 GiB, and `remaining` says what it left.
+   64 groups and uses a 1 GiB accounting budget; `remaining` says what it left.
+   Actual bytes are charged after each group, so a peer whose inventory
+   understates a group can move that final group past the budget, but never
+   beyond 2 GiB because each group is capped independently at 1 GiB. A group
+   larger than 1 GiB is refused on every pass and requires the shard to be
+   restored or reseeded outside this endpoint.
 
 Tested end to end by `TestDrillALostReplicaIsRebuiltByRepair`, including that
 the surviving replica is unchanged and a second pass copies nothing.

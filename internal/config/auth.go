@@ -330,7 +330,7 @@ func (a *AuthConfig) Principals() (map[string]*Principal, error) {
 			}
 			p.Tenants[k] = true
 		}
-		out[strings.ToLower(t.SHA256)] = p
+		out[strings.ToLower(strings.TrimSpace(t.SHA256))] = p
 	}
 	return out, nil
 }

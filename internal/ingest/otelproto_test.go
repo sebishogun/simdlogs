@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -413,6 +414,40 @@ func TestTheTwoOTLPEncodingsAgreeOnAnUnstorableTimestamp(t *testing.T) {
 	}
 }
 
+// TestUvarintMatchesBinaryAcrossTheBoundary: the helper must decode exactly
+// what binary.Uvarint does. The values cross the boundary where a varint
+// stops being its own byte, plus the two's-complement negatives a signed
+// int32/int64 field (severity_number, Loki nanos, int attrs) encodes as a
+// 10-byte varint.
+func TestUvarintMatchesBinaryAcrossTheBoundary(t *testing.T) {
+	for _, v := range []uint64{0, 1, 7, 127, 128, 129, 200, 255, 300, 1000,
+		65535, 1 << 20, 1<<32 - 1, 1 << 32, 1 << 63, 1<<63 + 1, ^uint64(0)} {
+		enc := binary.AppendUvarint(nil, v)
+		if got := uvarint(enc); got != v {
+			t.Fatalf("uvarint(%x) = %d, want %d", enc, got, v)
+		}
+	}
+	// The signed path: proto3 encodes a negative int32/int64 as the uint64
+	// two's-complement cast, and the call sites decode then cast. The cast
+	// must round-trip the wire value.
+	for _, s := range []int64{-1, -128, -129, -1 << 31, -1 << 63, math.MinInt64} {
+		enc := binary.AppendUvarint(nil, uint64(s))
+		if got := int64(uvarint(enc)); got != s {
+			t.Fatalf("int64(uvarint(%x)) = %d, want %d", enc, got, s)
+		}
+	}
+	// The int32 path (Loki Timestamp.nanos): the wire carries the int32
+	// sign-extended, so a value past int32 truncates on the wire -- MinInt64
+	// as an int32 field IS zero, and the receiver's int32 cast must recover
+	// what the client sent.
+	for _, s := range []int64{-1, -128, -129, -1 << 31, math.MinInt32, math.MaxInt32} {
+		enc := binary.AppendUvarint(nil, uint64(int32(s)))
+		if got := int64(int32(uvarint(enc))); got != s {
+			t.Fatalf("int64(int32(uvarint(%x))) = %d, want %d", enc, got, s)
+		}
+	}
+}
+
 // rowsOverTheWholeDomain is storeRows' window widened to every instant an int64
 // nanosecond count can hold. storeRows uses [0, 1<<62), which stops in 2116 --
 // fine for its fixtures and wrong for a timestamp near MaxInt64, where a row
@@ -425,4 +460,49 @@ func rowsOverTheWholeDomain(t *testing.T, st *storage.Store) []query.Row {
 	}
 	q.From, q.To, q.MatAll = math.MinInt64, math.MaxInt64, true
 	return query.RunPipeline(st, q)
+}
+
+// TestEachFieldVarintZeroAlloc: the wire-type-0 path must allocate nothing.
+//
+// The old shape re-encoded every varint field's value into a local [8]byte
+// buffer whose address escaped into the callback ("moved to heap: buf" in
+// -gcflags=-m), so eachField allocated once per varint field. Loki entries
+// carry seconds+nanos varints; OTLP records carry severity_number and the
+// dropped counts -- a per-field allocation on the default encodings of both
+// protocols. AllocsPerRun over a message of NOTHING but varint fields
+// isolates exactly that allocation: no protocol allocation (strings, maps,
+// slices) is inside the measured call, so the count is the field loop's own.
+func TestEachFieldVarintZeroAlloc(t *testing.T) {
+	var msg []byte
+	for i := 0; i < 64; i++ {
+		msg = pvarint(msg, 1, uint64(i+1))
+	}
+	fn := func(num, wire int, payload []byte) {}
+	if got := testing.AllocsPerRun(100, func() { eachField(msg, fn) }); got != 0 {
+		t.Fatalf("eachField allocates %.0f objects per 64-varint-field walk (want 0): "+
+			"the wire-type-0 payload is re-encoded into an escaping buffer, once per field", got)
+	}
+}
+
+// TestEachFieldHandsRawVarintBytes pins the wire-type-0 payload contract: the
+// callback receives the RAW varint bytes from the message, not a re-encoded
+// 8-byte little-endian image. The values cross the boundary where a varint
+// stops being its own byte -- that is where a decode reading the wrong shape
+// goes wrong (docs/wrong.md entry 105).
+func TestEachFieldHandsRawVarintBytes(t *testing.T) {
+	for _, v := range []uint64{1, 127, 128, 129, 200, 255, 65535, 1 << 32, 1<<63 + 1, ^uint64(0)} {
+		var msg []byte
+		msg = pvarint(msg, 3, v)
+		var payload []byte
+		eachField(msg, func(num, wire int, p []byte) {
+			if num != 3 || wire != 0 {
+				t.Fatalf("callback saw field %d wire %d, want 3/0", num, wire)
+			}
+			payload = append(payload[:0], p...)
+		})
+		want := binary.AppendUvarint(nil, v)
+		if !bytes.Equal(payload, want) {
+			t.Fatalf("value %d: callback payload %x, want the raw varint %x", v, payload, want)
+		}
+	}
 }

@@ -156,10 +156,8 @@ func TestQuorumNeedsMoreThanHalf(t *testing.T) {
 	}
 }
 
-// The default is `all` -- and it stays that way until repair is proven.
-// Quorum without a repair process means a replica silently missing data
-// forever, and a read that lands on it returns a short answer with nothing to
-// say so.
+// The default is `all`. Repair is operator-triggered rather than automatic,
+// so quorum can leave a replica stale until the next repair pass.
 func TestTheDefaultConsistencyIsAll(t *testing.T) {
 	if got, err := ParseConsistency(""); err != nil || got != ConsistencyAll {
 		t.Fatalf("default = %q (%v), want all", got, err)
@@ -204,6 +202,38 @@ func TestEveryReplicaGetsTheSameWriteID(t *testing.T) {
 	}
 }
 
+// Per-request field mappings are query parameters. A router must carry them
+// to storage nodes with the body; dropping them stores a different schema and
+// can replace the sender's timestamp with ingest time while still answering
+// success.
+func TestReplicatedWriteForwardsFieldMappingQuery(t *testing.T) {
+	seen := make(chan string, 1)
+	_, ts, _ := writeRouter(t, func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.URL.RawQuery
+		w.Header().Set(HdrProtocolVersion, "1")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req, err := http.NewRequest(http.MethodPost,
+		ts.URL+"/insert/jsonline?_time_field=ts&_msg_field=message",
+		strings.NewReader(`{"ts":"2026-06-01T12:00:00Z","message":"x"}`+"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("router answered %d, want 200", resp.StatusCode)
+	}
+	if got := <-seen; got != "_time_field=ts&_msg_field=message" {
+		t.Fatalf("replica saw query %q, want the client's field mappings", got)
+	}
+}
+
 // A client-supplied write id is used, so a retry names the write it repeats.
 // An unusable one is refused rather than written into the manifest.
 func TestAClientWriteIDIsUsedAndValidated(t *testing.T) {
@@ -226,6 +256,41 @@ func TestAClientWriteIDIsUsedAndValidated(t *testing.T) {
 		if code, _ := postWrite(t, ts, bad, "all"); code != http.StatusBadRequest {
 			t.Errorf("write id %q returned %d, want 400", bad, code)
 		}
+	}
+}
+
+func TestARetryWithTheSameWriteIDReturnsToTheSameShard(t *testing.T) {
+	var hits [2]atomic.Int64
+	peers := make([]*httptest.Server, len(hits))
+	urls := make([]string, len(hits))
+	for i := range peers {
+		i := i
+		peers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits[i].Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer peers[i].Close()
+		urls[i] = peers[i].URL
+	}
+
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.SetBackends(urls)
+	srv.SetReplicas(1) // two shards, one replica each
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	const id = "0123456789abcdef"
+	for i := 0; i < 2; i++ {
+		if code, _ := postWrite(t, ts, id, "all"); code != http.StatusServiceUnavailable {
+			t.Fatalf("attempt %d returned %d, want 503", i+1, code)
+		}
+	}
+	if a, b := hits[0].Load(), hits[1].Load(); !((a == 2 && b == 0) || (a == 0 && b == 2)) {
+		t.Fatalf("two attempts with one write id hit shard counts %d and %d, want 2 and 0", a, b)
 	}
 }
 

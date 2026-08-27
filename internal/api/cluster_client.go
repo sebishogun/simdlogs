@@ -40,6 +40,12 @@ type clusterClient struct {
 	// smaller answer, it is an unparseable one, and a truncated NDJSON stream
 	// is a partial answer indistinguishable from a complete one.
 	maxBody int64
+	// spoolDir is where spool creates its temp files. Empty means the process
+	// temp dir (os.TempDir), which is the fallback for a bare client; a server
+	// sets it to its own data directory, because os.TempDir is often tmpfs --
+	// memory-backed, which is exactly where a gigabyte repair transfer must
+	// not land.
+	spoolDir string
 }
 
 // Peer client defaults.
@@ -137,20 +143,78 @@ var forwardedHeaders = []string{
 	"X-Request-Id", "Traceparent", "Tracestate",
 }
 
-// do performs one peer request and returns the parsed envelope.
+// peerStatusClass maps a peer's HTTP status to a class, reading a bounded
+// diagnostic prefix of a refused request's body.
 //
-// It never returns a nil PeerResponse: every failure is a response with a
-// class, because the caller's job is to decide what to do about it and "error
-// was nil-checked away" is how a failed peer became a silently missing shard.
+// Shared by doReader and spool so a peer's refusal reads the same on every
+// path: 401/403 is the router's credential, 429/503 is load, 5xx is a peer
+// that did not answer, and every other 4xx is a refused request whose body
+// says why. Without the body, a source answering 404 for a group it no longer
+// holds (or whose bytes changed underneath it) reads as a bare "HTTP 404",
+// and the operator is sent to the source to learn what it already said.
+//
+// The protocol version is checked by the callers, before this runs; a 2xx
+// returns PeerOK with no error and the caller reads the body itself.
+func peerStatusClass(h http.Header, status int, body io.Reader) (PeerErrorClass, error) {
+	if raw := h.Get(HdrErrorClass); raw != "" {
+		cls := PeerErrorClass(raw)
+		if !knownPeerClass(cls) {
+			// NOT REPEATED. This value is rendered into this node's own
+			// client-facing 503 body, so taking it verbatim let a peer write
+			// text into an error message this node signs.
+			return PeerMalformed, fmt.Errorf("peer sent an unrecognised %s header (HTTP %d)",
+				HdrErrorClass, status)
+		}
+		if cls != PeerOK {
+			return cls, fmt.Errorf("peer reported %s (HTTP %d)", cls, status)
+		}
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return PeerUnauthorized, fmt.Errorf("peer refused this router's credential (HTTP %d)", status)
+	case status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable:
+		return PeerOverloaded, fmt.Errorf("peer refused for load (HTTP %d)", status)
+	case status >= 500:
+		return PeerUnavailable, fmt.Errorf("peer returned HTTP %d", status)
+	case status >= 400:
+		// Every remaining 4xx. This used to fall through as success, so the
+		// peer's error body became part of the merged answer -- and an
+		// operation the peer REFUSED was reported as having happened. A bounded
+		// prefix of the body comes along because a 4xx from a peer is a bug in
+		// what this router sent, and the peer already said what was wrong.
+		msg, _ := io.ReadAll(io.LimitReader(body, 512))
+		return PeerRejected, fmt.Errorf("peer refused the request (HTTP %d): %s",
+			status, bytes.TrimSpace(msg))
+	}
+	return PeerOK, nil
+}
+
+// do performs one peer request whose body is the caller's OWN bytes, and
+// returns the parsed envelope.
+//
+// The request logic lives in doReader, which takes any io.Reader: a repaired
+// group is spooled to a file and streamed from it, and routing that through a
+// []byte here would put a gigabyte on this router's heap.
 func (c *clusterClient) do(
 	r *http.Request, shard, replica int, url, method, path string, body []byte, ct string,
 ) PeerResponse {
-	out := PeerResponse{Shard: shard, Replica: replica, URL: url}
-
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
 	}
+	return c.doReader(r, shard, replica, url, method, path, rdr, ct)
+}
+
+// doReader performs one peer request and returns the parsed envelope.
+//
+// It never returns a nil PeerResponse: every failure is a response with a
+// class, because the caller's job is to decide what to do about it and "error
+// was nil-checked away" is how a failed peer became a silently missing shard.
+func (c *clusterClient) doReader(
+	r *http.Request, shard, replica int, url, method, path string, body io.Reader, ct string,
+) PeerResponse {
+	out := PeerResponse{Shard: shard, Replica: replica, URL: url}
+
 	target := url + path
 	// The query string travels with EVERY method, not only GET.
 	//
@@ -162,7 +226,7 @@ func (c *clusterClient) do(
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
-	req, err := http.NewRequestWithContext(r.Context(), method, target, rdr)
+	req, err := http.NewRequestWithContext(r.Context(), method, target, body)
 	if err != nil {
 		out.Class, out.Err = PeerMalformed, err
 		return out
@@ -248,47 +312,8 @@ func (c *clusterClient) do(
 	if v := resp.Header.Get(HdrIncompleteReason); v != "" && knownIncompleteReason(v) {
 		out.IncompleteReason = v
 	}
-	if raw := resp.Header.Get(HdrErrorClass); raw != "" {
-		cls := PeerErrorClass(raw)
-		if !knownPeerClass(cls) {
-			// NOT REPEATED. This value is rendered into this node's own
-			// client-facing 503 body, so taking it verbatim let a peer write
-			// text into an error message this node signs.
-			out.Class = PeerMalformed
-			out.Err = fmt.Errorf("peer sent an unrecognised %s header (HTTP %d)",
-				HdrErrorClass, resp.StatusCode)
-			return out
-		}
-		if cls != PeerOK {
-			out.Class = cls
-			out.Err = fmt.Errorf("peer reported %s (HTTP %d)", cls, resp.StatusCode)
-			return out
-		}
-	}
-	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		out.Class = PeerUnauthorized
-		out.Err = fmt.Errorf("peer refused this router's credential (HTTP %d)", resp.StatusCode)
-		return out
-	case resp.StatusCode == http.StatusTooManyRequests ||
-		resp.StatusCode == http.StatusServiceUnavailable:
-		out.Class = PeerOverloaded
-		out.Err = fmt.Errorf("peer refused for load (HTTP %d)", resp.StatusCode)
-		return out
-	case resp.StatusCode >= 500:
-		out.Class = PeerUnavailable
-		out.Err = fmt.Errorf("peer returned HTTP %d", resp.StatusCode)
-		return out
-	case resp.StatusCode >= 400:
-		// Every remaining 4xx. This used to fall through as success, so the
-		// peer's error body became part of the merged answer -- and an
-		// operation the peer REFUSED was reported as having happened. A bounded
-		// prefix of the body comes along because a 4xx from a peer is a bug in
-		// what this router sent, and the peer already said what was wrong.
-		out.Class = PeerRejected
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		out.Err = fmt.Errorf("peer refused the request (HTTP %d): %s",
-			resp.StatusCode, bytes.TrimSpace(msg))
+	if cls, cerr := peerStatusClass(resp.Header, resp.StatusCode, resp.Body); cerr != nil {
+		out.Class, out.Err = cls, cerr
 		return out
 	}
 
@@ -360,17 +385,39 @@ func (c *clusterClient) do(
 // archive containing only the manifest; with it aborting, they receive nothing.
 // Neither is a backup.
 //
-// A temp file bounds the memory at one copy buffer regardless of shard size,
-// and gives the SIZE the tar header needs before the body is written -- which
-// is the reason the buffered version existed at all: a tar entry declares its
-// length up front, and a streamed body of unknown length cannot fill it in.
+// It is wrong for a REPAIRED GROUP for the same reason in miniature: a group
+// may be a gigabyte, and a router that read it whole would hold it whole.
+//
+// A temp file bounds the memory at one copy buffer regardless of what crosses
+// the wire, and gives the SIZE the tar header needs before the body is written
+// -- which is the reason the buffered version existed at all: a tar entry
+// declares its length up front, and a streamed body of unknown length cannot
+// fill it in.
+//
+// # Bounded, addressed, and placed
+//
+// query is appended to the path when non-empty, which is how a caller names
+// one group (`?digest=`). maxBytes bounds the response; 0 is unbounded. The
+// backup is unbounded -- a shard archive is as large as the shard -- while
+// repair bounds one group at maxRepairBytes, so a group past the ceiling is
+// refused here the same way `do` refuses a response past maxBody, and the
+// caller's budget is charged nothing for it.
+//
+// The temp file is created in c.spoolDir when set -- a server sets it to its
+// data directory -- and the process temp dir otherwise. Refusals are
+// classified by the same peerStatusClass doReader uses, so a 404 carries the
+// source's own words about why.
 func (c *clusterClient) spool(
-	r *http.Request, shard, replica int, url, path string,
+	r *http.Request, shard, replica int, url, path, query string, maxBytes int64,
 ) (f *os.File, size int64, resp PeerResponse, cleanup func()) {
 	cleanup = func() {}
 	out := PeerResponse{Shard: shard, Replica: replica, URL: url}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url+path, nil)
+	target := url + path
+	if query != "" {
+		target += "?" + query
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
 		out.Class, out.Err = PeerMalformed, err
 		return nil, 0, out, cleanup
@@ -382,6 +429,10 @@ func (c *clusterClient) spool(
 	}
 	req.Header.Set(HdrInternal, "1")
 	req.Header.Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+	out.TraceID = r.Header.Get("X-Request-Id")
+	if out.TraceID != "" {
+		req.Header.Set(HdrTraceID, out.TraceID)
+	}
 
 	hr, err := c.http.Do(req)
 	if err != nil {
@@ -407,27 +458,60 @@ func (c *clusterClient) spool(
 		out.Err = fmt.Errorf("peer speaks protocol %q, this node speaks %d", v, ProtocolVersion)
 		return nil, 0, out, cleanup
 	}
-	if hr.StatusCode < 200 || hr.StatusCode >= 300 {
-		out.Class = PeerRejected
-		out.Err = fmt.Errorf("peer refused the request (HTTP %d)", hr.StatusCode)
+	if cls, cerr := peerStatusClass(hr.Header, hr.StatusCode, hr.Body); cerr != nil {
+		out.Class, out.Err = cls, cerr
 		return nil, 0, out, cleanup
 	}
 
-	tmp, err := os.CreateTemp("", "simdlogs-shard-*.tar")
+	// The configured spool directory, or the process temp dir for a bare
+	// client. A server points this at its own data directory: os.TempDir is
+	// often tmpfs, and a gigabyte group must land on disk, not in RAM.
+	var tmp *os.File
+	if c.spoolDir != "" {
+		tmp, err = os.CreateTemp(c.spoolDir, "simdlogs-spool-*")
+	} else {
+		tmp, err = os.CreateTemp("", "simdlogs-spool-*")
+	}
 	if err != nil {
 		out.Class, out.Err = PeerUnavailable, err
 		return nil, 0, out, cleanup
 	}
 	// Unlinked immediately: the file stays readable through the handle and
-	// vanishes when it is closed, so a crash mid-backup leaves nothing behind
-	// and a caller that forgets the cleanup leaks nothing durable.
-	os.Remove(tmp.Name())
+	// vanishes when it is closed, so a crash mid-transfer leaves nothing
+	// behind and a caller that forgets the cleanup leaks nothing durable.
+	//
+	// A failure to unlink is FATAL to the spool, not a warning: the file
+	// would otherwise sit NAMED in the spool directory, filling it with one
+	// full-size file per transfer, and only a human would notice. Closing and
+	// retrying once is the limit of what a process can do; the error says
+	// where the file is.
+	if err := os.Remove(tmp.Name()); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		out.Class, out.Err = PeerUnavailable,
+			fmt.Errorf("could not unlink the spool file %s: %w", tmp.Name(), err)
+		return nil, 0, out, func() {}
+	}
 	cleanup = func() { tmp.Close() }
 
-	n, err := io.Copy(tmp, hr.Body)
+	// Bounded the way do() is: one extra byte past the ceiling is read so a
+	// response exactly at the limit is distinguishable from one that was cut.
+	var rdr io.Reader = hr.Body
+	if maxBytes > 0 {
+		rdr = &io.LimitedReader{R: hr.Body, N: maxBytes + 1}
+	}
+	n, err := io.Copy(tmp, rdr)
 	if err != nil {
 		out.Class, out.Err = PeerUnavailable, err
 		cleanup()
+		return nil, 0, out, func() {}
+	}
+	if maxBytes > 0 && n > maxBytes {
+		// Discarded, not truncated: the receiver hashes what it is given, so
+		// a truncated group would fail there as something it is not.
+		cleanup()
+		out.Class, out.Err = PeerMalformed,
+			fmt.Errorf("peer response exceeds %d bytes", maxBytes)
 		return nil, 0, out, func() {}
 	}
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
@@ -453,6 +537,9 @@ func (c *clusterClient) spool(
 	}
 	if v := hr.Header.Get(HdrIncompleteReason); v != "" && knownIncompleteReason(v) {
 		out.IncompleteReason = v
+	}
+	if id := hr.Header.Get(HdrTraceID); id != "" {
+		out.TraceID = id
 	}
 	return tmp, n, out, cleanup
 }

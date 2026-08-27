@@ -64,7 +64,7 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 		}
 		sawResourceLogs = true
 		var resAttrs []otlpKV
-		var resDropped uint64
+		var resDropped uint32
 		// First pass: the resource's attributes; second: the records. The
 		// resource message may follow its scope_logs on the wire, so both
 		// passes are needed for the order protobuf allows.
@@ -86,17 +86,19 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 						// default. The conformance fixture could not see it:
 						// its builder had no way to write the field, so
 						// neither encoding was ever asked.
-						// LittleEndian.Uint64, not Uvarint. eachField has
-						// ALREADY decoded the varint and hands the callback an
-						// 8-byte little-endian buffer -- every other
-						// wire-type-0 case in this file reads it that way.
-						// Decoding it a second time gave a wrong NUMBER for
-						// every count of 128 or more (200 -> 72, 255 -> 127,
-						// 1000 -> 488, 65535 -> 16383), which is worse than
-						// the absent field it replaced, and the fixture that
-						// was supposed to catch it used 7 -- inside the range
-						// where the two agree.
-						resDropped = binary.LittleEndian.Uint64(p2)
+						// uvarint, like every other wire-type-0 case in this
+						// file: eachField hands the callback the raw varint
+						// BYTES, already validated, and the callback decodes
+						// them once. The first version of this case decoded
+						// the payload a SECOND time (the varint had already
+						// been decoded into the old 8-byte little-endian
+						// image) and stored a wrong NUMBER for every count
+						// of 128 or more (200 -> 72, 255 -> 127, 1000 -> 488,
+						// 65535 -> 16383) -- worse than the absent field it
+						// replaced, and the fixture that was supposed to
+						// catch it used 7, inside the range where the two
+						// agree.
+						resDropped = uint32(uvarint(p2))
 					}
 				})
 			}
@@ -141,7 +143,7 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				}
 				if resDropped != 0 {
 					fields["resource_dropped_attributes_count"] =
-						strconv.FormatUint(resDropped, 10)
+						strconv.FormatUint(uint64(resDropped), 10)
 				}
 				for _, a := range scopeAttrs {
 					fields[a.Key] = a.Value.str()
@@ -198,14 +200,14 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 						// name table out of range: a remote panic from a
 						// 31-byte body, and a 500 an OTLP exporter retries
 						// forever.
-						if v := binary.LittleEndian.Uint64(fp); v < uint64(len(severityNumberName)) {
+						if v := uvarint(fp); v < uint64(len(severityNumberName)) {
 							sevNum = int(v)
 						}
 						isLog = true
 					case fn == 3 && fw == 2: // severity_text
 						sevText = string(fp)
 					case fn == 7 && fw == 0: // dropped_attributes_count
-						dropped = uint32(binary.LittleEndian.Uint64(fp))
+						dropped = uint32(uvarint(fp))
 					case fn == 8 && fw == 5: // flags (fixed32)
 						flags = binary.LittleEndian.Uint32(fp)
 						isLog = true
@@ -392,9 +394,9 @@ func validProtobuf(data []byte) bool {
 }
 
 // eachField walks one protobuf message, calling fn per field with the wire type
-// and payload (the value bytes for varint/fixed encodings, the message bytes
-// for length-delimited). Unknown fields are skipped, malformed input stops the
-// walk -- lenient the way ingest must be.
+// and payload (the raw varint bytes for wire type 0, the fixed-size bytes for
+// fixed encodings, the message bytes for length-delimited). Unknown fields are
+// skipped, malformed input stops the walk -- lenient the way ingest must be.
 func eachField(msg []byte, fn func(num, wire int, payload []byte)) {
 	for len(msg) > 0 {
 		tag, n := binary.Uvarint(msg)
@@ -405,13 +407,15 @@ func eachField(msg []byte, fn func(num, wire int, payload []byte)) {
 		num, wire := int(tag>>3), int(tag&7)
 		switch wire {
 		case 0: // varint
-			v, vn := binary.Uvarint(msg)
+			// The payload is the encoded varint itself, NOT a re-encoded
+			// 8-byte little-endian image. The old shape built the image in a
+			// local buffer whose address escaped into the callback, so every
+			// varint field cost an allocation; the bytes are already in msg.
+			_, vn := binary.Uvarint(msg)
 			if vn <= 0 {
 				return
 			}
-			var buf [8]byte
-			binary.LittleEndian.PutUint64(buf[:], v)
-			fn(num, 0, buf[:])
+			fn(num, 0, msg[:vn])
 			msg = msg[vn:]
 		case 1: // fixed64
 			if len(msg) < 8 {
@@ -436,6 +440,21 @@ func eachField(msg []byte, fn func(num, wire int, payload []byte)) {
 			return // groups and reserved wire types: not in OTLP
 		}
 	}
+}
+
+// uvarint decodes the raw varint payload eachField hands a wire-type-0
+// callback. eachField has already validated the encoding, so neither the
+// length nor the 10-byte overflow needs checking here. Inlined at every call
+// site; values below 128 decode in a few instructions.
+func uvarint(p []byte) uint64 {
+	var v uint64
+	for i, b := range p {
+		v |= uint64(b&0x7f) << (7 * i)
+		if b < 0x80 {
+			return v
+		}
+	}
+	return v
 }
 
 // decodeKV reads a KeyValue message.
@@ -495,10 +514,10 @@ func decodeAnyValueDepth(msg []byte, depth int) (otlpValue, bool) {
 			s := string(p)
 			out.StringValue, found = &s, true
 		case num == 2 && wire == 0: // bool_value
-			b := binary.LittleEndian.Uint64(p) != 0
+			b := uvarint(p) != 0
 			out.BoolValue, found = &b, true
 		case num == 3 && wire == 0: // int_value (varint; OTLP JSON writes it as a string)
-			s := strconv.FormatInt(int64(binary.LittleEndian.Uint64(p)), 10)
+			s := strconv.FormatInt(int64(uvarint(p)), 10)
 			out.IntValue, found = &s, true
 		case num == 4 && wire == 1: // double_value
 			f := math.Float64frombits(binary.LittleEndian.Uint64(p))

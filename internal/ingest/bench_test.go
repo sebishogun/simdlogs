@@ -49,6 +49,25 @@ func BenchmarkIngestParallel(b *testing.B) {
 	}
 }
 
+// BenchmarkEachFieldVarint measures the wire-type-0 walk's allocation count.
+// The old shape re-encoded every varint field's value into an escaping [8]byte
+// buffer -- one allocation per varint field on the default OTLP and Loki
+// encodings (severity_number and the dropped counts; Timestamp seconds and
+// nanos). The regression test TestEachFieldVarintZeroAlloc gates the count;
+// this reports the same number as allocs/op for -benchmem runs.
+func BenchmarkEachFieldVarint(b *testing.B) {
+	var msg []byte
+	for i := 0; i < 64; i++ {
+		msg = pvarint(msg, 1, uint64(i+1))
+	}
+	fn := func(num, wire int, payload []byte) {}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		eachField(msg, fn)
+	}
+}
+
 // BenchmarkJournalMicros is the number behind the byte scan's justification.
 //
 // The doc comment on journalMicros first claimed the scan was there because

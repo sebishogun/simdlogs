@@ -115,9 +115,9 @@ func IngestLokiProto(w *Writer, data []byte, fallback func() int64, opts *Option
 					eachField(p, func(tn, tw int, tp []byte) {
 						switch {
 						case tn == 1 && tw == 0:
-							seconds = int64(leU64(tp))
+							seconds = int64(uvarint(tp))
 						case tn == 2 && tw == 0:
-							nanos = int64(int32(leU64(tp)))
+							nanos = int64(int32(uvarint(tp)))
 						}
 					})
 				case n == 2 && wt == 2: // line
@@ -185,16 +185,6 @@ func IngestLokiProto(w *Writer, data []byte, fallback func() int64, opts *Option
 		return res, envelopeErr(errNoLokiStreams)
 	}
 	return res, nil
-}
-
-// leU64 reads the 8-byte little-endian buffer eachField hands back for a
-// varint field.
-func leU64(p []byte) uint64 {
-	var v uint64
-	for i := 0; i < 8 && i < len(p); i++ {
-		v |= uint64(p[i]) << (8 * i)
-	}
-	return v
 }
 
 func first80(s string) string {

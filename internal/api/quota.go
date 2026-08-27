@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"net/http"
 
 	obs "github.com/sebishogun/simdlogs/internal/observability"
@@ -55,6 +54,7 @@ func (s *Server) checkStorage(spec routeSpec, h http.HandlerFunc) http.HandlerFu
 		// line that happened twice.
 		//
 		// Checked before the body is read, so a duplicate costs nothing.
+		var writeID storage.WriteID
 		if wid := r.Header.Get(HdrWriteID); wid != "" && storage.ValidWriteID(wid) {
 			if tn.store.CommittedWrite(storage.WriteID(wid)) {
 				w.Header().Set(HdrDuplicate, "true")
@@ -63,43 +63,32 @@ func (s *Server) checkStorage(spec routeSpec, h http.HandlerFunc) http.HandlerFu
 					"simdlogs: this write id is already committed; nothing was stored")
 				return
 			}
-			// Carried to the writer through the request context: the ingest
-			// handlers take a body and a writer, not a header set, and
-			// threading it through every one of them is the change this
-			// avoids.
-			r = r.WithContext(withWriteID(r.Context(), storage.WriteID(wid)))
-			// The receipt is committed AFTER the handler, because it is only
-			// true once the rows are durable -- and the writer batches, so
-			// that means a flush. A replicated write pays a flush; an ordinary
-			// client write carries no id and pays nothing.
-			defer func() {
-				if err := tn.w.FlushWithReceipt(storage.WriteID(wid)); err != nil {
-					obs.L().Error("could not record a write receipt",
-						obs.FieldEvent, "cluster.receipt_failed",
-						"write_id", wid, obs.FieldTenant, tn.key,
-						obs.FieldErrorClass, string(obs.ClassStorage), "error", err)
-				}
-			}()
+			writeID = storage.WriteID(wid)
 		}
 		if err := tn.store.CheckWrite(); err != nil {
 			storage.NoteRejectedWrite(err)
 			s.writeErr(w, r, spec, http.StatusInsufficientStorage, err.Error())
 			return
 		}
-		h(w, r)
+		if writeID == "" {
+			h(w, r)
+			return
+		}
+
+		// A receipt says the whole request became durable. A quota refusal or
+		// parser error must not record one: the router will retry that id, and a
+		// false receipt would turn the retry into a duplicate success with no
+		// rows stored. Capture the handler's status and flush only a success.
+		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
+		h(sw, r)
+		if sw.code < 200 || sw.code >= 300 {
+			return
+		}
+		if err := tn.w.FlushWithReceipt(writeID); err != nil {
+			obs.L().Error("could not record a write receipt",
+				obs.FieldEvent, "cluster.receipt_failed",
+				"write_id", string(writeID), obs.FieldTenant, tn.key,
+				obs.FieldErrorClass, string(obs.ClassStorage), "error", err)
+		}
 	}
-}
-
-// writeIDKey carries a replicated write's idempotency token from the
-// middleware to the writer.
-type writeIDKey struct{}
-
-func withWriteID(ctx context.Context, id storage.WriteID) context.Context {
-	return context.WithValue(ctx, writeIDKey{}, id)
-}
-
-// writeIDOf is the request's write id, or "" for a direct client write.
-func writeIDOf(r *http.Request) storage.WriteID {
-	id, _ := r.Context().Value(writeIDKey{}).(storage.WriteID)
-	return id
 }

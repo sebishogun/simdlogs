@@ -874,15 +874,47 @@ func TestResourceDroppedAttributeCountSurvivesBothEncodings(t *testing.T) {
 	// EVERY COUNT, not one below 128.
 	//
 	// The first version of this used 7 and passed while the protobuf path
-	// decoded the varint a SECOND time, because eachField has already decoded
-	// it: below 128 a varint is its own byte, so the two agree exactly where
-	// the fixture looked. 200 stored as 72, 255 as 127, 1000 as 488, 65535 as
-	// 16383, and 128 vanished entirely.
+	// decoded the old little-endian callback payload as a varint a SECOND time:
+	// below 128 the two forms agree exactly where the fixture looked. 200 stored
+	// as 72, 255 as 127, 1000 as 488, 65535 as 16383, and 128 vanished entirely.
 	for _, dropped := range []uint64{1, 7, 127, 128, 129, 200, 255, 300, 1000,
 		65535, 1 << 20, 1<<32 - 1} {
 		t.Run(fmt.Sprint(dropped), func(t *testing.T) {
 			checkDroppedCount(t, dropped)
 		})
+	}
+}
+
+// Resource.dropped_attributes_count is uint32 in the OTLP schema. A protobuf
+// sender may put a wider varint on the wire; generated decoders retain the low
+// 32 bits, so the hand-written decoder must do the same rather than inventing
+// a value the field cannot hold.
+func TestResourceDroppedAttributeCountUsesProtoUint32(t *testing.T) {
+	const (
+		atNano  = 1_700_000_000_000_000_000
+		dropped = uint64(1<<32 + 7)
+	)
+	var resource []byte
+	resource = pvarint(resource, 2, dropped)
+	var rec []byte
+	rec = pfixed64(rec, 1, atNano)
+	rec = pbytes(rec, 5, anyString("m"))
+	var scope []byte
+	scope = pbytes(scope, 2, rec)
+	var rl []byte
+	rl = pbytes(rl, 1, resource)
+	rl = pbytes(rl, 2, scope)
+	protoBody := pbytes(nil, 1, rl)
+
+	rows, _ := rowsOf(t, func(w *Writer) (Result, error) {
+		return IngestOTLPLogsProto(w, protoBody, func() int64 { return 0 }, nil)
+	})
+	if len(rows) != 1 {
+		t.Fatalf("protobuf stored %d rows, want 1", len(rows))
+	}
+	const key = "resource_dropped_attributes_count"
+	if got := fieldsOfRow(rows[0])[key]; got != "7" {
+		t.Fatalf("protobuf stored %s=%q, want uint32 truncation %q", key, got, "7")
 	}
 }
 

@@ -220,10 +220,9 @@ func (s *Server) routeWrites(next http.Handler) http.Handler {
 	})
 }
 
-// forwardWrite sends the ingest body to one storage node, round-robin, and
-// relays its response -- so a burst of inserts spreads across the cluster.
-// It round-robins over shards and writes the record to every replica in the
-// chosen shard, so a replica loss never loses data.
+// forwardWrite sends the ingest body to every replica in one shard. The write
+// id selects the shard with a stable hash, so fresh random ids distribute a
+// burst while every retry returns to the replicas that may already hold it.
 // ConsistencyLevel is how many replicas must acknowledge a write before the
 // client is told it succeeded.
 //
@@ -243,13 +242,10 @@ const (
 	ConsistencyQuorum ConsistencyLevel = "quorum"
 	// ConsistencyAll succeeds only when every replica commits.
 	//
-	// The DEFAULT, and it stays the default until repair is proven. Quorum is
-	// the usual production choice because a repair process reconciles the
-	// replicas that missed a write -- and this has no repair process (task
-	// 8.7). Without one, "quorum" means a replica silently missing data
-	// forever, and a read that happens to land on it returns a short answer
-	// with nothing to say so. Defaulting to the strictest level is the honest
-	// position for a system that cannot yet heal.
+	// The DEFAULT. Repair is operator-triggered rather than automatic, so a
+	// quorum write can still leave a replica stale until the next repair pass.
+	// The default keeps normal writes converged without depending on that pass;
+	// callers can choose quorum or one when their availability policy differs.
 	ConsistencyAll ConsistencyLevel = "all"
 )
 
@@ -329,7 +325,7 @@ func (s *Server) forwardWrite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	shards := s.shards()
-	shard := shards[int(atomic.AddInt64(&s.rr, 1)-1)%len(shards)]
+	shard := shards[writeShardIndex(wid, len(shards))]
 
 	// Every replica, in parallel, each carrying the SAME write id. A replica
 	// that already has it answers "duplicate", which counts as an
@@ -386,6 +382,22 @@ func (s *Server) forwardWrite(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// writeShardIndex is stable across routers and restarts. Write ids are random,
+// so FNV-1a spreads new writes without mutable routing state; hashing the id is
+// what makes a retry return to the shard whose receipts can recognize it.
+func writeShardIndex(id string, shards int) int {
+	const (
+		offset64 = uint64(14695981039346656037)
+		prime64  = uint64(1099511628211)
+	)
+	h := offset64
+	for i := 0; i < len(id); i++ {
+		h ^= uint64(id[i])
+		h *= prime64
+	}
+	return int(h % uint64(shards))
+}
+
 // visibleOutcomes redacts per-replica detail from unauthorized callers.
 //
 // Replica URLs and their individual failures are the cluster's internal
@@ -406,7 +418,11 @@ func (s *Server) visibleOutcomes(r *http.Request, outcomes []replicaOutcome) []r
 // replicateTo sends the write to one replica and classifies the answer.
 func (s *Server) replicateTo(r *http.Request, url string, body []byte, wid string) replicaOutcome {
 	out := replicaOutcome{URL: url}
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, url+r.URL.Path,
+	// RequestURI carries the write route's query parameters too. Field
+	// mappings (_time_field, _msg_field, and the rest) live there; dropping
+	// them makes a router store a different row than the same request on a
+	// storage node while still answering success.
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, url+r.URL.RequestURI(),
 		bytes.NewReader(body))
 	if err != nil {
 		out.Class, out.Error = string(PeerMalformed), err.Error()

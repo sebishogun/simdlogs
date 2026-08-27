@@ -60,8 +60,7 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 				ordinal++
 				continue
 			}
-			var tsStr, line string
-			_ = json.Unmarshal(ent[0], &tsStr)
+			var line string
 			_ = json.Unmarshal(ent[1], &line)
 			// The optional third element: structured metadata. A malformed one
 			// is a warning against that entry, not a silent drop and not a
@@ -93,7 +92,7 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 				fields[k] = v
 			}
 			fields["_msg"] = line
-			ts, ok, tsErr := parseTime(tsStr)
+			ts, ok, tsErr := lokiJSONTime(ent[0])
 			if tsErr != nil {
 				// See ErrTimeOutOfRange: refused and counted, not stored at an
 				// instant the client did not send.
@@ -113,4 +112,19 @@ func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options
 		}
 	}
 	return res, nil
+}
+
+// lokiJSONTime accepts Loki's documented quoted nanosecond string and the
+// numeric spelling its readers and deployed shippers also emit. Treating a
+// number as a failed string decode used to replace a supplied timestamp with
+// the receiver's fallback clock while answering success.
+func lokiJSONTime(raw []byte) (int64, bool, error) {
+	if len(raw) > 0 && raw[0] != '"' {
+		return numberTime(raw)
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return 0, false, nil
+	}
+	return parseTime(s)
 }

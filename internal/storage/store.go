@@ -20,7 +20,7 @@ type Store struct {
 	digestMu   sync.Mutex
 	digestByID map[uint64]string
 
-	// adoptMu serializes AdoptGroup, which is check-then-act: it asks whether
+	// adoptMu serializes AdoptGroupStream, which is check-then-act: it asks whether
 	// this store already holds the digest and then appends. The two steps each
 	// took s.mu and released it, so concurrent adopts of ONE group all saw it
 	// absent and all appended. Measured, one digest of four rows:
@@ -45,18 +45,21 @@ type Store struct {
 	nextID   uint64
 	closed   bool
 	openHook func(uint64)
-	lock     *dirLock
-	man      *manifest
+	// beforeMmap, nil in production, is called between a structural rewrite's
+	// atomic rename and its mmap, so a test can hold a rewrite in that window.
+	beforeMmap func(path string)
+	lock       *dirLock
+	man        *manifest
 	// receipts is the bounded set of committed write ids, rebuilt from the
 	// manifest at open. It is what makes a replicated write safe to retry.
 	receipts *receiptSet
 	// tombstones are files whose group is committed as removed but whose
 	// unlink failed; retried on every later retention pass.
 	tombstones []string
-	// structMu serializes structural operations -- recompaction, cold
-	// demotion, promotion -- against each other. They each read a candidate
-	// set, do IO, then swap; overlapping two of them lets a stale candidate
-	// recreate a group another one removed.
+	// structMu serializes structural operations -- recompaction, group
+	// compaction, cold demotion, promotion, retention's removals -- against
+	// each other. They each read a candidate set, do IO, then swap; overlapping
+	// two of them lets a stale candidate recreate a group another one removed.
 	structMu sync.Mutex
 
 	// health carries the corruption policy and what it has seen.
@@ -476,19 +479,8 @@ func (s *Store) appendGroupWithReceipt(g *Group, wid WriteID) (uint64, error) {
 	return s.appendBlob(g.Marshal(), wid)
 }
 
-// appendRawGroup commits an already-marshaled group.
-//
-// The bytes come from a peer, through AdoptGroup, which has validated them:
-// hashed against the digest that was asked for and parsed as a group. This does
-// the same commit every write does -- fresh id, atomic file, manifest record --
-// with no receipt, because a repaired group is not a client write and must not
-// consume an idempotency token that a real retry would need.
-func (s *Store) appendRawGroup(blob []byte) error {
-	_, err := s.appendBlob(blob, "")
-	return err
-}
-
-// appendBlob is the commit shared by a marshaled group and an adopted one.
+// appendBlob writes a locally marshaled group; commitGroupFile below shares
+// the parse, manifest and visibility tail with streamed adoption.
 func (s *Store) appendBlob(blob []byte, wid WriteID) (uint64, error) {
 	s.mu.Lock()
 	id := s.nextID
@@ -510,19 +502,67 @@ func (s *Store) appendBlob(blob []byte, wid WriteID) (uint64, error) {
 		s.discardUncommitted(final, id, err)
 		return 0, err
 	}
-	// Map the freshly written file rather than keeping the marshaled blob on
-	// the heap, so a large store holds only its working set in RAM (the OS
-	// pages the mapping in and out). The Marshal output is now free to GC.
-	mb, unmap, err := mmapFile(final)
+	// writeFileAtomic already renamed the bytes into place, so the commit
+	// sees staged == final and skips the rename step below.
+	return s.commitGroupFile(final, final, id, int64(len(blob)), wid, nil)
+}
+
+// commitGroupFile completes an append whose bytes are durable at staged and
+// need to become the group at final, and is the commit the write path and the
+// repair path share so the two cannot diverge.
+//
+// The file is mapped rather than the marshaled blob kept on the heap, so a
+// large store holds only its working set in RAM (the OS pages the mapping in
+// and out).
+//
+// checks, when non-nil, runs after the group parses and before the bytes take
+// their final name -- the repair path's last chance to refuse a group that
+// validated (zero rows, or the server's retention horizon). Its error is
+// returned unchanged and the staged file is discarded.
+//
+// staged differs from final only on the repair path, which stages a .tmp file
+// so refused input never reaches a group-*.bin name; the rename and its
+// directory sync then carry the bytes to final before the manifest record is
+// committed. The append path hands in final for both, its writeFileAtomic
+// having already renamed.
+func (s *Store) commitGroupFile(staged, final string, id uint64, size int64, wid WriteID, checks func(*Reader) error) (uint64, error) {
+	mb, unmap, err := mmapFile(staged)
 	if err != nil {
-		s.discardUncommitted(final, id, err)
+		s.discardUncommitted(staged, id, err)
 		return 0, err
 	}
 	r, err := ReadGroup(mb)
 	if err != nil {
 		unmap()
-		s.discardUncommitted(final, id, err)
+		s.discardUncommitted(staged, id, err)
 		return 0, err
+	}
+	if checks != nil {
+		if err := checks(r); err != nil {
+			unmap()
+			s.discardUncommitted(staged, id, err)
+			return 0, err
+		}
+	}
+	if staged != final {
+		// Validation is done; the bytes may take their final name. The
+		// rename is atomic, so the manifest record below either names a
+		// complete group or nothing.
+		if err := fault(faultRename); err != nil {
+			unmap()
+			s.discardUncommitted(staged, id, err)
+			return 0, err
+		}
+		if err := os.Rename(staged, final); err != nil {
+			unmap()
+			s.discardUncommitted(staged, id, err)
+			return 0, err
+		}
+		if err := syncDirNamed(final); err != nil {
+			unmap()
+			s.discardUncommitted(final, id, err)
+			return 0, err
+		}
 	}
 	s.mu.Lock()
 	// Commit before the group is visible. A crash between the rename and this
@@ -557,7 +597,7 @@ func (s *Store) appendBlob(blob []byte, wid WriteID) (uint64, error) {
 	// The size cache is told what just landed. Without this the tenant quota
 	// measured every write in a ten-second window against the size from before
 	// the first of them -- see noteGrowth.
-	s.noteGrowth(int64(len(blob)))
+	s.noteGrowth(size)
 	return id, nil
 }
 

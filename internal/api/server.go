@@ -105,6 +105,11 @@ type Server struct {
 	// mutates, and two overlapping passes read the same missing set before
 	// either writes it -- see repairCluster.
 	repairBusy atomic.Bool
+	// replicaGroupLimit is the body ceiling of the anti-entropy adopt route,
+	// applied by the MaxBytesReader replicaGroupSpec installs. Defaults to
+	// maxRepairBytes; tests shrink it to exercise the boundary without a
+	// gigabyte fixture.
+	replicaGroupLimit int64
 
 	// quota is the storage budget every tenant store opens under. Validated
 	// once at construction, so a tenant opening later cannot fail for a
@@ -148,7 +153,6 @@ type Server struct {
 	szMu    sync.Mutex // guards the cached store footprint
 	szBytes int64
 	szAt    time.Time
-	rr      int64 // round-robin cursor for write routing (atomic)
 
 	rmu   sync.Mutex
 	rules []*logRule // metrics-from-logs: LogsQL evaluated on a timer, exposed on /metrics
@@ -277,6 +281,11 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	// construction, and a nil client at that point would be a nil dereference
 	// on the first peer call rather than at configuration time.
 	srv.peers = newClusterClient(nil)
+	// Peer spools land on the configured data disk, not in the process temp
+	// dir: os.TempDir is often tmpfs, and a repair transfer may be a gigabyte
+	// that must not be memory-backed.
+	srv.peers.spoolDir = dir
+	srv.replicaGroupLimit = maxRepairBytes
 	if c.DirRereadInterval != 0 {
 		srv.dirRereadEvery = c.DirRereadInterval
 		if c.DirRereadInterval < 0 {
@@ -750,7 +759,7 @@ func (s *Server) Handler() http.Handler {
 	// endpoint discloses the shape of the data.
 	handle(pathReplicaState, adm(s.serveReplicaState))
 	handle(pathReplicaGroup, func() http.HandlerFunc {
-		sp := replicaGroupSpec()
+		sp := s.replicaGroupSpec()
 		return s.requireAuth(config.RoleAdmin, sp, s.guard(sp, s.serveReplicaGroup))
 	}())
 	handle("/admin/storage/quarantine", adm(s.listQuarantined)) // which group, why, how big

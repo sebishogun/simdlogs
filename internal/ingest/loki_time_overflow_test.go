@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -38,6 +39,28 @@ func TestALokiProtoTimestampOutsideTheStorableRangeIsRefused(t *testing.T) {
 	}
 	if got := fieldsOfRow(rows[0])["_msg"]; got != "storable" {
 		t.Fatalf("the stored row is %q, want the storable one", got)
+	}
+}
+
+// Loki documents timestamps as quoted nanosecond strings, but its readers and
+// deployed shippers also accept the same integer as a JSON number. Ignoring the
+// string-unmarshal error must not replace a timestamp the sender supplied with
+// the receiver's fallback clock.
+func TestLokiJSONNumericTimestampIsNotReplacedByFallback(t *testing.T) {
+	const (
+		wantTS     = int64(1_700_000_000_000_000_000)
+		fallbackTS = int64(999_999_999)
+	)
+	body := []byte(`{"streams":[{"stream":{"app":"api"},"values":[[1700000000000000000,"line"]]}]}`)
+	rows, res := rowsOf(t, func(w *Writer) (Result, error) {
+		return IngestLoki(w, body, func() int64 { return fallbackTS })
+	})
+	if res.Accepted != 1 || res.Rejected != 0 || len(rows) != 1 {
+		t.Fatalf("accepted=%d rejected=%d rows=%d, want 1/0/1", res.Accepted, res.Rejected, len(rows))
+	}
+	if wantPrefix := time60(wantTS) + "|"; !strings.HasPrefix(rows[0], wantPrefix) {
+		t.Fatalf("stored row has the wrong timestamp; want sender's %d, fallback was %d: %q",
+			wantTS, fallbackTS, rows[0])
 	}
 }
 

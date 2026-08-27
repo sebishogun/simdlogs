@@ -15,6 +15,7 @@ jobs:
   test:
     name: linux/amd64
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,20 +40,32 @@ jobs:
       - name: test
         # -timeout, always. go test defaults to 600s, which at the rate a
         # runaway loop launches binaries is far too loose to bound anything;
-        # 120s is ~30x the slowest package here.
-        run: go test -timeout 120s ./...
+        # five minutes leaves headroom above the ~90s API package while the
+        # job ceiling bounds the suite as a whole.
+        run: go test -timeout 300s ./...
       - name: race
-        run: go test -race -timeout 300s ./...
+        run: go test -race -timeout 600s ./...
       - name: purego
-        run: go test -tags purego -timeout 120s ./...
-      - name: whitespace
-        run: git diff --check
+        run: go test -tags purego -timeout 300s ./...
+      - name: committed whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          zero=0000000000000000000000000000000000000000
+          if [ -z "${BASE_SHA}" ] || [ "${BASE_SHA}" = "$zero" ] ||
+             ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            empty=$(git hash-object -t tree /dev/null)
+            git diff --check "$empty" "$GITHUB_SHA"
+          else
+            git diff --check "${BASE_SHA}..${GITHUB_SHA}"
+          fi
 
   # Compile-only for the targets the kernels claim to support. These do not
   # run: no hardware, and a build that passes is the claim being made.
   cross:
     name: build ${{ matrix.goarch }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

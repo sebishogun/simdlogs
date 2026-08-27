@@ -100,6 +100,23 @@ func TestPrincipalsAreKeyedByHash(t *testing.T) {
 	}
 }
 
+// Validation accepts surrounding whitespace and uppercase hex, so the lookup
+// table must use that same normalized spelling. Otherwise startup succeeds but
+// the credential can never authenticate.
+func TestPrincipalHashUsesValidationNormalization(t *testing.T) {
+	hash := HashToken("s3cret")
+	a := &AuthConfig{Tokens: []TokenSpec{
+		{SHA256: " \t" + strings.ToUpper(hash) + "\n", Subject: "ops", Roles: []string{"query"}, Tenants: []string{"0:0"}},
+	}}
+	ps, err := a.Principals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ps[hash]; !ok {
+		t.Fatal("the accepted hash spelling was not normalized for lookup")
+	}
+}
+
 // Admin implies every role, so an operator credential does not need four
 // entries that can drift apart.
 func TestAdminImpliesAllRoles(t *testing.T) {

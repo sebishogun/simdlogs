@@ -57,6 +57,15 @@ func (s *Store) DropGroupsBefore(cutoff int64) int {
 //  3. Unlink. A failure is retried on the next pass and counted; the group is
 //     already invisible and stays that way.
 func (s *Store) dropGroups(match func(*groupEntry) bool) int {
+	// structMu, like Recompact, Demote and Promote: retention unlinks group
+	// paths, and a removal running alongside a rewrite of the same path is
+	// two writers deciding what the path holds. Without the lock here, the
+	// unlink could land between the rewrite's rename and its mmap -- a
+	// spurious Recompact error. Lock order stays structMu then s.mu, as
+	// everywhere.
+	s.structMu.Lock()
+	defer s.structMu.Unlock()
+
 	s.mu.Lock()
 	var victims []*groupEntry
 	// A fresh slice, not s.groups[:0]. Filtering in place overwrote the

@@ -21,6 +21,7 @@ jobs:
   gate:
     name: gates
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,6 +52,7 @@ jobs:
     name: ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: gate
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -121,6 +123,7 @@ jobs:
     name: publish
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -149,7 +152,7 @@ jobs:
           go-version: '1.26.5'
       - name: SBOM
         run: |
-          go install sigs.k8s.io/bom/cmd/bom@latest
+          go install sigs.k8s.io/bom/cmd/bom@v0.7.1
           bom generate --format json -o staged/sbom.spdx.json .
 
       # Provenance: a signed statement of WHICH workflow, at which commit,
@@ -191,6 +194,7 @@ jobs:
     name: container
     needs: gate
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:

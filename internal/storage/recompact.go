@@ -136,6 +136,9 @@ func (s *Store) Recompact(cutoff int64, dropPostings bool) (groups int, before, 
 		if err = writeGroupFile(ge.path, blob); err != nil {
 			return groups, before, after, err
 		}
+		if s.beforeMmap != nil {
+			s.beforeMmap(ge.path)
+		}
 		mb, unmap, merr := mmapFile(ge.path)
 		if merr != nil {
 			return groups, before, after, merr
@@ -194,6 +197,15 @@ func (s *Store) Recompact(cutoff int64, dropPostings bool) (groups int, before, 
 			timeMin: nr.TimeMin, timeMax: nr.TimeMax, unmap: unmap,
 		}
 		s.groups[idx] = ne
+		// The bytes under this id changed, so the digest cache is stale: the
+		// cached digest is a property of the OLD bytes, and an inventory that
+		// reports it sends peers to fetch a group that no longer exists. The
+		// cache is dropped at the INSTALL -- the point at which the new bytes
+		// become the store's -- so the next inventory or fetch re-hashes the
+		// file. An inventory that read the cache between the file write and
+		// the install reports the old digest once, which is a transient stale
+		// view; permanent staleness is what this prevents.
+		s.invalidateDigest(ge.id)
 		s.mu.Unlock()
 		ge.retire()
 

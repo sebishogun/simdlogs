@@ -35,10 +35,10 @@ import (
 // respect. AppendGroupIdempotent commits it in the SAME record as the group,
 // so the rows and the receipt become durable together and no crash can leave
 // one without the other. CommitReceipt commits it in its own record after the
-// rows are durable, which is what the batching writer needs -- a flush holds
-// rows from many requests, so no single group is "this request's rows" -- and
-// that leaves a window: a crash between the two loses the receipt while
-// keeping the rows, so a retry stores them again.
+// rows are durable. The batching writer takes that fallback when concurrent or
+// already-started batches mean no single group proves the whole request is
+// durable, and that leaves a window: a crash between the two loses the receipt
+// while keeping the rows, so a retry stores them again.
 //
 // Given a choice between a duplicate and a loss, that window takes the
 // duplicate. Recording the receipt first would close it in the other

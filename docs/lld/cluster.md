@@ -348,12 +348,10 @@ refused by a coin flip — and in the other order, a retry duplicated into the
 replica that had already taken it.
 
 **Consistency is explicit.** `X-Simdlogs-Consistency: one | quorum | all`,
-default **all**. Quorum is the usual production choice *because a repair
-process reconciles the replicas that missed a write* — and this has none yet
-(task 8.7). Without one, "quorum" means a replica silently missing data forever
-and a read that lands on it returning a short answer with nothing to say so.
-Defaulting to the strictest level is the honest position for a system that
-cannot yet heal; the default moves when repair is proven, not before.
+default **all**. Repair exists, but it is operator-triggered rather than
+automatic; quorum can therefore leave a replica stale until the next repair
+pass. The default keeps normal writes converged without depending on that pass,
+while callers whose availability policy differs can select quorum or one.
 
 **Every write carries an id.** The router mints one (or accepts the client's,
 so a retry can name the write it repeats) and sends the same id to every
@@ -379,14 +377,15 @@ before it reaches the manifest.
 **Where the receipt is committed, and the window that leaves.**
 `AppendGroupIdempotent` commits the id in the *same* manifest record as the
 group — one record is one transaction, so the rows and the receipt become
-durable together. The server's ingest path cannot use it: the writer batches
-rows from many requests, so no single group is "this request's rows". It uses
-`CommitReceipt` after the flush instead, which leaves a window — a crash
-between the group commit and the receipt commit keeps the rows and loses the
-receipt, so a retry stores them again. Given a choice between a duplicate and a
-loss that window takes the duplicate; recording the receipt first would lose
-the rows while claiming they were stored and refuse the retry that would have
-saved them.
+durable together. `Writer.FlushWithReceipt` uses that path when one newly
+enqueued group and no older in-flight batch prove the whole request durable.
+Under concurrency it falls back to `CommitReceipt` after the flush, which
+leaves a window — a crash between the group commit and the receipt commit keeps
+the rows and loses the receipt, so a retry stores them again. Given a choice
+between a duplicate and a loss that window takes the duplicate; recording the
+receipt first would lose the rows while claiming they were stored and refuse
+the retry that would have saved them. A rejected request never records a
+receipt: only a 2xx ingest response reaches `FlushWithReceipt`.
 
 A replicated write therefore pays a **flush**. An ordinary client write carries
 no id and pays nothing.
@@ -423,11 +422,13 @@ data to every member.
 
 - **Write** (`routeWrites` → `forwardWrite`): a write path (`/insert*`,
   `/_bulk`, `/v1/logs`, `/v1/input`, `/api/*`, `/loki*`) is forwarded with a
-  round-robin cursor (`s.rr`, atomic) to one shard, and to EVERY replica in
-  that shard, with the request headers cloned (tenant headers ride along).
-  The last response is relayed; if no replica answered at all the client gets
-  a 502. A replica loss never loses data, and a burst of inserts spreads
-  across shards.
+  stable hash of its write id to one shard, and to EVERY replica in that shard.
+  Fresh random ids spread a burst; a retry returns to the shard whose receipts
+  can recognize it. Only the explicit content, tenant, tracing, internal
+  protocol and write-id headers are forwarded; field-mapping query parameters
+  are carried unchanged. Client authorization and cookies never leave the
+  router. Replica outcomes are aggregated against the requested consistency
+  level rather than relaying whichever response finished last.
 - **Read** (`getFromShard`): each shard is asked via one replica at a time —
   a downed replica (connect error or ≥ 500) is skipped for the next in the
   shard, so replicated data is read exactly once per shard and never
@@ -648,11 +649,19 @@ Three properties do the safety work:
 - **The receiver validates.** Bytes are hashed against the digest that was asked
   for and parsed as a group before anything is committed, so a peer that is
   compromised or on another format version cannot write into the store.
-- **Bounded per pass** — 64 groups, 1 GiB, counted cluster-wide rather than per
-  shard — and the report says what it left, so
-  "still diverging" is visible rather than inferred. An unreachable replica is
-  never read as an empty one: its silence would otherwise make the union wrong
-  in both directions at once.
+- **Bounded per pass** — 64 groups and a 1 GiB accounting budget, both
+  cluster-wide rather than per shard — and the report says what it left, so
+  "still diverging" is visible rather than inferred. Actual bytes are charged
+  after each group. A peer that understates its inventory can therefore admit
+  one final group past the accounting budget; because one group is independently
+  capped at 1 GiB, the hard pass ceiling is 2 GiB. An unreachable
+  replica is never read as an empty one: its silence would otherwise make the
+  union wrong in both directions at once.
+
+The 1 GiB byte bound is also the ceiling for one group transfer. Multiple passes
+converge a backlog of smaller groups, but they cannot repair one group larger
+than that ceiling; the pass reports the refusal and remains incomplete. Such a
+shard must be restored or reseeded outside the repair endpoint.
 
 A repaired group is committed under a fresh local id and consumes no write
 receipt. It is not a client write, and taking an idempotency token a real retry

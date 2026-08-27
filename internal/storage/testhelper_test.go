@@ -2,7 +2,9 @@ package storage
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -40,6 +42,12 @@ const (
 	crashOpManifestCompact = "manifest-compact"
 	crashOpRecompact       = "recompact"
 	crashOpGroupCompact    = "group-compact"
+	// crashOpAdopt is the repair path: AdoptGroupStream, which stages a peer's
+	// bytes itself instead of going through writeFileAtomic. crashOpAdoptRefused
+	// is the same call with a refusing pre-commit check, for the phases a
+	// REFUSED adoption may not reach.
+	crashOpAdopt        = "adopt"
+	crashOpAdoptRefused = "adopt-refused"
 )
 
 const (
@@ -144,7 +152,8 @@ func crashChild(phase, dir, op string, batches int) {
 	// and is acknowledged, which is what the parent asserts must survive.
 	crashOnBatch := batches - 1
 	batch := 0
-	if op == crashOpManifestCompact || op == crashOpRecompact || op == crashOpGroupCompact {
+	if op == crashOpManifestCompact || op == crashOpRecompact || op == crashOpGroupCompact ||
+		op == crashOpAdopt || op == crashOpAdoptRefused {
 		// The hook closure reads THIS variable, and the setup loop leaves
 		// batch past it. Without -1 ("fire on any batch") the hook could never
 		// match during the operation under test and every subtest would pass
@@ -205,6 +214,36 @@ func crashChild(phase, dir, op string, batches int) {
 		if _, err := st.CompactGroups(CompactOptions{MinGroups: 2}); err != nil {
 			fmt.Fprintf(os.Stderr, "CHILD_GROUP_COMPACT_FAILED %v\n", err)
 			os.Exit(8)
+		}
+	case crashOpAdopt, crashOpAdoptRefused:
+		// The repair path, which stages a peer's bytes itself rather than
+		// calling writeFileAtomic. The group adopted is batch 99, so the
+		// parent can tell its rows from the setup batches' and assert it is
+		// either fully committed or fully absent.
+		crashChildAppend(st, faultPoint(-1), -1, &batch, rows, batches, suicide)
+		armed = true
+		blob := crashGroupN(99, rows).Marshal()
+		refuse := func(*Reader) error { return nil }
+		if op == crashOpAdoptRefused {
+			// A refusal IS the expected outcome of this lane, so the child
+			// treats it as success -- the phase determines whether the hook
+			// fires before it (and the child dies) or never (and the child
+			// completes).
+			refuse = func(*Reader) error {
+				return errors.New("storage: refused for the adopt-refused lane")
+			}
+		}
+		adopted, _, aerr := st.AdoptGroupStream(digestBytes(blob), bytes.NewReader(blob), refuse)
+		if aerr != nil {
+			if op == crashOpAdoptRefused && strings.Contains(aerr.Error(), "refused for the adopt-refused lane") {
+				break // the refusal is the expected outcome; close and report CHILD_DONE
+			}
+			fmt.Fprintf(os.Stderr, "CHILD_ADOPT_FAILED %v\n", aerr)
+			os.Exit(10)
+		}
+		if op == crashOpAdoptRefused && adopted {
+			fmt.Fprintln(os.Stderr, "CHILD_ADOPT_FAILED the refused lane adopted the group")
+			os.Exit(11)
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "CHILD_BAD_OP %s\n", op)

@@ -226,7 +226,7 @@ func (s *Server) clusterBackup(w http.ResponseWriter, r *http.Request) {
 		// in-memory ceiling discarded every real one as malformed -- and the
 		// cluster backup then captured no shard data at all. The file also
 		// gives the tar header the size it needs before the body is written.
-		f, size, resp, cleanup := s.peers.spool(r, i, 0, sources[i], "/admin/backup")
+		f, size, resp, cleanup := s.peers.spool(r, i, 0, sources[i], "/admin/backup", "", 0)
 		if !resp.OK() {
 			cleanup()
 			// Mid-stream failure, and the manifest is already on the wire.

@@ -69,10 +69,13 @@ func (a *alertRule) eval(s *Server) {
 	q.SetWindow(now.Add(-a.spec.Window.D()).UnixNano(), now.UnixNano())
 	q.SetNow(q.To)
 
-	st, err := s.ruleStore(a.spec.Tenant)
+	st, held, err := s.ruleStore(a.spec.Tenant)
 	if err != nil {
 		a.fail(now, err)
 		return
+	}
+	if held != nil {
+		defer held.inFlight.Add(-1)
 	}
 	q.Bind(context.Background(), query.Limits{
 		Timeout:  ruleEvalTimeout,
