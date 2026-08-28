@@ -319,8 +319,12 @@ func TestAParameterInBothTheURLAndTheBodyResolvesTheSameWay(t *testing.T) {
 	node, router := loadedPair(t, 10)
 	for _, tc := range []struct{ name, path, ct, body string }{
 		{
+			// Node and router are separate requests. Pin the sample instant so
+			// a slow emulated run crossing a second boundary does not turn this
+			// parameter-precedence assertion into a clock comparison.
 			name: "stats_query, urlencoded",
-			path: "/select/logsql/stats_query?query=" + url.QueryEscape(`level:error | stats count() c`),
+			path: "/select/logsql/stats_query?time=2026-08-16T03:01:00Z&query=" +
+				url.QueryEscape(`level:error | stats count() c`),
 			ct:   "application/x-www-form-urlencoded",
 			body: "query=" + url.QueryEscape(`* | stats count() c`),
 		},
