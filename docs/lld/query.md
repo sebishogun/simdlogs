@@ -109,7 +109,9 @@ materializes the matched rows. `runCountFast`, `runTopFast`, `runUniqFast`
      header and decodes only the boundary blocks;
    - predicate bitsets: `Eq` picks by selectivity — count ≤ n/8 reads the
      posting list directly (`EqualityRows`), otherwise the vectorized
-     residual scan (`simd.EqualScalarInto` + `MaskBits` pack, `eqMaskInto`);
+     residual scan (`simd.EqualScalarInto` + `MaskBits` pack, `eqMaskInto`),
+     normalizing the packed bytes before native-word access on big-endian
+     hosts;
      every other kind marks which dict values match (the test runs once per
      distinct value, not per row) and maps rows through the indices;
    - `cnt == 0` → never decode the timestamps; bounded queries trim the

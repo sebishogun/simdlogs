@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1535,7 +1536,20 @@ func packBools(b *Bitset, bools []bool) {
 	bb := b.bytesForPack()
 	boolBytes := boolsAsBytes(bools)
 	simd.MaskBits(bb, boolBytes, 1)
+	if nativeBigEndian {
+		// MaskBits writes row zero to bit zero of the first byte. That byte is
+		// the high byte of a native uint64 on big-endian hosts, while Bitset's
+		// row operations define row zero as bit zero of the word.
+		for i := range b.words {
+			b.words[i] = bits.ReverseBytes64(b.words[i])
+		}
+	}
 }
+
+var nativeBigEndian = func() bool {
+	one := uint16(1)
+	return *(*byte)(unsafe.Pointer(&one)) == 0
+}()
 
 func boolsAsBytes(s []bool) []byte {
 	if len(s) == 0 {
