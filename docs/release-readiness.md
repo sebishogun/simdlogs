@@ -17,6 +17,7 @@ as an announcement: the point of the list is the rows that are not green.
 | Soak, 60 s with retention running | ok — groups peak 5,899 and fall to 5,677 |
 | `scripts/release-check.sh` (the artifact, not the source) | passed |
 | Cross-build arm64, ppc64le, s390x, riscv64 | ok |
+| Hosted `ci` and `cross` on PR #1 | 9 jobs ok at `7b55bae` |
 | `git diff --check` | clean |
 
 ## Blockers
@@ -56,8 +57,12 @@ limitations as well:
 
 ## What has not been run here
 
-- The GitHub workflows (`ci`, `cross`, `fuzz`, `release`). They are authored
-  and their YAML parses; none has been observed running. That is how
+- The hosted `fuzz` and `release` workflows. The `ci` and `cross` workflows
+  ran on PR #1: runs `33217672085` and `33217672087` passed all nine jobs at
+  `7b55bae`, including native arm64 and normal plus purego execution under
+  s390x, ppc64le, and riscv64 QEMU. The first s390x run exposed a packed-mask
+  byte-order defect, which `7b55bae` corrected before this green run.
+  Before that observation,
   `release.yml`'s dry-run path stayed broken through several reviews: the
   `tag` input was read as `${GITHUB_REF_NAME:-inputs.tag}`, and
   `GITHUB_REF_NAME` is always set -- on a dispatch it is the BRANCH -- so a
@@ -98,12 +103,12 @@ evidence-complete, shipped, rejected (terminal without a reopen condition in
 | ID | state | work | evidence | exit |
 |---|---|---|---|---|
 | `LOGS-V1-01` | open | Quiet benchmark provenance: re-measure the published tables under `requireQuiet`, with no skip and no `SIMDLOGS_BENCH_NOISY` override, with a machine/commit record | corrected tables with provenance | the standing blocker cleared |
-| `LOGS-V1-02` | in-progress | Push and observed CI: the workflows have never been observed running; operation-time permission now covers one reviewed commit, push, PR and hosted-CI observation | the correctness blockers found at `0f24536` are closed; final local gates and three review tracks are green; commit, PR and hosted CI remain | CI observed |
+| `LOGS-V1-02` | evidence-complete | Push and observed CI: the workflows have never been observed running; operation-time permission now covers one reviewed commit, push, PR and hosted-CI observation | PR #1; hosted `ci` run `33217672085` and `cross` run `33217672087` passed all nine jobs at `7b55bae`, including the s390x normal and purego lanes that found the preceding byte-order defect | CI observed |
 | `LOGS-V1-03` | open | Long fuzz and dev/release soak beyond the short runs that pass | completed runs with durations | soak/fuzz evidence complete |
 | `LOGS-V1-04` | evidence-complete | Stale docs/comments corrective: the `es.go` package comment, the `scale_test.go` header comment, the duplicated entry-37 heading in `docs/wrong.md`, and the stale `Task B.2` / `Task G.1` references in `docs/roadmap.md`'s known-implementation-doc-defects section (task IDs the production plan's numeric scheme does not use) reconciled; a code/record task, never a source drive-by from a docs session | dated historical corrections; `TestResolvedDocumentationDefectsDoNotReturn` and `TestTheStatedFactsAboutTheCodeAreTrueOfTheCode`; `go test`, `go test -race`, `go test -tags purego`, `go vet`, gofmt and diff gates green on 2026-08-27 | stale items fixed and entry references unambiguous |
 | `LOGS-V1-05` | open | Bounded-ingest decision: taken with measurement - implemented, or rejected with a reopen condition in `docs/wrong.md` | the decision record | decision recorded |
 | `LOGS-V1-06` | open | End-to-end release rehearsal without tagging (`scripts/release-check.sh` is the artifact under test) | the rehearsal run | rehearsal green |
-| `LOGS-V1-07` | in-progress | v1 preparation: the full production exit, phases 0-10 plus the release gate set green; commit, tag and publish operations stop at the evidence checkpoint until separately authorized | 2026-08-27: local default, race, purego, vet, format, module and workflow gates green; every claimed cross-build, the release artifact smoke test and the rootless container build green; three final review tracks found no blockers. Hosted CI, quiet benchmark provenance, long fuzz/soak and the remaining v1 decisions are still open | release evidence complete; operational v1 release only when separately authorized |
+| `LOGS-V1-07` | in-progress | v1 preparation: the full production exit, phases 0-10 plus the release gate set green; commit, tag and publish operations stop at the evidence checkpoint until separately authorized | 2026-08-28: local default, race, purego, vet, format, module and workflow gates green; every claimed cross-build, the release artifact smoke test and the rootless container build green; three final review tracks found no blockers; hosted `ci` and `cross` passed all nine jobs at `7b55bae`. Quiet benchmark provenance, long fuzz/soak and the remaining v1 decisions are still open | release evidence complete; operational v1 release only when separately authorized |
 | `LOGS-V1-08` | open | Workload-backed ecosystem decisions: the parity and ecosystem documents reconciled against concrete ingest, query, storage, recovery, and operations workloads from VictoriaLogs, Loki, Elasticsearch/OpenSearch, ClickHouse, and Vector; every material gap classified as a v1 blocker, post-v1 work, or rejected with evidence; no feature is added merely for parity | the decision record | decisions recorded |
 | `LOGS-IO-01` | open | Deferred, non-v1-blocking: queries are mmap-backed; durable ingest keeps file, directory, and manifest sync barriers. Instrument the ingest stages first; prototype an io_uring path only if explicit I/O waits are at least 30% of durable-ingest time; retain it only for a repeatable at least 20% end-to-end throughput or p99 gain while the durability and conformance gates stay green; without that evidence it stays deferred and no `docs/wrong.md` entry is written | the instrumented measurement or the deferred decision record | decision recorded with measurement |
 

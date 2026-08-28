@@ -24,9 +24,10 @@ stabilization, and rehearsal, all staged in the task ledger in
 [`docs/release-readiness.md`](release-readiness.md). The header's `planned`
 status is this roadmap's own - the stage sections below are the plan, not a
 description of the shipped state - so the two statuses do not contradict. The
-high-level blockers are the ledger's standing ones: the published benchmark
-table has no machine-checked provenance, and none of the CI workflows has
-been observed running. Per-task statuses live in the ledger, not here.
+high-level blocker is the ledger's standing benchmark item: the published
+benchmark table has no machine-checked provenance. The hosted `ci` and `cross`
+workflows have now been observed green; per-task statuses live in the ledger,
+not here.
 
 ## Stage 0 — Compatibility hardening
 

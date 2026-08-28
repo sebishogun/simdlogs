@@ -75,6 +75,10 @@ No version has been tagged. This section is what a first release would carry.
 - Land the adversarial security review of the cluster work (`ea0b4f2`)
 - The distributed query path returned wrong answers seven ways (`94e2c3a`)
 - Close the rest of the cluster review — silent drops, order-dependent refusals, and guards nothing tested (`825b61c`)
+- Keep vector-packed query masks in row order on big-endian hosts (`7b55bae`).
+  On s390x, time and field filters that used `MaskBits` returned empty or
+  slightly short answers because row zero landed in the high byte of a native
+  word.
 
 ### Not included
 
