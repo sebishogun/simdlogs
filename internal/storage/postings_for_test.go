@@ -112,14 +112,14 @@ func BenchmarkPostingsDecodeOne(b *testing.B) {
 		b.Run(rg.name+"/lz4varint", func(b *testing.B) {
 			i := 0
 			for b.Loop() {
-				sinkRows = postingRows(v7, ids[i&255])
+				sinkRows = postingRows(v7, ids[i&255], n)
 				i++
 			}
 		})
 		b.Run(rg.name+"/for-simd", func(b *testing.B) {
 			i := 0
 			for b.Loop() {
-				sinkRows = postingRows(v8, ids[i&255])
+				sinkRows = postingRows(v8, ids[i&255], n)
 				i++
 			}
 		})

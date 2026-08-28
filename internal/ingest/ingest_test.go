@@ -31,9 +31,9 @@ func TestIngestThenQuery(t *testing.T) {
 			base+int64(i)*1000, lvl, i)
 	}
 	var mono int64
-	ing, skip := IngestJSONLines(w, []byte(sb.String()), func() int64 { mono++; return mono })
-	if ing != 50_000 || skip != 0 {
-		t.Fatalf("ingested %d skipped %d", ing, skip)
+	ingRes, _ := IngestJSONLines(w, []byte(sb.String()), func() int64 { mono++; return mono })
+	if ingRes.Accepted != 50_000 || ingRes.Rejected != 0 {
+		t.Fatalf("ingested %d skipped %d", ingRes.Accepted, ingRes.Rejected)
 	}
 	if err := w.Flush(); err != nil {
 		t.Fatal(err)
@@ -48,8 +48,8 @@ func TestIngestThenQuery(t *testing.T) {
 		t.Fatalf("query got %d error rows, want %d", len(rows), wantErr)
 	}
 	// Malformed lines are skipped, not fatal.
-	_, skip = IngestJSONLines(w, []byte("not json\n{bad\n"), func() int64 { return 0 })
-	if skip == 0 {
+	badRes, _ := IngestJSONLines(w, []byte("not json\n{bad\n"), func() int64 { return 0 })
+	if badRes.Rejected == 0 {
 		t.Fatal("malformed lines were not counted as skipped")
 	}
 }
@@ -60,33 +60,27 @@ func TestIngestThenQuery(t *testing.T) {
 func TestTimeStoredOnce(t *testing.T) {
 	for _, tc := range []struct {
 		name, body   string
-		parse        func(*Writer, []byte, func() int64) (int, int)
+		parse        func(*Writer, []byte, func() int64) (Result, error)
 		wantTimeCol  int
 		wantKeptText bool
 	}{
 		{
-			name: "jsonline parsed",
-			body: `{"_time":"2024-05-01T00:00:00Z","level":"error"}` + "\n",
-			parse: func(w *Writer, b []byte, f func() int64) (int, int) {
-				return IngestJSONLines(w, b, f)
-			},
+			name:        "jsonline parsed",
+			body:        `{"_time":"2024-05-01T00:00:00Z","level":"error"}` + "\n",
+			parse:       IngestJSONLines,
 			wantTimeCol: 1,
 		},
 		{
-			name: "jsonline unparseable time is kept as data",
-			body: `{"_time":"not a time","level":"error"}` + "\n",
-			parse: func(w *Writer, b []byte, f func() int64) (int, int) {
-				return IngestJSONLines(w, b, f)
-			},
+			name:         "jsonline unparseable time is kept as data",
+			body:         `{"_time":"not a time","level":"error"}` + "\n",
+			parse:        IngestJSONLines,
 			wantTimeCol:  2, // the timestamp column plus the value we could not read
 			wantKeptText: true,
 		},
 		{
-			name: "logfmt parsed",
-			body: "_time=2024-05-01T00:00:00Z level=error\n",
-			parse: func(w *Writer, b []byte, f func() int64) (int, int) {
-				return IngestLogfmt(w, b, f)
-			},
+			name:        "logfmt parsed",
+			body:        "_time=2024-05-01T00:00:00Z level=error\n",
+			parse:       IngestLogfmt,
 			wantTimeCol: 1,
 		},
 	} {
@@ -97,8 +91,8 @@ func TestTimeStoredOnce(t *testing.T) {
 			}
 			defer st.Close()
 			w := NewWriter(st)
-			if n, _ := tc.parse(w, []byte(tc.body), func() int64 { return 1 }); n != 1 {
-				t.Fatalf("ingested %d records, want 1", n)
+			if r, _ := tc.parse(w, []byte(tc.body), func() int64 { return 1 }); r.Accepted != 1 {
+				t.Fatalf("ingested %d records, want 1", r.Accepted)
 			}
 			w.Close()
 			groups := st.Groups(0, int64(1)<<62)

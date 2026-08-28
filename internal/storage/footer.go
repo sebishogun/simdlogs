@@ -210,6 +210,24 @@ func (r *Reader) TimestampsRange(name string, lo, hi int) []int64 {
 	return decodeTsRange(data, lo, hi)
 }
 
+// TimestampsRangeInto is TimestampsRange writing into the caller's buffer.
+//
+// It is opt-in, and deliberately not what TimestampsRange does, because the
+// two are not interchangeable: rebuild() keeps the slice it gets as a
+// Column's Ts for the lifetime of a Group, and handing it a buffer that is
+// about to be refilled would rewrite a group being written out. Only a caller
+// that reads the timestamps and drops them before the buffer is reused may
+// pass one -- the group scan and the histogram, where the times are copied
+// into rows and buckets and nothing survives the call.
+func (r *Reader) TimestampsRangeInto(dst []int64, name string, lo, hi int) []int64 {
+	m := r.col(name)
+	if m == nil || m.Type != ColTimestamp {
+		return nil
+	}
+	data := r.blob[m.DataOff : m.DataOff+m.DataLen]
+	return decodeTsRangeInto(dst, data, lo, hi)
+}
+
 // DictIndices decodes the per-row dictionary indices of a dict column,
 // and returns them with the dict table for value lookup.
 func (r *Reader) DictIndices(name string) ([]uint32, []string) {
@@ -346,7 +364,7 @@ func (r *Reader) EqualityRows(name, value string) (rows []uint32, has bool) {
 	if id < 0 {
 		return nil, true
 	}
-	return postingRows(r.blob[m.PostOff:m.PostOff+m.PostLen], id), true
+	return postingRows(r.blob[m.PostOff:m.PostOff+m.PostLen], id, r.Rows), true
 }
 
 // ---- dict-value bloom, on the simd hash ----
@@ -488,17 +506,78 @@ type ValueCount struct {
 // posting count table alone (bit-packed in v8, prefix-sum differences in
 // v7) -- so no per-row index or row list is decoded.
 func (r *Reader) ValueCounts(name string) []ValueCount {
+	return r.ValueCountsInto(nil, name)
+}
+
+// vcFused selects how ValueCountsInto pairs values with counts: streamed off a
+// dictWalk into the caller's buffer (true), or via a materialized []string of
+// the whole dictionary into a fresh slice (false). Both arms compile into ONE
+// binary so they can be benchmarked interleaved in a single session -- a
+// two-build comparison would put the 8.3% code-layout noise floor between
+// them. Production always streams.
+var vcFused = true
+
+// ValueCountsInto is ValueCounts appending into a caller-owned buffer. A caller
+// looping over groups passes the same buffer back each time and the per-group
+// result slice stops being allocated at all -- it was 37% of every byte a
+// `top N by (field)` allocated. The buffer's contents are the callee's: pass
+// it back only after copying out what the previous group needed.
+//
+// dst is returned truncated (never nil, unless dst was) when the column is
+// absent, so a loop that reassigns its buffer keeps it across groups that do
+// not carry the field.
+func (r *Reader) ValueCountsInto(dst []ValueCount, name string) []ValueCount {
 	m := r.col(name)
 	if m == nil || m.Type != ColDict || m.PostLen == 0 {
-		return nil
+		return dst[:0]
 	}
 	blob := r.blob[m.PostOff : m.PostOff+m.PostLen]
-	out := make([]ValueCount, 0, m.DictLen)
-	// The whole dictionary in one pass: dictSectionAt decompresses the block a
-	// value lives in on EVERY call, so asking it for each id in turn re-inflated
-	// each block once per value it holds. That was 47% of a `top N by (host)`.
-	vals := dictSectionAll(r.dictSec(m), m.DictLen)
+	if !vcFused {
+		return r.valueCountsMaterialized(m, blob)
+	}
+	out := dst[:0]
+	if cap(out) < m.DictLen {
+		out = make([]ValueCount, 0, m.DictLen)
+	}
+	// The dictionary in one streamed pass: dictSectionAt decompresses the block
+	// a value lives in on EVERY call, so asking it for each id in turn
+	// re-inflated each block once per value it holds. That was 47% of a
+	// `top N by (host)`. dictWalk keeps that single pass and drops the []string
+	// it used to be collected into, which nothing outside this function read.
+	w := newDictWalk(r.dictSec(m), m.DictLen)
 	// Each count is then an O(1) read from the bit-packed table.
+	if dictLen, cw, cs, _, _, ok := postV8Header(blob); ok {
+		n := m.DictLen
+		if dictLen < n {
+			n = dictLen
+		}
+		for id := 0; id < n; id++ {
+			v, ok := w.next()
+			if !ok { // the section held fewer values than the header claims
+				break
+			}
+			out = append(out, ValueCount{Value: v, Count: extractCountBits(cs, id, cw)})
+		}
+		return out
+	}
+	no := int(le32(blob))
+	for id := 0; id+1 < no && id < m.DictLen; id++ {
+		v, ok := w.next()
+		if !ok {
+			break
+		}
+		start := le32(blob[4+id*4:])
+		end := le32(blob[4+(id+1)*4:])
+		out = append(out, ValueCount{Value: v, Count: int(end - start)})
+	}
+	return out
+}
+
+// valueCountsMaterialized is the pre-dictWalk shape, kept as the A/B arm and
+// as the reference the fused path is tested against.
+func (r *Reader) valueCountsMaterialized(m *colMeta, blob []byte) []ValueCount {
+	out := make([]ValueCount, 0, m.DictLen)
+	vals := dictSectionAll(r.dictSec(m), m.DictLen)
 	if dictLen, cw, cs, _, _, ok := postV8Header(blob); ok {
 		n := m.DictLen
 		if dictLen < n {

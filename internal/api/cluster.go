@@ -4,14 +4,21 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/sebishogun/simdlogs/internal/storage"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"unsafe"
 
+	"github.com/sebishogun/simdlogs/internal/config"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/query"
 	"sync/atomic"
 	"time"
@@ -21,7 +28,22 @@ import (
 // out to these peer base URLs and merges their rows, the way VictoriaLogs'
 // vmselect queries a set of vmstorage nodes. With no backends the node serves
 // its own store.
-func (s *Server) SetBackends(urls []string) { s.backends = urls }
+func (s *Server) SetBackends(urls []string) {
+	// A COPY. The caller's slice is the caller's, and storing it means a later
+	// append on their side rewrites this server's topology underneath the
+	// goroutines reading it.
+	cp := append([]string(nil), urls...)
+	s.backendsAt.Store(&cp)
+}
+
+// backendList is the current peer list. One atomic load; nil when this node is
+// not a router.
+func (s *Server) backendList() []string {
+	if p := s.backendsAt.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
 
 // SetReplicas sets the replication factor: the backends partition into shards
 // of r replicas each. A write goes to every replica of its shard; a read takes
@@ -29,9 +51,14 @@ func (s *Server) SetBackends(urls []string) { s.backends = urls }
 // double-counted. r<=1 is plain sharding (no replication).
 func (s *Server) SetReplicas(r int) { s.replicas = r }
 
-// SetMaxRows caps how many rows a bare (no-pipe) select may return; 0 = unlimited.
-// Over the cap the query errors rather than truncating silently.
-func (s *Server) SetMaxRows(n int) { s.maxRows = n }
+// SetMaxRowsForTest caps how many rows a bare (no-pipe) select may return;
+// 0 = unlimited. Over the cap the query errors rather than truncating silently.
+//
+// ForTest BY NAME, because that is what it is: production sets the cap through
+// config (-search.maxRows reaches the server at NewServerConfig), and every
+// caller of this is a test. It was on the unwired baseline as "a dead exported
+// setter", which was half right -- the setter is not dead, its name was.
+func (s *Server) SetMaxRowsForTest(n int) { s.maxRows = n }
 
 // shards groups the backends into replica sets of size max(1, replicas).
 func (s *Server) shards() [][]string {
@@ -40,55 +67,66 @@ func (s *Server) shards() [][]string {
 		r = 1
 	}
 	var out [][]string
-	for i := 0; i < len(s.backends); i += r {
+	// ONE load. Four separate ones could see two different lists across the
+	// bound check and the slice, which is the exact tear the atomic exists to
+	// remove -- moving a race from the field to its accessor is no fix.
+	b := s.backendList()
+	for i := 0; i < len(b); i += r {
 		hi := i + r
-		if hi > len(s.backends) {
-			hi = len(s.backends)
+		if hi > len(b) {
+			hi = len(b)
 		}
-		out = append(out, s.backends[i:hi])
+		out = append(out, b[i:hi])
 	}
 	return out
 }
 
-// getFromShard tries each replica in the shard in turn until one returns a
-// body, so a read tolerates a downed replica. ok is false if all replicas fail.
-func (s *Server) getFromShard(r *http.Request, shard []string, path string, post []byte) ([]byte, bool) {
-	for _, b := range shard {
-		var req *http.Request
-		var err error
-		if post != nil {
-			req, err = http.NewRequestWithContext(r.Context(), "POST", b+path, bytes.NewReader(post))
-			if req != nil {
-				req.Header.Set("Content-Type", "application/json")
-			}
-		} else {
-			req, err = http.NewRequestWithContext(r.Context(), "GET", b+path+"?"+r.URL.RawQuery, nil)
-		}
-		if err != nil {
-			continue
-		}
-		for _, h := range []string{"AccountID", "ProjectID"} {
-			if v := r.Header.Get(h); v != "" {
-				req.Header.Set(h, v)
-			}
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			continue // replica down: try the next
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode >= 500 {
-			continue
-		}
-		return body, true
+// askShard asks one shard, trying its replicas in order, and returns the
+// PeerResponse -- including when every replica failed.
+//
+// The failure is RETURNED rather than folded into a bool. Every replica error
+// used to be a bare `continue` and the whole shard a `return nil, false`, so a
+// caller could not tell "this shard has no data" from "every replica is down"
+// from "the credential was refused" -- and the merge treated all three as an
+// empty contribution.
+//
+// Not every class is worth another replica: an unauthorized answer is the
+// ROUTER's credential being refused, so every replica refuses it identically
+// and retrying turns one 401 into N while delaying the report by the timeout.
+func (s *Server) askShard(
+	r *http.Request, shardID int, shard []string, path string, post []byte, ct string,
+) PeerResponse {
+	method := http.MethodGet
+	if post != nil {
+		method = http.MethodPost
 	}
-	return nil, false
+	var last PeerResponse
+	for i, b := range shard {
+		last = s.peers.do(r, shardID, i, b, method, path, post, ct)
+		if last.OK() {
+			return last
+		}
+		obs.L().Warn("peer did not answer",
+			obs.FieldEvent, "cluster.peer_failed",
+			obs.FieldShard, shardID, "replica", i, "peer", b,
+			obs.FieldErrorClass, string(last.Class), "error", last.Err)
+		if !last.Class.retryAnotherReplica() {
+			return last
+		}
+	}
+	return last
 }
 
 // isWritePath reports whether a path ingests data (and so, in router mode,
 // should forward to a storage node rather than be served locally).
 func isWritePath(p string) bool {
+	// A liveness probe is not a write. It lives under /insert only because
+	// that is where the reference put it, and forwarding it made a router
+	// answer 401 to an unauthenticated Kubernetes probe -- forever -- while
+	// the same probe on a non-router node answered 200.
+	if p == "/insert/ready" {
+		return false
+	}
 	switch {
 	case strings.HasPrefix(p, "/insert"), p == "/_bulk", p == "/v1/logs", p == "/v1/input",
 		strings.HasPrefix(p, "/api/"), strings.HasPrefix(p, "/loki"):
@@ -102,7 +140,79 @@ func isWritePath(p string) bool {
 // (federatedSelect), so only writes are intercepted here.
 func (s *Server) routeWrites(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.backends) > 0 && isWritePath(r.URL.Path) {
+		if len(s.backendList()) > 0 && isWritePath(r.URL.Path) {
+			// Forwarding returns before the mux, so none of the per-route
+			// wrappers run: the role check, method, media type and body limit
+			// all live in there. Unguarded, a router was an unauthenticated,
+			// unbounded ingest proxy -- an anonymous multi-megabyte POST was
+			// relayed to a backend whose own limits it had already bypassed.
+			// The same checks are applied here before anything is forwarded.
+			spec := specForPath(r.URL.Path)
+			// Authentication FIRST, exactly as Handler() orders it. With the
+			// shape checks outside, a wrong Content-Type answered 415 and a
+			// wrong method 405 before the 401 -- telling an anonymous caller
+			// which media types and methods a route accepts. Single-node
+			// answered 401 for both.
+			if st := s.auth; st != nil && st.enabled {
+				p := principalOf(r)
+				if p == nil {
+					w.Header().Set("WWW-Authenticate", `Bearer realm="simdlogs"`)
+					s.writeErr(w, r, spec, http.StatusUnauthorized, "authentication required")
+					return
+				}
+				if !p.Can(config.RoleIngest) {
+					s.writeErr(w, r, spec, http.StatusForbidden,
+						"principal "+p.Subject+" does not hold the ingest role")
+					return
+				}
+			}
+			if !allowedMethod(spec.methods, r.Method) {
+				w.Header().Set("Allow", strings.Join(spec.methods, ", "))
+				s.writeErr(w, r, spec, http.StatusMethodNotAllowed,
+					"method "+r.Method+" not allowed")
+				return
+			}
+			// Gated the same two ways guard() gates it. Neither guard was
+			// here, so a spec with deliberately nil types -- datadogValidateSpec,
+			// the very route specForPath exists to select -- rejected every
+			// Content-Type with 415, and a GET body-less request was typed at
+			// all.
+			if len(spec.types) > 0 && r.Method != http.MethodGet && r.Method != http.MethodHead {
+				if ct := r.Header.Get("Content-Type"); ct != "" {
+					if mt, _, err := mime.ParseMediaType(ct); err != nil || !allowedType(spec.types, mt) {
+						s.writeErr(w, r, spec, http.StatusUnsupportedMediaType,
+							"unsupported media type "+ct)
+						return
+					}
+				}
+			}
+			if lim := s.limits.MaxBodyBytes; lim != config.Unlimited && r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, lim)
+			}
+			// Resolve the tenant here too, and forward the RESOLVED key
+			// rather than whatever the client sent. forwardWrite clones the
+			// client's headers verbatim, and a storage node normally runs
+			// with no -auth.config at all, so the router is the only place
+			// AccountID is ever checked: without this a token scoped to one
+			// tenant wrote into any other by setting a header.
+			key, err := s.tenantFor(r)
+			if err != nil {
+				s.writeErr(w, r, spec, authStatus(err), err.Error())
+				return
+			}
+			r.Header.Set("AccountID", key.Account)
+			r.Header.Set("ProjectID", key.Project)
+			// Admission and the request counter both live in guard() and
+			// withTenant(), which forwarding returns before. Without the
+			// first, N concurrent posts each ReadAll a whole body with no
+			// bound; without the second, /metrics reads zero ingest on a
+			// router under full load.
+			if release, ok := s.admit(s.writeSem, spec, w, r); ok {
+				defer release()
+			} else {
+				return
+			}
+			s.countRequest(r.URL.Path)
 			s.forwardWrite(w, r)
 			return
 		}
@@ -110,42 +220,263 @@ func (s *Server) routeWrites(next http.Handler) http.Handler {
 	})
 }
 
-// forwardWrite sends the ingest body to one storage node, round-robin, and
-// relays its response -- so a burst of inserts spreads across the cluster.
-// It round-robins over shards and writes the record to every replica in the
-// chosen shard, so a replica loss never loses data.
+// forwardWrite sends the ingest body to every replica in one shard. The write
+// id selects the shard with a stable hash, so fresh random ids distribute a
+// burst while every retry returns to the replicas that may already hold it.
+// ConsistencyLevel is how many replicas must acknowledge a write before the
+// client is told it succeeded.
+//
+// The old behaviour was none of these: forwardWrite replicated to every member
+// and relayed the LAST response's status. Replica A refusing on its own quota
+// and replica B accepting answered whichever finished last, so the same write
+// was reported as stored or refused depending on scheduling -- and a 507 in
+// the other order made a retry duplicate into the replica that had already
+// taken it.
+type ConsistencyLevel string
+
+const (
+	// ConsistencyOne succeeds when any replica commits. The write may exist on
+	// one machine only, so losing that machine loses the data.
+	ConsistencyOne ConsistencyLevel = "one"
+	// ConsistencyQuorum succeeds when more than half commit.
+	ConsistencyQuorum ConsistencyLevel = "quorum"
+	// ConsistencyAll succeeds only when every replica commits.
+	//
+	// The DEFAULT. Repair is operator-triggered rather than automatic, so a
+	// quorum write can still leave a replica stale until the next repair pass.
+	// The default keeps normal writes converged without depending on that pass;
+	// callers can choose quorum or one when their availability policy differs.
+	ConsistencyAll ConsistencyLevel = "all"
+)
+
+// required is how many acknowledgements this level needs from n replicas.
+func (c ConsistencyLevel) required(n int) int {
+	switch c {
+	case ConsistencyOne:
+		return 1
+	case ConsistencyQuorum:
+		return n/2 + 1
+	default:
+		return n
+	}
+}
+
+// ParseConsistency validates a level.
+func ParseConsistency(s string) (ConsistencyLevel, error) {
+	switch ConsistencyLevel(s) {
+	case "":
+		return ConsistencyAll, nil
+	case ConsistencyOne:
+		return ConsistencyOne, nil
+	case ConsistencyQuorum:
+		return ConsistencyQuorum, nil
+	case ConsistencyAll:
+		return ConsistencyAll, nil
+	}
+	return "", fmt.Errorf("simdlogs: consistency must be one, quorum or all, not %q", s)
+}
+
+// replicaOutcome is one replica's answer to a write.
+type replicaOutcome struct {
+	URL       string `json:"replica"`
+	Status    int    `json:"status,omitempty"`
+	Duplicate bool   `json:"duplicate,omitempty"`
+	Class     string `json:"class,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
 func (s *Server) forwardWrite(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), 400)
+		// MaxBytesReader is installed by routeWrites, so an oversized body
+		// lands here as a MaxBytesError and must be 413 rather than 400.
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			s.writeErr(w, r, ndjsonSpec(), http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("request body exceeds %d bytes", mbe.Limit))
+			return
+		}
+		s.writeErr(w, r, ndjsonSpec(), http.StatusBadRequest, err.Error())
 		return
 	}
+
+	level, err := ParseConsistency(r.Header.Get(HdrConsistency))
+	if err != nil {
+		s.writeErr(w, r, ndjsonSpec(), http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// The write id: the client's if it sent one -- that is how a retry names
+	// the write it is repeating -- otherwise a fresh one. Validated because a
+	// client-supplied id ends up in the manifest.
+	wid := r.Header.Get(HdrWriteID)
+	if wid != "" && !storage.ValidWriteID(wid) {
+		s.writeErr(w, r, ndjsonSpec(), http.StatusBadRequest,
+			"simdlogs: "+HdrWriteID+" must be 8-64 hex characters")
+		return
+	}
+	if wid == "" {
+		id, err := storage.NewWriteID()
+		if err != nil {
+			s.writeErr(w, r, ndjsonSpec(), http.StatusInternalServerError, err.Error())
+			return
+		}
+		wid = string(id)
+	}
+
 	shards := s.shards()
-	shard := shards[int(atomic.AddInt64(&s.rr, 1)-1)%len(shards)]
-	var lastResp *http.Response
-	var okAny bool
-	for _, b := range shard { // replicate to every member of the shard
-		req, err := http.NewRequestWithContext(r.Context(), r.Method, b+r.URL.Path, bytes.NewReader(body))
-		if err != nil {
-			continue
-		}
-		req.Header = r.Header.Clone()
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			continue
-		}
-		if lastResp != nil {
-			lastResp.Body.Close()
-		}
-		lastResp, okAny = resp, true
+	shard := shards[writeShardIndex(wid, len(shards))]
+
+	// Every replica, in parallel, each carrying the SAME write id. A replica
+	// that already has it answers "duplicate", which counts as an
+	// acknowledgement: the data is there, which is the only thing the level is
+	// asking about.
+	outcomes := make([]replicaOutcome, len(shard))
+	var wg sync.WaitGroup
+	for i, b := range shard {
+		wg.Add(1)
+		go func(i int, b string) {
+			defer wg.Done()
+			outcomes[i] = s.replicateTo(r, b, body, wid)
+		}(i, b)
 	}
-	if !okAny {
-		http.Error(w, "all replicas unreachable", 502)
+	wg.Wait()
+
+	acked := 0
+	for _, o := range outcomes {
+		if o.Error == "" {
+			acked++
+		}
+	}
+	need := level.required(len(shard))
+	w.Header().Set(HdrWriteID, wid)
+	w.Header().Set(HdrConsistency, string(level))
+	w.Header().Set("Content-Type", "application/json")
+
+	if acked < need {
+		// Refused, and the client is told the write id. That is what makes the
+		// retry safe: the replicas that DID commit recognise the id and answer
+		// duplicate rather than storing the rows twice.
+		obs.L().Error("replicated write did not reach its consistency level",
+			obs.FieldEvent, "cluster.write_underreplicated",
+			"write_id", wid, "acked", acked, "required", need,
+			obs.FieldErrorClass, string(obs.ClassUpstream))
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": fmt.Sprintf(
+				"%d of %d replicas acknowledged, %s requires %d; retry with %s: %s "+
+					"-- replicas that already committed will not duplicate",
+				acked, len(shard), level, need, HdrWriteID, wid),
+			"write_id": wid,
+			"replicas": s.visibleOutcomes(r, outcomes),
+			"acked":    acked,
+			"required": need,
+		})
 		return
 	}
-	defer lastResp.Body.Close()
-	w.WriteHeader(lastResp.StatusCode)
-	io.Copy(w, lastResp.Body)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"write_id": wid,
+		"acked":    acked,
+		"replicas": s.visibleOutcomes(r, outcomes),
+	})
+}
+
+// writeShardIndex is stable across routers and restarts. Write ids are random,
+// so FNV-1a spreads new writes without mutable routing state; hashing the id is
+// what makes a retry return to the shard whose receipts can recognize it.
+func writeShardIndex(id string, shards int) int {
+	const (
+		offset64 = uint64(14695981039346656037)
+		prime64  = uint64(1099511628211)
+	)
+	h := offset64
+	for i := 0; i < len(id); i++ {
+		h ^= uint64(id[i])
+		h *= prime64
+	}
+	return int(h % uint64(shards))
+}
+
+// visibleOutcomes redacts per-replica detail from unauthorized callers.
+//
+// Replica URLs and their individual failures are the cluster's internal
+// topology. An operator needs them to act; an ordinary ingest client needs to
+// know only that the write did or did not reach its level, and telling it
+// which machines exist and which are down is a map of the deployment.
+func (s *Server) visibleOutcomes(r *http.Request, outcomes []replicaOutcome) []replicaOutcome {
+	if s.healthDetailAllowed(r) {
+		return outcomes
+	}
+	out := make([]replicaOutcome, len(outcomes))
+	for i, o := range outcomes {
+		out[i] = replicaOutcome{Status: o.Status, Duplicate: o.Duplicate, Class: o.Class}
+	}
+	return out
+}
+
+// replicateTo sends the write to one replica and classifies the answer.
+func (s *Server) replicateTo(r *http.Request, url string, body []byte, wid string) replicaOutcome {
+	out := replicaOutcome{URL: url}
+	// RequestURI carries the write route's query parameters too. Field
+	// mappings (_time_field, _msg_field, and the rest) live there; dropping
+	// them makes a router store a different row than the same request on a
+	// storage node while still answering success.
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, url+r.URL.RequestURI(),
+		bytes.NewReader(body))
+	if err != nil {
+		out.Class, out.Error = string(PeerMalformed), err.Error()
+		return out
+	}
+	// Explicit headers, not r.Header.Clone().
+	//
+	// Cloning forwarded the client's Authorization and cookies to every
+	// storage node -- the router authenticates to peers as itself, and a
+	// client credential travelling past the node it was presented to is how
+	// one node's compromise becomes the cluster's.
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		req.Header.Set("Content-Type", ct)
+	}
+	if ce := r.Header.Get("Content-Encoding"); ce != "" {
+		req.Header.Set("Content-Encoding", ce)
+	}
+	for _, h := range forwardedHeaders {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+	req.Header.Set(HdrInternal, "1")
+	req.Header.Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+	req.Header.Set(HdrWriteID, wid)
+
+	resp, err := s.peers.http.Do(req)
+	if err != nil {
+		out.Class, out.Error = string(PeerUnavailable), err.Error()
+		return out
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	out.Status = resp.StatusCode
+	out.Duplicate = resp.Header.Get(HdrDuplicate) == "true"
+
+	switch {
+	case out.Duplicate:
+		// Already committed: an acknowledgement, not a failure. The data is
+		// there, which is the only thing the consistency level asks about.
+		return out
+	case resp.StatusCode/100 == 2:
+		return out
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		out.Class = string(PeerUnauthorized)
+	case resp.StatusCode == http.StatusInsufficientStorage:
+		out.Class = string(PeerDegraded)
+	case resp.StatusCode == http.StatusTooManyRequests:
+		out.Class = string(PeerOverloaded)
+	default:
+		out.Class = string(PeerUnavailable)
+	}
+	out.Error = fmt.Sprintf("replica answered HTTP %d", resp.StatusCode)
+	return out
 }
 
 // federatedSelect queries every backend concurrently, merges the NDJSON rows
@@ -154,25 +485,129 @@ func (s *Server) forwardWrite(w http.ResponseWriter, r *http.Request) {
 // correct distributed answer. Tenant headers propagate so each backend answers
 // for the same tenant.
 func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
-	// Rows are kept as slices into each shard's response body, not strings: the
-	// merge touches every row of every shard, and a string per row was the
-	// router's cost on a big result (a Scanner's Text() copies each line).
-	type row struct {
-		t    int64
-		line []byte
+	// The PLAN before the fan-out.
+	//
+	// The whole query used to go to every shard and the final rows were
+	// concatenated: `| stats count()` answered once per shard, `| sort |
+	// limit 10` returned each shard's top ten, `| uniq` returned each shard's
+	// distinct values. Only the row-local prefix is distributable; everything
+	// from the first non-row-local pipe runs here, once, over the merged rows.
+	shardQuery, coordPipes, allPipes, ok := s.planQuery(w, r)
+	if !ok {
+		return
 	}
+	shardReq := r.Clone(r.Context())
+	shardReq.URL.RawQuery = shardQueryURL(r, shardQuery, coordPipes)
+	// shardQueryURL rewrites `query` and, when there is a coordinator half,
+	// DELETES `limit` -- the shards must return everything and the bound is
+	// applied once over the merged rows. A deleted key is not in the shard URL,
+	// so withFormInURL's "skip what the URL already has" rule would put the
+	// caller's limit back over a POST. Measured before this: three shards of
+	// ten rows and `&limit=5`, `* | stats count() c` answered 30 on a single
+	// node, 30 over a cluster GET and 15 over a cluster POST form.
+	// `limit` only when the plan DELETES it, which is only when there is a
+	// coordinator half.
+	//
+	// Marking it unconditionally suppressed a shard limit the plan
+	// deliberately KEEPS -- shardQueryURL's own comment says "with no
+	// coordinator half the shard limit is exactly right and stays". Over a POST
+	// form it stopped staying. Measured, one shard, `POST query=*&limit=5`:
+	// the shard received `limit=5&query=%2A` before and `query=%2A` after, and
+	// the same request over GET still carried it.
+	//
+	// The answer stayed correct -- mergeRows applies the bound from the
+	// original request -- so this was blast radius, not a wrong number. One
+	// storage node, 20,000 rows of ~109 B NDJSON, `query=*` against
+	// `query=*&limit=5` measured at about 3.76 MB against 944 bytes: roughly
+	// four thousand times the body. The RATIO is the stable part; the exact
+	// bytes are a property of the fixture, which is written down in
+	// docs/wrong.md entry 63 because three measurements of this without one
+	// gave three different seven-figure numbers. Every shard streamed its whole
+	// matching set to the router on the exact path POST exists for.
+	//
+	// `query` is marked ALWAYS, and that marking is load-bearing now.
+	//
+	// Entry 63 removed it as inert: shardQueryURL always Sets it, so it was
+	// always a URL key and withFormInURL's "already in the query" rule covered
+	// it. That rule is gone -- it made the URL win over the body, where a node
+	// lets the BODY win for a urlencoded form -- so what stops the caller's
+	// form from overwriting the plan's rewritten query is this mark and
+	// nothing else.
+	shardReq = withPlanKeys(shardReq, "query")
+	if len(coordPipes) > 0 {
+		shardReq = withPlanKeys(shardReq, "limit")
+	}
+
+	// The completeness gate BEFORE the merge. A shard that did not answer used
+	// to contribute nothing and the merge proceeded, so a cluster read with one
+	// shard down returned the other shards' rows with HTTP 200 and nothing to
+	// say a third of the data was missing.
+	bodies, w, ok := s.fanOutChecked(w, shardReq, "/select/logsql/query", nil)
+	if !ok {
+		return
+	}
+	s.mergeRows(w, r, bodies, coordPipes, allPipes)
+}
+
+// federatedRows answers an NDJSON-row endpoint for the cluster: fan out
+// unchanged, merge in time order, apply `limit` across the merged set.
+//
+// For endpoints whose whole pipeline is row-local, which is the condition under
+// which concatenate-sort-limit is the correct distributed answer. A caller that
+// cannot guarantee that must plan first, as federatedSelect does.
+func (s *Server) federatedRows(w http.ResponseWriter, r *http.Request, path string) {
+	bodies, w, ok := s.fanOutChecked(w, r, path, nil)
+	if !ok {
+		return
+	}
+	s.mergeRows(w, r, bodies, nil, nil)
+}
+
+// mergedRow is one row as it arrived from a shard.
+//
+// The line is a slice INTO that shard's response body, not a string: the merge
+// touches every row of every shard, and a string per row was the router's cost
+// on a big result (a Scanner's Text() copies each line).
+type mergedRow struct {
+	t    int64
+	line []byte
+	// shard and seq make the order TOTAL and reproducible.
+	//
+	// rowLineTime returns 0 for any line with no `"_time":"` -- which is every
+	// row after a projecting pipe -- so a whole result could share one key and
+	// the sort left it in the order the goroutines happened to finish. `* |
+	// fields _msg | limit 5` over three shards returned shard 2's first five,
+	// because shard 2's chunk landed first.
+	//
+	// Ties on t are broken by (shard, position within that shard), which is the
+	// order a single node would have produced: shards hold disjoint time
+	// ranges, and within a shard the scan order is preserved.
+	shard int
+	seq   int
+}
+
+// collectShardRows splits every shard's NDJSON into rows, in parallel, and
+// reports the first line that is not a row.
+//
+// One copy, because two callers need it: the row endpoints merge and stream
+// these, and the exact-stats path merges them and runs an aggregate over them.
+// The split has to agree between those two -- same emptiness rule, same
+// not-a-row refusal, same per-shard sequence numbering -- or a cluster answers
+// `stats` over a different row set than `select` returns for the same query,
+// which is the exact class of divergence this file exists to close.
+//
+// badShard is -1 when every line was a JSON object.
+func collectShardRows(answers []shardAnswer) (all []mergedRow, badShard int, badLine []byte) {
 	var mu sync.Mutex
-	var all []row
+	badShard = -1
+
 	var wg sync.WaitGroup
-	for _, sh := range s.shards() { // one live replica per shard
+	for _, a := range answers {
 		wg.Add(1)
-		go func(sh []string) {
+		go func(shardOf int, body []byte) {
 			defer wg.Done()
-			body, ok := s.getFromShard(r, sh, "/select/logsql/query", nil)
-			if !ok {
-				return
-			}
-			local := make([]row, 0, bytes.Count(body, []byte{'\n'}))
+			local := make([]mergedRow, 0, bytes.Count(body, []byte{'\n'}))
+			var bad []byte
 			for start := 0; start < len(body); {
 				e := bytes.IndexByte(body[start:], '\n')
 				var line []byte
@@ -184,23 +619,199 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 				if len(line) == 0 {
 					continue
 				}
-				local = append(local, row{t: rowLineTime(bytesToString(line)), line: line})
+				// Every line a storage node emits is one JSON object. A line
+				// that is not one is not a row, and mergeRows used to carry it
+				// through: a proxy's HTML error page in a 200 body came back to
+				// the caller AS A LOG LINE, and with a coordinator half it
+				// became _msg="<html>...". mergeDecode covers the eight
+				// envelope merges; this is the primary read path and had
+				// nothing.
+				if !looksLikeJSONObject(line) {
+					if bad == nil {
+						bad = line
+					}
+					continue
+				}
+				local = append(local, mergedRow{
+					t: rowLineTime(bytesToString(line)), line: line, shard: shardOf,
+					seq: len(local),
+				})
 			}
 			mu.Lock()
 			all = append(all, local...)
+			if bad != nil && (badShard < 0 || shardOf < badShard) {
+				badShard, badLine = shardOf, bad
+			}
 			mu.Unlock()
-		}(sh)
+		}(a.shard, a.body)
 	}
 	wg.Wait()
+	return all, badShard, badLine
+}
 
-	sort.Slice(all, func(i, j int) bool { return all[i].t > all[j].t }) // newest first
+// refuseNotARow refuses an answer in which some shard sent a line that is not a
+// row. It reports whether the caller may continue.
+func (s *Server) refuseNotARow(
+	w http.ResponseWriter, r *http.Request, badShard int, badLine []byte,
+) bool {
+	if badShard < 0 {
+		return true
+	}
+	obs.L().Error("cluster read refused: a shard sent a line that is not a row",
+		obs.FieldEvent, "cluster.read_not_a_row",
+		obs.FieldRoute, r.URL.Path, "shard", badShard,
+		obs.FieldErrorClass, string(obs.ClassUpstream))
+	s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+		"simdlogs: shard %d answered 200 with a line that is not a JSON row "+
+			"(%q). Returning it would put that text in front of you as a log "+
+			"line, so the answer is refused",
+		badShard, truncateLine(badLine, 120)))
+	return false
+}
+
+// mergeRows merges shard NDJSON and applies the coordinator half of a plan.
+// allPipes is the WHOLE pipeline the caller wrote, which is what decides
+// whether the endpoint's `limit` bounds this answer. coordPipes is only the
+// suffix that runs here, and reading the bound off it gets the answer wrong the
+// moment a row-local prefix is pushed to the shards: the suffix then begins
+// with the aggregate, and "the aggregate is leading" is exactly the case where
+// a node does NOT apply the bound. nil for the row endpoints, whose pipeline is
+// row-local by definition and always bounded.
+func (s *Server) mergeRows(
+	w http.ResponseWriter, r *http.Request, answers []shardAnswer,
+	coordPipes, allPipes []query.Pipe,
+) {
+	all, badShard, badLine := collectShardRows(answers)
+	if !s.refuseNotARow(w, r, badShard, badLine) {
+		return
+	}
+	// The coordinator half of the plan, applied ONCE over the merged rows.
+	if len(coordPipes) > 0 {
+		// The order the pipes see must be the order a single storage node would
+		// have given them, or a pipe that reads POSITION -- offset, limit
+		// without a sort, tail -- answers a different question on a cluster than
+		// on one node.
+		//
+		// AND SO MUST THE ROW SET. `limit` is LastN, and on a node LastN bounds
+		// the SCAN: `Run` returns the newest n rows newest-first and every pipe
+		// then runs on those n. Applying it after the pipes instead -- taking
+		// the last n of an ascending result and reversing -- is a different
+		// answer, not a different order. Measured, three shards of ten rows,
+		// `&limit=5`:
+		//
+		//	query                          node            this path before
+		//	* | limit 5                    02:09..02:05    00:04..00:00
+		//	* | sort by (_time)            02:05..02:09    02:09..02:05
+		//	* | sort by (_time) | limit 5  02:05..02:09    00:04..00:00
+		//	* | offset 2 | limit 3         02:07..02:05    00:04..00:02
+		//
+		// So the bound is applied HERE, to the merged rows, before the pipes --
+		// which is where the node applies it -- and the order flips to
+		// newest-first with it, because that is what a bounded scan returns.
+		// Unbounded, a node scans oldest-first and this stays ascending.
+		//
+		// limitBoundsOutput is the same set as before and still names the pipe
+		// heads a node lets BYPASS the scan bound: runStats and runUniqFast run
+		// their own scan, which is why `* | stats count() c` answers 30 on a
+		// node with `&limit=5` and not 5.
+		bounded := 0
+		if n := endpointLimit(r); n > 0 && limitBoundsOutput(allPipes) {
+			bounded = n
+		}
+		sort.Slice(all, func(i, j int) bool {
+			if all[i].t != all[j].t {
+				if bounded > 0 {
+					return all[i].t > all[j].t
+				}
+				return all[i].t < all[j].t
+			}
+			if all[i].shard != all[j].shard {
+				return all[i].shard < all[j].shard
+			}
+			return all[i].seq < all[j].seq
+		})
+		if bounded > 0 && len(all) > bounded {
+			all = all[:bounded]
+		}
+
+		// The rows are parsed into fields ONLY here.
+		//
+		// The merge keeps raw NDJSON lines because it only has to order and
+		// re-emit them, and a string per row was the router's cost on a big
+		// result. A pipe operates on fields, so this path has to pay the
+		// decode -- and only this path does.
+		qrows := make([]query.Row, 0, len(all))
+		for _, rw := range all {
+			qrows = append(qrows, jsonLineToRow(rw.line))
+		}
+		merged, err := s.applyCoordinatorPipes(r, qrows, coordPipes)
+		if err != nil {
+			s.writeErr(w, r, readSpec(), query.HTTPStatus(err), err.Error())
+			return
+		}
+
+		// NO post-pipeline limit. The bound was applied to the rows entering the
+		// pipes, above, because that is where a node applies it. Applying it
+		// again here would truncate a result the pipes already shaped -- and
+		// truncate it from the wrong end, which is the defect this replaced.
+		w.Header().Set("Content-Type", ndjsonContentType)
+		w.WriteHeader(http.StatusOK)
+		bw := bufio.NewWriter(w)
+		defer bw.Flush()
+		var buf []byte
+		for _, row := range merged {
+			// withStream is FALSE here, unlike every direct read: these rows
+			// came back from a storage node that already stamped the pair, and
+			// they survived the round trip as ordinary fields. Asking for it
+			// again appended a second _stream_id to every row -- valid JSON,
+			// duplicate key, and the two decoders in this repo disagree about
+			// which one wins.
+			buf = appendRowJSON(buf[:0], row, false)
+			bw.Write(buf)
+		}
+		return
+	}
+
+	// The bare-select order, matching a single node exactly.
+	//
+	// Newest-first ONLY when `limit` is set. A single node answers `*` with
+	// line 00 first and `*&limit=3` with line 29 first on the same data --
+	// `limit` is LastN, "the newest N", and an unlimited select is scan order,
+	// which is oldest first. This path sorted newest-first unconditionally, so
+	// every unlimited cluster select came back reversed relative to the server
+	// it is a cluster of.
+	//
+	// The tiebreak is TOTAL. sort.Slice is not stable, so rows sharing a
+	// timestamp came back in an order that varied between identical requests:
+	// 40 requests over three shards of eight rows at one timestamp produced two
+	// distinct four-row answers. With `limit` that is different ROWS, not
+	// merely a different order.
+	newestFirst := endpointLimit(r) > 0
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].t != all[j].t {
+			if newestFirst {
+				return all[i].t > all[j].t
+			}
+			return all[i].t < all[j].t
+		}
+		if all[i].shard != all[j].shard {
+			return all[i].shard < all[j].shard
+		}
+		return all[i].seq < all[j].seq
+	})
+
 	limit := 0
 	if v := r.FormValue("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			limit = n
 		}
 	}
-	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Content-Type", ndjsonContentType)
+	// Explicit, because an EMPTY result writes no bytes -- and a handler that
+	// returns without writing sends 200 by default, which on a partial answer
+	// is exactly the confident-and-wrong status this whole mechanism exists to
+	// prevent. The partial writer upgrades this to 206.
+	w.WriteHeader(http.StatusOK)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	for i, rw := range all {
@@ -212,56 +823,605 @@ func (s *Server) federatedSelect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// fanOut sends the GET to one live replica of each shard concurrently and
-// returns the response bodies (one per shard), so replicated data is read once.
-func (s *Server) fanOut(r *http.Request, path string) [][]byte {
+// fanOutPeers asks every shard and returns one PeerResponse each, in shard
+// order -- including the failures.
+//
+// The failures are what the old [][]byte could not carry: a nil entry meant
+// "no data", "every replica down" and "refused" alike, so a merge could not
+// report an incomplete answer because it could not see one.
+func (s *Server) fanOutPeers(r *http.Request, path string, body []byte, ct string) []PeerResponse {
 	shards := s.shards()
-	out := make([][]byte, len(shards))
+	out := make([]PeerResponse, len(shards))
 	var wg sync.WaitGroup
 	for i, sh := range shards {
 		wg.Add(1)
 		go func(i int, sh []string) {
 			defer wg.Done()
-			if body, ok := s.getFromShard(r, sh, path, nil); ok {
-				out[i] = body
-			}
+			out[i] = s.askShard(r, i, sh, path, body, ct)
+			s.checkWatermark(&out[i], i)
 		}(i, sh)
 	}
 	wg.Wait()
 	return out
 }
 
-// fanOutPost sends the same POST (body + tenant headers) to every backend and
-// returns the response bodies -- the ES surface fans out this way, since its
-// query is a JSON body rather than URL params.
-func (s *Server) fanOutPost(r *http.Request, path string, body []byte) [][]byte {
-	shards := s.shards()
-	out := make([][]byte, len(shards))
-	var wg sync.WaitGroup
-	for i, sh := range shards {
-		wg.Add(1)
-		go func(i int, sh []string) {
-			defer wg.Done()
-			if b, ok := s.getFromShard(r, sh, path, body); ok {
-				out[i] = b
-			}
-		}(i, sh)
+// withFormInURL folds a POST form body into the request's query string so the
+// fan-out carries it.
+//
+// The peer client sends r.URL.RawQuery with every request and the read fan-out
+// sends no body -- askShard's `post` is nil for every read path. So a client
+// that POSTs `query=...` as a form, which the reference accepts and which is how
+// anything longer than a URL is sent, had its parameters dropped on the way to
+// the shards. Every federated endpoint except /select/logsql/query was affected:
+// that one survives only because planQuery rebuilds the shard URL from the
+// parsed form on its own, which is this fix written once for one endpoint.
+//
+// Worse than losing them: the shards then answered the EMPTY query, and the
+// router reported that as the shards having rejected the request -- pointing an
+// operator at the storage nodes for a fault in the router.
+//
+// Folded into the URL rather than forwarded as a body, because the shard call is
+// a GET and every parameter these endpoints take is a query parameter anyway.
+// r.Form is the union of the URL query and the parsed body, so re-encoding it
+// preserves both. Only for a form content type: ParseForm does not touch a JSON
+// body, and the two ES endpoints that DO send a body build their own.
+// maxPeerQueryBytes is how much of a peer request may travel in the request
+// LINE before the rest is moved into a form body.
+//
+// A request line and its headers together are bounded by net/http's
+// MaxHeaderBytes, 1 MiB by default, and a peer that exceeds it answers 431 from
+// the server itself -- before the handler, so with no protocol-version header
+// and no error class. Measured: a 1.2 MB `level:in(...)` query, the shape a
+// dashboard templating variable expands to, POSTed to a ONE-NODE cluster
+// running one build, came back
+//
+//	503 ... 1 of 1 shards could not answer completely (0(version_mismatch))
+//
+// on a cluster with no version mismatch in it. The same query on a non-router
+// node is answered. POST exists so a query can be larger than a URL, and
+// folding the form into the URL took that away in clustered mode only.
+//
+// 60 KiB of ENCODED parameters, which is not 60 KB of query text.
+//
+// The comparison is against url.Values.Encode(), and percent-encoding a LogsQL
+// query roughly doubles it -- every `{`, `}`, `"`, `:`, `(`, `)` and space
+// becomes three bytes. Measured switch point on an `in(...)` list: 30,001 raw
+// characters still travelled in the URL, 31,001 (62,001 encoded) took the body.
+// So the raw budget is about 30 KB, and an earlier version of this comment said
+// "no dashboard emits 60 KB of parameters" while the real threshold was half
+// what it named.
+//
+// The number is still chosen to leave the ordinary GET path untouched -- 30 KB
+// of query text is far past anything a dashboard emits -- while the oversized
+// case, which cannot work in a URL at all, takes the body. Stated in encoded
+// bytes because that is what the request line actually carries.
+const maxPeerQueryBytes = 60 << 10
+
+// withFormInURL folds a POST form into the peer request. It returns the request
+// and, when the parameters are too large for a request line, the form body the
+// peer request must carry instead.
+func withFormInURL(r *http.Request) (*http.Request, []byte) {
+	// isFormPost, not a second copy of its rule. This function used to inline
+	// the same method check and strip-at-`;` comparison, and the two copies
+	// still disagreed -- not about which requests are forms, but about what a
+	// ParseForm error means. `...urlencoded; charset` parsed here and was
+	// refused in withoutLimits, so /select/logsql/hits answered 400 to the
+	// request eleven other federated reads answered 200. Both surfaces now ask
+	// one predicate and correct the header the same way before parsing.
+	if !isFormPost(r) {
+		return r, nil
 	}
-	wg.Wait()
+	// The Content-Type is corrected before parsing, and this call is NOT
+	// redundant with withoutLimits'.
+	//
+	// It was deleted once on the measurement that nothing reddened. The measure
+	// was blind: the parity matrix filters `rt.body != ""`, which excludes
+	// exactly the routes whose body is a document -- and those pass a non-nil body to
+	// fanOutChecked, so its missing-query guard (whose FormValue is what primes
+	// r.Form for every other route) is skipped and THIS becomes the first parse
+	// of the request. With `; charset` that parse returns
+	// ErrInvalidMediaParameter and the router refuses what a node answers:
+	//
+	//	POST /_count   ct "...urlencoded; charset"  body {"query":{"match_all":{}}}
+	//	  single node 200 {"count":30}
+	//	  router      400 the request body is not a readable form
+	//	POST /_search  same content type             200 / 400 the same way
+	//
+	// jQuery's spelling, on the routes whose body IS a document. The test
+	// the deletion cited as its coverage is the one that could not see them.
+	normalizeFormContentType(r)
+	if err := parseFormBody(r); err != nil {
+		// A form the router cannot parse is not a request it can fan out. This
+		// used to `return r`, which sent the shards the EMPTY query at HTTP 200
+		// -- the exact behaviour this function's own doc comment names as the
+		// reason it exists, left in place for the error path.
+		return nil, nil
+	}
+	if len(r.Form) == 0 {
+		return r, nil
+	}
+	// MERGED UNDER the query string, never over it.
+	//
+	// http.Request.Clone copies Form and PostForm. Every federated handler that
+	// rewrites the shard URL -- federatedSelect's plan, withoutLimits' facets
+	// bounds, federatedValueCounts -- clones the request first, so ParseForm
+	// here returns immediately with the CALLER's parsed form still attached, and
+	// replacing RawQuery with it discarded the rewrite.
+	//
+	// That made a POST form answer a different question than the same GET:
+	// `stats count()` over two shards of five rows answered 10 over GET and 2
+	// over POST, because each shard ran the whole pipeline and the coordinator
+	// re-ran it over the two results. It also handed the shards the caller's
+	// `limit=3` in place of the `limit=0` the facets path sets, so the cluster
+	// merged shard-local top-3s -- the defect 883508c exists to prevent.
+	//
+	// Worst of it: /select/logsql/query over a POST form was CORRECT before the
+	// commit that added this, and the commit message said so. A key already in
+	// the query string wins; the form only supplies what the URL does not have.
+	// The PLAN's keys win; every other key takes the precedence a NODE gives
+	// it.
+	//
+	// This used to skip any key already in the shard URL, which made the URL
+	// win over the body -- and a node does the opposite for a urlencoded form,
+	// because ParseForm puts PostForm before the URL query and FormValue reads
+	// the first. So a parameter sent in both places asked the cluster a
+	// different question than it asked a node, at HTTP 200 on both:
+	//
+	//	POST /select/logsql/stats_query?query=level:error | stats count() c
+	//	     ct urlencoded, body query=* | stats count() c
+	//	  node   "30"      router  "10"
+	//	same shape with limit=1 in the URL and limit=3 in the body:
+	//	  node   3 rows    router  1 row
+	//
+	// r.Form ALREADY encodes that precedence -- Go builds it body-first for a
+	// urlencoded form and URL-first for multipart -- so forwarding r.Form's
+	// values verbatim gives the shard the node's answer for both encodings,
+	// multi-valued parameters included.
+	//
+	// What the URL must still win is the plan's own rewrite, and that is now
+	// marked rather than inferred from "it is in the URL": shardQueryURL's
+	// `query`, the `limit` it deletes, and withoutLimits' bounds.
+	q := r.URL.Query()
+	extra := make(url.Values, len(r.Form))
+	for k, vs := range r.Form {
+		if planOwns(r, k) {
+			continue
+		}
+		extra[k] = vs
+	}
+	out := r.Clone(r.Context())
+
+	// The MERGED set, resolved here, so exactly one of the two carries it.
+	//
+	// The first version of this moved only the form's contribution to the body
+	// and left the query string alone. That covered eleven of the twelve
+	// fan-out endpoints and missed the one the change was written for:
+	// federatedSelect writes the PLANNED query into the shard URL
+	// (shardQueryURL -> vals.Set("query", ...)) before this runs, so `query` is
+	// already a URL key, is skipped from `extra`, and cannot move. With nothing
+	// else in the form there was no body at all and the request line was
+	// unchanged. Measured on one router and one shard: a 520 KB query answered
+	// 200, a 560 KB one answered 503 `0(unavailable)` with the shard never
+	// reached, and the same query on a NON-router node answered 200.
+	//
+	// Resolving first and sending the whole set one way removes the precedence
+	// question rather than relying on disjointness: r.Form copies PostForm
+	// BEFORE the URL query, so on the peer a body value beats a query one, and
+	// a set split across both depends on which half each key landed in. With
+	// RawQuery cleared there is one source and the plan wins because the plan
+	// is what was merged in.
+	//
+	// Safe because every fan-out endpoint's shard handler reads r.FormValue,
+	// which is the union of both. The one deliberate r.URL.Query() reader,
+	// ingestOptions, is on the ingest paths and never reaches here.
+	merged := make(url.Values, len(q)+len(extra))
+	for k, vs := range q {
+		merged[k] = vs
+	}
+	for k, vs := range extra {
+		merged[k] = vs
+	}
+	enc := merged.Encode()
+	if len(enc) > maxPeerQueryBytes {
+		out.URL.RawQuery = ""
+		return out, []byte(enc)
+	}
+	if len(extra) == 0 {
+		return r, nil
+	}
+	out.URL.RawQuery = enc
+	return out, nil
+}
+
+// checkWatermark demotes an answer served by a replica that has fallen behind.
+//
+// askShard returns the FIRST replica that answers, and Complete is that peer's
+// report on its OWN store -- true, and useless here, because a lagging replica's
+// store is complete as far as it knows. Two replicas of one shard holding 12 and
+// 8 rows answered the same query with 12 or 8 depending on which was up, both at
+// HTTP 200, with nothing in the response saying which had happened.
+//
+// PeerResponse.HighWatermark is the field that tells them apart, and its own
+// documentation says so -- "what lets a caller tell no results from no results
+// yet". It was populated on the wire, parsed by the client, and read by no read
+// path: built, documented, and wired to nothing, which is the shape round six
+// found four times over.
+//
+// This is the reader. The router remembers the highest watermark it has seen
+// from each shard and LOGS when an answer comes in below it, naming the shard,
+// the peer and both numbers.
+//
+// # What it does not do
+//
+// It does not refuse. The first version marked such an answer incomplete, which
+// made it a 503 -- and a watermark going backwards turned out not to be reliable
+// evidence of a lagging replica: tenant eviction, a topology change and
+// retention each lower it on a perfectly healthy cluster. See the comment at the
+// comparison below.
+//
+// It is also blind where it has no history: a router freshly started, or one
+// whose only answer for a shard ever came from the lagging replica, has nothing
+// to compare against. Catching that needs a quorum read, a request per replica
+// on every query.
+//
+// One atomic per read and no extra replica asked.
+func (s *Server) checkWatermark(p *PeerResponse, shard int) {
+	// ABSENT is not ZERO, and the two used to be the same value here.
+	//
+	// A peer that omits the header is on a build that predates it, and treating
+	// silence as maximally-lagging would fail every read against it. A peer that
+	// SENDS zero has accepted nothing, which is a statement -- and skipping it
+	// as if it were silence let a replica that had lost its entire dataset
+	// answer 200 for a shard whose sibling held twelve rows. The whole shard
+	// disappeared from the result with nothing to say so.
+	//
+	// The client always knew the difference: it parses the header only when it
+	// is present. PeerResponse threw that away by storing both as int64(0).
+	if !p.OK() || !p.HasWatermark {
+		return
+	}
+	// The shard's current replica set, so a high set by a machine that has
+	// since left the topology is discarded rather than enforced.
+	var members []string
+	if sh := s.shards(); shard >= 0 && shard < len(sh) {
+		members = sh[shard]
+	}
+	behind, prev, certain := s.shardHW(shard).observe(p.URL, p.Generation, p.HighWatermark, members)
+	if behind {
+		obs.L().Warn("shard answered from a replica behind the highest watermark seen",
+			obs.FieldEvent, "cluster.replica_lagging",
+			obs.FieldShard, shard, "replica", p.Replica, "peer", p.URL,
+			"watermark", p.HighWatermark, "highest_seen", prev, "certain", certain,
+			obs.FieldErrorClass, string(obs.ClassUpstream))
+		// AND NOW IT REFUSES, where the fall is evidence.
+		//
+		// The first version refused unconditionally and was reverted: three
+		// ways to lower a watermark on a HEALTHY cluster were found, and each
+		// one is a hard outage. All three are closed:
+		//
+		//   - highWatermark() was the max over OPEN tenants and over the data
+		//     currently HELD, so evicting a tenant or expiring the newest rows
+		//     lowered it. It is a running maximum now: node-level, moving only
+		//     when a write arrives.
+		//   - the history was keyed by shard INDEX, so SetBackends repointing
+		//     an index at a different machine handed the new machine the old
+		//     one's floor. The entry records which peer set the high, and a
+		//     floor from a peer no longer in the shard is discarded.
+		//   - a restart re-derives the watermark from the stores that load, so
+		//     a replica whose newest data retention already deleted came back
+		//     below its own previous report. It needs no durable watermark,
+		//     only the ability to tell a restart from lag, and a process says
+		//     which it is by carrying a different generation.
+		//
+		// `certain` is the fourth guard and the one that makes this safe to
+		// deploy: it is false when either side of the comparison predates the
+		// generation header, and during a rolling upgrade an old peer
+		// restarting looks exactly like one falling behind. Then the line above
+		// is the whole answer, as it was before.
+		//
+		// A serving replica that is genuinely behind its sibling answers a
+		// SHORT result at 200, which is the confident-and-wrong outcome this
+		// whole envelope exists to prevent -- so where the evidence is there,
+		// the answer is refused and the client retries.
+		if certain {
+			p.Complete = false
+			p.IncompleteReason = reasonWatermark
+			return
+		}
+		// NOT certain, so not refused -- and not silent either. The shard is
+		// named in the response, which is the difference between an operator
+		// who can see a short answer and one who cannot.
+		p.BehindSibling = true
+		return
+	}
+	if prev > 0 {
+		// A RESTART, and nothing else reaches here. The message used to say the
+		// floor's owner "has left the topology", which it shared with a
+		// peer-replacement branch that no longer exists -- marks are keyed by
+		// peer URL and dropped when the URL leaves the member list, so there is
+		// nothing to report about that case and every line here was a restart
+		// being described as a departure.
+		obs.L().Info("a peer restarted, so its watermark floor starts again",
+			obs.FieldEvent, "cluster.watermark_floor_reset",
+			obs.FieldShard, shard, "peer", p.URL, "generation", p.Generation,
+			"watermark", p.HighWatermark, "previous_floor", prev)
+	}
+}
+
+// shardHW is the per-shard highest watermark this router has observed. Created
+// on first use: the shard count is a runtime property of the backend list, and
+// sizing a slice from it would need re-sizing every time that list changes.
+func (s *Server) shardHW(shard int) *shardHigh {
+	s.hwMu.Lock()
+	defer s.hwMu.Unlock()
+	if s.hw == nil {
+		s.hw = map[int]*shardHigh{}
+	}
+	v, ok := s.hw[shard]
+	if !ok {
+		v = &shardHigh{}
+		s.hw[shard] = v
+	}
+	return v
+}
+
+// shardHigh is the highest watermark seen for one shard and the peer that
+// reported it.
+//
+// The PEER is what makes a topology change survivable. The history used to be
+// a bare number keyed by shard index, and SetBackends may repoint an index at a
+// different machine -- which then inherited the previous machine's floor and
+// read as lagging while being perfectly healthy and legitimately empty. Knowing
+// who set the high lets that case be told apart from a replica that really is
+// behind its sibling.
+//
+// A small mutex rather than two atomics: the pair must move together, and this
+// is one lock per shard per read against a network round trip.
+// peerMark is one peer's last report: its watermark and the process that made
+// it. Keyed by peer URL rather than by shard index, so SetBackends repointing an
+// index at a different machine cannot hand the new machine the old one's floor.
+type peerMark struct {
+	hw int64
+	// floor is the highest this peer has reported WITHIN gen. A process's
+	// watermark is a running maximum, so its own floor is the one number it
+	// cannot go below; comparing against the last report instead made the fall
+	// a single-read event -- refused once, then silently served short forever,
+	// because the next read compared 1000 against 1000.
+	floor int64
+	gen   string
+}
+
+// shardHigh is what this router has heard from each replica of one shard.
+//
+// PER PEER, not one floor for the shard. A single shared floor compared every
+// replica against the highest any of them had ever reported, which is not a
+// statement any of them made: two replicas of a shard are microseconds apart
+// under ordinary ingest, so the lower one was refused continuously on data that
+// was not missing, and because the floor only ever rose, one replica failing
+// became a permanent read outage on an idle shard. Measured: two replicas
+// holding the SAME twelve rows at watermarks 2000 and 1999, kill the first, and
+// the second was refused 503 forever with an answer that would have been
+// byte-identical.
+type shardHigh struct {
+	mu    sync.Mutex
+	marks map[string]peerMark
+}
+
+// observe records a peer's report and says whether it is evidence of loss.
+//
+// `certain` separates the two things this can see, because only one of them
+// justifies refusing a read:
+//
+//   - CERTAIN. A single process's watermark is a running maximum, so it cannot
+//     fall. The same peer, in the same generation, reporting lower than it did
+//     is either data loss or a lie, and there is no benign reading. So is a
+//     peer reporting ZERO -- it has accepted nothing, ever -- while a live
+//     member of the same shard has reported data.
+//
+//   - NOT CERTAIN, and reported only. A peer whose watermark is merely below a
+//     sibling's. That is the ordinary state of a replicated shard taking
+//     writes, and nothing in one peer's answer distinguishes "replication is a
+//     millisecond behind" from "this replica lost a day". Refusing it was the
+//     failure that got the first version of this check reverted, and narrowing
+//     the refusal to the two cases above is what makes the check deployable at
+//     all.
+//
+// certain is also false when either side of a comparison carries no generation:
+// a peer on a build predating the header cannot be told apart from one that
+// restarted, and a rolling upgrade must not produce a cluster-wide 503.
+func (h *shardHigh) observe(peer, gen string, hw int64, members []string) (behind bool, prev int64, certain bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.marks == nil {
+		h.marks = make(map[string]peerMark, 2)
+	}
+	old, seen := h.marks[peer]
+	// Same process: the floor is this peer's own running maximum. A different
+	// generation is a restart, which re-derives the watermark from the stores
+	// that load, so the floor starts again from what it now reports.
+	sameProcess := seen && gen != "" && old.gen != "" && gen == old.gen
+	unknownProcess := seen && (gen == "" || old.gen == "")
+	mk := peerMark{hw: hw, gen: gen, floor: hw}
+	if sameProcess || unknownProcess {
+		mk.floor = old.floor
+		if hw > mk.floor {
+			mk.floor = hw
+		}
+	}
+	h.marks[peer] = mk
+	// Forget peers the topology no longer lists, so a replaced machine's report
+	// cannot outlive it and the map cannot grow without bound.
+	if len(members) > 0 {
+		for u := range h.marks {
+			if u == peer {
+				continue
+			}
+			live := false
+			for _, m := range members {
+				if m == u {
+					live = true
+					break
+				}
+			}
+			if !live {
+				delete(h.marks, u)
+			}
+		}
+	}
+
+	// A PEER BELOW ITS OWN FLOOR.
+	if seen && hw < old.floor {
+		switch {
+		case sameProcess:
+			return true, old.floor, true
+		case unknownProcess:
+			// A build without the header: a restart and a loss look the same.
+			return true, old.floor, false
+		default:
+			// It restarted. Not evidence, and the mark above already re-based.
+			return false, old.floor, true
+		}
+	}
+
+	// THERE IS NO CROSS-REPLICA ZERO RULE, AND THERE CANNOT BE.
+	//
+	// A previous version refused a peer reporting zero while a live sibling's
+	// mark was above zero -- "a node holding nothing cannot be a correct
+	// replica of a shard that has some". Both halves of that turned out to be
+	// wrong, in opposite directions:
+	//
+	//   - It never fired where it mattered. The own-floor arm above returns
+	//     first, so a peer that RESTARTED onto an empty volume -- new
+	//     generation, watermark zero -- took the restart branch and was served
+	//     at 200 with the shard's rows gone. Measured on the fixture in this
+	//     file: leader 12 rows at 2000, leader restarts with 0, third read
+	//     answers `200 total=0` and logs "a peer restarted". The extreme case
+	//     the rule was written for was the case it could not reach.
+	//
+	//   - And where it did fire it was wrong. `sibling.hw > 0` does not mean
+	//     the shard currently holds anything: highWatermark() is a per-process
+	//     RUNNING MAXIMUM that survives retention, which is the same property
+	//     this file already cites as the reason a cross-replica comparison
+	//     cannot be trusted. A shard both of whose replicas legitimately hold
+	//     nothing -- retention swept it, one replica restarted afterwards --
+	//     was refused 503 permanently.
+	//
+	// The two pull opposite ways: making the rule reachable after a restart
+	// worsens the false refusal, and dropping the comparison makes the missed
+	// case moot. Neither is decidable from one peer's answer.
+	//
+	// So the refusal is ONE observation: a process below its own floor inside
+	// its own generation. A replica that lost its dataset is real and is not
+	// caught here -- catching it means comparing what the replicas actually
+	// HOLD, which is the digest and repair machinery in cluster_repair.go, not
+	// a watermark.
+
+	// BELOW A SIBLING. Reported, never refused: see the doc comment.
+	for _, m := range members {
+		if m == peer {
+			continue
+		}
+		if mk, ok := h.marks[m]; ok && mk.hw > hw {
+			return true, mk.hw, false
+		}
+	}
+	return false, 0, gen != ""
+}
+
+// mergeDecode unmarshals one shard's answer into v, refusing rather than
+// skipping when it will not parse.
+//
+// A shard that answered 200 with a body this coordinator cannot read has NOT
+// contributed its rows. Skipping it produces a short answer that looks
+// complete -- which is exactly what the completeness rule in fanOutChecked
+// exists to prevent, one layer down and invisible to it, because as far as the
+// fan-out is concerned that shard answered fine.
+//
+// EIGHT handlers decode a shard body: _count, _search, valueCounts, matrix,
+// statsQuery, hits, facets and vector. Four of them reached this point with a
+// bare `continue` (matrix, hits, facets, vector) and four with an
+// `if json.Unmarshal(...) == nil` guard around the whole body (the rest); both
+// shapes drop the shard. An earlier version of this comment said "six", and
+// the commit that wrote it said "eight merges continued", and neither was the
+// count of either thing.
+func (s *Server) mergeDecode(w http.ResponseWriter, r *http.Request, a shardAnswer, v any) bool {
+	shard := a.shard
+	if err := json.Unmarshal(a.body, v); err != nil {
+		obs.L().Error("cluster read refused: unreadable shard answer",
+			obs.FieldEvent, "cluster.read_unreadable",
+			obs.FieldRoute, r.URL.Path,
+			"shard", shard,
+			"error", err.Error(),
+			obs.FieldErrorClass, string(obs.ClassUpstream))
+		s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+			"simdlogs: shard %d answered 200 with a body this coordinator could not "+
+				"parse (%v). Its rows are missing from this answer with no way for you "+
+				"to tell, so the answer is refused rather than returned short.",
+			shard, err))
+		return false
+	}
+	return true
+}
+
+// shardAnswer is one shard's response body with the shard it came from.
+//
+// This used to be a [][]byte indexed by shard with a nil for any shard that did
+// not answer, and every merge told the two apart by testing the body for nil.
+// That is the same value json.Unmarshal fails on, so "this shard is absent and
+// the caller opted into a partial answer" and "this shard sent something
+// unreadable" arrived at the merge indistinguishable. Absent shards are now
+// absent from the slice, and anything in it is an answer that has to parse.
+type shardAnswer struct {
+	shard int
+	body  []byte
+}
+
+func answersOf(rs []PeerResponse) []shardAnswer {
+	out := make([]shardAnswer, 0, len(rs))
+	for i, p := range rs {
+		if p.OK() {
+			out = append(out, shardAnswer{shard: i, body: p.Body})
+		}
+	}
 	return out
 }
 
 // federatedESCount sums the ES _count across storage nodes.
 func (s *Server) federatedESCount(w http.ResponseWriter, r *http.Request) {
+	// The body is read UNCONDITIONALLY, including under a form content type.
+	//
+	// A previous version skipped the read when isFormPost(r) said the content
+	// type was a form, so withFormInURL could fold `q` into the shard URL. Two
+	// things were wrong with it. `curl -d` sends
+	// `Content-Type: application/x-www-form-urlencoded` BY DEFAULT, so a real
+	// Elasticsearch document took that path: ParseForm turned the JSON into one
+	// URL key and the shard got an empty body.
+	//
+	//	curl -d '{"query":{"term":{"level":"error"}}}' <router>/_count
+	//	  before  200 {"count":1}          after  503
+	//	  shard url ".../_count?%7B%22query%22...%7D=" ct="" body=""
+	//
+	// And the parameter it was folding is one NO storage node reads: esCount
+	// decodes the JSON body and there is no `q` handling anywhere in es.go, so
+	// `/_count?q=level:error` with a valid body answers about the whole store
+	// on a single node too. The test that passed was passing against a
+	// recording shard that called FormValue("q") itself.
+	//
+	// So it traded a working capability for a parameter that does nothing.
 	body, _ := io.ReadAll(r.Body)
 	total := 0
-	for _, b := range s.fanOutPost(r, "/_count", body) {
+	bodies, w, ok := s.fanOutChecked(w, r, "/_count", body)
+	if !ok {
+		return
+	}
+	for _, a := range bodies {
 		var v struct {
 			Count int `json:"count"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			total += v.Count
+		if !s.mergeDecode(w, r, a, &v) {
+			return
 		}
+		total += v.Count
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"count": total})
@@ -270,9 +1430,58 @@ func (s *Server) federatedESCount(w http.ResponseWriter, r *http.Request) {
 // federatedESSearch merges ES _search hits across storage nodes.
 func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
+
+	// The SHARDS are asked for from=0 and size=from+size.
+	//
+	// The client's body went to every shard verbatim, so each one skipped
+	// `from` of its OWN hits before answering -- and then the coordinator
+	// skipped `from` again over the concatenation. Measured, 2 shards x 6 docs,
+	// {"from":4,"size":4}:
+	//
+	//   single node   4 hits (a-04 a-05 b-00 b-01)
+	//   cluster       0 hits, "total":12, HTTP 200
+	//
+	// Each shard returned its last 2, the coordinator dropped 4 more, and rows
+	// 0-3 of every shard were unreachable from any page at all. A shard must
+	// return everything the coordinator might need to page over, which is the
+	// first from+size of that shard, and the paging happens once, here.
+	// Decoded with the SAME rules a single node applies, and the errors kept.
+	//
+	// This discarded both: `_ = dec0.Decode(&want)`. So the federated path
+	// accepted a body the single node rejects with 400 -- `{"from":-1,"size":3}`
+	// came back 200 with the WRONG DOCUMENTS, because need = from+size = 2 made
+	// each shard return two hits and rows 2-5 were never fetched, while
+	// "total":12 said they existed. An unknown field was swallowed the same
+	// way, and a reframe failure fell back to shipping the caller's body
+	// verbatim, which is the double-paging bug the comment above documents.
+	var want esQuery
+	dec0 := json.NewDecoder(bytes.NewReader(body))
+	dec0.DisallowUnknownFields()
+	if err := dec0.Decode(&want); err != nil {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, "simdlogs: "+err.Error())
+		return
+	}
+	if want.Size < 0 || want.From < 0 {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+			"simdlogs: size and from must not be negative")
+		return
+	}
+	shardBody, err := reframeESPaging(body, want)
+	if err != nil {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, fmt.Sprintf(
+			"simdlogs: this search body could not be reframed for the shards (%v). "+
+				"Sending it unchanged would apply from/size twice -- once on each "+
+				"shard and again here -- so it is refused", err))
+		return
+	}
+
 	var hits []json.RawMessage
 	total := 0
-	for _, b := range s.fanOutPost(r, "/_search", body) {
+	bodies, w, ok := s.fanOutChecked(w, r, "/_search", shardBody)
+	if !ok {
+		return
+	}
+	for _, a := range bodies {
 		var v struct {
 			Hits struct {
 				Total struct {
@@ -281,14 +1490,48 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 				Hits []json.RawMessage `json:"hits"`
 			} `json:"hits"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			total += v.Hits.Total.Value
-			hits = append(hits, v.Hits.Hits...)
+		if !s.mergeDecode(w, r, a, &v) {
+			return
 		}
+		total += v.Hits.Total.Value
+		hits = append(hits, v.Hits.Hits...)
+	}
+	// from/size applied to the MERGED hits.
+	//
+	// The shards' hits were concatenated and returned whole, so `size: 10`
+	// across three shards returned thirty documents -- and an ES client that
+	// renders `size` results shows three pages' worth on one page, while one
+	// that paginates by `from` skips two thirds of the corpus on every step.
+	// The total was already cluster-wide; only the page was not.
+	// Ordered before paging. The concatenation is in shard-response order, so
+	// without this a page is "whichever shard answered first", and two
+	// identical requests can return different documents.
+	sortESHits(hits)
+
+	body2 := want
+	if body2.From > 0 {
+		if body2.From >= len(hits) {
+			hits = nil
+		} else {
+			hits = hits[body2.From:]
+		}
+	}
+	size := body2.Size
+	if size <= 0 {
+		size = esDefaultSize
+	}
+	if len(hits) > size {
+		hits = hits[:size]
+	}
+	if hits == nil {
+		hits = []json.RawMessage{}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"hits": map[string]any{
+			// The cluster-wide count of MATCHING documents, which is what
+			// hits.total means -- not the number returned. Every ES client
+			// renders it as "N results".
 			"total": map[string]any{"value": total, "relation": "eq"},
 			"hits":  hits,
 		},
@@ -298,15 +1541,54 @@ func (s *Server) federatedESSearch(w http.ResponseWriter, r *http.Request) {
 // federatedValueCounts fans a GET out to the storage nodes and merges the
 // value/hits list found under key, summing hits per value -- the cluster form
 // of streams/stream_ids/stream_field_values.
-func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, path, key string) {
-	w.Header().Set("Content-Type", "application/json")
+// The key is ALWAYS "values", whatever the path.
+//
+// Every one of these endpoints answers through writeValues on a storage node,
+// which emits {"values": [...]}. The router asked for "streams" on
+// /select/logsql/streams and "stream_ids" on /select/logsql/stream_ids --
+// keys no backend has ever sent -- so both merged an absent field and answered
+// an empty list, under a key a storage node does not use either. The same path
+// returned a different SHAPE depending on deployment mode, and the router's
+// half was empty.
+//
+// This is the "decodes envelopes the backends no longer send" the LLD banner
+// has been warning about. The key parameter is gone rather than corrected:
+// a parameter that must always take one value is a way to get it wrong again.
+func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, path string) {
 	counts := map[string]int{}
-	for _, b := range s.fanOut(r, path) {
-		var v map[string][]query.ValueCount
-		if json.Unmarshal(b, &v) == nil {
-			for _, vc := range v[key] {
-				counts[vc.Value] += vc.Count
-			}
+	// The SHARDS are asked without a limit.
+	//
+	// `limit` reached them too, so each returned only its own top N and the
+	// merge combined N truncated lists. Re-applying the limit afterwards then
+	// looked like it made the answer cluster-wide, and the comment below said
+	// so, but a value can only survive if it was already in some shard's top N:
+	//
+	//   svc counts per shard {big1:4, spread:3, second:2} x3, limit=2
+	//     single node   [spread:9, second:6]
+	//     cluster       [spread:9, big1:4]
+	//
+	// second has 6 hits cluster-wide and is displaced by one with 4, because
+	// second was third on every shard and never returned by any of them.
+	// `limit` here defaults to 0 (unlimited) on a storage node, so deleting it
+	// is enough -- unlike facets, whose default caps at 10.
+	vcReq, wlOK := withoutLimits(r, nil)
+	if !wlOK {
+		s.refuseUnparseableQuery(w, r)
+		return
+	}
+	vcBodies, w, ok := s.fanOutChecked(w, vcReq, path, nil)
+	if !ok {
+		return
+	}
+	for _, a := range vcBodies {
+		var v struct {
+			Values []query.ValueCount `json:"values"`
+		}
+		if !s.mergeDecode(w, r, a, &v) {
+			return
+		}
+		for _, vc := range v.Values {
+			counts[vc.Value] += vc.Count
 		}
 	}
 	out := make([]query.ValueCount, 0, len(counts))
@@ -319,67 +1601,337 @@ func (s *Server) federatedValueCounts(w http.ResponseWriter, r *http.Request, pa
 		}
 		return out[i].Value < out[j].Value
 	})
-	json.NewEncoder(w).Encode(map[string]any{key: out})
-}
-
-// federatedStrings merges a string list under key across storage nodes (union).
-func (s *Server) federatedStrings(w http.ResponseWriter, r *http.Request, path, key string) {
+	// The limit applies to the MERGED list.
+	//
+	// Each backend applies its own limit and the router merged what came back,
+	// so `limit=2` across three shards returned up to six values -- and the
+	// two kept from each shard are that shard's top two, which is not the
+	// cluster's top two. A cluster-wide question needs a cluster-wide answer.
+	if n := intParam(r, "limit", 0); n > 0 && len(out) > n {
+		out = out[:n]
+	}
 	w.Header().Set("Content-Type", "application/json")
-	seen := map[string]struct{}{}
-	for _, b := range s.fanOut(r, path) {
-		var v map[string][]string
-		if json.Unmarshal(b, &v) == nil {
-			for _, x := range v[key] {
-				seen[x] = struct{}{}
-			}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for x := range seen {
-		out = append(out, x)
-	}
-	sort.Strings(out)
-	json.NewEncoder(w).Encode(map[string]any{key: out})
+	json.NewEncoder(w).Encode(map[string]any{"values": out})
 }
 
 // federatedMatrix merges stats_query_range across storage nodes by concatenating
 // each shard's series (shards hold disjoint groups, so a series is one shard's).
+// matrixSeries is one Prometheus matrix series: a label set and [ts, "value"]
+// pairs.
+type matrixSeries struct {
+	Metric map[string]string `json:"metric"`
+	Values [][2]any          `json:"values"`
+}
+
+// federatedMatrix merges stats-range series, combining identical label sets.
+//
+// It CONCATENATED the shards' results, so a series present on three shards
+// appeared three times with the same labels. That is not a valid matrix: a
+// Prometheus client renders them as three lines, every point is drawn
+// repeatedly, and any aggregation over the result counts each shard's
+// contribution as a separate series. The numbers are individually correct and
+// the answer is wrong.
+//
+// Points at the same timestamp are SUMMED, because these are counts over
+// disjoint shards and the cluster's value for a bucket is the total. A
+// non-additive statistic (an average, a quantile) cannot be merged this way at
+// all -- so it does not come through here. federatedMatrix routes those to the
+// exact path instead, which fetches the window's rows and aggregates per
+// bucket at the coordinator. See cluster_stats_exact.go.
 func (s *Server) federatedMatrix(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	var result []json.RawMessage
-	for _, b := range s.fanOut(r, "/select/logsql/stats_query_range") {
+	// The same CHOICE the other two stats surfaces make.
+	//
+	// This function's own doc comment said "stats_query_range over a cluster is
+	// meaningful only for additive aggregates" and nothing checked it, so it
+	// summed whatever came back: two shards averaging 10 answered 20. That was
+	// fixed by refusing, and refusing was then replaced by answering exactly --
+	// the same progression the other two surfaces went through, and they have
+	// to move together or one binary answers the same aggregate three ways
+	// depending on which endpoint was asked.
+	if needsExactStats(r.FormValue("query")) {
+		s.exactMatrix(w, r)
+		return
+	}
+	// THE MERGE BRANCH BOUNDS AND RESOLVES THE WINDOW TOO.
+	//
+	// Two things went wrong when only the exact branch did it.
+	//
+	// The ceiling: this forwarded the request unchanged, so every shard
+	// applied the bucket ceiling itself and answered 413, and fanOutChecked's
+	// all-rejected branch collapsed that into a 400 blaming the request
+	// generically. One binary answered the same over-wide range two ways --
+	// `?step=1h&start=<t>` with no end gave 413 with the bucket count for
+	// `avg` and 400 "every shard refused this request" for `count`.
+	//
+	// The window: with no start/end the narrowing branch computes `now`, and
+	// forwarding the request unchanged made EVERY SHARD compute its own.
+	// Bucket starts go out as truncated seconds, so two shards whose clock
+	// reads straddle a second boundary produce timestamps 1s apart, and this
+	// merge -- which folds points by timestamp -- folds nothing: twice the
+	// points, each carrying one shard's value, at HTTP 200.
+	//
+	// Resolved once here and written onto the shard request, which is what the
+	// exact path already does and why it never had either problem.
+	// The missing-`query` refusal FIRST, because the ceiling below refuses too
+	// and a caller who named no query should be told the thing they can fix.
+	//
+	// fanOutChecked has this check and it runs after the bounding, so
+	// `?step=1m&start=<t>` with no query answered 413 "47189513 buckets
+	// requested" where a node answers 400 "missing `query` arg". The bucket
+	// count is a consequence of the default window, which a request naming a
+	// query would never have had.
+	if strings.TrimSpace(r.FormValue("query")) == "" {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, errMissingQuery.Error())
+		return
+	}
+	rFrom, rTo := timeWindow(r)
+	rStep := parseStepNs(r.FormValue("step"), rFrom, rTo)
+	rFrom, rTo, ok := s.boundRangeBuckets(w, r, rFrom, rTo, rStep)
+	if !ok {
+		return
+	}
+	rangeReq := r.Clone(r.Context())
+	rv := rangeReq.URL.Query()
+	// RFC3339Nano, not a bare nanosecond integer.
+	//
+	// parseTimeParam infers the UNIT of a bare integer from its magnitude --
+	// under 1e11 seconds, under 1e14 milliseconds, under 1e17 microseconds --
+	// so any resolved edge below 1e17 ns is read back by the shard as a
+	// different instant. That is every timestamp before 1973-03-03, which
+	// includes `start=100`, epoch-seconds under 1e8, and any small window a
+	// test or a script uses. Restoring the integer form here and at
+	// mergedRowsAcrossShards turns
+	// `TestASmallTimeWindowReachesTheShardsUnchanged` red across all four
+	// queries and three routes, as node-has-rows against cluster-empty:
+	//
+	//	?start=100&end=200&step=3h ... count() c   node 20,  cluster []
+	//	?start=100&end=200&step=3h ... sum(n) s    node 190, cluster []
+	//	?start=100&end=200 ... avg(n) a            node 9.5, cluster []
+	//
+	// all at HTTP 200. An earlier version of this comment quoted node 6 against
+	// cluster 4 and node 15 against 406 -- numbers from a scratch fixture that
+	// is not in this repository, and that nobody reading this file could
+	// reproduce from it. The committed corpus has no rows in the decade the
+	// shard mis-reads, so its cluster half comes back empty rather than
+	// plausible; the defect is the same one either way.
+	//
+	// The layout round-trips exactly across the whole int64 range, 1<<62 and
+	// negative starts included, because parseTimeParam tries it before giving
+	// up. This file already carried a comment saying the integer form does not
+	// round-trip below 1e17 -- and then a new call site was written using it
+	// anyway, which is what makes this worth the paragraph rather than the
+	// one-line fix.
+	rv.Set("start", time.Unix(0, rFrom).UTC().Format(time.RFC3339Nano))
+	rv.Set("end", time.Unix(0, rTo).UTC().Format(time.RFC3339Nano))
+	rangeReq.URL.RawQuery = rv.Encode()
+	rangeReq = withPlanKeys(rangeReq, "start", "end")
+	srBodies, w, ok := s.fanOutChecked(w, rangeReq, "/select/logsql/stats_query_range", nil)
+	if !ok {
+		return
+	}
+	// The operator per output name. This merge added unconditionally, so a
+	// range query over min() summed the shards' minima -- a number in the right
+	// units, on the right axis, that no row produced.
+	// nil for a query with no stats pipe: nothing to get wrong, and summing is
+	// the only defined behaviour. See federatedVector.
+	ops, opsOK := query.MergeOps(r.FormValue("query"))
+	if query.HasStatsPipe(r.FormValue("query")) && !opsOK {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+			"simdlogs: this query's aggregates cannot be combined across shards. "+
+				"The router reads from the stats pipe whether each output is summed "+
+				"or taken extremally, and this build does not know for at least one "+
+				"of them, so the query is refused rather than summed by default")
+		return
+	}
+	if !opsOK {
+		ops = nil
+	}
+	type acc struct {
+		metric map[string]string
+		points map[string]float64
+		seen   map[string]bool
+		op     query.MergeOp
+		order  []string // timestamps in first-seen order, sorted before output
+	}
+	byLabels := map[string]*acc{}
+	var labelOrder []string
+	for _, a := range srBodies {
 		var v struct {
 			Data struct {
-				Result []json.RawMessage `json:"result"`
+				Result []matrixSeries `json:"result"`
 			} `json:"data"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			result = append(result, v.Data.Result...)
+		if !s.mergeDecode(w, r, a, &v) {
+			return
+		}
+		for _, se := range v.Data.Result {
+			key := labelKey(se.Metric)
+			a := byLabels[key]
+			if a == nil {
+				m := se.Metric
+				if m == nil {
+					m = map[string]string{}
+				}
+				op, known := query.MergeSum, true
+				if ops != nil {
+					op, known = ops[m["__name__"]]
+				}
+				if !known {
+					s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+						"simdlogs: a shard returned a series named %q, which is not an "+
+							"output of this query's stats pipe, so the router does not "+
+							"know whether to sum it or take its extreme", m["__name__"]))
+					return
+				}
+				a = &acc{metric: m, points: map[string]float64{},
+					seen: map[string]bool{}, op: op}
+				byLabels[key] = a
+				labelOrder = append(labelOrder, key)
+			}
+			for _, pt := range se.Values {
+				ts := fmt.Sprint(pt[0])
+				if !a.seen[ts] {
+					a.order = append(a.order, ts)
+				}
+				// A value this router cannot read is refused, not counted as
+				// zero. matrixValue returned 0 for an unreadable value, so a
+				// term went missing from a sum and a min gained a zero that
+				// beats every positive value -- both plausible, both wrong.
+				// federatedVector refuses the identical condition; this was the
+				// odd one out.
+				f, ferr := parseMatrixValue(pt[1])
+				if ferr != nil {
+					s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+						"simdlogs: a shard returned the value %q for series %q at %s, "+
+							"which this router cannot read as a number. Counting it as "+
+							"zero would change the answer without saying so",
+						fmt.Sprint(pt[1]), a.metric["__name__"], ts))
+					return
+				}
+				a.points[ts] = a.op.Combine(a.points[ts], f, !a.seen[ts])
+				a.seen[ts] = true
+			}
 		}
 	}
-	json.NewEncoder(w).Encode(map[string]any{
-		"status": "success",
-		"data":   map[string]any{"resultType": "matrix", "result": result},
+
+	sort.Strings(labelOrder)
+	out := make([]matrixSeries, 0, len(labelOrder))
+	for _, key := range labelOrder {
+		a := byLabels[key]
+		stamps := append([]string(nil), a.order...)
+		for _, ts := range stamps {
+			if _, err := strconv.ParseFloat(ts, 64); err != nil {
+				s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+					"simdlogs: a shard returned the bucket start %q for series %q, "+
+						"which this router cannot read as a number. It was silently "+
+						"sorted to the epoch and emitted as 0", ts, a.metric["__name__"]))
+				return
+			}
+		}
+		sort.Slice(stamps, func(i, j int) bool {
+			return matrixStamp(stamps[i]) < matrixStamp(stamps[j])
+		})
+		pts := make([][2]any, 0, len(stamps))
+		for _, ts := range stamps {
+			// The value is a STRING in the Prometheus wire format, and it goes
+			// back as one: a client that parses it expects to.
+			pts = append(pts, [2]any{matrixStamp(ts),
+				strconv.FormatFloat(a.points[ts], 'f', -1, 64)})
+		}
+		out = append(out, matrixSeries{Metric: a.metric, Values: pts})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	// A STRUCT, not a map: encoding/json sorts a map's keys, so the router
+	// answered {"data":{"result":…,"resultType":…},"status":…} where a node
+	// answers {"status":…,"data":{"resultType":…,"result":…}}. Identical to any
+	// JSON client, and a difference a byte-for-byte comparison against a node
+	// reports as a disagreement.
+	json.NewEncoder(w).Encode(struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string         `json:"resultType"`
+			Result     []matrixSeries `json:"result"`
+		} `json:"data"`
+	}{
+		Status: "success",
+		Data: struct {
+			ResultType string         `json:"resultType"`
+			Result     []matrixSeries `json:"result"`
+		}{ResultType: "matrix", Result: out},
 	})
 }
 
-// federatedStatsQuery merges stats across storage nodes: a total count is
-// summed; a group-by count sums each value's hits. (avg/quantile across shards
-// need sum+count / sketch merge -- a follow-up; count and count-by are exact.)
+// matrixValue reads a point's value, which the wire format carries as a
+// string.
+// parseMatrixValue is matrixValue with the error kept.
+//
+// matrixValue substitutes 0 for anything it cannot read, which is a term
+// silently missing from a sum and a zero that wins every min. The merge uses
+// this; matrixValue stays for callers that genuinely have no way to report.
+func parseMatrixValue(v any) (float64, error) {
+	switch x := v.(type) {
+	case float64:
+		return x, nil
+	case string:
+		return strconv.ParseFloat(x, 64)
+	}
+	return strconv.ParseFloat(fmt.Sprint(v), 64)
+}
+
+func matrixValue(v any) float64 {
+	switch x := v.(type) {
+	case string:
+		f, _ := strconv.ParseFloat(x, 64)
+		return f
+	case float64:
+		return x
+	}
+	return 0
+}
+
+// matrixStamp reads a point's timestamp, which is a number.
+func matrixStamp(s string) float64 {
+	f, _ := strconv.ParseFloat(s, 64)
+	return f
+}
+
+// federatedStatsQuery merges stats across storage nodes.
+//
+// Two response shapes, because the endpoint has two. With `by=` the backend
+// answers this repository's `{"stats":[{value,hits}]}` extension and hits sum
+// per value. Without it the backend answers the Prometheus instant vector
+// envelope, which is federatedVector's job.
+//
+// That second case used to decode `{"count":N}` from each backend. No backend
+// emits that field, so the sum was always zero and the router answered
+// `{"count":0}` for every query against every cluster, however much data the
+// shards held -- a confident zero, and the shape a client is least likely to
+// question.
+//
+// Non-mergeable aggregates are ANSWERED here on the same rule the LogsQL
+// planner applies -- exactly, over merged rows -- so one binary does not answer
+// the same aggregate two ways.
 func (s *Server) federatedStatsQuery(w http.ResponseWriter, r *http.Request) {
+	// Which SHAPE the shards send is decided by whether the query has a stats
+	// pipe, not by `by=`.
+	//
+	// A storage node emits `{"stats":[...]}` only when StatsQueryInstant FAILS
+	// -- which it does exactly when the query has no stats pipe -- and `by=` is
+	// set. A query that DOES have one gets the Prometheus vector whatever `by=`
+	// says. Switching on `by=` therefore decoded `{"stats":...}` out of a
+	// vector envelope, which unmarshals cleanly into a nil slice, so
+	// `* | stats count() c` with `by=level` answered `{"stats":[]}` -- HTTP
+	// 200, empty, and mergeDecode cannot see it because nothing failed to
+	// parse. A dashboard panel grouped by a label drew nothing.
+	if query.HasStatsPipe(r.FormValue("query")) || r.FormValue("by") == "" {
+		s.federatedVector(w, r)
+		return
+	}
+	// No aggregate check on this branch: it is reached only when the query has
+	// NO stats pipe, which is the one shape with no aggregate to get wrong.
 	w.Header().Set("Content-Type", "application/json")
-	bodies := s.fanOut(r, "/select/logsql/stats_query")
-	if r.FormValue("by") == "" {
-		total := 0
-		for _, b := range bodies {
-			var v struct {
-				Count int `json:"count"`
-			}
-			if json.Unmarshal(b, &v) == nil {
-				total += v.Count
-			}
-		}
-		json.NewEncoder(w).Encode(map[string]any{"count": total})
+	bodies, w, ok := s.fanOutChecked(w, r, "/select/logsql/stats_query", nil)
+	if !ok {
 		return
 	}
 	type vc struct {
@@ -387,48 +1939,224 @@ func (s *Server) federatedStatsQuery(w http.ResponseWriter, r *http.Request) {
 		Hits  int    `json:"hits"`
 	}
 	merged := map[string]int{}
-	for _, b := range bodies {
+	for _, a := range bodies {
 		var v struct {
 			Stats []vc `json:"stats"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			for _, s := range v.Stats {
-				merged[s.Value] += s.Hits
-			}
+		if !s.mergeDecode(w, r, a, &v) {
+			return
+		}
+		for _, s := range v.Stats {
+			merged[s.Value] += s.Hits
 		}
 	}
 	stats := make([]vc, 0, len(merged))
 	for val, h := range merged {
 		stats = append(stats, vc{val, h})
 	}
-	sort.Slice(stats, func(i, j int) bool { return stats[i].Hits > stats[j].Hits })
+	// Value breaks the tie: without it, equal hit counts came out of a map in
+	// per-process order, so two routers over the same shards answered the same
+	// query with the rows in different orders.
+	sort.Slice(stats, func(i, j int) bool {
+		if stats[i].Hits != stats[j].Hits {
+			return stats[i].Hits > stats[j].Hits
+		}
+		return stats[i].Value < stats[j].Value
+	})
 	json.NewEncoder(w).Encode(map[string]any{"stats": stats})
 }
 
 // federatedHits sums per-bucket histogram counts across storage nodes.
+// clusterHitSeries is the shape a storage node returns: one entry per label
+// set, with parallel timestamp and value arrays.
+type clusterHitSeries struct {
+	Fields     map[string]string `json:"fields"`
+	Timestamps []string          `json:"timestamps"`
+	Values     []int             `json:"values"`
+	Total      int               `json:"total"`
+}
+
+// federatedHits merges dense hit series by label set and timestamp.
+//
+// It decoded `{"_time": ..., "hits": ...}` -- a bag of {time, count} objects
+// that no backend has ever sent. /select/logsql/hits returns the reference's
+// DENSE shape, so every field the merge read was absent: the router answered
+// one bogus series, `[{"_time":"","hits":0}]`, on every cluster histogram.
+//
+// The same stale shape was in the embedded UI (task 7.4). Two independent
+// readers of one endpoint had both been written against a remembered
+// envelope, which is what a fixture test is for and why there is one now.
 func (s *Server) federatedHits(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	type hit struct {
-		Time  string `json:"_time"`
-		Count int    `json:"hits"`
+	// THE SAME BUCKET CEILING THE NODE APPLIES, in the same order.
+	//
+	// This is the third range surface and it was the one left forwarding `r`
+	// untouched, so an over-wide range was refused by the node and accepted
+	// here -- and then refused anyway, with the wrong status and the wrong
+	// reason, once every shard had independently hit its own ceiling:
+	//
+	//	/select/logsql/hits?step=1s&start=<t>&query=*
+	//	  node    413  ... buckets requested ...
+	//	  cluster 400  every shard refused this request (0(rejected),1(rejected))
+	//
+	// One binary, two answers to an over-wide range, which is the defect the
+	// record already holds for stats_query_range. A refusal that names the
+	// shards for a fault in the REQUEST sends the operator to look at healthy
+	// nodes.
+	if strings.TrimSpace(r.FormValue("query")) == "" {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, errMissingQuery.Error())
+		return
 	}
-	merged := map[string]int{}
-	for _, b := range s.fanOut(r, "/select/logsql/hits") {
+	hFrom, hTo := timeWindow(r)
+	// hitsStepNs, NOT parseStepNs. This endpoint has its own step rule and the
+	// ceiling has to be computed from the step the scan will actually use --
+	// see hitsStepNs for the two shapes where reaching for the other parser
+	// made the router refuse what the node answers.
+	hFrom, hTo, okBound := s.boundRangeBuckets(w, r, hFrom, hTo, hitsStepNs(r))
+	if !okBound {
+		return
+	}
+	// AND THE RESOLVED WINDOW GOES TO THE SHARDS. The first version of this
+	// kept the 413 and discarded the from/to, so a request with no start/end
+	// still let every shard compute its own `now` -- which is the defect
+	// federatedMatrix's own comment describes in full, on the route next door.
+	// Measured, `?query=*` with no window, 2 shards at `step=1ns`: node 240
+	// buckets, cluster 480, because the two shards' `now` differ and this
+	// merge folds points by timestamp.
+	hitsReq := r.Clone(r.Context())
+	hv := hitsReq.URL.Query()
+	// RFC3339Nano, for the reason mergedRowsAcrossShards gives: a bare
+	// nanosecond integer under 1e17 is read back by the shard as a different
+	// instant.
+	hv.Set("start", time.Unix(0, hFrom).UTC().Format(time.RFC3339Nano))
+	hv.Set("end", time.Unix(0, hTo).UTC().Format(time.RFC3339Nano))
+	hitsReq.URL.RawQuery = hv.Encode()
+	hitsReq = withPlanKeys(hitsReq, "start", "end")
+
+	hitBodies, w, ok := s.fanOutChecked(w, hitsReq, "/select/logsql/hits", nil)
+	if !ok {
+		return
+	}
+	// Merged by LABEL SET first: a shard contributes its own series per label
+	// set, and two shards' `{level=error}` are the same series, not two.
+	// Buckets are keyed by NANOSECONDS, not by the shard's timestamp text.
+	//
+	// RFC3339Nano omits trailing zeros in the fractional second, so the format
+	// is not fixed-width and lexicographic order is not time order: '.' (0x2E)
+	// sorts before 'Z' (0x5A), which puts `00:00:00.5Z` BEFORE `00:00:00Z`.
+	// `step` is a time.Duration off the query string, so `step=500ms` produces
+	// exactly that mix -- whole seconds with no fraction interleaved with half
+	// seconds that have one. Sorting the text drew the graph out of order.
+	type acc struct {
+		fields  map[string]string
+		buckets map[int64]int
+		total   int
+	}
+	byLabels := map[string]*acc{}
+	var order []string
+	for _, ans := range hitBodies {
 		var v struct {
-			Hits []hit `json:"hits"`
+			Hits []clusterHitSeries `json:"hits"`
 		}
-		if json.Unmarshal(b, &v) == nil {
-			for _, h := range v.Hits {
-				merged[h.Time] += h.Count
+		if !s.mergeDecode(w, r, ans, &v) {
+			return
+		}
+		for _, se := range v.Hits {
+			key := labelKey(se.Fields)
+			a := byLabels[key]
+			if a == nil {
+				a = &acc{fields: se.Fields, buckets: map[int64]int{}}
+				if a.fields == nil {
+					a.fields = map[string]string{}
+				}
+				byLabels[key] = a
+				order = append(order, key)
 			}
+			// The dense shape means the two arrays are indexed together, so
+			// unequal lengths are a protocol violation, not a short read to
+			// absorb: truncating to the shorter one drops counts silently.
+			if len(se.Timestamps) != len(se.Values) {
+				s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+					"simdlogs: shard %d returned %d timestamps and %d values for one "+
+						"series; the dense shape indexes them together, so this answer "+
+						"is refused rather than truncated to the shorter array",
+					ans.shard, len(se.Timestamps), len(se.Values)))
+				return
+			}
+			// Buckets summed per timestamp: shards cover the same window, so
+			// the same bucket appears on each and the cluster's count for it
+			// is the sum.
+			for j, ts := range se.Timestamps {
+				t, err := time.Parse(time.RFC3339Nano, ts)
+				// UnixNano is only defined for 1677-09-21 .. 2262-04-11 and
+				// wraps silently outside it, while time.Parse accepts any year:
+				// 2600-01-01 became 2015-06-13, and its count was filed on --
+				// and summed into -- a real 2015 bucket. The round trip is the
+				// check, because the wrap has no error to test.
+				if err == nil && !time.Unix(0, t.UnixNano()).UTC().Equal(t.UTC()) {
+					s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+						"simdlogs: shard %d returned the bucket timestamp %q, which is "+
+							"outside the range nanoseconds since the epoch can represent "+
+							"(1677-09-21 to 2262-04-11). Converting it wraps to an "+
+							"unrelated date, so the answer is refused", ans.shard, ts))
+					return
+				}
+				if err != nil {
+					s.writeErr(w, r, readSpec(), http.StatusBadGateway, fmt.Sprintf(
+						"simdlogs: shard %d returned bucket timestamp %q, which is not "+
+							"RFC3339: it cannot be ordered against the other shards' "+
+							"buckets, so the answer is refused", ans.shard, ts))
+					return
+				}
+				a.buckets[t.UnixNano()] += se.Values[j]
+			}
+			a.total += se.Total
 		}
 	}
-	out := make([]hit, 0, len(merged))
-	for tm, c := range merged {
-		out = append(out, hit{tm, c})
+
+	sort.Strings(order)
+	out := make([]clusterHitSeries, 0, len(order))
+	for _, key := range order {
+		a := byLabels[key]
+		ns := make([]int64, 0, len(a.buckets))
+		for t := range a.buckets {
+			ns = append(ns, t)
+		}
+		// Ascending and gap-free is what the dense shape means: a client
+		// indexes the two arrays together.
+		sort.Slice(ns, func(i, j int) bool { return ns[i] < ns[j] })
+		stamps := make([]string, 0, len(ns))
+		vals := make([]int, 0, len(ns))
+		for _, t := range ns {
+			stamps = append(stamps, time.Unix(0, t).UTC().Format(time.RFC3339Nano))
+			vals = append(vals, a.buckets[t])
+		}
+		out = append(out, clusterHitSeries{
+			Fields: a.fields, Timestamps: stamps, Values: vals, Total: a.total,
+		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Time < out[j].Time })
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"hits": out})
+}
+
+// labelKey is a canonical key for a label set, so two shards' identical label
+// sets merge whatever order their fields decoded in.
+func labelKey(fields map[string]string) string {
+	if len(fields) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte(0)
+		b.WriteString(fields[k])
+		b.WriteByte(0)
+	}
+	return b.String()
 }
 
 // rowLineTime extracts and parses the "_time":"..." value from a result line
@@ -448,7 +2176,11 @@ func rowLineTime(line string) int64 {
 		return ns
 	}
 	if t, err := time.Parse(time.RFC3339Nano, line[i:i+j]); err == nil {
-		return t.UnixNano()
+		// satNanos, not UnixNano: `time.Parse` accepts any year and this value
+		// only orders the merge, so an instant past 2262 belongs at the newest
+		// end and one before 1678 at the oldest. Wrapping put each at the
+		// opposite end.
+		return satNanos(t)
 	}
 	return 0
 }
@@ -484,6 +2216,15 @@ func fastRFC3339Nano(s string) (int64, bool) {
 		return 0, false
 	}
 	year := y1*100 + y2
+	// A YEAR OUTSIDE THE STORABLE RANGE IS NOT PARSED HERE. The multiply below
+	// is days*86400*1e9, which overflows int64 for year 9999 (2.5e20) and for
+	// year 0000 (-6.2e19) -- and this function's answer orders the federated
+	// merge, so a wrapped value silently sorts a row to the wrong end of the
+	// result. The caller's fallback saturates instead of wrapping, which is the
+	// right ORDER for an instant beyond the domain.
+	if year < 1678 || year > 2261 {
+		return 0, false
+	}
 	// Days from the civil epoch (Howard Hinnant's algorithm): exact, no tables.
 	yy := year
 	if mo <= 2 {
@@ -520,4 +2261,476 @@ func fastRFC3339Nano(s string) (int64, bool) {
 		return 0, false
 	}
 	return ns, true
+}
+
+// SetIdentity records this node's place in the cluster: which shard it holds
+// and which replica of it this is.
+//
+// Reported in every internal response. Without it a router that got a partial
+// answer could say only that something was incomplete -- not which shard, so
+// not which machine to look at.
+func (s *Server) SetIdentity(shard, replica int) {
+	s.shardID, s.replicaID = shard, replica
+}
+
+// Read completeness: what a router does when a shard cannot answer.
+//
+// # The failure
+//
+// Every merge consumed `[][]byte` with a nil entry for a shard that did not
+// answer, and merged the rest. So a cluster read with one shard down returned
+// the other shards' rows, with HTTP 200 and nothing anywhere in the response
+// to say a third of the data was missing. A caller cannot tell that from a
+// query that genuinely matched fewer rows, which makes it the worst kind of
+// wrong answer: confident, plausible, and silent.
+//
+// # The rule
+//
+// A read fails unless every shard contributed a COMPLETE answer. Not "every
+// shard answered" -- a shard whose store is degraded answers, and says so in
+// the envelope, and that answer is missing data too.
+//
+// # Why partial is opt-in rather than the default
+//
+// A dashboard that would rather draw something than nothing is a real use, and
+// so is an operator triaging with one node down. But it has to be ASKED for:
+// `allow_partial_response=1`, answered 206 with headers naming the shards that
+// are missing. The default is failure because the caller who did not ask has
+// no way to know, and a monitoring system built on silently-partial answers
+// alerts on the wrong thing at the worst time.
+
+// partialParam is the opt-in. Named for the reference's own parameter so a
+// client that already sets it keeps working.
+const partialParam = "allow_partial_response"
+
+// Response headers describing a partial answer.
+const (
+	HdrPartial        = "X-Simdlogs-Partial"
+	HdrShardsTotal    = "X-Simdlogs-Shards-Total"
+	HdrShardsAnswered = "X-Simdlogs-Shards-Answered"
+	HdrShardsMissing  = "X-Simdlogs-Shards-Missing"
+	// HdrShardsLagging names shards served by a replica whose watermark is
+	// below a sibling's. Separate from HdrShardsMissing because it does NOT
+	// refuse: a replica microseconds behind under ordinary ingest is
+	// indistinguishable from one that lost a day, so the answer is served and
+	// the shortfall is said out loud instead of only being logged.
+	HdrShardsLagging = "X-Simdlogs-Shards-Lagging"
+	// HdrIncompleteReason carries WHY a router's own answer is not whole, so
+	// the distinction survives a hop. Without it a child's watermark refusal
+	// reached its parent as a bare Complete: false and was rendered
+	// `N(degraded)` -- an operator sent to look at the wrong thing, one level
+	// up.
+	HdrIncompleteReason = "X-Simdlogs-Incomplete-Reason"
+
+	// The reasons that header may carry. A closed set, because it is rendered
+	// into this node's client-facing error and a peer must not be able to
+	// write text into it -- the same rule as PeerErrorClass.
+	reasonWatermark = "watermark"
+	reasonDegraded  = "degraded"
+)
+
+// fanOutChecked fans out, then enforces the completeness rule.
+//
+// It returns the bodies and true when the caller may proceed to merge. When it
+// returns false it has already written the response, and the handler must
+// return immediately.
+// It returns the writer the handler must use: on a partial answer that writer
+// forces 206 on the first write. The status cannot be set here directly --
+// every handler sets its own Content-Type and then writes, so a WriteHeader in
+// this function would be overtaken by the handler's first Write, which sends
+// 200. Returning the writer makes the substitution visible at the call site
+// rather than hidden in a wrapper the handler does not know about.
+func (s *Server) fanOutChecked(
+	w http.ResponseWriter, r *http.Request, path string, body []byte,
+) ([]shardAnswer, http.ResponseWriter, bool) {
+	// A MISSING query is refused HERE, before any shard is asked.
+	//
+	// body == nil is the set of routes whose parameters come from the form and
+	// the URL; a single node refuses each of them with errMissingQuery when
+	// `query` is blank (parseRequest). The router instead fanned out an empty
+	// selector, every shard refused it, and the caller got
+	//
+	//	503 2 of 2 shards could not answer completely (0(rejected),1(rejected))
+	//
+	// -- an operator sent to inspect the storage nodes for a parameter their
+	// own request did not carry. Measured across the twelve federated reads
+	// with the parameters in a body no form parser reads (`text/plain`, no
+	// Content-Type, a malformed multipart): the router answered 400 on two and
+	// 5xx on ten, against a single node's 400.
+	//
+	// Not applied to a route that HAS no query language. The two federated
+	// admin surfaces take none -- a quarantine listing and an acknowledgement
+	// are about the shards, not about a selector -- so the check that protects
+	// every read from an empty selector would refuse them for missing a
+	// parameter they never take. They opt out explicitly rather than by
+	// passing an empty body, which is a different thing here: `body == nil`
+	// also selects the form-folding path below.
+	if body == nil && !routeTakesNoQuery(r) &&
+		strings.TrimSpace(r.FormValue("query")) == "" {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, errMissingQuery.Error())
+		return nil, w, false
+	}
+	fr, formBody := withFormInURL(r)
+	if fr == nil {
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+			"simdlogs: the request body is not a readable form, so the query it "+
+				"carries cannot be sent to the shards. Asking them the empty query "+
+				"instead would answer a question you did not ask.")
+		return nil, w, false
+	}
+	// The form overflow only applies where the caller sent no body of its own.
+	//
+	// len(body) on BOTH arms, and that is the whole point: the two ES handlers
+	// pass io.ReadAll(r.Body), which NEVER returns nil, so an empty body is an
+	// empty non-nil slice. Fixing only the first arm and leaving the second as
+	// `body == nil` made the switch non-exhaustive at exactly that value --
+	// `len(body)==0 && body!=nil` matched neither -- and since withFormInURL
+	// has already cleared RawQuery, the shard was then sent an empty query
+	// string and an empty body. Measured on `POST /_count?q=<70 KiB filter>`
+	// with a form content type and no body, against a shard answering 3 when
+	// it sees the filter and 1000 when it does not:
+	//
+	//	body == nil arm:  200 {"count":1000}   the shard was asked nothing
+	//	len(body)==0 arm: 200 {"count":3}      the shard was asked the filter
+	//
+	// A loud 400 became a silent wrong number at the one size this path
+	// exists for. The switch is now total in len(body), so no value of it
+	// falls through with a formBody in hand.
+	//
+	// The refusing case really is a client that sends both. That is a
+	// statement about what CLIENTS send, not a property of this code -- so it
+	// is refused rather than reasoned away. Under the previous shape the
+	// query string survived a dropped formBody; now RawQuery has been cleared,
+	// so dropping it would hand the shard neither, and the answer would be a
+	// smaller one at HTTP 200.
+	ct := ""
+	if formBody != nil {
+		if len(body) > 0 {
+			// What this actually refuses, named as it is. Both Elasticsearch
+			// handlers io.ReadAll the body before fanOutChecked, so r.Form
+			// holds only URL-query keys and formBody is that query re-encoded
+			// -- "a form large enough to need one" is never a form the client
+			// sent, and the message described a situation this code cannot
+			// produce. The reachable one is `POST /_count?q=<70 KiB>` with a
+			// body of its own.
+			s.writeErr(w, r, readSpec(), http.StatusBadRequest,
+				"simdlogs: this request carries both a body of its own and a query "+
+					"string too long to forward in a shard's request line, and the "+
+					"router has one body to send. Refused rather than silently "+
+					"dropping either: sending the query would discard the request "+
+					"body, and sending the body would ask the shards a shorter "+
+					"question than you asked")
+			return nil, w, false
+		}
+		body, ct = formBody, "application/x-www-form-urlencoded"
+	}
+	peers := s.fanOutPeers(fr, path, body, ct)
+
+	var missing []string
+	var incomplete []string
+	var lagging []string
+	for i, p := range peers {
+		if p.BehindSibling {
+			lagging = append(lagging, strconv.Itoa(i))
+		}
+		switch {
+		case !p.OK():
+			// THE REASON WINS OVER THE CLASS when the peer sent one.
+			//
+			// A router that refuses answers 503, so its parent classes it from
+			// the status alone -- `0(overloaded)` -- and the watermark/degraded
+			// distinction died one level up even though the child had said
+			// exactly which it was. An operator two levels from the shard was
+			// sent to look at an overloaded node that was not overloaded.
+			why := string(p.Class)
+			if p.IncompleteReason != "" {
+				why = p.IncompleteReason
+			}
+			missing = append(missing, fmt.Sprintf("%d(%s)", i, why))
+		case !p.Complete && aboutTheShardsHealth(r):
+			// NOT counted for a route whose SUBJECT is the degradation.
+			//
+			// EXACTLY ONE route reaches this: /admin/storage/quarantine, which
+			// is the only caller of aboutHealth.
+			//
+			// /admin/acknowledge-degraded is NOT marked -- it hands the bare
+			// request to fanOutPeers, because it is a write and writes its own
+			// refusal. Two earlier versions of this comment got that wrong in
+			// both directions: the first said both routes reach this case, the
+			// second said the second route is marked "for symmetry" and cannot
+			// reach it. It is not marked at all, and the mark is what this
+			// case reads.
+			//
+			// A shard with a quarantined group reports Complete: false on
+			// every answer, which is right for a read -- its rows are missing.
+			// It is wrong for `/admin/storage/quarantine`, which exists to say
+			// WHICH groups are quarantined, and for
+			// `/admin/acknowledge-degraded`, whose whole job is to clear that
+			// state. Applying the read rule there refuses both endpoints in
+			// exactly the situation they were built for: the listing that
+			// names the corruption cannot be fetched because there is
+			// corruption.
+			//
+			// A shard that cannot be ASKED still refuses them -- that is the
+			// case above, and it is the one where the answer is silently
+			// short. The distinction is "did not answer" against "answered,
+			// about its own bad health".
+			continue
+		case !p.Complete:
+			// Answered, but not from its whole dataset. Counted as missing for
+			// the completeness rule: a shard serving from a degraded store is
+			// missing data just as surely as one that did not answer, and the
+			// only difference is that this one looks fine.
+			//
+			// WITH A REASON, the way the missing bucket carries a class. A bare
+			// index cannot tell an operator whether the shard's store is
+			// degraded or its watermark went backwards -- different problems
+			// with different fixes, and this bucket now produces mostly the
+			// second.
+			reason := p.IncompleteReason
+			if reason == "" {
+				reason = reasonDegraded // the peer's own report on its own store
+			}
+			incomplete = append(incomplete, fmt.Sprintf("%d(%s)", i, reason))
+		}
+	}
+	if len(lagging) > 0 {
+		w.Header().Set(HdrShardsLagging, strings.Join(lagging, ","))
+	}
+	// And the reason, so a parent of this router gets the same distinction its
+	// own client does.
+	for _, p := range peers {
+		if p.IncompleteReason != "" {
+			w.Header().Set(HdrIncompleteReason, p.IncompleteReason)
+			break
+		}
+	}
+	bad := append(append([]string(nil), missing...), incomplete...)
+	if len(bad) == 0 {
+		return answersOf(peers), w, true
+	}
+
+	answered := len(peers) - len(bad)
+	w.Header().Set(HdrShardsTotal, strconv.Itoa(len(peers)))
+	w.Header().Set(HdrShardsAnswered, strconv.Itoa(answered))
+	w.Header().Set(HdrShardsMissing, strings.Join(bad, ","))
+	// AND THIS NODE'S OWN ENVELOPE STOPS SAYING THE ANSWER IS WHOLE.
+	//
+	// serveEnvelope stamps Complete from this node's degraded snapshot, before
+	// the handler runs, and nothing lowered it afterwards. A middle router that
+	// answered 206 with a shard missing still told its PARENT Complete: true,
+	// so the parent merged a knowingly-partial answer as a whole one and a
+	// shard missing two levels down was invisible at the top.
+	//
+	// Set here, before any byte of the body is written: a header set after the
+	// first write is dropped silently.
+	if w.Header().Get(HdrComplete) != "" {
+		w.Header().Set(HdrComplete, "false")
+	}
+
+	// EVERY SHARD REFUSED THE REQUEST: that is a 4xx, not a 503.
+	//
+	// PeerRejected's own doc says why -- "a 4xx that is not an auth or load
+	// problem. The router sent something this peer would not accept, so every
+	// replica will refuse it identically." Answering 503 told the client to
+	// retry a query that can never succeed, and sent the operator to look at a
+	// shard that is working. Measured on the same malformed query:
+	//
+	//	node   400  simdlogs: unknown pipe "nonsense"
+	//	router 503  1 of 1 shards could not answer completely (0(rejected))
+	//
+	// EVERY, not any: one shard refusing while another is unreachable is a
+	// degraded cluster, and telling the client to fix their query would be
+	// wrong about a shard that never judged it.
+	// No `len(peers) > 0` term: this point is past the `len(bad) == 0` early
+	// return, and bad is built from peers, so an empty peer list has already
+	// returned. A guard for it would be one nothing can reach -- checked by
+	// mutation, which is how it was found.
+	allRejected := true
+	for _, p := range peers {
+		if p.Class != PeerRejected {
+			allRejected = false
+			break
+		}
+	}
+	if allRejected {
+		// "USUALLY the request", not "that is the request".
+		//
+		// The stronger sentence was here and is not always true. A query the
+		// exact-stats path answers asks every shard for a BARE select of the
+		// whole window, so a shard-side row limit (-search.maxRows) can refuse
+		// what a single node answers 200 -- measured, cap 5, 30-row window:
+		//
+		//	* | stats by (_msg) count() c | limit 2   node 200   cluster 400
+		//	* | stats avg(n) a                        node 200   cluster 400
+		//	* | sort by (n) | stats count() c         node 200   cluster 400
+		//
+		// Telling that caller "a retry will be refused the same way" sends them
+		// to rewrite a query that is not the problem. Each shard's own answer
+		// still says what it objected to, which is the part that was always
+		// true and is the part worth keeping.
+		s.writeErr(w, r, readSpec(), http.StatusBadRequest, fmt.Sprintf(
+			"simdlogs: every shard refused this request (%s). Each shard's own "+
+				"answer says what it objected to -- usually the request itself, "+
+				"in which case a retry is refused the same way, but a shard-side "+
+				"row or byte limit can also refuse a query a single node answers",
+			strings.Join(bad, ",")))
+		return nil, w, false
+	}
+
+	if r.FormValue(partialParam) != "1" {
+		// The reason rides the REFUSAL too. A router that refuses answers 503,
+		// so its parent classes it as a failed peer -- `0(overloaded)`, from
+		// the status alone -- and the watermark/degraded distinction died with
+		// the body it was never in.
+		obs.L().Error("cluster read refused: shards missing",
+			obs.FieldEvent, "cluster.read_incomplete",
+			obs.FieldRoute, r.URL.Path,
+			"shards_total", len(peers), "shards_answered", answered,
+			"missing", strings.Join(bad, ","),
+			obs.FieldErrorClass, string(obs.ClassUpstream))
+		s.writeErr(w, r, readSpec(), http.StatusServiceUnavailable, fmt.Sprintf(
+			"simdlogs: %d of %d shards could not answer completely (%s). "+
+				"This answer would have been missing data with no way for you to tell, "+
+				"so it is refused. Set %s=1 to accept a partial answer, which is "+
+				"returned as 206 with the missing shards named in %s",
+			len(bad), len(peers), strings.Join(bad, ","), partialParam, HdrShardsMissing))
+		return nil, w, false
+	}
+
+	// Asked for. 206, so a client that switches on the status sees it, and the
+	// headers say exactly what is missing.
+	obs.L().Warn("cluster read answered partially",
+		obs.FieldEvent, "cluster.read_partial",
+		obs.FieldRoute, r.URL.Path,
+		"shards_total", len(peers), "shards_answered", answered,
+		"missing", strings.Join(bad, ","))
+	w.Header().Set(HdrPartial, "true")
+	// The counter is NOT incremented here.
+	//
+	// PartialReads() is documented as "answers this router knowingly returned
+	// incomplete", which is what an operator alerts on. Counting at this point
+	// counts every read that was ALLOWED to be partial, including the ones a
+	// merge then refuses with 502 -- so a refused read arrived at the operator
+	// as a returned partial answer, with X-Simdlogs-Partial: true on a 502
+	// telling the client the same wrong thing. partialWriter increments when it
+	// actually writes the 206.
+	return answersOf(peers), &partialWriter{ResponseWriter: w, srv: s}, true
+}
+
+// partialWriter answers 206 on the first write.
+//
+// A partial answer must be distinguishable by STATUS, not only by a header: a
+// client that checks `resp.ok` sees 200 for both, and the whole point is that
+// a caller cannot accidentally treat an incomplete answer as a complete one.
+type partialWriter struct {
+	http.ResponseWriter
+	srv   *Server
+	wrote bool
+}
+
+func (p *partialWriter) WriteHeader(code int) {
+	if p.wrote {
+		return
+	}
+	p.wrote = true
+	if code == http.StatusOK {
+		code = http.StatusPartialContent
+		// Counted HERE, where a partial answer is actually being returned. A
+		// merge that refuses writes a 4xx/5xx through this same writer and does
+		// not count.
+		if p.srv != nil {
+			p.srv.notePartialRead()
+		}
+	} else {
+		// Not a partial answer after all: the merge refused. The header set
+		// before the merge would otherwise tell the client it is holding one.
+		p.Header().Del(HdrPartial)
+	}
+	p.ResponseWriter.WriteHeader(code)
+}
+
+func (p *partialWriter) Write(b []byte) (int, error) {
+	if !p.wrote {
+		// StatusOK, not StatusPartialContent: WriteHeader maps 200 to 206 and
+		// treats anything else as a refusal that must not be marked partial.
+		// Passing 206 here took the refusal branch and deleted the header on
+		// every successful partial answer.
+		p.WriteHeader(http.StatusOK)
+	}
+	return p.ResponseWriter.Write(b)
+}
+
+// partialReads counts answers this router knowingly returned incomplete.
+var partialReads atomic.Int64
+
+func (s *Server) notePartialRead() { partialReads.Add(1) }
+
+// PartialReads is the count, for /metrics. An operator alerts on it: a
+// dashboard quietly running on partial answers is the state this whole
+// mechanism exists to make visible.
+func PartialReads() int64 { return partialReads.Load() }
+
+// reframeESPaging rewrites a search body so the shards return enough for the
+// coordinator to page over: from=0, size=from+size.
+//
+// The original body is edited as JSON rather than re-marshalled from the parsed
+// struct, because esQuery does not carry every field a client may send and
+// re-marshalling would silently drop the ones it does not know.
+func reframeESPaging(body []byte, q esQuery) ([]byte, error) {
+	size := q.Size
+	if size <= 0 {
+		size = esDefaultSize
+	}
+	need := q.From + size
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	raw["from"] = json.RawMessage("0")
+	raw["size"] = json.RawMessage(strconv.Itoa(need))
+	return json.Marshal(raw)
+}
+
+// sortESHits orders merged hits by @timestamp, OLDEST FIRST.
+//
+// Oldest first because that is what a single node returns -- measured, not
+// assumed: `{"from":0,"size":2}` against one node answers doc-00 then doc-01.
+// A page has to be the same page whichever it is asked of, and the first
+// version of this sorted newest-first, which made every page a different set
+// of documents rather than a wrongly-ordered one.
+//
+// A hit whose timestamp cannot be read sorts last: an unreadable timestamp
+// should not displace a real document from page one.
+func sortESHits(hits []json.RawMessage) {
+	key := func(h json.RawMessage) string {
+		var v struct {
+			Source struct {
+				Time string `json:"@timestamp"`
+			} `json:"_source"`
+		}
+		if json.Unmarshal(h, &v) != nil {
+			return ""
+		}
+		return v.Source.Time
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		a, b := key(hits[i]), key(hits[j])
+		if a == b {
+			return false
+		}
+		if a == "" {
+			return false
+		}
+		if b == "" {
+			return true
+		}
+		return a < b // oldest first, as a single node returns them
+	})
+}
+
+// knownIncompleteReason keeps a peer's own text out of this node's answer, the
+// same way knownPeerClass does for the error class.
+func knownIncompleteReason(v string) bool {
+	return v == reasonWatermark || v == reasonDegraded
 }

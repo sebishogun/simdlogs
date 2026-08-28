@@ -15,8 +15,8 @@ import (
 // grows -- the concrete scaling question, since every query linearly scans
 // the groups a time window selects. It builds groups directly (no JSON) with
 // a high-cardinality trace column and a planted needle, disk-backed so the
-// group files land on disk (the Readers stay in RAM -- there is no mmap yet,
-// so this measures the cache-resident regime honestly). Run:
+// group files land on disk and AppendGroup mmaps each immutable reader. The
+// query warmup therefore measures the warmed mmap/page-cache regime. Run:
 //
 //	SIMDLOGS_SCALE=1 go test -run TestScale -v -timeout 30m ./internal/bench/
 //	SIMDLOGS_SCALE=1 SIMDLOGS_SCALE_SIZES=3000000,30000000,100000000 ...

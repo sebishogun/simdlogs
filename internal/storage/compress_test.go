@@ -36,6 +36,7 @@ func TestLZ4RoundTrip(t *testing.T) {
 // compressing the dict string data (compress + a block-min index for
 // random access) is the footprint follow-up; see the perf-max task.
 func TestGroupFootprint(t *testing.T) {
+	t.Parallel()
 	n := 100_000
 	var ts []int64
 	var msgs []string

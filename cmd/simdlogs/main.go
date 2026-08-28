@@ -5,11 +5,16 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
+	"fmt"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -17,15 +22,130 @@ import (
 	"github.com/sebishogun/simd"
 	"github.com/sebishogun/simdlogs/internal/api"
 	"github.com/sebishogun/simdlogs/internal/config"
+	"github.com/sebishogun/simdlogs/internal/storage"
+)
+
+// version and commit are stamped at build time:
+//
+//	go build -ldflags "-X main.version=v1.0.0 -X main.commit=$(git rev-parse --short HEAD)"
+//
+// Defaults say "dev" and "unknown" rather than a plausible-looking version. A
+// binary that claims to be a release it is not is worse than one that admits
+// it was built from a working tree -- an operator reading a support ticket
+// needs the difference.
+var (
+	version = "dev"
+	commit  = "unknown"
 )
 
 func main() {
+	// Subcommands before flags: `simdlogs restore ...` takes a different set
+	// of arguments and exits when it is done, so it does not belong behind a
+	// flag on a binary whose other flags all describe a long-running server.
+	if len(os.Args) > 1 && os.Args[1] == "restore" {
+		os.Exit(runRestore(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
+
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	addr := flag.String("addr", ":9428", "listen address (VL's default port)")
 	dir := flag.String("storage", "./simdlogs-data", "storage directory")
 	retention := flag.Duration("retention", 0, "drop data older than this (e.g. 720h); 0 disables")
 	tierDropPost := flag.Bool("recompact-drop-postings", false, "when recompacting, also drop the per-column inverted index (35% smaller total vs 8% for flate alone, but cold equality queries fall back to a scan -- what VictoriaLogs does for every query)")
-	tierAfter := flag.Duration("recompact-after", 0, "re-encode groups older than this with flate dictionaries (~17% smaller, slower value reads on cold data); 0 disables")
+	tierAfter := flag.Duration("recompact-after", 0, "re-encode groups older than this with flate dictionaries (~8% smaller, slower value reads on cold data); 0 disables")
+	compactMin := flag.Int("compact-min-groups", 0,
+		"merge runs of at least this many small adjacent groups into one; 0 disables. "+
+			"A client sending one row per request writes one group per row, and every query "+
+			"walks the group list before it reads a column, so the cost is paid by every "+
+			"query. This is the group COUNT axis; -recompact-after is the group SIZE axis")
+	compactRows := flag.Int("compact-max-rows", 8192,
+		"cap an output group's rows. The time-window skip is per group, so a bigger group "+
+			"is a coarser skip: this trades the count against the skip")
+	compactAfter := flag.Duration("compact-after", time.Hour,
+		"only merge groups whose newest row is older than this, so compaction never "+
+			"rewrites the range ingest is still appending to")
+	compactEvery := flag.Duration("compact-every", time.Hour, "how often to run a compaction pass")
+	compactMaxOut := flag.Int("compact-max-outputs", 64,
+		"bound one pass to this many output groups PER TENANT, which bounds its I/O. "+
+			"There is no cross-tenant budget: each store enforces its own")
+	compactMaxIn := flag.Int64("compact-max-input-bytes", 0,
+		"refuse to read and rewrite more than this many bytes in one pass, per tenant; "+
+			"0 means no bound")
+	maxPerTenantQ := flag.Int("max-queries-per-tenant", 0,
+		"bound reads in flight for ONE tenant; 0 is unbounded. -max-concurrent-query is "+
+			"process-wide and cannot express this: with only that, one tenant's dashboard "+
+			"takes every slot and every other tenant is refused work the server had room for")
+	queryQueueWait := flag.Duration("query-queue-wait", 0,
+		"how long a read may wait for an admission slot before 429; 0 refuses immediately, "+
+			"which is right for an interactive endpoint")
+	rulesFile := flag.String("rules.file", "",
+		"JSON file of metrics-from-logs and alert rules. Every rule needs a `window`: "+
+			"without one a rule evaluates over ALL history, so a gauge only ever grows, "+
+			"an alert fires once and never clears, and each evaluation costs more than "+
+			"the last. Rules are loaded and validated at startup -- a bad rule is a "+
+			"startup failure, because an invalid metric name corrupts the whole /metrics "+
+			"exposition rather than just its own rule. Changing rules means restarting; "+
+			"there is no reload endpoint and no half-applied rule set")
+	logFormat := flag.String("log.format", "text",
+		"`text` or `json`. JSON for a log pipeline; text is the default because it is "+
+			"what this process wrote before structured logging, and a silent format "+
+			"change breaks whatever was parsing it")
+	logLevel := flag.String("log.level", "info", "debug, info, warn or error")
+	auditFile := flag.String("audit.file", "",
+		"write audit records here instead of to stderr. Audit records answer to a "+
+			"different reader with a different retention than the operational log: an "+
+			"operator greps one while an incident is open, a security review reads the "+
+			"other months later and needs it complete. They are never filtered by "+
+			"-log.level -- \"we stopped recording authentication failures because someone "+
+			"raised the log level\" is not a thing an audit trail may do")
+	vectorFields := flag.String("vector-fields", "",
+		"comma-separated name:dim pairs declaring which record fields are embeddings, "+
+			"e.g. `embedding:768`. A JSON array is only read as a vector for a field named "+
+			"here: [1,2,3] is not self-evidently an embedding, and a store that guessed "+
+			"would type the column from whichever record arrived first")
+	maxVectorK := flag.Int("search.maxVectorK", 0,
+		"cap on k for /select/vector; 0 = unbounded")
+	maxVectorDim := flag.Int("search.maxVectorDim", 0,
+		"cap on the query vector's dimension, and so on the cost of one comparison; 0 = unbounded")
+	maxVectorCandidates := flag.Int("search.maxVectorCandidates", 0,
+		"cap on stored vectors scored by one search; 0 = unbounded. Distinct from "+
+			"-search.maxVectorK: the top 10 of a billion still reads a billion")
+	maxGroupKeys := flag.Int("search.maxGroupKeys", 0,
+		"cap on an aggregate's distinct `by` keys (stats/uniq/top); 0 = unbounded. "+
+			"Nothing else bounds it: -search.maxRows counts scanned rows, of which a "+
+			"high-cardinality aggregate may read few, and -search.maxQueryBytes counts "+
+			"materialized row bytes, which an aggregate does not accumulate")
+	maxPipeRows := flag.Int("search.maxPipeRows", 0,
+		"cap on the rows one pipe may produce; 0 = unbounded. A join whose key is not "+
+			"unique on the right multiplies, so two results each inside -search.maxRows "+
+			"become an output no other budget covers. Over it the query errors 413")
+	maxScanWorkers := flag.Int("max-scan-workers", 0,
+		"total scan goroutines shared by all concurrent queries; 0 means GOMAXPROCS. "+
+			"Each query used to take GOMAXPROCS of its own, so ten concurrent queries on a "+
+			"32-core box ran 320 workers for 32 cores")
+	reserveWarn := flag.Int64("storage-reserve-warn-bytes", 0,
+		"free space at which readiness degrades while writes are still accepted; 0 disables. "+
+			"Bytes rather than a percentage: what has to be protected is room for the "+
+			"RECOVERY, and a retention pass has to write a manifest record before it can "+
+			"unlink anything")
+	reserveReject := flag.Int64("storage-reserve-reject-bytes", 0,
+		"free space at which new writes are refused with 507; 0 disables. When "+
+			"-storage-reserve-warn-bytes is also set it must be below it, or writes would "+
+			"stop before anything reported degraded. Queries, /metrics and retention keep "+
+			"working past it")
+	tenantBytes := flag.Int64("storage-max-tenant-bytes", 0,
+		"refuse writes once one tenant's own groups reach this many bytes; 0 is unbounded")
+	compactMaxGroup := flag.Int64("compact-max-group-bytes", 0,
+		"leave any input group larger than this alone -- merging one that is already big "+
+			"copies its bytes for no change in the group count; 0 means no bound")
 	streamFields := flag.String("stream-fields", "", "comma-separated fields that identify a log stream (synthesizes _stream)")
+	readinessReread := flag.Duration("readiness-reread-interval", 0,
+		"how often /-/ready re-reads the store directory of a degraded tenant that is not open, "+
+			"to notice that an operator has cleared the quarantine (0 = the built-in 250ms, "+
+			"negative = every probe)")
+	corruptionPolicy := flag.String("corruption-policy", "fail",
+		"what to do with a stored group that cannot be read: fail (refuse to open the tenant) "+
+			"or quarantine (move it aside, serve the rest, and report the tenant degraded and "+
+			"not ready until POST /admin/acknowledge-degraded)")
 	syslogAddr := flag.String("syslog", "", "also listen for syslog on this UDP/TCP address (e.g. :514)")
 	backends := flag.String("select-backends", "", "comma-separated peer node URLs; when set this node is a select router (vmselect role)")
 	compact := flag.Bool("compact", false, "compact mode: flate dictionaries for ~15% smaller groups, but 2-10x slower value-reading queries -- for cold archival only, not a queryable store")
@@ -33,11 +153,68 @@ func main() {
 	maxRows := flag.Int("search.maxRows", 0, "cap on rows a bare (no-pipe) select may return; 0 = the built-in default, -1 = unlimited. Over the cap the query errors (never silently truncates); add a `| limit N` or a stats pipe.")
 	maxBody := flag.Int64("http.maxBodyBytes", 0, "maximum request body in bytes; 0 = the built-in default, -1 = unlimited")
 	maxQueryDur := flag.Duration("search.maxDuration", 0, "maximum wall time for one query; 0 = the built-in default, -1ns = unlimited")
+	maxQueryBytes := flag.Int64("search.maxQueryBytes", 0, "maximum bytes one query may materialize; 0 = the built-in default, -1 = unlimited. Over it the query errors rather than returning a short answer.")
 	maxTenants := flag.Int("tenants.max", 0, "maximum tenants held open; 0 = the built-in default, -1 = unlimited")
 	authFile := flag.String("auth.config", "", "path to the JSON auth file (bearer-token hashes, roles, tenants). Without it the server is UNAUTHENTICATED: every client can query, ingest and download backups.")
+	tlsCert := flag.String("tls.certFile", "", "PEM certificate; with -tls.keyFile this serves HTTPS")
+	tlsKey := flag.String("tls.keyFile", "", "PEM private key for -tls.certFile")
+	tlsClientCA := flag.String("tls.clientCAFile", "", "PEM CA bundle; when set, clients must present a certificate signed by it (mTLS)")
+	// Two spellings: -tls.insecure follows the dotted convention of every
+	// neighbouring flag, and -insecure-http is kept because it is what the
+	// first documentation said. Either turns it on.
+	insecureTLS := flag.Bool("tls.insecure", false, "serve plaintext on a non-loopback address (log data travels in clear text)")
+	insecureHTTP := flag.Bool("insecure-http", false, "alias for -tls.insecure")
+	syslogTLS := flag.Bool("syslog.tls", false,
+		"serve RFC 5425 syslog-over-TLS on the syslog TCP listener, using -tls.certFile/-tls.keyFile (UDP stays plaintext)")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("simdlogs %s (%s) %s %s/%s\n",
+			version, commit, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		return
+	}
+
+	// Validate the listener configuration before anything is acquired. It
+	// depends only on flags, and log.Fatal calls os.Exit, so a failure after
+	// the store is open leaves a data directory, bound sockets and running
+	// goroutines behind with no deferred cleanup.
+	tlsCfg := config.TLSConfig{
+		CertFile:     *tlsCert,
+		KeyFile:      *tlsKey,
+		ClientCAFile: *tlsClientCA,
+		InsecureHTTP: *insecureTLS || *insecureHTTP,
+	}
+	if err := tlsCfg.CheckListen(*addr); err != nil {
+		log.Fatal(err)
+	}
+	// The syslog listener is unauthenticated and writes to the default tenant,
+	// so a plaintext one on a non-loopback address is refused for the same
+	// reason the HTTP listener is. -syslog.tls turns the TCP half into RFC
+	// 5425 syslog-over-TLS using the same certificate, which is what makes
+	// that refusal something an operator can actually satisfy rather than
+	// only work around with -tls.insecure.
+	//
+	// UDP stays plaintext: RFC 5425 is TLS over TCP, and RFC 5426's UDP
+	// transport has no TLS form at all.
+	if *syslogAddr != "" && !*syslogTLS {
+		// CheckPlaintextListen, not CheckListen: the syslog port is plaintext
+		// whatever the HTTP listener does, so a certificate on the HTTP side
+		// must not exempt it.
+		if err := tlsCfg.CheckPlaintextListen(*syslogAddr); err != nil {
+			log.Fatalf("syslog: %v (or pass -syslog.tls to serve RFC 5425 "+
+				"syslog-over-TLS on the TCP half)", err)
+		}
+	}
+	if *syslogTLS && !tlsCfg.Enabled() {
+		log.Fatal("-syslog.tls needs -tls.certFile and -tls.keyFile")
+	}
+	tc, err := tlsCfg.Build()
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	cfg := config.Default()
+	cfg.CorruptionPolicy = *corruptionPolicy
+	cfg.DirRereadInterval = *readinessReread
 	cfg.Dir = *dir
 	cfg.Compact = *compact
 	if *streamFields != "" {
@@ -49,11 +226,66 @@ func main() {
 	cfg.Limits.MaxQueryRows = *maxRows
 	cfg.Limits.MaxBodyBytes = *maxBody
 	cfg.Limits.MaxQueryDuration = *maxQueryDur
+	cfg.Limits.MaxQueryBytes = *maxQueryBytes
 	cfg.Limits.MaxOpenTenants = *maxTenants
+	cfg.Limits.MaxQueriesPerTenant = *maxPerTenantQ
+	cfg.Limits.QueryQueueWait = *queryQueueWait
+	cfg.VectorFields = *vectorFields
 
-	srv, err := api.NewServerConfig(cfg)
-	if err != nil {
-		log.Fatal(err)
+	var auditOut io.Writer
+	if *auditFile != "" {
+		f, err := os.OpenFile(*auditFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			log.Fatalf("simdlogs: -audit.file: %v", err)
+		}
+		defer f.Close()
+		auditOut = f
+	}
+	if err := obs.Init(obs.Config{
+		Format: *logFormat, Level: *logLevel, AuditOut: auditOut,
+	}); err != nil {
+		log.Fatalf("simdlogs: %v", err)
+	}
+	// Loaded and validated BEFORE the server starts serving, so a bad rule is
+	// a startup failure rather than a corrupted /metrics an hour later.
+	var rules *config.RuleSet
+	if *rulesFile != "" {
+		rules, err = config.LoadRules(*rulesFile)
+		if err != nil {
+			log.Fatalf("simdlogs: %v", err)
+		}
+	}
+	cfg.Limits.MaxVectorK = *maxVectorK
+	cfg.Limits.MaxVectorDim = *maxVectorDim
+	cfg.Limits.MaxVectorCandidates = *maxVectorCandidates
+	cfg.Limits.MaxGroupKeys = *maxGroupKeys
+	cfg.Limits.MaxPipeRows = *maxPipeRows
+	cfg.Limits.MaxScanWorkers = *maxScanWorkers
+	cfg.Storage.ReserveWarnBytes = *reserveWarn
+	cfg.Storage.ReserveRejectBytes = *reserveReject
+	cfg.Storage.MaxTenantBytes = *tenantBytes
+
+	srv, err2 := api.NewServerConfig(cfg)
+	if err2 != nil {
+		log.Fatal(err2)
+	}
+	if rules != nil {
+		// Registered after the server exists and before it serves. Each
+		// registration re-validates -- the file was already checked, so a
+		// failure here is a rule whose QUERY does not parse, which the file
+		// loader deliberately does not know how to check.
+		for _, m := range rules.Metrics {
+			if err := srv.AddMetricRule(m); err != nil {
+				log.Fatalf("simdlogs: %v", err)
+			}
+		}
+		for _, a := range rules.Alerts {
+			if err := srv.AddAlertRule(a); err != nil {
+				log.Fatalf("simdlogs: %v", err)
+			}
+		}
+		log.Printf("rules: %d metric, %d alert from %s",
+			len(rules.Metrics), len(rules.Alerts), *rulesFile)
 	}
 	if *authFile != "" {
 		ac, err := config.LoadAuth(*authFile)
@@ -66,12 +298,26 @@ func main() {
 		if ac.Disabled {
 			log.Print("WARNING: authentication is explicitly disabled in " + *authFile)
 		} else {
-			log.Printf("authentication enabled: %d credentials from %s", len(ac.Tokens), *authFile)
+			// Count every credential kind, not just tokens: a certs-only file
+			// logged "0 credentials".
+			creds := len(ac.Tokens) + len(ac.Certs)
+			if ac.TrustedProxy {
+				creds++
+			}
+			log.Printf("authentication enabled: %d credentials from %s", creds, *authFile)
+			if *tlsClientCA != "" && len(ac.Certs) == 0 {
+				log.Print("WARNING: -tls.clientCAFile is set but the auth file has no certs entries; " +
+					"a client certificate proves only that the CA trusts the client and grants nothing")
+			}
 		}
 	} else {
 		// Loud, once, at startup. A server that is open to everyone should
 		// say so rather than leaving an operator to infer it.
 		log.Print("WARNING: no -auth.config; the server is UNAUTHENTICATED and every client can query, ingest and download backups")
+		if *tlsClientCA != "" {
+			log.Print("WARNING: -tls.clientCAFile without -auth.config gates the transport only; " +
+				"every client the CA signs gets full access, including /admin/backup")
+		}
 	}
 	if *backends != "" {
 		srv.SetBackends(strings.Split(*backends, ","))
@@ -87,14 +333,48 @@ func main() {
 		defer stopTier()
 		log.Printf("tiering: recompacting groups older than %s", *tierAfter)
 	}
+	if *compactMin > 0 {
+		// OlderThan is left unset here on purpose: StartCompactionAfter
+		// resolves it at the start of every pass, because a cutoff computed
+		// once at startup ages with the process.
+		opt := storage.CompactOptions{
+			MinGroups:        *compactMin,
+			MaxRowsPerOutput: *compactRows,
+			MaxOutputs:       *compactMaxOut,
+			MaxInputBytes:    *compactMaxIn,
+			MaxGroupBytes:    *compactMaxGroup,
+		}
+		stopCompact := srv.StartCompactionAfter(opt, *compactAfter, *compactEvery)
+		defer stopCompact()
+		log.Printf("compaction: merging runs of %d+ groups older than %s every %s, "+
+			"up to %d outputs a pass", *compactMin, *compactAfter, *compactEvery, *compactMaxOut)
+	}
 	if *retention > 0 {
 		stop := srv.StartRetention(*retention, time.Hour)
 		defer stop()
 		log.Printf("retention: dropping data older than %s", *retention)
 	}
+	var syslogClosers []io.Closer
 	if *syslogAddr != "" {
-		if _, _, err := srv.ListenSyslog(*syslogAddr); err != nil {
+		// Both closers are kept. Discarding them left the UDP and TCP
+		// listeners accepting data all the way through shutdown, into writers
+		// that were being flushed and stores that were being unmapped.
+		syslogCfg := api.DefaultSyslogConfig()
+		if *syslogTLS {
+			// The same certificate the HTTP listener uses. A separate one
+			// would be a second thing to rotate for no gain: both are this
+			// process's identity on this host.
+			syslogCfg.TLS = tc
+		}
+		udpC, tcpC, err := srv.ListenSyslogConfig(*syslogAddr, syslogCfg)
+		if err != nil {
 			log.Fatalf("syslog listen %s: %v", *syslogAddr, err)
+		}
+		if udpC != nil {
+			syslogClosers = append(syslogClosers, udpC)
+		}
+		if tcpC != nil {
+			syslogClosers = append(syslogClosers, tcpC)
 		}
 		log.Printf("syslog listener on %s (UDP+TCP)", *syslogAddr)
 	}
@@ -102,10 +382,33 @@ func main() {
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second, // slowloris protection
+		ReadTimeout:       5 * time.Minute,  // a large ingest body may legitimately take a while
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+		TLSConfig:         tc,
+		// No WriteTimeout on purpose: it is absolute, not idle-based, and
+		// would cut the live tail off mid-stream. Per-route deadlines belong
+		// with the query executor (plan task 6.1), which can tell a tail from
+		// a query.
 	}
 	go func() {
-		log.Printf("simdlogs on %s, storage %s, simd tier %s", *addr, *dir, simd.Tier())
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		scheme := "http"
+		if tc != nil {
+			scheme = "https"
+			if tc.ClientAuth == tls.RequireAndVerifyClientCert {
+				scheme = "https+mtls"
+			}
+		}
+		log.Printf("simdlogs %s on %s, storage %s, simd tier %s", scheme, *addr, *dir, simd.Tier())
+		var err error
+		if tc != nil {
+			// The certificate is already in TLSConfig; empty paths here tell
+			// ListenAndServeTLS to use it rather than re-reading the files.
+			err = httpSrv.ListenAndServeTLS("", "")
+		} else {
+			err = httpSrv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			log.Fatal(err)
 		}
 	}()
@@ -116,10 +419,30 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 	log.Print("shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+
+	// Order matters, and each step has a reason.
+	//
+	// 1. Stop the native listeners first. They are not part of the HTTP
+	//    server, so Shutdown does not touch them: leaving them open fed rows
+	//    into writers that were already being flushed.
+	for _, c := range syslogClosers {
+		if err := c.Close(); err != nil {
+			log.Printf("syslog listener close: %v", err)
+		}
+	}
+	// 2. Drain HTTP. Shutdown stops accepting and waits for in-flight
+	//    requests. Its error was discarded before, so a deadline expiring with
+	//    requests still running looked identical to a clean drain.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	httpSrv.Shutdown(ctx)
+	if err := httpSrv.Shutdown(ctx); err != nil {
+		log.Printf("http shutdown did not drain cleanly (requests may have been cut): %v", err)
+	}
+	// 3. Close the server: stops background loops and waits for them, flushes
+	//    every tenant writer, then releases the stores. Only now is it safe to
+	//    unmap -- steps 1 and 2 guarantee nothing is still reading.
 	if err := srv.Close(); err != nil {
 		log.Printf("close: %v", err)
 	}
+	log.Print("stopped")
 }

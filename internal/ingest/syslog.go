@@ -11,12 +11,13 @@ import (
 // named severity; the structured header fields (hostname, app, procid, msgid)
 // become fields and the free text becomes _msg. A line that is not syslog at
 // all is stored whole as _msg so nothing is dropped.
-func IngestSyslog(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestSyslog(w *Writer, data []byte, fallback func() int64) (Result, error) {
 	return IngestSyslogOpts(w, data, fallback, nil)
 }
 
 // IngestSyslogOpts is IngestSyslog with the request's field mappings applied.
-func IngestSyslogOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestSyslogOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	fields := map[string]string{}
 	for len(data) > 0 {
@@ -33,25 +34,77 @@ func IngestSyslogOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 		for k := range fields {
 			delete(fields, k)
 		}
-		ts, ok := parseSyslogInto(string(line), fields)
+		ordinal := res.Accepted + res.Rejected
+		ts, ok, tsErr := parseSyslogInto(string(line), fields)
+		if tsErr != nil {
+			// See ErrTimeOutOfRange. Refused and COUNTED, like every other
+			// protocol in this package -- see parseSyslogInto for what this
+			// replaced.
+			res.Reject(ordinal)
+			res.WarnAt(ordinal, "%v", tsErr)
+			continue
+		}
 		if !ok {
 			ts = fallback()
 		}
 		if mapped {
 			opts.apply(fields)
 		}
-		addWithStream(w, ts, fields, opts)
-		ingested++
+		addOrReject(w, ts, fields, opts, &res, ordinal)
 	}
-	return ingested, skipped
+	return res, nil
+}
+
+// IngestSyslogMessage ingests ONE syslog message, newlines included.
+//
+// The line-splitting entry point above is right for UDP (one datagram, one
+// message) and for newline-framed TCP. It is WRONG for an RFC 6587
+// octet-counted frame, which is the framing that exists precisely so a message
+// CAN contain newlines: a forwarded multi-line stack trace arrives as one
+// counted frame, and splitting it again turns line two onward into records
+// that parse as nothing.
+func IngestSyslogMessage(w *Writer, msg []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
+	if len(trimSpace(msg)) == 0 {
+		return res, nil
+	}
+	fields := map[string]string{}
+	ts, ok, tsErr := parseSyslogInto(string(msg), fields)
+	if tsErr != nil {
+		res.Reject(0)
+		res.WarnAt(0, "%v", tsErr)
+		return res, nil
+	}
+	if !ok {
+		ts = fallback()
+	}
+	if !opts.Empty() {
+		opts.apply(fields)
+	}
+	addOrReject(w, ts, fields, opts, &res, res.Accepted+res.Rejected)
+	return res, nil
 }
 
 var severityName = [8]string{"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"}
 
 // parseSyslogInto fills fields from one syslog line and returns its timestamp.
-// ok is false when no timestamp could be read (the caller substitutes one);
-// fields are populated regardless.
-func parseSyslogInto(line string, fields map[string]string) (int64, bool) {
+//
+// THREE OUTCOMES, the same three parseTime has. ok is false with a nil error
+// when no timestamp could be read at all (the caller substitutes one, which is
+// RFC 5424 relay behaviour for a missing or unparseable stamp); a non-nil error
+// is a stamp that PARSED and cannot be stored, and the caller REFUSES the
+// record and counts it.
+//
+// The third outcome used to be folded into the second, justified as "the
+// datagram has no client to report a per-record rejection to". That is true of
+// the UDP listener and FALSE of `/insert/syslog`, which is an HTTP request with
+// a client on the other end -- and it was the wrong trade even on the datagram,
+// because stamping a year-9999 line with the receiver's clock files it under an
+// instant nobody sent, which is the fabrication ErrTimeOutOfRange exists to
+// stop. Both transports count the rejection now: the HTTP route reports it in
+// the response, and the listener adds it to the same rejected counter every
+// other malformed frame lands in.
+func parseSyslogInto(line string, fields map[string]string) (int64, bool, error) {
 	rest := line
 	// PRI: <N> at the very start. N = facility*8 + severity.
 	if strings.HasPrefix(rest, "<") {
@@ -73,7 +126,7 @@ func parseSyslogInto(line string, fields map[string]string) (int64, bool) {
 // parse5424 handles `TIMESTAMP HOST APP PROCID MSGID [SD] MSG`; a "-" means the
 // field is absent. Structured data (the [...] section) is passed through as one
 // field rather than fully unpacked.
-func parse5424(rest string, fields map[string]string) (int64, bool) {
+func parse5424(rest string, fields map[string]string) (int64, bool, error) {
 	f := splitN(rest, 6) // ts, host, app, procid, msgid, tail(sd+msg)
 	setIf := func(k, v string) {
 		if v != "" && v != "-" {
@@ -82,8 +135,16 @@ func parse5424(rest string, fields map[string]string) (int64, bool) {
 	}
 	var ts int64
 	haveTS := false
+	var tsErr error
 	if len(f) > 0 {
-		if t, ok := parseTime(f[0]); ok {
+		// An out-of-range timestamp is REFUSED, not stamped `now`. See
+		// parseSyslogInto. The fields are still filled in below so the caller
+		// has the record to name in its warning.
+		t, ok, err := parseTime(f[0])
+		switch {
+		case err != nil:
+			tsErr = err
+		case ok:
 			ts, haveTS = t, true
 		}
 	}
@@ -114,13 +175,16 @@ func parse5424(rest string, fields map[string]string) (int64, bool) {
 		}
 		fields["_msg"] = tail
 	}
-	return ts, haveTS
+	return ts, haveTS, tsErr
 }
 
 // parse3164 handles the BSD form `Mon _2 15:04:05 HOST TAG: MSG`. The yearless
 // timestamp is completed with the current year; if it will not parse, ok is
 // false and the caller supplies a timestamp.
-func parse3164(rest string, fields map[string]string) (int64, bool) {
+// parse3164's own conversion cannot go out of range: `time.Stamp` is yearless
+// and AddDate shifts it to the CURRENT year, so the result is always within a
+// year of now. It returns a nil error to keep one signature across both forms.
+func parse3164(rest string, fields map[string]string) (int64, bool, error) {
 	ts, haveTS := int64(0), false
 	if len(rest) >= 15 {
 		stamp := rest[:15]
@@ -142,7 +206,7 @@ func parse3164(rest string, fields map[string]string) (int64, bool) {
 		}
 		fields["_msg"] = tail
 	}
-	return ts, haveTS
+	return ts, haveTS, nil
 }
 
 // splitN splits on runs of spaces into at most n fields, the last holding the

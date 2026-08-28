@@ -62,7 +62,9 @@ func TestParseLogsQLFilter(t *testing.T) {
 		}
 	}
 	// Malformed input errors rather than silently matching.
-	for _, bad := range []string{`level:`, `(level:=error`, `latency:>abc`} {
+	for _, bad := range []string{
+		`level:`, `(level:=error`, `latency:>abc`, `_stream:{service=~"("}`,
+	} {
 		if _, err := ParseLogsQL(bad); err == nil {
 			t.Fatalf("%q: expected a parse error", bad)
 		}

@@ -9,6 +9,7 @@ import (
 // TestQuantileBounded checks the thinning that bounds a quantile's sample
 // buffer still yields an accurate quantile.
 func TestQuantileBounded(t *testing.T) {
+	t.Parallel()
 	const n = 500000
 	full := make([]float64, n)
 	for i := range full {

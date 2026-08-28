@@ -37,19 +37,19 @@ What it is not (current, unambiguously):
   ingest exists.
 - **Not a consensus system.** The cluster layer has no leader election, no
   automatic membership, no cross-node transactions, no consensus protocol.
-  Shards and replicas are configured statically. The router surface is
-  **experimental, not production-safe**: the `streams`, `stream_ids`, plain
-  `stats_query`, and `hits` merges are stale and answer bogus/empty results,
-  and `facets`, `tail`, `/alerts` and other endpoints are router-local —
-  representative, not complete (see [`lld/cluster.md`](lld/cluster.md)).
+  Shards and replicas are configured statically. Every route is classified
+  federated / router-local / refused, and the classification is checked
+  against the mux, so an endpoint's status is derived rather than remembered
+  (see [`lld/cluster.md`](lld/cluster.md)). The stale merges this paragraph
+  used to list are fixed; what remains outstanding is in
+  [`release-readiness.md`](release-readiness.md).
 - **Not released.** There is no tag and no stable-version promise; the storage
   format and HTTP surface may change. Pin a commit to deploy.
 - **Not full Elasticsearch.** `/_search` and `/_count` cover a log-relevant
-  DSL subset: `bool` (`must`/`filter`), `term`, and timestamp `range`.
-  `exists` is accepted on the wire but changes no answer (decoded, never
-  mapped to a predicate — `docs/wrong.md` entry 37); `terms`, `_msearch`,
-  the complete Query DSL, and ES aggregation-response compatibility are out
-  of scope.
+  DSL subset: `bool` (`must`/`filter`/`must_not`/`should`), `term`, `terms`,
+  `match`, `prefix`, `exists`, `match_all`, and timestamp `range`. `_msearch`,
+  non-time ranges, the complete Query DSL, scoring, analyzed-text semantics,
+  and ES aggregation-response compatibility are out of scope.
 
 ## Components
 
@@ -108,13 +108,11 @@ committed assembly; every kernel has a portable fallback) and
 6. In router mode, queries fan out to one live replica per shard and the
    router merges — where a merge exists. Only `/select/logsql/query` (sort by
    `_time` descending, apply `limit`), `stats_query_range`, `field_names`,
-   `field_values`, `stream_field_names`, `stream_field_values`, `/_search`
-   and `/_count` merge correctly today. The `streams`, `stream_ids`, plain
-   `stats_query`, and `hits` merges decode stale envelopes and answer
-   empty/bogus results, and `facets`, `tail`, `/alerts` and other endpoints
-   are router-local, not federated. The enumeration here is representative,
-   not complete — the per-endpoint status is in
-   [`lld/cluster.md`](lld/cluster.md); the cluster surface is
+   `field_values`, `stream_field_names`, `stream_field_values`, `/_search`,
+   `/_count`, `facets` and `/select/sql` all merge. `tail` and `/select/vector`
+   answer 501 on a router rather than pretending. The per-endpoint status is
+   the table in [`lld/cluster.md`](lld/cluster.md), which is checked against
+   the mux by a test; the cluster surface is
    experimental, not production-safe.
 
 ### Ops loops
@@ -123,11 +121,46 @@ committed assembly; every kernel has a portable fallback) and
   age; per-stream retention drops by `_stream` label set. Files unlink only
   after leaving the index.
 - `-recompact-after` (hourly): re-encode old groups' dictionaries with flate
-  (or also drop postings with `-recompact-drop-postings`); replaced mmaps are
-  retired for 5 minutes before unmapping.
-- `/admin/backup`: tar of the current group files — a consistent snapshot
-  because groups are immutable; `storage.RestoreTar` unpacks it, entry names
-  flattened so an archive cannot escape the directory.
+  (or also drop postings with `-recompact-drop-postings`). A replaced mapping
+  is retired and unmapped when its last reader releases it -- reference
+  counting, not a five-minute timer, which is what this line described until
+  `recompact.go` replaced it.
+- `-compact-min-groups` (0, off): merge runs of small adjacent groups into
+  fewer larger ones. The other axis from recompaction -- group COUNT rather
+  than group size -- because every query walks the group list before it reads
+  a column. `-compact-after` keeps a pass off the range ingest is still
+  appending to, and `-compact-max-outputs` / `-compact-max-input-bytes` /
+  `-compact-max-group-bytes` bound its I/O, per tenant.
+- `/admin/backup`: a self-describing tar — `BACKUP-MANIFEST` first, the group
+  files, `BACKUP-COMPLETE` last — taken from a leased snapshot so a group
+  retention removes mid-stream is still in it. Admin-only, one at a time per
+  tenant, and the tenant is flushed before the snapshot -- with a ten-second
+  bound, and skipped entirely when another backup's pre-flush is already
+  parked on a stalled writer. Both exceptions exist so a stalled writer cannot
+  turn "take a backup" into "wait forever"; the consequence is an archive that
+  stops at the last durable group rather than the last acknowledged row.
+  `storage.Restore`, behind the `simdlogs restore` command, unpacks it,
+  validating each group against the manifest's size, checksum and a full parse,
+  with entry names flattened so an archive cannot escape the directory. It
+  stages into a sibling and moves the result into place with one rename while
+  holding a lock on the destination and arranging for the lock file the rename
+  installs to be one it already holds, so the destination is the whole store or
+  holds no groups at all -- a failed restore into a path that did not exist
+  leaves an empty directory carrying a lock nobody holds, which the next
+  restore accepts. A server that opens the directory in the one gap that
+  exists --
+  between the rename that takes the old store away and the one that puts the
+  new store in place -- has to create it,
+  which makes the second rename fail with `EEXIST` and the restore abort
+  without touching that server's store. That is one of two orderings: Go's
+  `os.Rename` `Lstat`s first and returns `EEXIST` for an existing directory,
+  and a directory created between that `Lstat` and the raw `rename(2)` is
+  empty, so the rename replaces it -- safe too, because the server then flocks
+  the staging lock this call still holds and gets `ErrLocked`.
+  `storage.RestoreTar` is the older unstaged path and leaves a partial
+  destination on failure. Immutability is why a group's BYTES are stable,
+  not why the archive is complete: the previous version copied paths out and
+  silently skipped any that had gone. See `docs/lld/storage.md`.
 
 ## Read order
 

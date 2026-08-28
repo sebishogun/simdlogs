@@ -7,14 +7,19 @@ import "strings"
 // emit. Keys without a value become an empty field; a bare word becomes a
 // present-but-empty field. Timestamp comes from _time/@timestamp or the
 // fallback. Malformed nothing here -- every line yields a record.
-func IngestLogfmt(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestLogfmt(w *Writer, data []byte, fallback func() int64) (Result, error) {
 	return IngestLogfmtOpts(w, data, fallback, nil)
 }
 
 // IngestLogfmtOpts is IngestLogfmt with the request's field mappings applied.
-func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	fields := map[string]string{}
+	// ordinal counts RECORDS, not lines: a blank line is not a record a client
+	// sent, so counting it would shift every later position by one and a caller
+	// mapping a rejection back onto its own batch would name the wrong record.
+	ordinal := 0
 	for len(data) > 0 {
 		nl := indexByte(data, '\n')
 		var line []byte
@@ -31,9 +36,15 @@ func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 		}
 		var ts int64
 		haveTS := false
+		var tsErr error
 		parseLogfmtLine(line, func(k, v string) {
 			if isTimeKey(k) {
-				if t, ok := parseTime(v); ok {
+				t, ok, terr := parseTime(v)
+				if terr != nil {
+					tsErr = terr
+					return
+				}
+				if ok {
 					// Stored once, in the timestamp column -- see jsonline.
 					ts, haveTS = t, true
 					return
@@ -41,8 +52,17 @@ func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 			}
 			fields[k] = v
 		})
+		if tsErr != nil {
+			// A timestamp that parses and cannot be stored refuses the record
+			// and is counted -- see ErrTimeOutOfRange.
+			res.Reject(ordinal)
+			res.WarnAt(ordinal, "%v", tsErr)
+			ordinal++
+			continue
+		}
 		if len(fields) == 0 {
-			skipped++
+			res.Reject(ordinal)
+			ordinal++
 			continue
 		}
 		if !haveTS {
@@ -51,10 +71,10 @@ func IngestLogfmtOpts(w *Writer, data []byte, fallback func() int64, opts *Optio
 		if mapped {
 			opts.apply(fields)
 		}
-		addWithStream(w, ts, fields, opts)
-		ingested++
+		addOrReject(w, ts, fields, opts, &res, ordinal)
+		ordinal++
 	}
-	return ingested, skipped
+	return res, nil
 }
 
 // parseLogfmtLine tokenizes one logfmt line, calling emit per key/value.

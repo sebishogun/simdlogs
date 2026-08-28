@@ -1,0 +1,545 @@
+package api
+
+import (
+	"bytes"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+)
+
+// The client a router uses to talk to storage nodes.
+//
+// # Why not http.DefaultClient
+//
+// Every peer call used it. It has no timeout at all: a peer that accepts the
+// connection and then never answers holds the router's goroutine, its share of
+// the client's connection pool, and the caller's request, for as long as the
+// caller waits -- and a router fanning out to N shards multiplies that by N.
+// Its transport is shared process-wide, so peer traffic and any other outbound
+// HTTP compete for the same pool. And it cannot be given a client certificate,
+// so mTLS between nodes was not expressible.
+//
+// # Why the body is bounded
+//
+// `io.ReadAll(resp.Body)` on a peer response is an unbounded allocation driven
+// by another machine. A peer that is compromised, misconfigured or simply
+// running a version whose response shape exploded takes the router down with
+// it -- and the router is the node the whole cluster's reads go through.
+
+// clusterClient is a configured HTTP client for peer traffic.
+type clusterClient struct {
+	http *http.Client
+	// maxBody bounds one peer response. Beyond it the response is discarded
+	// as malformed rather than truncated: a truncated JSON document is not a
+	// smaller answer, it is an unparseable one, and a truncated NDJSON stream
+	// is a partial answer indistinguishable from a complete one.
+	maxBody int64
+	// spoolDir is where spool creates its temp files. Empty means the process
+	// temp dir (os.TempDir), which is the fallback for a bare client; a server
+	// sets it to its own data directory, because os.TempDir is often tmpfs --
+	// memory-backed, which is exactly where a gigabyte repair transfer must
+	// not land.
+	spoolDir string
+}
+
+// Peer client defaults.
+//
+// The dial and header timeouts are short because a peer is on the same
+// network as the router; the overall timeout is not set on the client at all
+// -- the caller's request context carries the deadline, and a client timeout
+// on top of it would cut a legitimately slow query that the caller was still
+// waiting for.
+const (
+	peerDialTimeout          = 2 * time.Second
+	peerTLSHandshakeTimeout  = 3 * time.Second
+	peerResponseHeaderTimeut = 10 * time.Second
+	peerIdleConns            = 64
+	peerIdleConnsPerHost     = 8
+	peerIdleConnTimeout      = 90 * time.Second
+	peerMaxBodyBytes         = 256 << 20
+)
+
+// newClusterClient builds the peer client. tlsCfg is nil for plaintext peer
+// traffic; when set it carries the client certificate for mTLS.
+// preHandlerStatus reports whether a status is one a peer's HTTP SERVER emits
+// on its own, before any handler runs -- so before the protocol-version header
+// and the error class are set.
+//
+// The version check runs first, deliberately: a peer on an unknown version may
+// have produced a body that parses and means something else. That reasoning is
+// about a body a HANDLER produced. These statuses come with no handler and no
+// body worth mistrusting, and reading their missing version header as a version
+// mismatch pointed an operator at the wrong fault entirely -- a 1.2 MB query
+// against a ONE-NODE cluster reported "version_mismatch", and upgrading nodes,
+// the action that message asks for, does nothing.
+//
+// 431 and 413 are net/http's own (MaxHeaderBytes, MaxBytesReader); 400, 414 and
+// 505 it emits on a request it cannot parse; 502/503/504 come from a proxy
+// between the two nodes, which is likewise not a version statement.
+func preHandlerStatus(code int) bool {
+	switch code {
+	case http.StatusRequestHeaderFieldsTooLarge, http.StatusRequestEntityTooLarge,
+		http.StatusBadRequest, http.StatusRequestURITooLong,
+		http.StatusHTTPVersionNotSupported,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+func newClusterClient(tlsCfg *tls.Config) *clusterClient {
+	return &clusterClient{
+		http: &http.Client{
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   peerDialTimeout,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSClientConfig:       tlsCfg,
+				TLSHandshakeTimeout:   peerTLSHandshakeTimeout,
+				ResponseHeaderTimeout: peerResponseHeaderTimeut,
+				MaxIdleConns:          peerIdleConns,
+				MaxIdleConnsPerHost:   peerIdleConnsPerHost,
+				IdleConnTimeout:       peerIdleConnTimeout,
+				// Peer bodies are already compressed where it matters and the
+				// router re-reads every one; transparent gzip would decompress
+				// into an unbounded buffer BEFORE maxBody could see it.
+				DisableCompression: true,
+			},
+			// No client timeout: the caller's context carries the deadline.
+			// A second one here would cut a query the caller was still
+			// waiting for, and the caller is the one who knows how long it is
+			// prepared to wait.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				// A peer does not redirect. Following one would send the
+				// router's credential to whatever host the response named.
+				return http.ErrUseLastResponse
+			},
+		},
+		maxBody: peerMaxBodyBytes,
+	}
+}
+
+// forwardedHeaders are copied from the client's request to the peer's,
+// explicitly.
+//
+// Explicitly, because the alternative -- copying the whole header set --
+// forwards the client's Authorization to every storage node, along with its
+// cookies and any header a proxy added. The router authenticates to peers as
+// ITSELF; a client credential travelling further than the node it was
+// presented to is how one node's compromise becomes the cluster's.
+var forwardedHeaders = []string{
+	// The RESOLVED tenant, stamped by this router's own resolver. A storage
+	// node normally has no -auth.config of its own, so this is the only place
+	// a read's tenant is decided.
+	"AccountID", "ProjectID",
+	// Tracing, so one request is one trace across nodes.
+	"X-Request-Id", "Traceparent", "Tracestate",
+}
+
+// peerStatusClass maps a peer's HTTP status to a class, reading a bounded
+// diagnostic prefix of a refused request's body.
+//
+// Shared by doReader and spool so a peer's refusal reads the same on every
+// path: 401/403 is the router's credential, 429/503 is load, 5xx is a peer
+// that did not answer, and every other 4xx is a refused request whose body
+// says why. Without the body, a source answering 404 for a group it no longer
+// holds (or whose bytes changed underneath it) reads as a bare "HTTP 404",
+// and the operator is sent to the source to learn what it already said.
+//
+// The protocol version is checked by the callers, before this runs; a 2xx
+// returns PeerOK with no error and the caller reads the body itself.
+func peerStatusClass(h http.Header, status int, body io.Reader) (PeerErrorClass, error) {
+	if raw := h.Get(HdrErrorClass); raw != "" {
+		cls := PeerErrorClass(raw)
+		if !knownPeerClass(cls) {
+			// NOT REPEATED. This value is rendered into this node's own
+			// client-facing 503 body, so taking it verbatim let a peer write
+			// text into an error message this node signs.
+			return PeerMalformed, fmt.Errorf("peer sent an unrecognised %s header (HTTP %d)",
+				HdrErrorClass, status)
+		}
+		if cls != PeerOK {
+			return cls, fmt.Errorf("peer reported %s (HTTP %d)", cls, status)
+		}
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return PeerUnauthorized, fmt.Errorf("peer refused this router's credential (HTTP %d)", status)
+	case status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable:
+		return PeerOverloaded, fmt.Errorf("peer refused for load (HTTP %d)", status)
+	case status >= 500:
+		return PeerUnavailable, fmt.Errorf("peer returned HTTP %d", status)
+	case status >= 400:
+		// Every remaining 4xx. This used to fall through as success, so the
+		// peer's error body became part of the merged answer -- and an
+		// operation the peer REFUSED was reported as having happened. A bounded
+		// prefix of the body comes along because a 4xx from a peer is a bug in
+		// what this router sent, and the peer already said what was wrong.
+		msg, _ := io.ReadAll(io.LimitReader(body, 512))
+		return PeerRejected, fmt.Errorf("peer refused the request (HTTP %d): %s",
+			status, bytes.TrimSpace(msg))
+	}
+	return PeerOK, nil
+}
+
+// do performs one peer request whose body is the caller's OWN bytes, and
+// returns the parsed envelope.
+//
+// The request logic lives in doReader, which takes any io.Reader: a repaired
+// group is spooled to a file and streamed from it, and routing that through a
+// []byte here would put a gigabyte on this router's heap.
+func (c *clusterClient) do(
+	r *http.Request, shard, replica int, url, method, path string, body []byte, ct string,
+) PeerResponse {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	return c.doReader(r, shard, replica, url, method, path, rdr, ct)
+}
+
+// doReader performs one peer request and returns the parsed envelope.
+//
+// It never returns a nil PeerResponse: every failure is a response with a
+// class, because the caller's job is to decide what to do about it and "error
+// was nil-checked away" is how a failed peer became a silently missing shard.
+func (c *clusterClient) doReader(
+	r *http.Request, shard, replica int, url, method, path string, body io.Reader, ct string,
+) PeerResponse {
+	out := PeerResponse{Shard: shard, Replica: replica, URL: url}
+
+	target := url + path
+	// The query string travels with EVERY method, not only GET.
+	//
+	// It used to be GET-only, which is fine for the read fan-out and wrong for
+	// anything that addresses a resource in the query and sends it in the body:
+	// the anti-entropy adopt is a POST whose ?digest= names what the body must
+	// hash to, and dropping it meant the destination refused every copy -- while
+	// the router reported them as copied, because a peer 4xx was success.
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, target, body)
+	if err != nil {
+		out.Class, out.Err = PeerMalformed, err
+		return out
+	}
+	if body != nil {
+		if ct == "" {
+			ct = "application/json"
+		}
+		req.Header.Set("Content-Type", ct)
+	}
+	for _, h := range forwardedHeaders {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+	// Marked internal, so the peer answers with the envelope rather than the
+	// plain public response.
+	req.Header.Set(HdrInternal, "1")
+	req.Header.Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+	out.TraceID = r.Header.Get("X-Request-Id")
+	if out.TraceID != "" {
+		req.Header.Set(HdrTraceID, out.TraceID)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		// Every transport failure -- refused, timed out, TLS rejected, DNS --
+		// is "this peer did not answer". They are one class because the
+		// router's response to all of them is the same: try another replica.
+		out.Class, out.Err = PeerUnavailable, err
+		return out
+	}
+	defer resp.Body.Close()
+	out.Status = resp.StatusCode
+
+	// The version FIRST, before anything in the body is trusted. A peer on an
+	// unknown version may have produced a body that parses and means something
+	// else, which is worse than one that does not parse.
+	if resp.Header.Get(HdrProtocolVersion) == "" && preHandlerStatus(resp.StatusCode) {
+		// Not a version statement: nothing on the peer that knows the version
+		// ran. Reported as unavailable, which is the class that retries another
+		// replica.
+		//
+		// For a 502/503/504 from a proxy in between, that retry IS the remedy.
+		// For the 431 or 413 that motivated this it is not: the refusal is
+		// deterministic and every replica answers the same way. What the class
+		// buys there is an accurate NAME -- the operator is no longer sent to
+		// compare node versions on a cluster running one build -- and the retry
+		// count is unchanged either way, because retryAnotherReplica() is
+		// already true for PeerVersionMismatch too.
+		out.Class = PeerUnavailable
+		out.Err = fmt.Errorf("peer's HTTP server refused the request before any "+
+			"handler ran (HTTP %d), so it sent no protocol version; this is not a "+
+			"version mismatch", resp.StatusCode)
+		return out
+	}
+	switch v := resp.Header.Get(HdrProtocolVersion); v {
+	case "":
+		// No version header at all: either a node from before this protocol
+		// existed, or something that is not a simdlogs node. Both are
+		// unusable and neither should be merged.
+		out.Class = PeerVersionMismatch
+		out.Err = errors.New("peer sent no protocol version")
+		return out
+	default:
+		n, err := strconv.Atoi(v)
+		if err != nil || n != ProtocolVersion {
+			out.Class = PeerVersionMismatch
+			out.Err = fmt.Errorf("peer speaks protocol %q, this node speaks %d",
+				v, ProtocolVersion)
+			return out
+		}
+		out.Version = n
+	}
+
+	// READ BEFORE THE ERROR RETURN. A router that refuses answers 503, so the
+	// class check below returns immediately -- and the reason it refused for is
+	// on that same response. Reading it afterwards meant it was never read at
+	// all on the path where it matters most.
+	if v := resp.Header.Get(HdrShardsLagging); v != "" {
+		out.BehindSibling = true
+	}
+	if v := resp.Header.Get(HdrIncompleteReason); v != "" && knownIncompleteReason(v) {
+		out.IncompleteReason = v
+	}
+	if cls, cerr := peerStatusClass(resp.Header, resp.StatusCode, resp.Body); cerr != nil {
+		out.Class, out.Err = cls, cerr
+		return out
+	}
+
+	// Bounded. One extra byte is read so a body exactly at the limit is
+	// distinguishable from one that was cut.
+	lr := &io.LimitedReader{R: resp.Body, N: c.maxBody + 1}
+	b, err := io.ReadAll(lr)
+	if err != nil {
+		out.Class, out.Err = PeerUnavailable, err
+		return out
+	}
+	if int64(len(b)) > c.maxBody {
+		// Discarded, not truncated: a truncated JSON document is unparseable
+		// and a truncated NDJSON stream is a partial answer that looks
+		// complete.
+		out.Class = PeerMalformed
+		out.Err = fmt.Errorf("peer response exceeds %d bytes", c.maxBody)
+		return out
+	}
+	out.Body = b
+
+	// Completeness and the watermark. A missing Complete header is NOT read as
+	// complete: absent means the peer did not say, and a router that assumed
+	// yes would report a partial answer as whole -- which is the failure the
+	// envelope exists to prevent.
+	out.Complete = resp.Header.Get(HdrComplete) == "true"
+	out.Generation = resp.Header.Get(HdrNodeGeneration)
+	if hw := resp.Header.Get(HdrHighWatermark); hw != "" {
+		// The error is NOT discarded.
+		//
+		// strconv.ParseInt returns MaxInt64 on ErrRange, so `out.HighWatermark,
+		// _ = ...` recorded 9223372036854775807 for a malformed header -- above
+		// every real nanosecond timestamp. checkWatermark then treated every
+		// later answer from that shard as lagging and refused it, for the life
+		// of the process: one bad header, 503 forever.
+		//
+		// A peer whose envelope this node cannot read is PeerMalformed, which is
+		// what a body it cannot read already is. That refuses this one answer
+		// and poisons nothing.
+		n, err := strconv.ParseInt(hw, 10, 64)
+		if err != nil || n < 0 {
+			out.Class = PeerMalformed
+			out.Err = fmt.Errorf("peer sent an unreadable %s header %q: %w",
+				HdrHighWatermark, hw, err)
+			return out
+		}
+		out.HighWatermark = n
+		out.HasWatermark = true
+	}
+	if id := resp.Header.Get(HdrTraceID); id != "" {
+		out.TraceID = id
+	}
+	return out
+}
+
+// spool fetches a peer response to a TEMPORARY FILE and returns it, its size,
+// and a cleanup.
+//
+// # Why a file and not a buffer
+//
+// `do` reads a peer's whole response into memory under a 256 MiB ceiling, and
+// discards anything larger as malformed. That is right for a query answer,
+// whose size a router controls through limits it set.
+//
+// It is wrong for a shard's BACKUP. A backup is as large as the shard, and a
+// shard is as large as the operator's data -- so every real deployment exceeds
+// the ceiling, and the cluster backup could not capture a single shard. With
+// the abandon path finishing the tar, the operator received a well-formed
+// archive containing only the manifest; with it aborting, they receive nothing.
+// Neither is a backup.
+//
+// It is wrong for a REPAIRED GROUP for the same reason in miniature: a group
+// may be a gigabyte, and a router that read it whole would hold it whole.
+//
+// A temp file bounds the memory at one copy buffer regardless of what crosses
+// the wire, and gives the SIZE the tar header needs before the body is written
+// -- which is the reason the buffered version existed at all: a tar entry
+// declares its length up front, and a streamed body of unknown length cannot
+// fill it in.
+//
+// # Bounded, addressed, and placed
+//
+// query is appended to the path when non-empty, which is how a caller names
+// one group (`?digest=`). maxBytes bounds the response; 0 is unbounded. The
+// backup is unbounded -- a shard archive is as large as the shard -- while
+// repair bounds one group at maxRepairBytes, so a group past the ceiling is
+// refused here the same way `do` refuses a response past maxBody, and the
+// caller's budget is charged nothing for it.
+//
+// The temp file is created in c.spoolDir when set -- a server sets it to its
+// data directory -- and the process temp dir otherwise. Refusals are
+// classified by the same peerStatusClass doReader uses, so a 404 carries the
+// source's own words about why.
+func (c *clusterClient) spool(
+	r *http.Request, shard, replica int, url, path, query string, maxBytes int64,
+) (f *os.File, size int64, resp PeerResponse, cleanup func()) {
+	cleanup = func() {}
+	out := PeerResponse{Shard: shard, Replica: replica, URL: url}
+
+	target := url + path
+	if query != "" {
+		target += "?" + query
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+	if err != nil {
+		out.Class, out.Err = PeerMalformed, err
+		return nil, 0, out, cleanup
+	}
+	for _, h := range forwardedHeaders {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+	req.Header.Set(HdrInternal, "1")
+	req.Header.Set(HdrProtocolVersion, strconv.Itoa(ProtocolVersion))
+	out.TraceID = r.Header.Get("X-Request-Id")
+	if out.TraceID != "" {
+		req.Header.Set(HdrTraceID, out.TraceID)
+	}
+
+	hr, err := c.http.Do(req)
+	if err != nil {
+		out.Class, out.Err = PeerUnavailable, err
+		return nil, 0, out, cleanup
+	}
+	defer hr.Body.Close()
+	out.Status = hr.StatusCode
+
+	if hr.Header.Get(HdrProtocolVersion) == "" && preHandlerStatus(hr.StatusCode) {
+		out.Class = PeerUnavailable
+		out.Err = fmt.Errorf("peer's HTTP server refused the request before any "+
+			"handler ran (HTTP %d), so it sent no protocol version; this is not a "+
+			"version mismatch", hr.StatusCode)
+		return nil, 0, out, cleanup
+	}
+	if v := hr.Header.Get(HdrProtocolVersion); v == "" {
+		out.Class = PeerVersionMismatch
+		out.Err = errors.New("peer sent no protocol version")
+		return nil, 0, out, cleanup
+	} else if n, cerr := strconv.Atoi(v); cerr != nil || n != ProtocolVersion {
+		out.Class = PeerVersionMismatch
+		out.Err = fmt.Errorf("peer speaks protocol %q, this node speaks %d", v, ProtocolVersion)
+		return nil, 0, out, cleanup
+	}
+	if cls, cerr := peerStatusClass(hr.Header, hr.StatusCode, hr.Body); cerr != nil {
+		out.Class, out.Err = cls, cerr
+		return nil, 0, out, cleanup
+	}
+
+	// The configured spool directory, or the process temp dir for a bare
+	// client. A server points this at its own data directory: os.TempDir is
+	// often tmpfs, and a gigabyte group must land on disk, not in RAM.
+	var tmp *os.File
+	if c.spoolDir != "" {
+		tmp, err = os.CreateTemp(c.spoolDir, "simdlogs-spool-*")
+	} else {
+		tmp, err = os.CreateTemp("", "simdlogs-spool-*")
+	}
+	if err != nil {
+		out.Class, out.Err = PeerUnavailable, err
+		return nil, 0, out, cleanup
+	}
+	// Unlinked immediately: the file stays readable through the handle and
+	// vanishes when it is closed, so a crash mid-transfer leaves nothing
+	// behind and a caller that forgets the cleanup leaks nothing durable.
+	//
+	// A failure to unlink is FATAL to the spool, not a warning: the file
+	// would otherwise sit NAMED in the spool directory, filling it with one
+	// full-size file per transfer, and only a human would notice. Closing and
+	// retrying once is the limit of what a process can do; the error says
+	// where the file is.
+	if err := os.Remove(tmp.Name()); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		out.Class, out.Err = PeerUnavailable,
+			fmt.Errorf("could not unlink the spool file %s: %w", tmp.Name(), err)
+		return nil, 0, out, func() {}
+	}
+	cleanup = func() { tmp.Close() }
+
+	// Bounded the way do() is: one extra byte past the ceiling is read so a
+	// response exactly at the limit is distinguishable from one that was cut.
+	var rdr io.Reader = hr.Body
+	if maxBytes > 0 {
+		rdr = &io.LimitedReader{R: hr.Body, N: maxBytes + 1}
+	}
+	n, err := io.Copy(tmp, rdr)
+	if err != nil {
+		out.Class, out.Err = PeerUnavailable, err
+		cleanup()
+		return nil, 0, out, func() {}
+	}
+	if maxBytes > 0 && n > maxBytes {
+		// Discarded, not truncated: the receiver hashes what it is given, so
+		// a truncated group would fail there as something it is not.
+		cleanup()
+		out.Class, out.Err = PeerMalformed,
+			fmt.Errorf("peer response exceeds %d bytes", maxBytes)
+		return nil, 0, out, func() {}
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		out.Class, out.Err = PeerUnavailable, err
+		cleanup()
+		return nil, 0, out, func() {}
+	}
+	out.Complete = hr.Header.Get(HdrComplete) == "true"
+	// A CHILD ROUTER'S OWN FINDINGS, forwarded rather than dropped.
+	//
+	// X-Simdlogs-Shards-Lagging was set by a router and parsed by nothing, so a
+	// fan-out where the only problem was lag left `bad` empty one level up, this
+	// node's Complete stayed true, and a parent saw a plain complete 200.
+	// Measured on the internal path: middle router -> status=200 complete=true
+	// lagging=0. "Named in the response so the shortfall is not silent" held
+	// for a direct client of that router and for nobody above it.
+	//
+	// The reason travels with it for the same reason: a child's watermark
+	// refusal reached the parent as a bare Complete: false and was rendered
+	// `N(degraded)`, so the distinction survived exactly one level.
+	if v := hr.Header.Get(HdrShardsLagging); v != "" {
+		out.BehindSibling = true
+	}
+	if v := hr.Header.Get(HdrIncompleteReason); v != "" && knownIncompleteReason(v) {
+		out.IncompleteReason = v
+	}
+	if id := hr.Header.Get(HdrTraceID); id != "" {
+		out.TraceID = id
+	}
+	return tmp, n, out, cleanup
+}

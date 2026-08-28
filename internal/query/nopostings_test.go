@@ -43,6 +43,7 @@ func buildTieredStore(t *testing.T, rows int, noPostings bool) *storage.Store {
 // inverted index is a size/speed trade, never a correctness one. Every query
 // shape must return byte-identical rows from both tiers.
 func TestNoPostingsSameResults(t *testing.T) {
+	t.Parallel()
 	const rows = 5000
 	withP := buildTieredStore(t, rows, false)
 	noP := buildTieredStore(t, rows, true)

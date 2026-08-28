@@ -5,12 +5,16 @@ ingest and LogsQL surfaces used by the repository's compatibility suite, adds
 an Elasticsearch-compatible search subset, and executes filters over columnar
 row groups with [simd.go](https://github.com/sebishogun/simd) kernels.
 
-It is built for selective queries and low-latency aggregations. That choice has
-a measured cost: its inverted indexes use more disk than VictoriaLogs — 110.08
+> **Historical footprint baseline, not a current claim.** The figures in this
+> paragraph come from the stamped tables below and predate LOGS-V1-01's
+> machine/commit provenance gate; they are being re-measured before release.
+
+It is built for selective queries and low-latency aggregations. That choice had
+a measured cost in the historical baseline: its inverted indexes used 110.08
 bytes per row on the realistic corpus, 2.05x VictoriaLogs, or 1.55x with
-cold-tier postings dropped. On a corpus built so every value is distinct the
-ratio reaches ~19x; that is the design's worst case, published with the [scale
-curve](docs/scale-curve.md), not a footprint to plan against.
+cold-tier postings dropped. On a corpus built so every value was distinct the
+ratio reached ~19x; that was the design's worst case, published with the
+[scale curve](docs/scale-curve.md), not a footprint to plan against.
 
 ## Run it
 
@@ -18,11 +22,36 @@ Go 1.26.5 or later is required. The server uses published `simd v1.20.0` and
 `simdjson v0.6.0`; neither dependency requires cgo.
 
 ```sh
-go run ./cmd/simdlogs -storage ./simdlogs-data -addr :9428
+go run ./cmd/simdlogs -storage ./simdlogs-data -addr 127.0.0.1:9428
 ```
 
 The default port matches VictoriaLogs. On startup the server prints the SIMD
 tier selected for the current CPU.
+
+**Binding a public address needs a decision about transport.** The server
+refuses to serve plaintext on anything but loopback, because log data is
+tenant data and a server that binds every interface in the clear should take a
+deliberate flag rather than be what happens when the operator forgets. Pick
+one:
+
+```sh
+# TLS (add -tls.clientCAFile for mTLS)
+go run ./cmd/simdlogs -storage ./simdlogs-data -addr :9428 \
+  -tls.certFile server.pem -tls.keyFile server-key.pem
+
+# behind a terminating proxy: bind loopback, let the proxy hold the certificate
+go run ./cmd/simdlogs -storage ./simdlogs-data -addr 127.0.0.1:9428
+
+# plaintext on a public interface, accepted deliberately
+go run ./cmd/simdlogs -storage ./simdlogs-data -addr :9428 -insecure-http
+```
+
+The same rule applies to `-syslog`: that listener is plaintext by construction
+and unauthenticated, so a public syslog address needs `-insecure-http` too.
+
+**The server is unauthenticated without `-auth.config`,** and says so at
+startup. See [docs/lld/api.md](docs/lld/api.md) for the token file format,
+roles, and the tenant-authorization rules.
 
 Ingest newline-delimited JSON:
 
@@ -85,15 +114,40 @@ materialize only fields needed by their predicates and transforms.
 ### Additional surfaces
 
 - `/_search` and `/_count` support a log-oriented Elasticsearch subset:
-  `bool` with `must`/`filter`, `term`, and timestamp `range`. An `exists`
-  clause is accepted on the wire but currently changes no answer (decoded,
-  not mapped to a predicate — see `docs/wrong.md` entry 37).
+  `bool` with `must`/`filter`/`must_not`/`should` and `minimum_should_match`,
+  `term`, `terms`, `match`, `prefix`, `exists`, and timestamp `range`. `exists`
+  maps to `NOT (field == "")`, which is what it means over a store where an
+  absent column reads as the empty value.
 - `/select/sql` translates a SQL `SELECT` subset into the same LogsQL engine.
 - `/select/vector` performs cosine k-nearest-neighbor search over an embedding
   field supplied by the ingested logs.
 - `/metrics`, `/alerts`, `/admin/backup`, and `/vmui` provide operational
-  endpoints. The backup endpoint streams immutable group files as a tar; the
-  Go storage API restores that tar into a new store.
+  endpoints. The backup endpoint streams immutable group files as a
+  self-describing tar; `simdlogs restore` unpacks one into a new store:
+
+  ```
+  simdlogs restore -src backup.tar -dry-run
+  simdlogs restore -src backup.tar -dst ./simdlogs-data/tenant-0-0
+  ```
+
+  The restore stages into a sibling directory and moves it into place with one
+  rename, holding a lock on the destination until the syscall that takes that
+  directory away, and arranging for the lock file the rename installs to be one
+  it already holds -- so a server starting on that directory either finds it
+  locked, or wins the one race there is and makes the restore abort without
+  touching that server's store. A second RESTORE cannot start while the lock is
+  held; in the gap between the two renames one can, and the outcome is one of
+  three: this call aborts `ENOENT`, or aborts `EEXIST`, or -- with both parked
+  in their own gaps -- returns success over the other's destination. Measured
+  at zero occurrences in 20,000 barrier rounds and in 11.6 million overlapping
+  attempts; every run that did observe it had something outside a restore
+  widening the window. Zero observations bound how often it happens, not
+  whether it can, so: do not run two restores at one `-dst`.
+
+  `-dry-run` checks every group against the
+  archive's own manifest, needs no destination at all, and writes nothing;
+  `-tenant` refuses an archive taken from a different tenant. The destination
+  and its parents are created if absent.
 
 This is not full Elasticsearch compatibility. In particular, `_msearch`, the
 complete Query DSL, and Elasticsearch aggregation response compatibility are
@@ -154,11 +208,24 @@ made for another architecture.
 | hits | 2.3ms | 2.8ms | 1.2x |
 
 Values above 1 mean `simdlogs` is faster; all 20 rows are above 1 in both runs.
-[`internal/bench/perops_test.go`](internal/bench/perops_test.go) fails the build
-if any row falls below 1. On the 3M-row harness ingest ran at 3.17M rec/s here
-and 0.49M rec/s in VictoriaLogs, and the selective window took 7.0 ms versus
-11.1 ms; the window figure was 20.6 ms before the bounded-decode change
-(`5419c80`). Disk on the realistic corpus is 110.08 bytes/row, down from 127.4.
+
+> **Provenance.** These figures were taken under the discipline stated above,
+> but before that discipline was *enforced*. `requireQuiet` now refuses to
+> produce a number above load average 1 and stamps every result with the
+> machine, CPU model, core count, Go version, commit and load it ran under —
+> and this table carries none of that, because it predates the gate. The
+> numbers have not been re-measured since. What is known about them is exactly
+> what the paragraph above says; what is not known is which machine and which
+> commit produced them.
+[`internal/bench/perops_test.go`](internal/bench/perops_test.go) fails the
+per-operation head-to-head run (`SIMDLOGS_OPS=1`) if any row falls below 1.
+The historical 3M-row harness reported 3.17M rec/s here and 0.49M rec/s in
+VictoriaLogs, but that ingest pair predates the corrected accept/queryable
+timing and is withdrawn pending LOGS-V1-01. That run also reported the
+selective window at 7.0 ms versus 11.1 ms; it was 20.6 ms before the
+bounded-decode change (`5419c80`).
+Disk on the 200k-row corpus was 110.08 bytes/row, down from 127.43
+(`docs/wrong.md` entry 33).
 VictoriaLogs still writes fewer bytes per row there; the paragraphs below give
 the magnitude.
 
@@ -191,8 +258,8 @@ entries 32–37:
   decode span to the matched rows (`1a85d8a`, `5419c80`).
 - The point-read threshold was expressed as a fraction of the group when the
   cost is absolute.
-- The Elasticsearch `exists` clause is accepted and changes no answer; it is
-  decoded but not mapped to a predicate.
+- The Elasticsearch `exists` clause was accepted and changed no answer; it was
+  decoded but not mapped to a predicate. It maps to `NOT (field == "")` now.
 
 | category | implemented |
 |---|---|
@@ -214,7 +281,7 @@ bytes over HTTP into disk-backed stores; query order is shuffled.
 
 | | simdlogs | VictoriaLogs | ratio |
 |---|---:|---:|---:|
-| ingest | 2.12 s (0.47M rec/s) | 8.96 s (0.11M rec/s) | 4.2x |
+| ingest | 2.12 s (0.47M rec/s) | 8.96 s (0.11M rec/s) | 4.2x — **withdrawn, see below** |
 | footprint | 0.11 GB (110.08 bytes/row) | 0.05 GB | **2.05x of VL** |
 | groupby | 21 µs | 9.84 ms | 463x |
 | topN | 33 µs | 13.3 ms | 407x |
@@ -223,6 +290,24 @@ bytes over HTTP into disk-backed stores; query order is shuffled.
 | and | 11.9 ms | 58.7 ms | 4.9x |
 | common | 98.6 ms | 171.0 ms | 1.7x |
 | or | 171.7 ms | 273.5 ms | 1.6x |
+
+**The ingest row is withdrawn.** At the commit it was measured on, the harness
+stamped VictoriaLogs' ingest duration *after* a hardcoded
+`time.Sleep(5 * time.Second)` that existed to let VL flush, so the 8.96 s
+contains five seconds VL did not spend. VL's accept was 8.96 − 5.00 = **3.96 s
+(0.25M rec/s)**, an accept ratio of **1.87x**, not 4.2x. The other half — when
+the written rows become *queryable*, which is the number that five seconds was
+standing in for — was never measured, so the true queryable ratio is somewhere
+in [1.87x, 4.2x] and this table cannot say where.
+
+The harness now measures **accept** and **queryable** separately, by polling
+each engine's row count rather than sleeping (`internal/bench/timing_test.go`).
+The ingest row will be replaced when it has been re-measured on a quiet machine;
+until then the number above is history, not a claim. The query rows are
+unaffected — they were timed with `timeQuery`, which never contained the sleep.
+The scale-curve `ingest` column below came from `TestScaleVsVL`, which slept the
+same fixed five seconds inside its timed interval: at 1M rows that dominates, at
+1B rows it is noise.
 | substring | 170.6 ms | 249.1 ms | 1.5x |
 
 Measured at `50d13df` on amd64/AVX-512, two consecutive runs. The footprint
@@ -232,8 +317,9 @@ as sound; the per-operation gate above is the quiet-machine measurement.
 
 Disk is the one axis VictoriaLogs wins, by 2.05x. That gap is the inverted
 index, which is also what produces the 463x groupby and 35x needle in the same
-table. Dropping postings in the cold tier measured 1.55x of VL on the 100k
-corpus, at the cost of a decode-and-scan for those groups — which is what
+table. Dropping postings in the cold tier measured a historical 1.55x of VL on
+the 100k corpus at the stamped build, pending LOGS-V1-01 remeasurement, at the
+cost of a decode-and-scan for those groups — which is what
 VictoriaLogs does for every query. Removing singleton postings entirely cut
 disk and made the needle 90x slower, so that change was reverted.
 
@@ -293,13 +379,18 @@ The cluster layer is application-level sharding and replication, not a
 consensus system. There is no automatic membership, leader election, or
 cross-node transaction protocol.
 
-The router surface is **experimental, not production-safe**: the `streams`,
-`stream_ids`, plain `stats_query`, and `hits` merges decode stale envelopes
-and answer empty/bogus results, and `facets`, `tail`, `/alerts` and other
-endpoints are router-local, not federated. The enumeration here is
-representative, not complete — the full per-endpoint status is in
-[`docs/lld/cluster.md`](docs/lld/cluster.md); do not read an endpoint's
-absence from this list as federation.
+Every route is classified federated / router-local / refused, and the
+classification is checked against the mux by a test — so the per-endpoint
+status in [`docs/lld/cluster.md`](docs/lld/cluster.md) is derived rather than
+remembered. Read it there rather than inferring from prose. The stale merges
+this paragraph used to list are fixed and fixture-tested.
+
+**The cluster is still not released**, and the reasons are specific rather than
+general: the published benchmark table has no machine-checked provenance,
+repair refuses rather than resolves a divergence caused by compaction or
+retention (there is no lineage to tell a missed write from a deliberate
+delete), and no single command restores a cluster archive.
+[`docs/release-readiness.md`](docs/release-readiness.md) is the current list.
 
 ## Verification
 

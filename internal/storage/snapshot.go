@@ -1,6 +1,9 @@
 package storage
 
-import "errors"
+import (
+	"errors"
+	"sync/atomic"
+)
 
 // ErrStoreClosed is returned by Snapshot once the store is closing. A caller
 // that gets it has no groups to read and should answer as it would for an
@@ -29,17 +32,27 @@ type Snapshot struct {
 	// store's time order. Valid until Close.
 	Groups []*Reader
 
+	// GroupIDs are the manifest ids of Groups, index for index. Pagination
+	// needs a row identity that survives a second query, and the position of a
+	// group WITHIN a snapshot does not: compaction, retention and cold
+	// demotion all change it. The manifest id is assigned once by AppendGroup
+	// and never reused, so a (time, group id, row index) tuple names the same
+	// row for as long as the row exists.
+	GroupIDs []uint64
+
 	entries []*groupEntry
-	closed  bool
+	// closed is atomic: two concurrent Close calls both passed a plain-bool
+	// check and released every entry twice, driving refs below zero and
+	// unmapping a version another snapshot still held.
+	closed atomic.Bool
 }
 
 // Close releases every group this snapshot holds. It is idempotent, so a
 // deferred Close next to an early return is safe.
 func (s *Snapshot) Close() error {
-	if s == nil || s.closed {
+	if s == nil || !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	s.closed = true
 	var firstErr error
 	for _, e := range s.entries {
 		if err := e.release(); err != nil && firstErr == nil {
@@ -48,6 +61,7 @@ func (s *Snapshot) Close() error {
 	}
 	s.entries = nil
 	s.Groups = nil
+	s.GroupIDs = nil
 	return firstErr
 }
 
@@ -129,8 +143,42 @@ func (s *Store) Snapshot(from, to int64) (*Snapshot, error) {
 		}
 		snap.entries = append(snap.entries, g)
 		snap.Groups = append(snap.Groups, g.reader)
+		snap.GroupIDs = append(snap.GroupIDs, g.id)
 	}
 	return snap, nil
+}
+
+// SnapshotAllWithSeq leases every group and reads the manifest sequence at the
+// SAME instant, under one lock acquisition.
+//
+// There was a SnapshotAll beside it that dropped the sequence, and nothing in
+// production called it -- every caller needs the pair, which is the whole
+// reason this exists. It was a two-line wrapper that let a caller take the
+// snapshot without the number that makes it verifiable, so it is gone rather
+// than kept for symmetry.
+//
+// Reading the sequence in a second acquisition is not the same number: an
+// AppendGroup between the two advances it, and the archive then declares a
+// high watermark covering a group it does not contain.
+func (s *Store) SnapshotAllWithSeq() (*Snapshot, uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, 0, ErrStoreClosed
+	}
+	snap := &Snapshot{}
+	for _, g := range s.groups {
+		if !g.acquire() {
+			continue
+		}
+		if s.openHook != nil {
+			s.openHook(g.id)
+		}
+		snap.entries = append(snap.entries, g)
+		snap.Groups = append(snap.Groups, g.reader)
+		snap.GroupIDs = append(snap.GroupIDs, g.id)
+	}
+	return snap, s.man.seq, nil
 }
 
 // SnapshotAfterID is the live-tail form: every group with an ID at or above
@@ -152,6 +200,7 @@ func (s *Store) SnapshotAfterID(cursor uint64) (*Snapshot, uint64, error) {
 		}
 		snap.entries = append(snap.entries, g)
 		snap.Groups = append(snap.Groups, g.reader)
+		snap.GroupIDs = append(snap.GroupIDs, g.id)
 		if g.id+1 > next {
 			next = g.id + 1
 		}

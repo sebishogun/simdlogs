@@ -5,8 +5,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -27,22 +25,10 @@ func TestEndpointShapes(t *testing.T) {
 	defer stopSL()
 	postNDJSON(t, sl+"/insert/jsonline", body)
 
-	vlBin, _ := filepath.Abs("victoria-logs")
-	if _, err := os.Stat(vlBin); err != nil {
-		t.Skip("victoria-logs binary not staged")
-	}
-	vlDir, _ := os.MkdirTemp("", "shapes-vl-")
-	defer os.RemoveAll(vlDir)
-	cmd := exec.Command(vlBin, "-httpListenAddr=127.0.0.1:19470", "-storageDataPath="+vlDir, "-retentionPeriod=10y")
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start VL: %v", err)
-	}
-	defer cmd.Process.Kill()
-	vl := "http://127.0.0.1:19470"
-	waitReadyCompat(t, vl+"/insert/ready", 30*time.Second)
+	vl := startVL(t, "127.0.0.1:19470", "the query-shape differential").url
 	postNDJSON(t, vl+"/insert/jsonline", body)
-	time.Sleep(2 * time.Second)
+	waitFor(t, readyAtLeast(vl, compatFrom, compatTo, compatRows), time.Minute,
+		"victoria-logs never made the compatibility corpus queryable")
 
 	// compatCorpus spans 2024-05-01T00:00:00Z for 500 seconds.
 	const win = "&start=1714521600&end=1714522200"
@@ -102,22 +88,10 @@ func TestParamsHonoured(t *testing.T) {
 	defer stopSL()
 	postNDJSON(t, sl+"/insert/jsonline", body)
 
-	vlBin, _ := filepath.Abs("victoria-logs")
-	if _, err := os.Stat(vlBin); err != nil {
-		t.Skip("victoria-logs binary not staged")
-	}
-	vlDir, _ := os.MkdirTemp("", "params-vl-")
-	defer os.RemoveAll(vlDir)
-	cmd := exec.Command(vlBin, "-httpListenAddr=127.0.0.1:19475", "-storageDataPath="+vlDir, "-retentionPeriod=10y")
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start VL: %v", err)
-	}
-	defer cmd.Process.Kill()
-	vl := "http://127.0.0.1:19475"
-	waitReadyCompat(t, vl+"/insert/ready", 30*time.Second)
+	vl := startVL(t, "127.0.0.1:19475", "the query-shape differential").url
 	postNDJSON(t, vl+"/insert/jsonline", body)
-	time.Sleep(2 * time.Second)
+	waitFor(t, readyAtLeast(vl, compatFrom, compatTo, compatRows), time.Minute,
+		"victoria-logs never made the compatibility corpus queryable")
 
 	const win = "&start=1714521600&end=1714522200"
 	all := url.QueryEscape("*")

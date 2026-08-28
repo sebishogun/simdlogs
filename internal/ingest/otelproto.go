@@ -1,9 +1,14 @@
 package ingest
 
 import (
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"math"
 	"strconv"
+	"unicode/utf8"
 )
 
 // The OTLP/HTTP protobuf encoding of ExportLogsServiceRequest, decoded by hand:
@@ -26,24 +31,74 @@ import (
 // IngestOTLPLogsProto ingests the protobuf encoding, producing records
 // IDENTICAL to the JSON path's: resource attributes plus record attributes,
 // severity_text -> severity, body -> _msg, time (or observed time) -> time.
-func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	fields := map[string]string{}
+	// Protobuf is OTLP's default encoding, and this parser accepted anything:
+	// a body that decoded to no records returned success, so an exporter
+	// sending garbage was told its data was delivered.
+	if !validProtobuf(data) {
+		return res, encodingErr(errBadProtobuf)
+	}
+	// ordinal is the record's position across the whole payload, flat rather
+	// than per resource or per scope: OTLP nests records two levels deep, and a
+	// caller matching a rejection back onto what it sent counts records in
+	// order. It used to be recorded with no position at all.
+	ordinal := 0
+	sawResourceLogs := false
+	// sawLogShape is the discriminator: a LogRecord carries its timestamp as
+	// a fixed64, where Metric.name and Span.trace_id at the same field number
+	// are length-delimited.
+	sawLogShape := false
+	// wrongShapeRejects counts ONLY the records refused for wearing a log's
+	// field numbers with a metric's or a span's wire types. It is separate
+	// from res.Rejected because a record refused for an UNSTORABLE TIMESTAMP
+	// is a log record -- the discrimination below used res.Rejected and would
+	// have told an OTLP exporter that its logs export was "a metrics or traces
+	// payload" whenever every record in it carried a timestamp past 2262.
+	wrongShapeRejects := 0
 	eachField(data, func(num int, wire int, payload []byte) {
 		if num != 1 || wire != 2 { // resource_logs
 			return
 		}
+		sawResourceLogs = true
 		var resAttrs []otlpKV
+		var resDropped uint32
 		// First pass: the resource's attributes; second: the records. The
 		// resource message may follow its scope_logs on the wire, so both
 		// passes are needed for the order protobuf allows.
 		eachField(payload, func(n, w int, p []byte) {
 			if n == 1 && w == 2 { // resource
 				eachField(p, func(n2, w2 int, p2 []byte) {
-					if n2 == 1 && w2 == 2 { // attributes
+					switch {
+					case n2 == 1 && w2 == 2: // attributes
 						if k, v, ok := decodeKV(p2); ok {
 							resAttrs = append(resAttrs, otlpKV{Key: k, Value: v})
 						}
+					case n2 == 2 && w2 == 0:
+						// Resource.dropped_attributes_count. This pass read
+						// field 1 and nothing else, so the JSON path wrote
+						// resource_dropped_attributes_count and this one never
+						// did -- the same logical export storing a different
+						// set of fields depending on which encoding the
+						// collector was configured for, and protobuf is the
+						// default. The conformance fixture could not see it:
+						// its builder had no way to write the field, so
+						// neither encoding was ever asked.
+						// uvarint, like every other wire-type-0 case in this
+						// file: eachField hands the callback the raw varint
+						// BYTES, already validated, and the callback decodes
+						// them once. The first version of this case decoded
+						// the payload a SECOND time (the varint had already
+						// been decoded into the old 8-byte little-endian
+						// image) and stored a wrong NUMBER for every count
+						// of 128 or more (200 -> 72, 255 -> 127, 1000 -> 488,
+						// 65535 -> 16383) -- worse than the absent field it
+						// replaced, and the fixture that was supposed to
+						// catch it used 7, inside the range where the two
+						// agree.
+						resDropped = uint32(uvarint(p2))
 					}
 				})
 			}
@@ -52,6 +107,30 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 			if n != 2 || wt != 2 { // scope_logs
 				return
 			}
+			// InstrumentationScope (scope = 1): name = 1, version = 2,
+			// attributes = 3. Read before the records, because the scope may
+			// precede or follow them on the wire, and dropped entirely before
+			// this -- so every record looked like it came from the
+			// application rather than from the library that emitted it.
+			var scopeAttrs []otlpKV
+			var scopeName, scopeVersion string
+			eachField(p, func(n2, w2 int, sc []byte) {
+				if n2 != 1 || w2 != 2 { // scope
+					return
+				}
+				eachField(sc, func(n3, w3 int, sp []byte) {
+					switch {
+					case n3 == 1 && w3 == 2:
+						scopeName = string(sp)
+					case n3 == 2 && w3 == 2:
+						scopeVersion = string(sp)
+					case n3 == 3 && w3 == 2:
+						if k, v, ok := decodeKV(sp); ok {
+							scopeAttrs = append(scopeAttrs, otlpKV{Key: k, Value: v})
+						}
+					}
+				})
+			})
 			eachField(p, func(n2, w2 int, rec []byte) {
 				if n2 != 2 || w2 != 2 { // log_records
 					return
@@ -62,17 +141,89 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				for _, a := range resAttrs {
 					fields[a.Key] = a.Value.str()
 				}
+				if resDropped != 0 {
+					fields["resource_dropped_attributes_count"] =
+						strconv.FormatUint(uint64(resDropped), 10)
+				}
+				for _, a := range scopeAttrs {
+					fields[a.Key] = a.Value.str()
+				}
+				if scopeName != "" {
+					fields["scope_name"] = scopeName
+				}
+				if scopeVersion != "" {
+					fields["scope_version"] = scopeVersion
+				}
 				var ts, observed int64
+				// A time_unix_nano that cannot be stored refuses the RECORD,
+				// which is what the JSON encoding of the same export already
+				// did through parseTime. See tsErr's use below.
+				var tsErr error
+				var sevNum int
+				var sevText, traceID, spanID, eventName string
+				var flags, dropped uint32
+				isLog := false
+				// wrongShape: field 1 present but length-delimited, which is
+				// Metric.name or Span.trace_id rather than time_unix_nano.
+				wrongShape := false
 				eachField(rec, func(fn, fw int, fp []byte) {
 					switch {
+					// A proto3 `fixed64` is UNSIGNED, and the conversion to
+					// int64 was raw. Every instant after 2262-04-11 is a legal
+					// value of this field and became a NEGATIVE nanosecond
+					// count: the row was accepted, counted, and filed before
+					// 1970. This is /v1/logs with
+					// `Content-Type: application/x-protobuf`, which is the
+					// OpenTelemetry Collector's DEFAULT encoding -- the round
+					// that fixed the JSON path (otel.go, through parseTime)
+					// left the file beside it, which is commit a92b638's
+					// finding again: "two OTLP encodings of one export were
+					// storing different things."
 					case fn == 1 && fw == 1: // time_unix_nano
-						ts = int64(binary.LittleEndian.Uint64(fp))
-					case fn == 11 && fw == 1: // observed_time_unix_nano
-						observed = int64(binary.LittleEndian.Uint64(fp))
-					case fn == 3 && fw == 2: // severity_text
-						if len(fp) > 0 {
-							fields["severity"] = string(fp)
+						if v := binary.LittleEndian.Uint64(fp); v > math.MaxInt64 {
+							tsErr = fmt.Errorf("%w: %d ns since the epoch", ErrTimeOutOfRange, v)
+						} else {
+							ts = int64(v)
 						}
+						isLog = true
+					case fn == 11 && fw == 1: // observed_time_unix_nano
+						if v := binary.LittleEndian.Uint64(fp); v > math.MaxInt64 {
+							tsErr = fmt.Errorf("%w: %d ns since the epoch", ErrTimeOutOfRange, v)
+						} else {
+							observed = int64(v)
+						}
+						isLog = true
+					case fn == 2 && fw == 0: // severity_number (enum, varint)
+						// Range-checked BEFORE the int conversion. A varint of
+						// 2^63 or more converts to a NEGATIVE int, which then
+						// passed a `sevNum < len(names)` test and indexed the
+						// name table out of range: a remote panic from a
+						// 31-byte body, and a 500 an OTLP exporter retries
+						// forever.
+						if v := uvarint(fp); v < uint64(len(severityNumberName)) {
+							sevNum = int(v)
+						}
+						isLog = true
+					case fn == 3 && fw == 2: // severity_text
+						sevText = string(fp)
+					case fn == 7 && fw == 0: // dropped_attributes_count
+						dropped = uint32(uvarint(fp))
+					case fn == 8 && fw == 5: // flags (fixed32)
+						flags = binary.LittleEndian.Uint32(fp)
+						isLog = true
+					// Fields 9, 10 and 12 collide with Metric.histogram,
+					// Metric.exponential_histogram and Metric.metadata, all at
+					// wire type 2 (docs/wrong.md records the collision). Length
+					// is the discriminator OTLP gives: a trace id is EXACTLY 16
+					// bytes and a span id exactly 8, which a histogram
+					// submessage is not. Without this a metrics payload posted
+					// to /v1/logs invented a trace_id out of its bucket bytes.
+					case fn == 9 && fw == 2 && len(fp) == 16: // trace_id: raw here, hex in JSON
+						traceID = hex.EncodeToString(fp)
+					case fn == 10 && fw == 2 && len(fp) == 8: // span_id
+						spanID = hex.EncodeToString(fp)
+					case fn == 12 && fw == 2 && utf8.Valid(fp): // event_name
+						eventName = string(fp)
 					case fn == 5 && fw == 2: // body
 						if v, ok := decodeAnyValue(fp); ok {
 							if msg := v.str(); msg != "" {
@@ -83,8 +234,59 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 						if k, v, ok := decodeKV(fp); ok {
 							fields[k] = v.str()
 						}
+					// Four field numbers where a length-delimited value
+					// cannot be a LogRecord and can be a Metric:
+					//   1  Metric.name       vs LogRecord.time_unix_nano (fixed64)
+					//   2  Metric.description vs LogRecord.severity_number (enum, varint)
+					//   7  Metric.sum        vs LogRecord.dropped_attributes_count (varint)
+					//   11 Metric.summary    vs LogRecord.observed_time_unix_nano (fixed64)
+					// Span.trace_id is field 1 wire 2 and every span has one.
+					// Rejecting these does not touch the legal case below --
+					// a LogRecord that omits every timestamp -- because none
+					// of these four is a LogRecord field of wire type 2.
+					//
+					// Field 3 (Metric.unit vs LogRecord.severity_text) and
+					// field 5 (Metric.gauge vs LogRecord.body) are both
+					// length-delimited on both sides and stay ambiguous; a
+					// unit-only or gauge-only metric is still stored as a log
+					// row. Recorded in docs/wrong.md.
+					case fw == 2 && (fn == 1 || fn == 2 || fn == 7 || fn == 11):
+						wrongShape = true
 					}
 				})
+				// Decide per record, before storing it. A LogRecord carries
+				// its timestamp as a fixed64; Metric.name and Span.trace_id
+				// sit at the same field number as length-delimited values. A
+				// check made only after the walk still stored the bogus rows.
+				//
+				// A record with NO field 1 and NO field 11 at all is legal:
+				// every LogRecord field is optional, and the spec has the
+				// receiver stamp observed_time_unix_nano when the producer
+				// omits it -- which is what the fallback below does. Only a
+				// record whose field 1 is length-delimited is another signal
+				// wearing a log's field numbers.
+				if wrongShape {
+					res.Reject(ordinal)
+					ordinal++
+					wrongShapeRejects++
+					res.WarnAt(ordinal-1, "record's field 1 is not a timestamp; a metrics or traces payload, not logs")
+					return
+				}
+				if isLog {
+					sawLogShape = true
+				}
+				if tsErr != nil {
+					// See ErrTimeOutOfRange. OTLP reports the count in its
+					// partial-success body rather than as a 4xx, so the
+					// exporter is told without being asked to drop the whole
+					// batch. Counted AFTER sawLogShape, so a rejected record
+					// still proves this was a logs payload.
+					res.Reject(ordinal)
+					ordinal++
+					res.WarnAt(ordinal-1, "%v", tsErr)
+					return
+				}
+				otlpRecordFields(fields, sevNum, sevText, traceID, spanID, eventName, flags, dropped)
 				if ts == 0 {
 					ts = observed
 				}
@@ -94,18 +296,107 @@ func IngestOTLPLogsProto(w *Writer, data []byte, fallback func() int64, opts *Op
 				if mapped {
 					opts.apply(fields)
 				}
-				addWithStream(w, ts, fields, opts)
-				ingested++
+				addOrReject(w, ts, fields, opts, &res, ordinal)
+				ordinal++
 			})
 		})
 	})
-	return ingested, skipped
+	// Discriminate logs from the other two signals. ResourceMetrics and
+	// ResourceSpans use the same field numbers as ResourceLogs -- resource=1,
+	// scope=2, and Metric/Span/LogRecord all sit at field 2 of the scope --
+	// so a metrics or traces export posted to /v1/logs walked as logs and
+	// stored a bogus row per record with a 200. Counting records could not
+	// see it; the wire types can.
+	//
+	// LogRecord.time_unix_nano is field 1 wire 1 (fixed64), while Metric.name
+	// and Span.trace_id are both field 1 wire 2. One record carrying field 1
+	// or field 11 as fixed64 separates all three.
+	// Fire on rejected-only, not on "no record had the log shape". Those are
+	// different: a ResourceLogs carrying genuinely zero records is a legal
+	// empty batch and must stay a success, and it has nothing to reject.
+	if len(data) > 0 && res.Accepted == 0 {
+		if !sawResourceLogs {
+			return res, envelopeErr(errNoResourceLogsProto)
+		}
+		if wrongShapeRejects > 0 {
+			return res, envelopeErr(errNotLogRecords)
+		}
+		// Every record refused for an unstorable timestamp and none for its
+		// shape: a LOGS export whose records this store cannot file. That is
+		// the partial-success body, not an envelope error -- the same answer
+		// the JSON encoding of the identical export gives, and a 4xx here
+		// would tell the exporter to drop a batch it should be told the count
+		// for.
+		if res.Rejected > 0 {
+			return res, nil
+		}
+		// A resource_logs that yielded no records is NOT an error. OTLP
+		// requires success for a request that carries no data, exporters
+		// treat 4xx as permanent, and an empty export is indistinguishable
+		// on the wire from an empty metrics one anyway -- both are field 1,
+		// wire 2, with nothing inside that names a signal. Rejecting it
+		// bought a discrimination that does not exist and cost a retry loop
+		// that does.
+		_ = sawLogShape
+	}
+	return res, nil
+}
+
+var (
+	errBadProtobuf         = errors.New("body is not decodable protobuf")
+	errNoResourceLogsProto = errors.New("no resource_logs field: not an OTLP protobuf logs payload")
+	errNotLogRecords       = errors.New("records carry no log timestamp: this is a metrics or traces payload, not logs")
+	errNoLogRecordsProto   = errors.New("resource_logs carries no log records")
+)
+
+// validProtobuf reports whether data is a well-formed sequence of protobuf
+// fields end to end. eachField stops silently at the first malformed tag,
+// which is why a garbage body parsed to zero records and no error.
+func validProtobuf(data []byte) bool {
+	for len(data) > 0 {
+		tag, n := binary.Uvarint(data)
+		if n <= 0 {
+			return false
+		}
+		data = data[n:]
+		switch tag & 7 {
+		case 0: // varint
+			_, n := binary.Uvarint(data)
+			if n <= 0 {
+				return false
+			}
+			data = data[n:]
+		case 1: // 64-bit
+			if len(data) < 8 {
+				return false
+			}
+			data = data[8:]
+		case 2: // length-delimited
+			l, n := binary.Uvarint(data)
+			if n <= 0 {
+				return false
+			}
+			data = data[n:]
+			if uint64(len(data)) < l {
+				return false
+			}
+			data = data[l:]
+		case 5: // 32-bit
+			if len(data) < 4 {
+				return false
+			}
+			data = data[4:]
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // eachField walks one protobuf message, calling fn per field with the wire type
-// and payload (the value bytes for varint/fixed encodings, the message bytes
-// for length-delimited). Unknown fields are skipped, malformed input stops the
-// walk -- lenient the way ingest must be.
+// and payload (the raw varint bytes for wire type 0, the fixed-size bytes for
+// fixed encodings, the message bytes for length-delimited). Unknown fields are
+// skipped, malformed input stops the walk -- lenient the way ingest must be.
 func eachField(msg []byte, fn func(num, wire int, payload []byte)) {
 	for len(msg) > 0 {
 		tag, n := binary.Uvarint(msg)
@@ -116,13 +407,15 @@ func eachField(msg []byte, fn func(num, wire int, payload []byte)) {
 		num, wire := int(tag>>3), int(tag&7)
 		switch wire {
 		case 0: // varint
-			v, vn := binary.Uvarint(msg)
+			// The payload is the encoded varint itself, NOT a re-encoded
+			// 8-byte little-endian image. The old shape built the image in a
+			// local buffer whose address escaped into the callback, so every
+			// varint field cost an allocation; the bytes are already in msg.
+			_, vn := binary.Uvarint(msg)
 			if vn <= 0 {
 				return
 			}
-			var buf [8]byte
-			binary.LittleEndian.PutUint64(buf[:], v)
-			fn(num, 0, buf[:])
+			fn(num, 0, msg[:vn])
 			msg = msg[vn:]
 		case 1: // fixed64
 			if len(msg) < 8 {
@@ -149,14 +442,38 @@ func eachField(msg []byte, fn func(num, wire int, payload []byte)) {
 	}
 }
 
+// uvarint decodes the raw varint payload eachField hands a wire-type-0
+// callback. eachField has already validated the encoding, so neither the
+// length nor the 10-byte overflow needs checking here. Inlined at every call
+// site; values below 128 decode in a few instructions.
+func uvarint(p []byte) uint64 {
+	var v uint64
+	for i, b := range p {
+		v |= uint64(b&0x7f) << (7 * i)
+		if b < 0x80 {
+			return v
+		}
+	}
+	return v
+}
+
 // decodeKV reads a KeyValue message.
 func decodeKV(msg []byte) (key string, val otlpValue, ok bool) {
+	return decodeKVDepth(msg, 0)
+}
+
+// decodeKVDepth carries the nesting depth through a kvlist, so a KeyValue
+// inside a KeyValueList inside a KeyValue cannot escape the recursion bound.
+func decodeKVDepth(msg []byte, depth int) (key string, val otlpValue, ok bool) {
+	if depth > maxAnyValueDepth {
+		return "", otlpValue{}, false
+	}
 	eachField(msg, func(num, wire int, p []byte) {
 		switch {
 		case num == 1 && wire == 2:
 			key, ok = string(p), true
 		case num == 2 && wire == 2:
-			if v, vok := decodeAnyValue(p); vok {
+			if v, vok := decodeAnyValueDepth(p, depth); vok {
 				val = v
 			}
 		}
@@ -166,8 +483,30 @@ func decodeKV(msg []byte) (key string, val otlpValue, ok bool) {
 
 // decodeAnyValue reads an AnyValue into the same struct the JSON path fills,
 // so one str() renders both encodings identically.
+//
+// All seven kinds. Stopping at four meant bytes, array and kvlist attributes
+// vanished from a protobuf export -- silently, with the record still stored
+// and still answered 200, so the attribute simply was not there when someone
+// went looking. bytes is base64-encoded rather than passed through raw,
+// because base64 is what the JSON encoding of the same attribute carries and
+// the two must produce the same row.
 func decodeAnyValue(msg []byte) (otlpValue, bool) {
+	return decodeAnyValueDepth(msg, 0)
+}
+
+// maxAnyValueDepth bounds the recursion. array and kvlist nest, and the
+// nesting arrives from an untrusted exporter: without a limit, a crafted body
+// a few hundred bytes long recurses until the goroutine stack is exhausted,
+// which takes the process down rather than the request. OTLP's own semantic
+// conventions do not nest attributes more than a couple of levels, so 16 is
+// past anything real and far short of what breaks.
+const maxAnyValueDepth = 16
+
+func decodeAnyValueDepth(msg []byte, depth int) (otlpValue, bool) {
 	var out otlpValue
+	if depth > maxAnyValueDepth {
+		return out, false
+	}
 	found := false
 	eachField(msg, func(num, wire int, p []byte) {
 		switch {
@@ -175,14 +514,37 @@ func decodeAnyValue(msg []byte) (otlpValue, bool) {
 			s := string(p)
 			out.StringValue, found = &s, true
 		case num == 2 && wire == 0: // bool_value
-			b := binary.LittleEndian.Uint64(p) != 0
+			b := uvarint(p) != 0
 			out.BoolValue, found = &b, true
 		case num == 3 && wire == 0: // int_value (varint; OTLP JSON writes it as a string)
-			s := strconv.FormatInt(int64(binary.LittleEndian.Uint64(p)), 10)
+			s := strconv.FormatInt(int64(uvarint(p)), 10)
 			out.IntValue, found = &s, true
 		case num == 4 && wire == 1: // double_value
 			f := math.Float64frombits(binary.LittleEndian.Uint64(p))
 			out.DoubleValue, found = &f, true
+		case num == 5 && wire == 2: // array_value: ArrayValue{ repeated AnyValue values = 1 }
+			arr := &otlpArray{}
+			eachField(p, func(n2, w2 int, e []byte) {
+				if n2 == 1 && w2 == 2 {
+					if v, ok := decodeAnyValueDepth(e, depth+1); ok {
+						arr.Values = append(arr.Values, v)
+					}
+				}
+			})
+			out.ArrayValue, found = arr, true
+		case num == 6 && wire == 2: // kvlist_value: KeyValueList{ repeated KeyValue values = 1 }
+			kvl := &otlpKvlist{}
+			eachField(p, func(n2, w2 int, e []byte) {
+				if n2 == 1 && w2 == 2 {
+					if k, v, ok := decodeKVDepth(e, depth+1); ok {
+						kvl.Values = append(kvl.Values, otlpKV{Key: k, Value: v})
+					}
+				}
+			})
+			out.KvlistValue, found = kvl, true
+		case num == 7 && wire == 2: // bytes_value
+			s := base64.StdEncoding.EncodeToString(p)
+			out.BytesValue, found = &s, true
 		}
 	})
 	return out, found

@@ -2,12 +2,17 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"path"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/sebishogun/simdlogs/internal/config"
 	"github.com/sebishogun/simdlogs/internal/ingest"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
@@ -18,7 +23,57 @@ type tenant struct {
 	store *storage.Store
 	w     *ingest.Writer
 	mono  int64
+	key   string
+	// lastUse is the unix-nano of the most recent request, and inFlight the
+	// number running. Eviction needs both: least-recently-used to choose, and
+	// in-flight to know the store is not being read right now.
+	lastUse  atomic.Int64
+	inFlight atomic.Int64
+
+	// preFlushing admits one parked pre-flush goroutine per tenant.
+	//
+	// The backup's pre-flush runs in a goroutine with a timeout so a stalled
+	// writer cannot hold the endpoint; the goroutine itself is not bounded by
+	// that timeout and stays parked on the stall. backupBusy is released when
+	// the HANDLER returns, so polling /admin/backup against a stalled writer
+	// spawned one permanently parked goroutine per request, counted by
+	// nothing: Server.Close waits on the background loops and on inFlight, and
+	// this is neither.
+	//
+	// At most one. A second pre-flush would wait on the same batches as the
+	// first, so skipping it costs nothing and bounds the leak at one goroutine
+	// per tenant, released the moment the stall clears.
+	preFlushing atomic.Bool
+
+	// backupBusy admits one backup at a time for this tenant.
+	//
+	// A backup holds a Snapshot for its whole duration, which pins every group
+	// it captured against unmapping. Concurrent backups of one tenant multiply
+	// that: N streams each hold the full group set, so retention frees nothing
+	// while any of them runs, and the mappings are the store's whole footprint
+	// rather than its working set. It is also an admin endpoint with no body
+	// and a large response -- the cheapest request to issue and the most
+	// expensive to serve.
+	backupBusy atomic.Bool
 }
+
+// Tenant lifecycle counters for /metrics. They carry no tenant-id label: a
+// per-tenant label on a map an untrusted header can grow is an unbounded
+// cardinality source, which is how a metrics endpoint takes down its own
+// scraper.
+var (
+	tenantsEvicted  atomic.Int64
+	tenantsRejected atomic.Int64
+)
+
+// TenantsEvicted is the number of tenants closed to make room.
+func TenantsEvicted() int64 { return tenantsEvicted.Load() }
+
+// TenantsRejected is the number of requests refused because every tenant slot
+// was in use.
+func TenantsRejected() int64 { return tenantsRejected.Load() }
+
+func (t *tenant) touch() { t.lastUse.Store(time.Now().UnixNano()) }
 
 // fallbackTS is the per-tenant timestamp source for records lacking their own:
 // wall-clock plus a monotonic bump (atomic -- the parallel ingest path calls
@@ -44,46 +99,297 @@ func (s *Server) tenantOf(r *http.Request) (*tenant, error) {
 	return s.tenant(k.Account, k.Project)
 }
 
+// account and project split the tenant's "acc:proj" key back apart, for the
+// places that need to hand one to a storage node.
+func (t *tenant) account() string {
+	if i := strings.IndexByte(t.key, ':'); i >= 0 {
+		return t.key[:i]
+	}
+	return t.key
+}
+
+func (t *tenant) project() string {
+	if i := strings.IndexByte(t.key, ':'); i >= 0 {
+		return t.key[i+1:]
+	}
+	return "0"
+}
+
 // tenant returns the store+writer for acc:proj, opening it under
 // dir/tenant-<acc>-<proj> the first time it is seen.
+//
+// The returned tenant is already marked busy (inFlight incremented). The
+// caller MUST release it with tn.inFlight.Add(-1) when done, or eviction can
+// never reclaim the slot. Handing it back busy is what closes the race
+// between this function returning and the caller marking it.
 func (s *Server) tenant(acc, proj string) (*tenant, error) {
 	key := acc + ":" + proj
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Once shutdown starts, no new store is opened. A request arriving after
+	// Close used to create a tenant directory, take its lock and start a
+	// writer pool that nothing would ever close.
+	if s.stopping.Load() {
+		return nil, &authError{msg: "server is shutting down", code: http.StatusServiceUnavailable}
+	}
 	if tn := s.tenants[key]; tn != nil {
+		tn.touch()
+		// Mark busy here, under the same lock that hands it out. Doing it in
+		// withTenant left a window: tenant() returned and released s.mu, and
+		// before the caller incremented inFlight an eviction saw zero and
+		// closed the store -- a panic on the ingest path, and on the query
+		// path a 200 with zero rows, which is worse.
+		tn.inFlight.Add(1)
 		return tn, nil
 	}
-	st, err := storage.OpenStore(filepath.Join(s.dir, "tenant-"+acc+"-"+proj))
+	// Bound the number of open tenants. Every tenant holds a store (mmaps,
+	// file descriptors) and a writer with a pool of flush goroutines, so an
+	// unbounded map is an unbounded resource commitment driven by a request
+	// header -- before authentication existed, by any client at all.
+	if max := s.limits.MaxOpenTenants; max != config.Unlimited && len(s.tenants) >= max {
+		if !s.evictIdleLocked() {
+			tenantsRejected.Add(1)
+			return nil, &authError{
+				msg:  fmt.Sprintf("too many open tenants (%d); all are in use", len(s.tenants)),
+				code: http.StatusServiceUnavailable,
+			}
+		}
+	}
+	st, err := storage.OpenStoreWith(filepath.Join(s.dir, "tenant-"+acc+"-"+proj),
+		storage.OpenOptions{Policy: s.corruptionPolicy})
 	if err != nil {
 		return nil, err
 	}
-	tn := &tenant{store: st, w: ingest.NewWriter(st)}
+	// The budget is applied at open, so a tenant that appears an hour after
+	// startup is under the same limits as the one opened with the server.
+	// SetQuota validates, and the server's copy was validated at construction,
+	// so this cannot fail for a reason the operator has not already been told
+	// about; the error is checked rather than dropped because a quota that
+	// silently did not apply is worse than one that refuses to start.
+	if err := st.SetQuota(s.quota); err != nil {
+		st.Close()
+		return nil, err
+	}
+	// Whether this tenant is degraded is recorded on the SERVER, not only on
+	// the store, and it survives eviction. forEachTenant iterates open tenants
+	// only, so readiness read "no degraded tenant among those currently open"
+	// -- evicting an idle degraded tenant turned a 503 into a 200 while the
+	// data was still missing, and a store never opened in this process was
+	// invisible to it from the start.
+	if h := st.Health(); h.Degraded() {
+		s.degradedLocked(key, h)
+	} else {
+		delete(s.degraded, key)
+	}
+	tn := &tenant{key: key, store: st, w: ingest.NewWriter(st)}
+	// Before the writer takes any rows: changing the vector configuration with
+	// rows buffered would put two dimensions in one column.
+	if len(s.vecFlds) > 0 {
+		tn.w.SetVectorFields(s.vecFlds)
+	}
+	tn.touch()
+	tn.inFlight.Add(1) // handed out busy, released by the caller
 	if len(s.strmFlds) > 0 {
 		tn.w.SetStreamFields(s.strmFlds)
 	}
 	if s.compact {
 		tn.w.SetCompact(true)
 	}
+	if s.limits.MaxLineBytes > 0 {
+		tn.w.SetMaxLineBytes(s.limits.MaxLineBytes)
+	}
+	if s.limits.MaxDecompressed > 0 {
+		tn.w.SetMaxDecompressedBytes(int(s.limits.MaxDecompressed))
+	}
+	tn.w.SetRecordLimits(s.recordLimits())
 	s.tenants[key] = tn
 	return tn, nil
 }
 
+// evictIdleLocked closes the least recently used tenant that has no request
+// in flight, returning whether it freed a slot. s.mu must be held.
+//
+// A tenant with active requests is never evicted: closing its store would
+// unmap under a query. If every tenant is busy the caller is told so rather
+// than being given a slot that does not exist.
+func (s *Server) evictIdleLocked() bool {
+	var victim *tenant
+	for _, tn := range s.tenants {
+		if tn.inFlight.Load() > 0 {
+			continue
+		}
+		// Never the default tenant. It sits in the map with no in-flight
+		// reference and the oldest lastUse, so it was the FIRST thing chosen
+		// -- and s.def is never re-pointed, so evicting it left a closed
+		// writer behind every syslog listener, /alerts and every
+		// metrics-from-logs rule, silently and permanently.
+		if tn == s.def {
+			continue
+		}
+		if victim == nil || tn.lastUse.Load() < victim.lastUse.Load() {
+			victim = tn
+		}
+	}
+	if victim == nil {
+		return false
+	}
+	delete(s.tenants, victim.key)
+	// Close outside the caller's critical path would be nicer, but the store
+	// must be shut before another OpenStore on the same directory: the
+	// directory lock allows one writer.
+	if err := victim.w.Close(); err != nil {
+		obs.L().Error("eviction flush failed",
+			obs.FieldEvent, "tenant.evict.flush_failed",
+			obs.FieldTenant, victim.key,
+			obs.FieldErrorClass, string(obs.ClassStorage),
+			"error", err)
+	}
+	if err := victim.store.Close(); err != nil {
+		obs.L().Error("eviction close failed",
+			obs.FieldEvent, "tenant.evict.close_failed",
+			obs.FieldTenant, victim.key,
+			obs.FieldErrorClass, string(obs.ClassStorage),
+			"error", err)
+	}
+	tenantsEvicted.Add(1)
+	return true
+}
+
 // withTenant resolves the request's tenant into its context (and counts the
 // request), so every handler reads it with s.tn(r) instead of a fixed store.
+// tenantPaths are the routes that read or write tenant data, and the only
+// ones for which a tenant is resolved.
+//
+// This is an allowlist because the deny-list version was trivially
+// sidestepped: it matched the raw path exactly, so "/health/", "//health",
+// "/vmui" and any 404 path all fell through and created a tenant -- and
+// withTenant runs before the mux, so it sees the uncleaned path. An allowlist
+// fails closed: a new route gets no tenant until it is named here.
+var tenantPaths = map[string]bool{
+	"/insert/jsonline":                   true,
+	"/insert/logfmt":                     true,
+	"/insert/syslog":                     true,
+	"/insert/journald":                   true,
+	"/_bulk":                             true,
+	"/insert/elasticsearch/_bulk":        true,
+	"/loki/api/v1/push":                  true,
+	"/insert/loki/api/v1/push":           true,
+	"/api/v2/logs":                       true,
+	"/v1/input":                          true,
+	"/insert/datadog/api/v2/logs":        true,
+	"/v1/logs":                           true,
+	"/insert/opentelemetry/v1/logs":      true,
+	"/select/logsql/query":               true,
+	"/select/logsql/hits":                true,
+	"/select/logsql/tail":                true,
+	"/select/logsql/field_names":         true,
+	"/select/logsql/field_values":        true,
+	"/select/logsql/facets":              true,
+	"/select/logsql/stats_query":         true,
+	"/select/logsql/stats_query_range":   true,
+	"/select/logsql/streams":             true,
+	"/select/logsql/stream_ids":          true,
+	"/select/logsql/stream_field_names":  true,
+	"/select/logsql/stream_field_values": true,
+	"/select/sql":                        true,
+	"/select/vector":                     true,
+	"/_search":                           true,
+	"/_count":                            true,
+	"/admin/backup":                      true,
+	// The quarantine listing reads THIS tenant's store, so it needs the same
+	// tenant resolution every other storage endpoint gets. Without the entry
+	// s.tn(r) has nothing to return and the handler panics into a 500 -- which
+	// is what the route-surface gate caught before this route ever shipped.
+	"/admin/storage/quarantine": true,
+	// Anti-entropy reads and writes one tenant's store, like every other data
+	// path. /admin/cluster/repair is deliberately absent: it runs on a router,
+	// touches no local store, and only talks to peers.
+	"/internal/replica/state": true,
+	"/internal/replica/group": true,
+}
+
 func (s *Server) withTenant(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// path.Clean first: "//health" and "/health/" reach here as different
+		// strings than "/health", and an exact match on the raw path missed
+		// both -- withTenant runs before the mux, so it sees what the client
+		// sent.
+		if !tenantPaths[path.Clean(r.URL.Path)] {
+			s.countRequest(r.URL.Path)
+			h.ServeHTTP(w, r)
+			return
+		}
 		tn, err := s.tenantOf(r)
 		if err != nil {
 			// A rejected tenant is the caller's fault (unparseable header) or
 			// a permission failure -- not a 500, which is what it used to be
 			// reported as for every cause.
+			//
+			// The challenge header belongs on every 401. This runs before the
+			// mux, so requireAuth -- the other place that sets it -- is never
+			// reached for these paths.
+			code := authStatus(err)
+			// Audited HERE as well as in requireAuth, because this is where
+			// most refusals actually happen: the tenant resolver runs before
+			// the mux, so an unauthenticated request to a privileged route is
+			// refused here and requireAuth's own branch is never reached. A
+			// trail that only recorded the second one would miss the common
+			// case entirely -- which is what it did.
+			switch code {
+			case http.StatusUnauthorized:
+				w.Header().Set("WWW-Authenticate", `Bearer realm="simdlogs"`)
+				obs.Audit(r.Context(), obs.EventAuthFailed, subjectOf(r), obs.OutcomeDenied,
+					obs.FieldRoute, r.URL.Path, obs.FieldMethod, r.Method,
+					"reason", err.Error())
+			case http.StatusForbidden:
+				obs.Audit(r.Context(), obs.EventAuthForbidden, subjectOf(r), obs.OutcomeDenied,
+					obs.FieldRoute, r.URL.Path, obs.FieldMethod, r.Method,
+					"reason", err.Error())
+			}
 			atomic.AddInt64(&s.nHTTPErrs, 1)
-			http.Error(w, err.Error(), authStatus(err))
+			// A storage failure's message is the SERVER's -- "mkdir
+			// /var/lib/simdlogs/tenant-42-0: permission denied" -- and
+			// returning it hands an unauthenticated client the data
+			// directory's absolute path and the process's uid situation. The
+			// client is told what it can act on; the detail goes to the log,
+			// where the operator who can act on it is looking.
+			//
+			// Only for the storage classes: an auth or parse failure's message
+			// is about the REQUEST and is what makes it fixable.
+			if k := storageErrKind(err); k != storageNotAnError {
+				// The server's own message, with the data directory in it,
+				// goes HERE -- the client gets the class. See
+				// storageErrMessage.
+				obs.L().Error("tenant store unavailable",
+					obs.FieldEvent, "tenant.open_failed",
+					obs.FieldTenant, tenantKeyOf(r),
+					obs.FieldRoute, r.URL.Path,
+					obs.FieldErrorClass, string(obs.ClassStorage),
+					"error", err)
+				http.Error(w, storageErrMessage(k), code)
+				return
+			}
+			http.Error(w, err.Error(), code)
 			return
 		}
+		// Stamp the RESOLVED key over whatever the client sent, before any
+		// handler runs. The federated read helpers copy AccountID/ProjectID
+		// out of the request and forward them to a storage node that normally
+		// has no -auth.config of its own, so this is the only place a read's
+		// tenant is ever checked. Without it a principal whose default tenant
+		// is 9:0, sending no header at all, forwarded no header at all -- and
+		// every backend answered out of ITS default, 0:0. routeWrites does
+		// the same for the write path.
+		r.Header.Set("AccountID", tn.account())
+		r.Header.Set("ProjectID", tn.project())
 		s.countRequest(r.URL.Path)
+		// tenantOf handed it back already marked busy; release it when the
+		// request ends -- or earlier, if the handler is a stream that will
+		// outlive any sensible notion of "in flight" (see tenantRef).
+		ref := &tenantRef{tn: tn}
+		defer ref.release()
 		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
-		h.ServeHTTP(sw, r.WithContext(context.WithValue(r.Context(), tenantKey{}, tn)))
+		h.ServeHTTP(sw, r.WithContext(context.WithValue(r.Context(), tenantKey{}, ref)))
 		if sw.code >= 400 {
 			atomic.AddInt64(&s.nHTTPErrs, 1)
 		}
@@ -110,7 +416,58 @@ func (w *statusWriter) Flush() {
 }
 
 // tn is the request's resolved tenant (set by withTenant).
-func (s *Server) tn(r *http.Request) *tenant { return r.Context().Value(tenantKey{}).(*tenant) }
+func (s *Server) tn(r *http.Request) *tenant { return tenantRefOf(r).tn }
+
+// tenantRef is a request's claim on a tenant. The claim blocks eviction, so a
+// handler that runs for as long as its client cares to leave the connection
+// open -- the live tail -- must give it up early or a handful of idle
+// connections pin every tenant slot and every other tenant gets 503.
+//
+// Giving it up is safe for a stream because the stream re-leases a Snapshot
+// on every poll and SnapshotAfterID reports a closing store, so an eviction
+// underneath ends the tail cleanly instead of unmapping under it.
+type tenantRef struct {
+	tn   *tenant
+	done atomic.Bool
+}
+
+// release drops the claim. Idempotent: the tail calls it explicitly and
+// withTenant calls it again on the way out.
+func (r *tenantRef) release() {
+	if r.done.CompareAndSwap(false, true) {
+		r.tn.inFlight.Add(-1)
+	}
+}
+
+func tenantRefOf(r *http.Request) *tenantRef {
+	return r.Context().Value(tenantKey{}).(*tenantRef)
+}
+
+// tenantOf is tenantRefOf without the panic, for a handler that runs on routes
+// which may not have resolved a tenant at all.
+//
+// `/insert/datadog/api/v1/validate` is one: it carries the ingest role and the
+// ingest middleware, and it writes nothing and never resolves a tenant. A
+// middleware that assumed every ingest route had one turned that endpoint into
+// a 500.
+// tenantKeyOf is the request's tenant identity for admission accounting.
+//
+// Read from the headers rather than from the resolved tenant, because
+// admission runs in the middleware chain and a resolved tenant means a store
+// is already open -- which is work the limit exists to decide about. The
+// resolver stamps these headers before any handler runs, so by this point they
+// are the AUTHORISED tenant and not whatever the client asked for.
+func tenantKeyOf(r *http.Request) string {
+	return r.Header.Get("AccountID") + ":" + r.Header.Get("ProjectID")
+}
+
+func tenantOf(r *http.Request) *tenant {
+	ref, ok := r.Context().Value(tenantKey{}).(*tenantRef)
+	if !ok || ref == nil {
+		return nil
+	}
+	return ref.tn
+}
 
 // forEachTenant calls fn under the lock for every open tenant -- the basis for
 // store-wide operations (retention, metrics).
@@ -119,5 +476,72 @@ func (s *Server) forEachTenant(fn func(*tenant)) {
 	defer s.mu.Unlock()
 	for _, tn := range s.tenants {
 		fn(tn)
+	}
+}
+
+// recordLimits is the per-record cap set, in one place so the serial writer
+// and the parallel shards cannot disagree. They did: ParallelConfig carried
+// no limits at all, so a body over MinParallelBytes bypassed every one.
+func (s *Server) recordLimits() ingest.RecordLimits {
+	return ingest.RecordLimits{
+		MaxFields:     s.limits.MaxFieldsPerRecord,
+		MaxNameBytes:  s.limits.MaxFieldNameBytes,
+		MaxValueBytes: s.limits.MaxFieldValueBytes,
+	}
+}
+
+// tenantDir is the store directory for a tenant key ("account:project"). It
+// mirrors the join in tenant(); a key that is not in that form gives a path
+// that does not exist, which every caller treats as "nothing to do".
+func (s *Server) tenantDir(key string) string {
+	acc, proj, ok := strings.Cut(key, ":")
+	if !ok {
+		return filepath.Join(s.dir, "tenant-"+key)
+	}
+	return filepath.Join(s.dir, "tenant-"+acc+"-"+proj)
+}
+
+// forEachTenantDetached calls fn for every open tenant WITHOUT holding the
+// server lock while fn runs.
+//
+// forEachTenant holds s.mu for the whole walk, and s.mu is what every request
+// takes to resolve its tenant. That is fine for the metrics walk it was
+// written for and not fine for an operation that does file I/O: a compaction
+// pass over 200,000 groups takes 1.3 seconds, and measured, a query issued
+// during a 50,000-group pass took 250.7ms end to end because it was waiting
+// for this lock.
+//
+// The tenants are snapshotted under the lock and marked in-flight, which is
+// the same mechanism a request uses to stop eviction closing a store it is
+// reading. Marked before the lock is released, or eviction can reclaim a
+// tenant between the snapshot and the call.
+func (s *Server) forEachTenantDetached(fn func(*tenant)) {
+	s.mu.Lock()
+	snapshot := make([]*tenant, 0, len(s.tenants))
+	for _, tn := range s.tenants {
+		tn.inFlight.Add(1)
+		snapshot = append(snapshot, tn)
+	}
+	s.mu.Unlock()
+	// Released as each one finishes, not all at the end. Eviction skips an
+	// in-flight tenant, so holding every one busy for the whole walk turns a
+	// long pass into `503 too many open tenants; all are in use` for any NEW
+	// tenant arriving during it -- where the locked walk made that request
+	// block and then succeed. One at a time, the window is one tenant's pass.
+	//
+	// The deferred loop is a backstop for a panic in fn, and double-release is
+	// impossible because done[] gates it.
+	done := make([]bool, len(snapshot))
+	defer func() {
+		for i, tn := range snapshot {
+			if !done[i] {
+				tn.inFlight.Add(-1)
+			}
+		}
+	}()
+	for i, tn := range snapshot {
+		fn(tn)
+		tn.inFlight.Add(-1)
+		done[i] = true
 	}
 }

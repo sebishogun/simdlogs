@@ -9,8 +9,8 @@ import (
 	"testing"
 )
 
-// TestClusterWriteRouting checks that ingest through a router spreads across
-// storage nodes round-robin and a federated read then returns every record.
+// TestClusterWriteRouting checks that distinct write ids spread across storage
+// shards and a federated read then returns every record.
 func TestClusterWriteRouting(t *testing.T) {
 	mk := func() (*Server, *httptest.Server) {
 		srv, err := NewServer(t.TempDir())
@@ -32,8 +32,11 @@ func TestClusterWriteRouting(t *testing.T) {
 	fs := httptest.NewServer(front.Handler())
 	defer fs.Close()
 
+	ids := writeIDsForShards(2, 2)
 	for i := 0; i < 4; i++ {
-		postBody(t, fs, fmt.Sprintf(`{"_time":%d,"service":"s","_msg":"m%d"}`+"\n", 1000+i, i))
+		shard := i % 2
+		postBodyWithID(t, fs, ids[shard][i/2],
+			fmt.Sprintf(`{"_time":%d,"service":"s","_msg":"m%d"}`+"\n", 1000+i, i))
 	}
 	if a, b := s1.def.store.TotalRows(), s2.def.store.TotalRows(); a != 2 || b != 2 {
 		t.Fatalf("write spread = %d/%d, want 2/2 across backends", a, b)
@@ -81,8 +84,9 @@ func TestClusterReplication(t *testing.T) {
 	fs := httptest.NewServer(front.Handler())
 	defer fs.Close()
 
-	postBody(t, fs, `{"_time":1,"service":"a"}`+"\n") // -> shard0 (b1,b2)
-	postBody(t, fs, `{"_time":2,"service":"b"}`+"\n") // -> shard1 (b3,b4)
+	ids := writeIDsForShards(2, 1)
+	postBodyWithID(t, fs, ids[0][0], `{"_time":1,"service":"a"}`+"\n") // -> shard0 (b1,b2)
+	postBodyWithID(t, fs, ids[1][0], `{"_time":2,"service":"b"}`+"\n") // -> shard1 (b3,b4)
 
 	if s1.def.store.TotalRows() != 1 || s2.def.store.TotalRows() != 1 {
 		t.Fatalf("shard0 replicas = %d/%d, want 1/1 (replicated)", s1.def.store.TotalRows(), s2.def.store.TotalRows())
@@ -106,6 +110,39 @@ func TestClusterReplication(t *testing.T) {
 	b1.Close() // down the shard0 primary
 	if n := count(); n != 2 {
 		t.Fatalf("after primary loss = %d rows, want 2 (failover to replica)", n)
+	}
+}
+
+func writeIDsForShards(shards, perShard int) [][]string {
+	ids := make([][]string, shards)
+	left := shards * perShard
+	for n := uint64(0); left > 0; n++ {
+		id := fmt.Sprintf("%016x", n)
+		shard := writeShardIndex(id, shards)
+		if len(ids[shard]) == perShard {
+			continue
+		}
+		ids[shard] = append(ids[shard], id)
+		left--
+	}
+	return ids
+}
+
+func postBodyWithID(t *testing.T, ts *httptest.Server, id, body string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/insert/jsonline", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	req.Header.Set(HdrWriteID, id)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		t.Fatalf("write id %s returned %d", id, resp.StatusCode)
 	}
 }
 
@@ -145,8 +182,16 @@ func TestClusterFederation(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("federated select got %d rows, want 2 (one per backend):\n%s", len(lines), b)
 	}
-	// _time 2000 (two) is newer than 1000 (one), so it merges first.
-	if !strings.Contains(lines[0], "two") || !strings.Contains(lines[1], "one") {
-		t.Fatalf("merge order wrong:\n%s", b)
+	// OLDEST first, because this select carries no `limit`.
+	//
+	// This asserted newest-first, which is what the merge used to do
+	// unconditionally -- and it is what a single node does only when `limit` is
+	// set. `*` on one node answers oldest-first (scan order); `*&limit=N`
+	// answers the newest N, newest-first. An unlimited cluster select was
+	// coming back reversed relative to the server it is a cluster of, and this
+	// test was pinning the reversal.
+	if !strings.Contains(lines[0], "one") || !strings.Contains(lines[1], "two") {
+		t.Fatalf("merge order wrong -- an unlimited select is oldest-first, as a "+
+			"single node returns it:\n%s", b)
 	}
 }

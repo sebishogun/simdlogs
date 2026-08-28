@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // A snapshot taken before a recompaction keeps reading the old mapping, and
@@ -143,6 +144,92 @@ func TestRecompactDoesNotResurrectRemovedGroup(t *testing.T) {
 	}
 	if got := s.Len(); got != 0 {
 		t.Fatalf("%d groups after recompaction, want 0 -- a removed group came back", got)
+	}
+}
+
+// Retention must serialize behind a recompaction rewriting the same path.
+// dropGroups took only s.mu while Recompact's rewrite -- atomic rename, then
+// mmap -- runs outside any lock, so a removal could unlink the path between
+// the two: a spurious Recompact error (mmap of a missing file) or a removed
+// group's file recreated on disk. The rewrite is held in that window below
+// and retention is let loose at it; the file must not leave the store's
+// hands until the rewrite is done.
+func TestRetentionSerializedAgainstRecompactRewrite(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	vals := make([]string, 4000)
+	ts := make([]int64, len(vals))
+	for i := range vals {
+		vals[i] = "a fairly long repeated value that compresses well " + string(rune('a'+i%5))
+		ts[i] = int64(i + 1)
+	}
+	d := BuildDict(vals)
+	g := &Group{Rows: len(vals), Columns: []Column{
+		{Name: "_time", Type: ColTimestamp, Ts: ts},
+		{Name: "msg", Type: ColDict, Dict: &d},
+	}}
+	if _, err := s.AppendGroup(g); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	path := s.groups[0].path
+	s.mu.Unlock()
+
+	// Hold the rewrite between its rename and its mmap: the window in which
+	// an unlink of the same path breaks it.
+	rewrote := make(chan struct{}, 1)
+	release := make(chan struct{})
+	s.beforeMmap = func(p string) {
+		if p == path {
+			rewrote <- struct{}{}
+			<-release
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() { _, _, _, err := s.Recompact(1<<62, false); done <- err }()
+
+	select {
+	case <-rewrote:
+	case <-time.After(5 * time.Second):
+		close(release)
+		<-done
+		t.Fatal("recompaction did not reach its rewrite window")
+	}
+
+	// Retention starts now, with the new blob already renamed over the path.
+	// It must wait for the rewrite to finish; reaching its unlink here is the
+	// bug. The waits below are progress guards, not timing assertions: with
+	// the lock missing, retention's removal is ~milliseconds of local work,
+	// and with it in place retention cannot pass structMu at all.
+	removed := make(chan int, 1)
+	go func() { removed <- s.DropGroupsBefore(1 << 62) }()
+	select {
+	case n := <-removed:
+		close(release)
+		<-done
+		t.Fatalf("retention removed %d group(s) while a recompaction was mid-rewrite: dropGroups must take structMu", n)
+	case <-time.After(2 * time.Second):
+		// Blocked behind the rewrite, as it must be.
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("recompaction errored: %v", err)
+	}
+	if n := <-removed; n != 1 {
+		t.Fatalf("dropped %d groups, want 1", n)
+	}
+	if got := s.Len(); got != 0 {
+		t.Fatalf("%d groups after the race, want 0 -- the removed group is still visible", got)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("group file still exists after retention removed it: %v", err)
 	}
 }
 

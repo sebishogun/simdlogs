@@ -65,6 +65,7 @@ func do(t *testing.T, ts *httptest.Server, method, path, token string, hdr map[s
 // caller without it is refused. Unwrapped, any client could query, ingest,
 // read the flag dump and download a full backup.
 func TestRoutePermissionMatrix(t *testing.T) {
+	t.Parallel()
 	_, ts := authedServer(t)
 	line := `{"_time":1700000000000000000,"level":"info"}` + "\n"
 

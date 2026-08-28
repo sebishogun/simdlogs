@@ -32,6 +32,7 @@ func ingestCorpus(t *testing.T, ts *httptest.Server, n int) int {
 }
 
 func TestSelectSurface(t *testing.T) {
+	t.Parallel()
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -86,6 +87,7 @@ func TestSelectSurface(t *testing.T) {
 }
 
 func TestESSearch(t *testing.T) {
+	t.Parallel()
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()

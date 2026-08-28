@@ -167,11 +167,9 @@ side index).
   before locking the expected value.
 - `go test ./...` green, `gofmt` clean, before each commit.
 
-  **Blocker (documented, not fixed from a docs session):** a `gofmt` release
-  gate currently fails on pre-existing formatting — `gofmt -l` flags
-  `internal/storage/group.go`. The desired gate stays as stated here; it
-  cannot go green until that file is reformatted in a code session. See
-  `docs/verification.md`.
+  The `gofmt` gate is green. A blocker on `internal/storage/group.go` used to
+  be recorded here; it is gone, and `docs/verification.md` is the one place
+  that carries the gate's status.
 
 ## Not gaps (documented so they are not re-audited)
 

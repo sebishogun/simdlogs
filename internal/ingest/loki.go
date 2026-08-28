@@ -1,10 +1,17 @@
 package ingest
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+)
 
 // lokiPush is Grafana Loki's push payload: streams of label sets, each with a
-// list of [timestamp-ns, line] pairs (an optional third element carries
-// structured metadata, which we ignore). https://grafana.com/docs/loki push API.
+// list of [timestamp-ns, line] entries. A third element carries structured
+// metadata as a JSON object -- Loki 3.x's home for the high-cardinality
+// attributes that must NOT become labels, which is exactly where a trace id or
+// a request id ends up. It used to be discarded, so those fields were accepted
+// with a 204 and then were not there.
+// https://grafana.com/docs/loki push API.
 type lokiPush struct {
 	Streams []struct {
 		Stream map[string]string   `json:"stream"`
@@ -12,47 +19,112 @@ type lokiPush struct {
 	} `json:"streams"`
 }
 
+var errNoStreams = errors.New("no streams field: not a Loki push payload")
+
 // IngestLoki ingests a Loki push body: each stream's labels become fields, its
 // log line becomes _msg, and the nanosecond timestamp is taken from the pair
 // (fallback when absent or unparseable). One record per value entry.
-func IngestLoki(w *Writer, data []byte, fallback func() int64) (ingested, skipped int) {
+func IngestLoki(w *Writer, data []byte, fallback func() int64) (Result, error) {
 	return IngestLokiOpts(w, data, fallback, nil)
 }
 
 // IngestLokiOpts is IngestLoki with the request's field mappings applied.
-func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (ingested, skipped int) {
+func IngestLokiOpts(w *Writer, data []byte, fallback func() int64, opts *Options) (Result, error) {
+	var res Result
 	mapped := !opts.Empty()
 	var p lokiPush
 	if err := json.Unmarshal(data, &p); err != nil {
-		return 0, 0
+		// A push whose JSON does not parse is a failed request, not an empty
+		// one. Returning zero records and no error made it answer 200, so a
+		// misconfigured agent looked healthy while nothing was stored.
+		return res, encodingErr(err)
+	}
+	if p.Streams == nil {
+		return res, envelopeErr(errNoStreams)
 	}
 	fields := map[string]string{}
+	// A FLAT ordinal across the whole payload, not a per-stream one. A Loki
+	// push nests entries inside streams, and a caller matching a rejection or a
+	// warning back onto what it sent counts entries in order -- so a position
+	// that restarted at each stream would name the wrong entry in every stream
+	// after the first.
+	ordinal := 0
 	for _, st := range p.Streams {
 		for _, ent := range st.Values {
 			if len(ent) < 2 {
-				skipped++
+				res.Reject(ordinal)
+				// The ORDINAL, not a byte offset: this parser decoded JSON
+				// into a struct, so it knows the entry's position in the batch
+				// and not its position in bytes.
+				res.WarnAt(ordinal, "stream entry has fewer than two elements")
+				ordinal++
 				continue
 			}
-			var tsStr, line string
-			_ = json.Unmarshal(ent[0], &tsStr)
+			var line string
 			_ = json.Unmarshal(ent[1], &line)
+			// The optional third element: structured metadata. A malformed one
+			// is a warning against that entry, not a silent drop and not a
+			// failed batch -- the line itself is still worth storing.
+			var meta map[string]string
+			if len(ent) >= 3 {
+				if err := json.Unmarshal(ent[2], &meta); err != nil {
+					res.WarnAt(ordinal, "entry's structured metadata is not an object: %v", err)
+					meta = nil
+				}
+			}
 			for k := range fields {
 				delete(fields, k)
 			}
 			for k, v := range st.Stream {
 				fields[k] = v
 			}
+			// After the labels: an entry's own metadata is more specific than
+			// its stream's labels, and the protobuf path applies it in the same
+			// order.
+			// Same guard as the protobuf path: an empty key was stored as a
+			// field with no name, and an empty value erased the stream label
+			// it collided with. Without both, the two encodings disagree on
+			// exactly the input proto3 makes most likely.
+			for k, v := range meta {
+				if k == "" || v == "" {
+					continue
+				}
+				fields[k] = v
+			}
 			fields["_msg"] = line
-			ts, ok := parseTime(tsStr)
+			ts, ok, tsErr := lokiJSONTime(ent[0])
+			if tsErr != nil {
+				// See ErrTimeOutOfRange: refused and counted, not stored at an
+				// instant the client did not send.
+				res.Reject(ordinal)
+				res.WarnAt(ordinal, "%v", tsErr)
+				ordinal++
+				continue
+			}
 			if !ok {
 				ts = fallback()
 			}
 			if mapped {
 				opts.apply(fields)
 			}
-			addWithStream(w, ts, fields, opts)
-			ingested++
+			addOrReject(w, ts, fields, opts, &res, ordinal)
+			ordinal++
 		}
 	}
-	return ingested, skipped
+	return res, nil
+}
+
+// lokiJSONTime accepts Loki's documented quoted nanosecond string and the
+// numeric spelling its readers and deployed shippers also emit. Treating a
+// number as a failed string decode used to replace a supplied timestamp with
+// the receiver's fallback clock while answering success.
+func lokiJSONTime(raw []byte) (int64, bool, error) {
+	if len(raw) > 0 && raw[0] != '"' {
+		return numberTime(raw)
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return 0, false, nil
+	}
+	return parseTime(s)
 }

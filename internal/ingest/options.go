@@ -111,7 +111,87 @@ func parsePairs(v string) [][2]string {
 // The writer's own stream fields are a deployment-wide default; a request that
 // names its own must not be forced through them, and must not end up with two
 // _stream columns in the same group.
-func addWithStream(w *Writer, ts int64, fields map[string]string, o *Options) {
+// RecordLimits bounds one record. They are applied by the writer rather than
+// by each parser, so a limit cannot be enforced on one protocol and forgotten
+// on the next.
+type RecordLimits struct {
+	MaxFields     int
+	MaxNameBytes  int
+	MaxValueBytes int
+}
+
+// addWithStreamVec is addWithStream for a record carrying embeddings.
+func addWithStreamVec(w *Writer, ts int64, fields map[string]string, o *Options,
+	vecs map[string][]float32,
+) {
+	if len(vecs) == 0 {
+		// The caller already parsed the embeddings, so a refusal here can only
+		// come from a DIFFERENT configured field arriving as text; it is the
+		// same refusal and the caller's Result records it.
+		_ = addWithStream(w, ts, fields, o)
+		return
+	}
+	if o != nil && len(o.StreamFields) > 0 {
+		if sv := buildStreamLabel(o.StreamFields, fields); sv != "" {
+			fields["_stream"] = sv
+		} else {
+			delete(fields, "_stream")
+		}
+	}
+	w.AddVectors(ts, fields, vecs)
+}
+
+// addOrReject writes one record, or counts a refusal against its ordinal with
+// the reason attached. Reports whether the record was stored.
+//
+// One helper rather than the same four lines at nine call sites, for the reason
+// the nine call sites exist: a rule applied at eight of them is a rule this
+// repository has already shipped as a defect more than once.
+func addOrReject(w *Writer, ts int64, fields map[string]string, o *Options, res *Result, ordinal int) bool {
+	if err := addWithStream(w, ts, fields, o); err != nil {
+		res.Reject(ordinal)
+		res.WarnAt(ordinal, "%s", err)
+		return false
+	}
+	res.Accepted++
+	return true
+}
+
+// addWithStream writes one record and returns an error when it cannot be
+// stored AS GIVEN. Every non-JSON-lines protocol goes through here -- Loki,
+// logfmt, OTLP in both encodings, Datadog, syslog and journald -- so a rule
+// stated here is stated once for all of them.
+//
+// # The embedding a record was ingested for
+//
+// Writer.Add DROPS a configured vector field arriving as an ordinary string,
+// with a comment explaining why storing 768 floats as dictionary text would be
+// the worst case for the dictionary. That is right; the drop is not. Only the
+// JSON-lines parser built the float path, so every other protocol stored the
+// line, answered the client 2xx, and left the row invisible to the vector
+// search it was ingested for. Measured: the same embedding through
+// /insert/jsonline is `dim=4 data=[1 2 3 4]` in the store, and through logfmt
+// the column is absent, both at accepted=1 rejected=0.
+//
+// Writer.ValidateVector was written for exactly this -- its doc said "exported
+// so the PARSE path refuses the record, with a reason, counted in
+// Result.Rejected, rather than the writer silently zero-filling it" -- and it
+// had no caller in the year it existed. splitVectors is that path, with a
+// better answer than refusing: a vector that PARSES is stored, and only one
+// that does not is refused. ValidateVector is deleted rather than left beside
+// it, because two functions asking the same question is how they come to
+// disagree.
+//
+// Costs one atomic load per record when no vector field is configured, which is
+// almost every deployment.
+func addWithStream(w *Writer, ts int64, fields map[string]string, o *Options) error {
+	var vecs map[string][]float32
+	if w.hasVec.Load() {
+		var err error
+		if vecs, err = splitVectors(w, fields); err != nil {
+			return err
+		}
+	}
 	// The override is a property of the request, not of the row. A row whose
 	// label comes out empty still belongs to the overriding request and must
 	// not silently pick up the deployment default -- that mixed two labelling
@@ -122,8 +202,46 @@ func addWithStream(w *Writer, ts int64, fields map[string]string, o *Options) {
 		} else {
 			delete(fields, "_stream")
 		}
+		if len(vecs) > 0 {
+			w.AddStreamOverriddenVectors(ts, fields, vecs)
+			return nil
+		}
 		w.AddStreamOverridden(ts, fields)
-		return
+		return nil
+	}
+	if len(vecs) > 0 {
+		w.AddVectors(ts, fields, vecs)
+		return nil
 	}
 	w.Add(ts, fields)
+	return nil
+}
+
+// splitVectors moves every configured embedding out of fields, parsed.
+//
+// The field is DELETED from fields on success: it is stored as floats, and
+// leaving the text behind would put the same data in the dictionary as well,
+// which is the cost Writer.Add's drop exists to avoid.
+func splitVectors(w *Writer, fields map[string]string) (map[string][]float32, error) {
+	flds := w.VectorFields()
+	var vecs map[string][]float32
+	for name, dim := range flds {
+		text, ok := fields[name]
+		if !ok {
+			continue
+		}
+		v, err := ParseVector(make([]float32, 0, dim), name, text, dim)
+		if err != nil {
+			// Refused, not dropped. A record whose embedding is unusable is a
+			// record the caller can fix; one stored without it is a row nobody
+			// can find and nobody was told about.
+			return nil, err
+		}
+		if vecs == nil {
+			vecs = make(map[string][]float32, len(flds))
+		}
+		vecs[name] = v
+		delete(fields, name)
+	}
+	return vecs, nil
 }

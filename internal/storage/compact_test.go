@@ -8,6 +8,7 @@ import (
 // TestCompactDict verifies compact mode round-trips identically to the default
 // and reports the footprint delta on realistic-shaped high-cardinality data.
 func TestCompactDict(t *testing.T) {
+	t.Parallel()
 	const n = 20000
 	msg := make([]string, n)
 	trace := make([]string, n)

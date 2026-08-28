@@ -45,3 +45,23 @@ func TestBitsetOps(t *testing.T) {
 		}
 	}
 }
+
+func TestPackedBoolsKeepRowBitOrder(t *testing.T) {
+	const n = 73
+	want := make([]bool, n)
+	rows := []int{0, 9, 31, 54, 63, 64, 70, 72}
+	for _, row := range rows {
+		want[row] = true
+	}
+
+	b := NewBitset(n)
+	packBools(b, want)
+	if got := b.Count(); got != len(rows) {
+		t.Fatalf("packed bit count = %d, want %d", got, len(rows))
+	}
+	for row := range n {
+		if got := b.Test(row); got != want[row] {
+			t.Fatalf("row %d: packed bit = %t, want %t", row, got, want[row])
+		}
+	}
+}

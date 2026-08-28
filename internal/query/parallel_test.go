@@ -1,15 +1,36 @@
 package query
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/sebishogun/simdlogs/internal/bench/corpus"
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
 
+func TestProgrammaticRegexpCompilationIsConcurrentSafe(t *testing.T) {
+	p := Pred{Field: "service", Kind: Regexp, Value: "^api$"}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			re := p.regex()
+			if re == nil || !re.MatchString("api") {
+				t.Error("programmatic regexp did not compile or match")
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+}
+
 // Parallel output must equal the serial path exactly, rows in the same
 // order, for a query spanning many groups.
 func TestParallelEqualsSerial(t *testing.T) {
+	t.Parallel()
 	s, _ := storage.OpenStore(t.TempDir())
 	var ts []int64
 	var sv []string

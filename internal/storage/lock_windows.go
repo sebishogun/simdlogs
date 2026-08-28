@@ -53,3 +53,35 @@ func (l *dirLock) unlock() error {
 	}
 	return err
 }
+
+// movedTo tells the lock its file has been renamed to a new directory. On
+// Windows this is what makes release able to remove it at all: unlock deletes
+// l.path, and after a staged restore's rename the lock file is at the
+// destination, not where it was created.
+func (l *dirLock) movedTo(dir string) {
+	if l != nil {
+		l.path = filepath.Join(dir, LockFileName)
+	}
+}
+
+// release drops the lock and removes its file.
+//
+// The order is the opposite of unix's and has to be: here the lock IS the open
+// handle -- a file opened without FILE_SHARE_DELETE cannot be deleted while
+// open -- so removing first fails and leaves the file behind. Since lockDir
+// uses O_EXCL, a leftover LOCK refuses every later open of that directory, so
+// a restore that removed it in the unix order produced a store nobody could
+// open.
+func (l *dirLock) release() error { return l.unlock() }
+
+// releaseBeforeRemoval closes the destination's lock before the directory
+// holding it is removed.
+//
+// Required here and only here: the lock IS the open handle, opened without
+// FILE_SHARE_DELETE, so os.RemoveAll of the directory containing it fails with
+// a sharing violation. Every restore would fail after staging and validating
+// the whole archive, leaving a LOCK that O_EXCL then refuses forever.
+//
+// On unix this is a no-op, and must be: there os.RemoveAll unlinks a held file
+// happily, and releasing early hands the destination to a second writer.
+func (l *dirLock) releaseBeforeRemoval() error { return l.release() }

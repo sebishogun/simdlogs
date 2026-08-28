@@ -5,8 +5,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -29,22 +27,10 @@ func TestAPISurface(t *testing.T) {
 	defer stopSL()
 	postNDJSON(t, slURL+"/insert/jsonline", body)
 
-	if _, err := os.Stat("victoria-logs"); err != nil {
-		t.Skip("victoria-logs binary not staged")
-	}
-	vlDir, _ := os.MkdirTemp("", "surface-vl-")
-	defer os.RemoveAll(vlDir)
-	abs, _ := filepath.Abs("victoria-logs")
-	cmd := exec.Command(abs, "-httpListenAddr=127.0.0.1:19450", "-storageDataPath="+vlDir, "-retentionPeriod=10y")
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start VL: %v", err)
-	}
-	defer cmd.Process.Kill()
-	vl := "http://127.0.0.1:19450"
-	waitReadyCompat(t, vl+"/insert/ready", 30*time.Second)
+	vl := startVL(t, "127.0.0.1:19450", "the API-surface probe").url
 	postNDJSON(t, vl+"/insert/jsonline", body)
-	time.Sleep(2 * time.Second)
+	waitFor(t, readyAtLeast(vl, compatFrom, compatTo, compatRows), time.Minute,
+		"victoria-logs never made the compatibility corpus queryable")
 
 	q := url.QueryEscape("*")
 	esc := url.QueryEscape("level:=error")

@@ -25,7 +25,84 @@ const (
 	faultRename
 	faultDirOpen
 	faultDirSync
+
+	// The manifest's own two steps. They are the commit point: a record that
+	// is written but not synced is not a commit, and a record that is synced
+	// IS one even if the process dies immediately after. The crash matrix
+	// needs to stop between them, which no fault point covered.
+	faultManifestWrite
+	faultManifestSync
+
+	// Points outside the durable write entirely, so the matrix can also stop
+	// with rows buffered and nothing on disk, and after a batch has been
+	// acknowledged to its caller.
+	faultBuffered
+	faultPostAck
+	// faultRestoreRenamed fires immediately after a staged restore has moved
+	// its staging directory into place, while the restore still holds the lock
+	// that rename installed. It exists so a test can try to open a store at the
+	// destination at the one instant the old code left unguarded.
+	faultRestoreRenamed
+	// faultRestoreRemoved fires between a staged restore's removal of the old
+	// destination and the rename that replaces it -- the window in which this
+	// call's own lock file no longer exists and another process can create the
+	// directory. It exists so a test can BE that process.
+	faultRestoreRemoved
+	// faultRestoreReleasing fires where a staged restore would release its
+	// destination lock before removing the destination -- a no-op on unix,
+	// and the window a test has to BE in to show why.
+	faultRestoreReleasing
+	// faultLockOpened fires inside lockDir, between the open of the lock file
+	// and the flock of it -- the two syscalls a staged restore can replace the
+	// whole directory between. It exists so a test can BE that restore, which
+	// is the only way to stand in a window a nanosecond wide on purpose.
+	faultLockOpened
+	// faultRestoreCleanup fires inside a staged restore's deferred cleanup,
+	// after the displaced directory is gone and before the marker that
+	// vouches for it is removed. On the SUCCESS path the staging directory is
+	// gone too -- it was renamed into place -- and on the abort path it is
+	// still there, removed by a later defer; the ordering this point exists to
+	// check is the marker's against both, and the marker outlives both either
+	// way. It exists so a test can stand
+	// where a kill would and check that ordering directly, rather than
+	// asserting the end state -- which is identical whichever order they go
+	// in, and was identical while the order was wrong.
+	faultRestoreCleanup
+	// The four points a compaction pass can be killed at, in order: before
+	// the output is written, after it is durable and before it is committed,
+	// at the manifest commit itself, and after the commit with the inputs
+	// still on disk. Each leaves a different residue and the crash matrix
+	// asserts that none of them loses or duplicates a row.
+	faultCompactWrite
+	faultCompactWritten
+	faultCompactCommit
+	faultCompactUnlink
 )
+
+// faultPointName is for test output and for the crash matrix's subprocess
+// protocol, which names the phase on the command line.
+var faultPointName = map[faultPoint]string{
+	faultCreate:           "temp-create",
+	faultWrite:            "partial-write",
+	faultSync:             "file-sync",
+	faultClose:            "file-close",
+	faultRename:           "rename",
+	faultDirOpen:          "dir-open",
+	faultDirSync:          "dir-sync",
+	faultManifestWrite:    "manifest-append",
+	faultManifestSync:     "manifest-sync",
+	faultBuffered:         "buffering",
+	faultPostAck:          "post-ack",
+	faultRestoreRenamed:   "restore-renamed",
+	faultRestoreRemoved:   "restore-removed",
+	faultRestoreReleasing: "restore-releasing",
+	faultLockOpened:       "lock-opened",
+	faultRestoreCleanup:   "restore-cleanup",
+	faultCompactWrite:     "compact-write",
+	faultCompactWritten:   "compact-written",
+	faultCompactCommit:    "compact-commit",
+	faultCompactUnlink:    "compact-unlink",
+}
 
 var (
 	faultMu   sync.RWMutex

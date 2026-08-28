@@ -3,6 +3,7 @@ package storage
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"math"
 )
@@ -68,6 +69,29 @@ type colMeta struct {
 
 // Marshal serializes the group to a self-describing blob.
 func (g *Group) Marshal() []byte {
+	// Every column must carry exactly Rows values. Nothing on the read side
+	// can recover a short one: the block-count check pins Rows only to block
+	// granularity, so a timestamp column up to blockSize-1 short was accepted
+	// and the missing rows decoded a fabricated time. Cheaper and exact to
+	// refuse to write it.
+	for i := range g.Columns {
+		switch c := &g.Columns[i]; c.Type {
+		case ColTimestamp:
+			if len(c.Ts) != g.Rows {
+				panic(fmt.Sprintf("simdlogs: column %q has %d timestamps for %d rows",
+					c.Name, len(c.Ts), g.Rows))
+			}
+		case ColDict:
+			if c.Dict == nil || len(c.Dict.Indices) != g.Rows {
+				n := -1
+				if c.Dict != nil {
+					n = len(c.Dict.Indices)
+				}
+				panic(fmt.Sprintf("simdlogs: column %q has %d indices for %d rows",
+					c.Name, n, g.Rows))
+			}
+		}
+	}
 	var b []byte
 	b = appU32(b, magic)
 	b = appU32(b, versionV8)
@@ -159,6 +183,19 @@ func (g *Group) Marshal() []byte {
 }
 
 var errCorrupt = errors.New("storage: corrupt group")
+
+// ErrCorruptGroup matches any group that failed its bounds or checksum
+// checks.
+//
+// Exported because a layer above needs to tell one kind of write failure from
+// another. A group that will not read back the instant after it was written
+// means the bytes that came out are not the bytes that went in, which is a
+// filesystem or a disk rather than a payload -- so ingest classifies it as
+// needing an operator before the next attempt, not as a failure to give up
+// on. An earlier version of this comment said the opposite, that the bytes are
+// deterministic and the client should be told not to bother; that reasoning
+// told shippers to drop data a media error had corrupted.
+var ErrCorruptGroup = errCorrupt
 
 func appU32(b []byte, v uint32) []byte { return binary.LittleEndian.AppendUint32(b, v) }
 func appU64(b []byte, v uint64) []byte { return binary.LittleEndian.AppendUint64(b, v) }

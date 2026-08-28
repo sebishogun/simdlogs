@@ -12,9 +12,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"io"
+	"math"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,6 +27,7 @@ import (
 
 	"github.com/sebishogun/simdlogs/internal/config"
 	"github.com/sebishogun/simdlogs/internal/ingest"
+	obs "github.com/sebishogun/simdlogs/internal/observability"
 	"github.com/sebishogun/simdlogs/internal/query"
 	"github.com/sebishogun/simdlogs/internal/storage"
 )
@@ -32,15 +36,110 @@ import (
 // tenant (AccountID:ProjectID headers, default 0:0) selects an isolated store;
 // see tenant.go.
 type Server struct {
-	dir        string
-	mu         sync.Mutex
-	tenants    map[string]*tenant
-	def        *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
-	strmFlds   []string
-	compact    bool     // compact mode default for new tenants (flate dict)
-	backends   []string // peer node base URLs; when set, selects fan out and merge (vmselect role)
-	replicas   int      // replication factor: backends group into shards of this many replicas
-	maxRows    int      // cap on a bare (no-pipe) select's rows. Errors, never truncates.
+	dir     string
+	mu      sync.Mutex
+	tenants map[string]*tenant
+	def     *tenant // the default 0:0 tenant, used by the non-HTTP paths (syslog listener)
+	// nStreamedSelects counts bare selects answered without materializing.
+	nStreamedSelects int64
+	// cursors signs pagination cursors. Per process and never persisted: a
+	// cursor that survived a restart would resume into a store that has since
+	// compacted, retired and re-ingested.
+	cursors *cursorSigner
+	// lastSyslogRefusal throttles the native transport's budget-refusal log.
+	// Nanos, atomic: written from every listener goroutine.
+	lastSyslogRefusal int64
+	strmFlds          []string
+	compact           bool // compact mode default for new tenants (flate dict)
+	// ingestShards overrides the parallel ingest shard count. Zero derives it
+	// from the core count, which is what a server does in production.
+	//
+	// IT EXISTS BECAUSE THE DERIVED VALUE IS runtime.NumCPU()/3, so the
+	// concurrent branch is UNREACHABLE on any host with fewer than six cores
+	// -- every stock CI runner among them. ParallelConfig.Shards' own doc
+	// comment says so and nothing in this package set it, so every test that
+	// covered the sharded ingest path passed by running the serial fallback
+	// instead: `base += 0` in mergeShardResults, which reports the WRONG
+	// DOCUMENT in a _bulk response, was green under `taskset -c 0-3`.
+	ingestShards int
+	// corruptionPolicy is what a tenant store does with an unreadable group.
+	// The zero value is storage.CorruptionFail, so a server configured with
+	// nothing refuses to open a damaged tenant rather than serving it short.
+	corruptionPolicy storage.CorruptionPolicy
+	// vecFlds is which record fields are embeddings, stamped on every tenant
+	// writer as it opens.
+	vecFlds ingest.VectorFields
+	// peers is the client for internal cluster traffic: its own transport,
+	// its own timeouts, its own pool, and a bounded response body. It replaced
+	// http.DefaultClient, which has no timeout at all -- a peer that accepts
+	// the connection and never answers held a router goroutine, a pool slot
+	// and the caller's request for as long as the caller waited, times the
+	// number of shards.
+	peers *clusterClient
+	// shardID and replicaID are this node's identity in the cluster, reported
+	// in every internal response so a router can say WHICH shard was
+	// incomplete rather than that something was.
+	shardID   int
+	replicaID int
+	// hw is the highest HighWatermark this router has seen from each PEER,
+	// which is what makes a lagging replica's answer detectable at all -- see
+	// checkWatermark. hwMu guards creation of an entry; each entry is atomic
+	// because the fan-out writes them from one goroutine per shard.
+	//
+	// Keyed by shard, because the signal wanted is CROSS-REPLICA -- two
+	// replicas of one shard holding 12 and 8 rows -- and a peer compared only
+	// against its own history cannot show that. Each entry also records WHICH
+	// peer set the high, so a SetBackends that repoints an index at a different
+	// machine does not hand the new machine the old one's floor: a high set by
+	// a peer no longer in the shard is discarded rather than enforced.
+	hwMu sync.Mutex
+	hw   map[int]*shardHigh
+	// hwOwn is the newest timestamp THIS node has accepted, kept as a running
+	// maximum so that evicting a tenant or expiring data cannot lower what it
+	// reports. See highWatermark.
+	hwOwn atomic.Int64
+	// generation identifies this PROCESS, so a router can tell a peer that
+	// restarted from a peer that fell behind. Set once, never changed.
+	generation string
+	// repairBusy admits one cluster repair at a time on this router. Repair
+	// mutates, and two overlapping passes read the same missing set before
+	// either writes it -- see repairCluster.
+	repairBusy atomic.Bool
+	// replicaGroupLimit is the body ceiling of the anti-entropy adopt route,
+	// applied by the MaxBytesReader replicaGroupSpec installs. Defaults to
+	// maxRepairBytes; tests shrink it to exercise the boundary without a
+	// gigabyte fixture.
+	replicaGroupLimit int64
+
+	// quota is the storage budget every tenant store opens under. Validated
+	// once at construction, so a tenant opening later cannot fail for a
+	// configuration problem the operator was never told about.
+	quota storage.QuotaConfig
+	// degraded is every tenant key whose store reported degraded when it was
+	// opened, and what it reported. Guarded by mu. It outlives the tenant so
+	// eviction cannot turn readiness green.
+	degraded map[string]storage.Health
+	// lastDirReread is when the snapshot last re-read the store directories of
+	// the degraded tenants that are not open. Guarded by mu.
+	lastDirReread time.Time
+	// dirRereadEvery is the throttle window. A field rather than the constant
+	// so a test can assert the re-read SEMANTICS at zero and the throttle
+	// itself separately -- a test that sleeps out a window is measuring the
+	// clock, and one that cannot set the window has to.
+	dirRereadEvery time.Duration
+	// backendsAt holds the peer node base URLs; when set, selects fan out and
+	// merge (the vmselect role). Read through backendList().
+	//
+	// ATOMIC, not a plain slice. SetBackends is a plain assignment against
+	// readers in per-shard goroutines, and the whole reason the watermark
+	// check records which PEER set a floor is "SetBackends repointing an index
+	// at a different machine" -- an operation the field's own type said could
+	// not be done at runtime without racing. Only main.go calls it today, and
+	// before serving, so the race is latent; a guard whose premise is an
+	// operation the code cannot safely perform is a guard with a hole under it.
+	backendsAt atomic.Pointer[[]string]
+	replicas   int // replication factor: backends group into shards of this many replicas
+	maxRows    int // cap on a bare (no-pipe) select's rows. Errors, never truncates.
 	limits     config.Limits
 	started    time.Time
 	nIngestReq int64 // ingest requests (atomic)
@@ -54,7 +153,6 @@ type Server struct {
 	szMu    sync.Mutex // guards the cached store footprint
 	szBytes int64
 	szAt    time.Time
-	rr      int64 // round-robin cursor for write routing (atomic)
 
 	rmu   sync.Mutex
 	rules []*logRule // metrics-from-logs: LogsQL evaluated on a timer, exposed on /metrics
@@ -68,10 +166,37 @@ type Server struct {
 	// retention pass in flight when the stores close would unmap under
 	// itself, and the alert and rule tickers had no stop at all and ran for
 	// the life of the process.
-	auth     *authState
+	auth *authState
+	// readyOnce records that readiness has answered at least once, so the
+	// startup grace stops applying to a server that has already reported.
+	readyOnce atomic.Bool
+	querySem  chan struct{} // MaxConcurrentQuery
+	// admission bounds reads per tenant, which the class semaphores cannot:
+	// they are process-wide, so one tenant can hold every slot.
+	admission *query.Admission
+	// workers is the shared scan worker budget. Without it every concurrent
+	// query sized its own fan-out at GOMAXPROCS.
+	workers  *query.WorkerBudget
+	writeSem chan struct{} // MaxConcurrentWrite
+	tailSem  chan struct{} // MaxConcurrentTail
+	// Syslog listeners accept outside the HTTP server, so shutdown has to
+	// close their connections explicitly.
+	syslogMu        sync.Mutex
+	syslogConns     map[net.Conn]struct{}
+	syslogListeners []io.Closer
+	syslogClosing   bool
+	syslogWG        sync.WaitGroup
+	// retentionMaxAge is this node's retention horizon in nanoseconds, 0 when
+	// retention is off. Read by the adopt path, which must not accept a group
+	// the next sweep would delete -- see StartRetention.
+	retentionMaxAge atomic.Int64
+
+	routeMu  sync.Mutex
+	routes   []string
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 	bg       sync.WaitGroup
+	bgMu     sync.Mutex // orders the stopping check against bg.Add
 	stopping atomic.Bool
 }
 
@@ -79,12 +204,21 @@ type Server struct {
 // only way this package starts a periodic loop, so no loop can be added that
 // shutdown does not know about.
 func (s *Server) goBackground(interval time.Duration, fn func()) (stop func()) {
-	if interval <= 0 || s.stopping.Load() {
+	if interval <= 0 {
+		return func() {}
+	}
+	// The check and the Add happen under the same lock Close takes before
+	// waiting, so a loop cannot register after bg.Wait() has returned --
+	// which is the documented WaitGroup misuse.
+	s.bgMu.Lock()
+	if s.stopping.Load() {
+		s.bgMu.Unlock()
 		return func() {}
 	}
 	done := make(chan struct{})
 	var once sync.Once
 	s.bg.Add(1)
+	s.bgMu.Unlock()
 	go func() {
 		defer s.bg.Done()
 		t := time.NewTicker(interval)
@@ -128,8 +262,78 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	srv := &Server{dir: dir, tenants: map[string]*tenant{}, started: time.Now()}
+	pol, err := storage.ParseCorruptionPolicy(c.CorruptionPolicy)
+	if err != nil {
+		return nil, err
+	}
+	// Parsed once, at startup: a typo in -vector-fields is a startup failure
+	// rather than a field silently stored as text and invisible to the one
+	// search it exists for.
+	vecFlds, err := ingest.ParseVectorFields(c.VectorFields)
+	if err != nil {
+		return nil, err
+	}
+	srv := &Server{dir: dir, tenants: map[string]*tenant{},
+		degraded: map[string]storage.Health{}, dirRereadEvery: DefaultDirRereadEvery,
+		started: time.Now(), generation: newNodeGeneration()}
+	srv.vecFlds = vecFlds
+	// Built even on a non-router: SetBackends can be called after
+	// construction, and a nil client at that point would be a nil dereference
+	// on the first peer call rather than at configuration time.
+	srv.peers = newClusterClient(nil)
+	// Peer spools land on the configured data disk, not in the process temp
+	// dir: os.TempDir is often tmpfs, and a repair transfer may be a gigabyte
+	// that must not be memory-backed.
+	srv.peers.spoolDir = dir
+	srv.replicaGroupLimit = maxRepairBytes
+	if c.DirRereadInterval != 0 {
+		srv.dirRereadEvery = c.DirRereadInterval
+		if c.DirRereadInterval < 0 {
+			srv.dirRereadEvery = 0 // negative means "every call", like zero
+		}
+	}
+	srv.corruptionPolicy = pol
 	srv.limits = c.Limits
+	// Validated here rather than at each store open, so a bad budget refuses
+	// to start the server instead of failing the first tenant to arrive.
+	srv.quota = storage.QuotaConfig{
+		ReserveWarnBytes:   c.Storage.ReserveWarnBytes,
+		ReserveRejectBytes: c.Storage.ReserveRejectBytes,
+		MaxTenantBytes:     c.Storage.MaxTenantBytes,
+	}
+	if err := srv.quota.Normalize(); err != nil {
+		return nil, err
+	}
+	// Concurrency budgets. A nil channel means unbounded.
+	if n := c.Limits.MaxConcurrentQuery; n > 0 {
+		srv.querySem = make(chan struct{}, n)
+	}
+	if n := c.Limits.MaxConcurrentWrite; n > 0 {
+		srv.writeSem = make(chan struct{}, n)
+	}
+	if n := c.Limits.MaxConcurrentTail; n > 0 {
+		srv.tailSem = make(chan struct{}, n)
+	}
+	if n := c.Limits.MaxQueriesPerTenant; n > 0 {
+		srv.admission = query.NewAdmission(query.AdmissionConfig{
+			MaxPerTenant: n,
+			Wait:         c.Limits.QueryQueueWait,
+		})
+	}
+	// The scan worker budget is process-wide and installed once. Three scan
+	// paths used to size their fan-out at GOMAXPROCS EACH, so ten concurrent
+	// queries on a 32-core box spawned 320 workers for 32 cores -- all doing
+	// memory-bound column decode and evicting each other's cache lines.
+	//
+	// Installed even when nothing else is configured, because the default it
+	// replaces is the pathological one.
+	srv.workers = query.NewWorkerBudget(c.Limits.MaxScanWorkers)
+	query.SetWorkerBudget(srv.workers)
+	cs, err := newCursorSigner()
+	if err != nil {
+		return nil, err
+	}
+	srv.cursors = cs
 	srv.compact = c.Compact
 	if len(c.StreamFields) > 0 {
 		srv.strmFlds = append([]string(nil), c.StreamFields...)
@@ -151,8 +355,54 @@ func NewServerConfig(c config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// tenant() hands it back marked busy; this one is the server's default,
+	// not an in-flight request, so release the reference or every request
+	// sees one permanently busy tenant. It is kept out of eviction by
+	// identity instead (evictIdleLocked), which is what a request-count
+	// reference cannot express: the default is not busy, it is not
+	// evictable.
+	def.inFlight.Add(-1)
 	srv.def = def
+	// Every tenant already on disk that is degraded, so readiness is right
+	// from the first probe rather than from the first request that happens to
+	// open one.
+	srv.scanDegradedTenants()
+
 	return srv, nil
+}
+
+// closeDrainTimeout bounds how long Close waits for in-flight requests. Past
+// it, closing anyway is the lesser evil: the alternative is a process that
+// will not exit because one client will not hang up.
+const closeDrainTimeout = 10 * time.Second
+
+// drainInFlight waits until no tenant has a request in flight, or until the
+// deadline. It reports whether the wait succeeded.
+//
+// s.stopping is already set, so no new request gets a tenant; this is only
+// about the ones already inside.
+func (s *Server) drainInFlight(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		busy := 0
+		s.mu.Lock()
+		for _, tn := range s.tenants {
+			if n := tn.inFlight.Load(); n > 0 {
+				busy += int(n)
+			}
+		}
+		s.mu.Unlock()
+		if busy == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			obs.L().Warn("closing with requests still in flight",
+				obs.FieldEvent, "shutdown.drain_timeout",
+				"in_flight", busy, "waited", d.String())
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // Dir is the data directory the server was opened on -- what a caller measures
@@ -166,11 +416,24 @@ func (s *Server) Close() error {
 	// Stop accepting new background work, cancel what is running, and wait
 	// for it. Closing the stores first would unmap under a retention or
 	// recompaction pass that is still walking them.
+	s.bgMu.Lock()
 	s.stopping.Store(true)
+	s.bgMu.Unlock()
 	if s.bgCancel != nil {
 		s.bgCancel()
 	}
 	s.bg.Wait()
+	// Syslog connections next: they write through the tenant writers, so they
+	// must be gone before those writers close.
+	s.closeSyslogConns()
+
+	// Then in-flight HTTP requests. Closing a store unmaps it, and a handler
+	// still inside a query is reading that mapping -- Close returning while a
+	// request was mid-flight was a use-after-unmap waiting for the timing to
+	// line up. http.Server.Shutdown is not enough on its own: it is the
+	// caller's to run, main.go logs its expiry and closes anyway, and a live
+	// tail is not an idle connection it would ever drain.
+	s.drainInFlight(closeDrainTimeout)
 
 	s.mu.Lock()
 	tenants := make([]*tenant, 0, len(s.tenants))
@@ -180,13 +443,22 @@ func (s *Server) Close() error {
 	s.mu.Unlock()
 	var firstErr error
 	for _, t := range tenants {
-		if err := t.w.Close(); err != nil && firstErr == nil { // flush buffered rows, stop the pool
+		// ErrWriterClosed on a second Close is the writer reporting it is
+		// already shut, not a failure -- Close is documented idempotent.
+		if err := t.w.Close(); err != nil && !errors.Is(err, ingest.ErrWriterClosed) && firstErr == nil {
 			firstErr = err
 		}
 		if err := t.store.Close(); err != nil && firstErr == nil { // unmap
 			firstErr = err
 		}
 	}
+	// Forget them. Leaving the map populated meant a request arriving after
+	// Close found a closed tenant, and a request for a NEW tenant opened a
+	// store -- with its directory lock and writer pool -- that nothing would
+	// ever close.
+	s.mu.Lock()
+	s.tenants = map[string]*tenant{}
+	s.mu.Unlock()
 	return firstErr
 }
 
@@ -214,18 +486,124 @@ func (s *Server) SetStreamFields(fields []string) {
 	s.mu.Unlock()
 }
 
+// applyQueryBudget stamps the configured wall-clock and byte budgets onto a
+// query, and returns a flag the caller checks afterwards.
+//
+// The request context alone did nothing: Go does not abort a handler when its
+// context is cancelled, and internal/query took no context, so
+// -search.maxDuration bounded the cluster fan-out and nothing else. The scan
+// checks these per group.
+func (s *Server) applyQueryBudget(r *http.Request, q *query.Query) *atomic.Bool {
+	stopped := new(atomic.Bool)
+	q.Stopped = stopped
+	if d := s.limits.MaxQueryDuration; d > 0 {
+		q.Deadline = time.Now().Add(d)
+	}
+	if dl, ok := r.Context().Deadline(); ok {
+		if q.Deadline.IsZero() || dl.Before(q.Deadline) {
+			q.Deadline = dl
+		}
+	}
+	if n := s.limits.MaxQueryBytes; n > 0 {
+		q.MaxBytes = n
+	}
+	// The REQUEST's context, so a client that hangs up ends the scan.
+	//
+	// Go does not abort a handler when its context is cancelled, so before
+	// this a disconnected client's query ran to completion and threw the
+	// answer away -- the whole cost, none of the benefit, and on a server
+	// under load that is the difference between shedding work and doing it
+	// twice. The Deadline above is kept as well: it is what -search.maxDuration
+	// sets, and a caller with no context deadline still gets it.
+	q.Bind(r.Context(), query.Limits{
+		MaxGroupKeys: s.limits.MaxGroupKeys,
+		MaxPipeRows:  s.limits.MaxPipeRows,
+	})
+	return stopped
+}
+
+// queryStopped answers a query that hit a budget. A short result presented as
+// complete is the silent truncation this exists to prevent.
+//
+// The bool says THAT it stopped; qerr says WHY, when the query was bound to a
+// context. Every stop used to answer 504 whatever caused it, so a client that
+// disconnected, one that asked for too many bytes and one that ran out of time
+// were indistinguishable in an access log -- and a client retrying a 504
+// against a byte budget retried forever.
+func (s *Server) queryStopped(w http.ResponseWriter, r *http.Request, stopped *atomic.Bool) bool {
+	return s.queryStoppedErr(w, r, stopped, nil)
+}
+
+// queryStoppedErr is queryStopped with the query's own stop reason.
+func (s *Server) queryStoppedErr(w http.ResponseWriter, r *http.Request, stopped *atomic.Bool, q *query.Query) bool {
+	if stopped == nil || !stopped.Load() {
+		return false
+	}
+	status := http.StatusGatewayTimeout
+	msg := "query exceeded its time or byte budget; narrow the window, add a filter, " +
+		"or raise -search.maxDuration / -search.maxQueryBytes"
+	if q != nil {
+		if err := q.StopErr(); err != nil {
+			// The cause AND the remedy. A message that says only what went
+			// wrong leaves an operator to guess which knob moves it, and a
+			// regression test pins that these name the real flags -- the
+			// budget errors used to name flags that did not exist.
+			status = query.HTTPStatus(err)
+			switch {
+			case errors.Is(err, query.ErrDeadlineExceeded):
+				msg = err.Error() + "; narrow the window, add a filter, or raise " +
+					"-search.maxDuration"
+			case errors.Is(err, query.ErrByteLimit), errors.Is(err, query.ErrMemoryLimit):
+				msg = err.Error() + "; narrow the window, add a filter, or raise " +
+					"-search.maxQueryBytes"
+			case errors.Is(err, query.ErrRowLimit):
+				msg = err.Error() + "; add a `| limit N`, a stats pipe, or raise " +
+					"-search.maxRows"
+			default:
+				msg = err.Error()
+			}
+			if errors.Is(err, query.ErrCanceled) {
+				// Nobody is reading: the connection is gone. The status is for
+				// the access log, and writing a body to a closed connection is
+				// an error the handler would then log as a second failure.
+				return true
+			}
+		}
+	}
+	s.writeErr(w, r, readSpec(), status, msg)
+	return true
+}
+
 // parallelCfg is the deployment writer configuration the temporary shard
-// writers of a large ingest must inherit. It reads the same two settings the
-// persistent per-tenant writer is built with (tenant), so a large body and a
-// small one produce the same schema. Copying only Compact here is what made
-// _stream appear under the small-body path and vanish under the parallel one.
-func (s *Server) parallelCfg() ingest.ParallelConfig {
+// writers of a large ingest must inherit. It is READ OFF THE TENANT WRITER,
+// which is the writer a body under MinParallelBytes is ingested on, so the
+// two paths cannot store the same records under different rules.
+//
+// IT USED TO ENUMERATE THE SETTINGS AGAIN, and the enumeration drifted three
+// times against the one in tenant(): Compact copied and StreamFields
+// forgotten (a _stream column on small bodies only), then Limits (no field,
+// name or value cap and a forgeable ".error" on large ones), then
+// VectorFields (every embedding on a body over MinParallelBytes dropped, at
+// HTTP 200). Three instances of one class is a design signal; the list is
+// gone rather than lengthened. Shards is the only thing added here, because
+// it is a property of this server's test configuration and not of the writer.
+func (s *Server) parallelCfg(w *ingest.Writer) ingest.ParallelConfig {
+	cfg := w.ShardSettings()
+	s.mu.Lock()
+	cfg.Shards = s.ingestShards
+	s.mu.Unlock()
+	return cfg
+}
+
+// setIngestShardsForTest forces the parallel ingest shard count.
+//
+// ForTest by name, the way routeCountForTest is: a helper only tests call
+// should say so. It is what makes the sharded ingest branch reachable from
+// this package at all -- see Server.ingestShards.
+func (s *Server) setIngestShardsForTest(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return ingest.ParallelConfig{
-		Compact:      s.compact,
-		StreamFields: append([]string(nil), s.strmFlds...),
-	}
+	s.ingestShards = n
 }
 
 // failIngest reports a partially or wholly failed ingest. The durable rows
@@ -238,14 +616,36 @@ func (s *Server) parallelCfg() ingest.ParallelConfig {
 // problem, not something this handler can solve.
 func (s *Server) failIngest(w http.ResponseWriter, err error, ingested, skipped, nbytes int) {
 	s.countRows(ingested, skipped, nbytes)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusInternalServerError)
-	json.NewEncoder(w).Encode(map[string]any{
+	body := map[string]any{
 		"error":    err.Error(),
 		"ingested": ingested,
 		"skipped":  skipped,
 		"durable":  ingested,
-	})
+	}
+	// The same retry facts every other write path reports. This one answered
+	// a flat 500 with no Retry-After and none of them, so a shipper posting a
+	// body over MinParallelBytes got a different -- and less useful -- answer
+	// to the same disk failure than one posting a smaller body. A fact that
+	// depends on the size of the request is a fact a client cannot rely on.
+	code := http.StatusInternalServerError
+	var we *ingest.WriteError
+	if errors.As(err, &we) {
+		code = we.HTTPStatus()
+		if after := int(we.RetryAfter() / time.Second); after > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(after))
+			body["retryAfterSeconds"] = after
+		}
+		body["retryable"] = we.Retryable()
+		body["duplicateOnRetry"] = we.DuplicatesOnRetry()
+		body["groupsFailed"] = we.FailedGroups
+		body["groupsTotal"] = we.TotalGroups
+		// On this path they are shard writers rather than groups.
+		body["unit"] = we.Units()
+	}
+	s.countErr()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(body)
 }
 
 // splitCSV splits a comma-separated list, trimming spaces and dropping empties.
@@ -260,88 +660,201 @@ func splitCSV(v string) []string {
 	return out
 }
 
+// routeCountForTest is how many patterns the mux registered.
+//
+// ForTest by name: the three callers are the route audit, the route-count gate
+// and the contract completeness check, all tests. It was on the unwired
+// baseline as having no production reader, which was true and was not the
+// finding -- the finding is that a helper only tests call should say so.
+func (s *Server) routeCountForTest() int {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	return len(s.routes)
+}
+
+func (s *Server) registeredPaths() []string {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	return append([]string(nil), s.routes...)
+}
+
 // Handler wires the routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	s.routeMu.Lock()
+	s.routes = nil
+	s.routeMu.Unlock()
+	handle := func(pattern string, h http.HandlerFunc) {
+		s.routeMu.Lock()
+		s.routes = append(s.routes, pattern)
+		s.routeMu.Unlock()
+		mux.HandleFunc(pattern, h)
+	}
 	// Every ingest route is wrapped: method, media type and a bounded body.
 	// Unwrapped, each handler read r.Body with io.ReadAll and no limit, took
 	// any method, and ignored Content-Type entirely.
 	nd := ndjsonSpec()
 	// ingest is the role every write path needs; query for reads; admin for
 	// the backup and diagnostic surfaces. in/rd/adm wrap guard with it.
+	// Authentication is outermost, then the request-shape guard. An
+	// unauthenticated caller gets 401 whatever it sends; with the guard
+	// outside, a wrong Content-Type answered 415 first, which tells an
+	// anonymous caller which media types a route accepts.
 	in := func(spec routeSpec, h http.HandlerFunc) http.HandlerFunc {
-		return s.guard(spec, s.requireAuth(config.RoleIngest, spec, h))
+		return s.requireAuth(config.RoleIngest, spec, s.guard(spec, s.checkStorage(spec, h)))
 	}
 	rd := func(h http.HandlerFunc) http.HandlerFunc {
 		sp := readSpec()
-		return s.guard(sp, s.requireAuth(config.RoleQuery, sp, h))
+		return s.requireAuth(config.RoleQuery, sp, s.guard(sp, h))
 	}
 	adm := func(h http.HandlerFunc) http.HandlerFunc {
 		sp := adminSpec()
-		return s.guard(sp, s.requireAuth(config.RoleAdmin, sp, h))
+		return s.requireAuth(config.RoleAdmin, sp, s.guard(sp, h))
 	}
-	mux.HandleFunc("/insert/jsonline", in(nd, s.insertJSONLine))
-	mux.HandleFunc("/insert/logfmt", in(nd, s.insertLogfmt))
-	mux.HandleFunc("/_bulk", in(nd, s.esBulk))                               // Elasticsearch bulk ingest
-	mux.HandleFunc("/loki/api/v1/push", in(nd, s.insertLoki))                // Grafana Loki push
-	mux.HandleFunc("/api/v2/logs", in(nd, s.insertDatadog))                  // Datadog logs intake
-	mux.HandleFunc("/v1/input", in(nd, s.insertDatadog))                     // Datadog legacy intake
-	mux.HandleFunc("/insert/syslog", in(nd, s.insertSyslog))                 // syslog over HTTP (native transport: ListenSyslog)
-	mux.HandleFunc("/v1/logs", in(otlpSpec(), s.insertOTLPLogs))             // OpenTelemetry OTLP/HTTP logs
-	mux.HandleFunc("/insert/journald", in(journaldSpec(), s.insertJournald)) // systemd journal export
-	mux.HandleFunc("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	// st: reads neither a form nor a body -- the UI and the alerts page.
+	st := func(h http.HandlerFunc) http.HandlerFunc {
+		sp := staticSpec()
+		return s.requireAuth(config.RoleQuery, sp, s.guard(sp, h))
+	}
+	// es: reads r.Body ITSELF, so nothing upstream may consume it.
+	es := func(h http.HandlerFunc) http.HandlerFunc {
+		sp := rawBodySpec()
+		return s.requireAuth(config.RoleQuery, sp, s.guard(sp, h))
+	}
+	handle("/insert/jsonline", in(nd, s.insertJSONLine))
+	handle("/insert/logfmt", in(nd, s.insertLogfmt))
+	handle("/_bulk", in(nd, s.esBulk))                                                // Elasticsearch bulk ingest
+	handle("/loki/api/v1/push", in(lokiSpec(), s.insertLoki))                         // Grafana Loki push
+	handle("/api/v2/logs", in(nd, s.insertDatadog))                                   // Datadog logs intake
+	handle("/v1/input", in(nd, s.insertDatadog))                                      // Datadog legacy intake
+	handle("/insert/syslog", in(nd, s.insertSyslog))                                  // syslog over HTTP (native transport: ListenSyslog)
+	handle("/v1/logs", in(specForPath("/v1/logs"), s.insertOTLPLogs))                 // OpenTelemetry OTLP/HTTP logs
+	handle("/insert/journald", in(specForPath("/insert/journald"), s.insertJournald)) // systemd journal export
+	// /insert/ready stays UNCONDITIONAL. A quarantined group is old data and
+	// the store takes writes normally, so failing the ingest probe converts a
+	// read-side loss into an ingest outage: agents stop shipping to a node
+	// that would have accepted the writes, and the pod leaves the ingest
+	// Service. docs/lld/api.md lists this path under "200 probes" and
+	// cluster.go calls it a liveness probe; only /-/ready reflects storage
+	// health.
+	handle("/insert/ready", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	// VictoriaLogs serves every third-party ingest protocol under /insert/<vendor>/.
 	// An agent whose config was written against VictoriaLogs sends the prefixed
 	// path, so serving only the vendor-native path 404s a drop-in client. Both
 	// spellings are registered; the unprefixed ones are what the vendors' own
 	// agents use when pointed at a bare host.
-	mux.HandleFunc("/insert/elasticsearch/_bulk", in(nd, s.esBulk))
-	mux.HandleFunc("/insert/loki/api/v1/push", in(nd, s.insertLoki))
-	mux.HandleFunc("/insert/datadog/api/v2/logs", in(nd, s.insertDatadog))
-	mux.HandleFunc("/insert/datadog/api/v1/validate", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
-	mux.HandleFunc("/insert/opentelemetry/v1/logs", in(otlpSpec(), s.insertOTLPLogs))
-	mux.HandleFunc("/admin/backup", adm(s.backup))                                                            // tar snapshot for offline restore
-	mux.HandleFunc("/metrics", s.guard(readSpec(), s.requireAuth(config.RoleMetrics, readSpec(), s.metrics))) // Prometheus text exposition
-	mux.HandleFunc("/alerts", rd(s.alertsHandler))                                                            // alerting rule state
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
-	mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
-	mux.HandleFunc("/-/ready", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("OK")) })
-	mux.HandleFunc("/flags", adm(s.flagsHandler)) // flag dump: administrative
-	mux.HandleFunc("/vmui", s.ui)                 // web UI (vmui equivalent)
-	mux.HandleFunc("/select/vmui", rd(s.ui))
-	mux.HandleFunc("/", s.ui) // catch-all: serve the UI at the root
-	mux.HandleFunc("/select/logsql/query", rd(s.selectQuery))
-	mux.HandleFunc("/select/sql", rd(s.sqlQuery))        // SQL SELECT subset (beyond VL)
-	mux.HandleFunc("/select/vector", rd(s.vectorSearch)) // k-NN over embeddings (beyond VL)
-	mux.HandleFunc("/select/logsql/tail", rd(s.tail))    // live tail: stream matching rows as they arrive
-	mux.HandleFunc("/select/logsql/hits", rd(s.selectHits))
-	mux.HandleFunc("/select/logsql/field_names", rd(s.fieldNames))
-	mux.HandleFunc("/select/logsql/field_values", rd(s.fieldValues))
-	mux.HandleFunc("/select/logsql/facets", rd(s.facets))
-	mux.HandleFunc("/select/logsql/stats_query", rd(s.statsQuery))
-	mux.HandleFunc("/select/logsql/stats_query_range", rd(s.statsQueryRange))
-	mux.HandleFunc("/select/logsql/streams", rd(s.streamsHandler))
-	mux.HandleFunc("/select/logsql/stream_ids", rd(s.streamIDsHandler))
-	mux.HandleFunc("/select/logsql/stream_field_names", rd(s.streamFieldNamesHandler))
-	mux.HandleFunc("/select/logsql/stream_field_values", rd(s.streamFieldValuesHandler))
+	handle("/insert/elasticsearch/_bulk", in(nd, s.esBulk))
+	handle("/insert/loki/api/v1/push", in(lokiSpec(), s.insertLoki))
+	handle("/insert/datadog/api/v2/logs", in(nd, s.insertDatadog))
+	// Datadog agents call this to check their API key. Answering 200
+	// unconditionally told every agent its key was valid; behind the ingest
+	// role it now answers for credentials this server actually accepts.
+	handle("/insert/datadog/api/v1/validate",
+		in(specForPath("/insert/datadog/api/v1/validate"), func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	handle("/insert/opentelemetry/v1/logs", in(specForPath("/insert/opentelemetry/v1/logs"), s.insertOTLPLogs))
+	handle("/admin/backup", adm(s.backup)) // tar snapshot for offline restore
+	// Anti-entropy. The state and group endpoints are what a peer calls; the
+	// repair endpoint is what an operator calls on a router. All three are
+	// admin-authorized: the group endpoint WRITES into the store, and the state
+	// endpoint discloses the shape of the data.
+	handle(pathReplicaState, adm(s.serveReplicaState))
+	handle(pathReplicaGroup, func() http.HandlerFunc {
+		sp := s.replicaGroupSpec()
+		return s.requireAuth(config.RoleAdmin, sp, s.guard(sp, s.serveReplicaGroup))
+	}())
+	handle("/admin/storage/quarantine", adm(s.listQuarantined)) // which group, why, how big
+	handle("/admin/cluster/repair", adm(s.repairCluster))
+	handle("/admin/cluster/backup", adm(s.clusterBackup))
+	// Exempt from the query budget, for opsSpec's own argument with one word
+	// changed: a scraper that gets 429 under load loses the telemetry that
+	// explains the load, and an operator who gets 429 under load loses the
+	// button that ENDS it. 32 in-flight queries is enough to make this return
+	// "too many concurrent requests", and the replica it would have restored
+	// is the one under that load.
+	handle("/admin/acknowledge-degraded", func() http.HandlerFunc {
+		sp := adminSpec()
+		sp.nosem = true
+		return s.requireAuth(config.RoleAdmin, sp, s.guard(sp, s.acknowledgeDegraded))
+	}()) // accept a degraded store
+	handle("/metrics", s.requireAuth(config.RoleMetrics, opsSpec(), s.guard(opsSpec(), s.metrics))) // Prometheus text exposition
+	handle("/alerts", st(s.alertsHandler))                                                          // alerting rule state
+	// /health and /-/healthy are LIVENESS: the process. They answered a
+	// literal "OK" whatever the server was doing, including while draining --
+	// so an orchestrator kept routing to a process that was going to exit.
+	// Every store, disk and peer condition belongs to readiness: a full disk
+	// that failed liveness would kill the process, which would restart onto
+	// the same full disk and lose the rows a graceful drain flushes.
+	handle("/health", s.healthHandler(healthLive))
+	handle("/-/healthy", s.healthHandler(healthLive))
+	handle("/-/ready", s.healthHandler(healthReady))
+	handle("/flags", adm(s.flagsHandler)) // flag dump: administrative
+	handle("/vmui", st(s.ui))             // web UI (vmui equivalent); same gate as /select/vmui
+	handle("/select/vmui", st(s.ui))
+	// The catch-all serves the same UI page /vmui and /select/vmui gate, so
+	// it carries the same role. It was the one registration in this function
+	// with no wrapper.
+	handle("/", st(s.ui))
+	handle("/select/logsql/query", rd(s.selectQuery))
+	handle("/select/sql", rd(s.sqlQuery))        // SQL SELECT subset (beyond VL)
+	handle("/select/vector", es(s.vectorSearch)) // k-NN over embeddings (beyond VL); body is a JSON document
+	// The tail has no deadline: it is long-lived by design.
+	handle("/select/logsql/tail", s.requireAuth(config.RoleQuery, tailSpec(), s.guard(tailSpec(), s.tail))) // live tail: stream matching rows as they arrive
+	handle("/select/logsql/hits", rd(s.selectHits))
+	handle("/select/logsql/field_names", rd(s.fieldNames))
+	handle("/select/logsql/field_values", rd(s.fieldValues))
+	handle("/select/logsql/facets", rd(s.facets))
+	handle("/select/logsql/stats_query", rd(s.statsQuery))
+	handle("/select/logsql/stats_query_range", rd(s.statsQueryRange))
+	handle("/select/logsql/streams", rd(s.streamsHandler))
+	handle("/select/logsql/stream_ids", rd(s.streamIDsHandler))
+	handle("/select/logsql/stream_field_names", rd(s.streamFieldNamesHandler))
+	handle("/select/logsql/stream_field_values", rd(s.streamFieldValuesHandler))
 	// The Elasticsearch search surface VictoriaLogs lacks.
-	mux.HandleFunc("/_search", s.esSearch)
-	mux.HandleFunc("/_count", s.esCount)
+	// The Elasticsearch read surface returns tenant _source documents, so it
+	// needs the query role like every other read route. Registered bare, it
+	// also skipped the method guard, the media-type allowlist and the body
+	// limit: an anonymous POST /_search returned another tenant's payloads.
+	handle("/_search", es(s.esSearch))
+	handle("/_count", es(s.esCount))
 	// In router mode, writes forward to storage nodes (outermost, before the
 	// tenant/local path); reads fall through to withTenant -> federatedSelect.
 	// recoverPanic is outermost so one bad request can never take the server down.
-	return recoverPanic(s.withPrincipal(s.routeWrites(s.withTenant(mux))))
+	// The envelope is OUTERMOST on the serving side, so it is stamped before
+	// any handler writes a byte. Headers set after the first write are
+	// silently dropped, and a dropped Complete header reads as "the peer did
+	// not say" -- which the router treats as not-complete, so a late stamp
+	// would make every answer look partial.
+	return recoverPanic(s.serveEnvelope(s.withPrincipal(s.routeWrites(s.withTenant(mux)))))
 }
 
 // recoverPanic turns a handler panic into a 500 and keeps the server serving --
 // a single malformed request must never crash the process.
+//
+// http.ErrAbortHandler is re-panicked, not converted. It is net/http's sentinel
+// meaning "abandon this response without a reply", and only net/http's own
+// conn.serve honours it -- silently, without logging. Because this middleware
+// is the OUTERMOST wrapper (see Handler above), swallowing it here made the
+// sentinel unreachable: /admin/backup's abort became a 200 with "internal
+// error" appended to a truncated tar, which is the exact failure the abort was
+// added to prevent. A handler that needs to abandon a half-written response has
+// no other mechanism, because the status and the first bytes are already gone.
 func recoverPanic(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
-			if v := recover(); v != nil {
-				log.Printf("simdlogs: panic serving %s: %v", r.URL.Path, v)
-				http.Error(w, "internal error", http.StatusInternalServerError)
+			v := recover()
+			if v == nil {
+				return
 			}
+			if v == http.ErrAbortHandler {
+				panic(v) // net/http handles this one; it must reach conn.serve
+			}
+			obs.L().Error("panic serving request",
+				obs.FieldEvent, "http.panic",
+				obs.FieldRoute, r.URL.Path,
+				obs.FieldMethod, r.Method,
+				obs.FieldErrorClass, string(obs.ClassInternal),
+				"panic", v)
+			http.Error(w, "internal error", http.StatusInternalServerError)
 		}()
 		h.ServeHTTP(w, r)
 	})
@@ -362,7 +875,7 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 	var ing, skip int
 	if len(body) >= ingest.MinParallelBytes {
 		var werr error
-		ing, skip, werr = ingest.IngestJSONLinesParallelCfg(tn.store, body, fallback, s.parallelCfg(), &opts)
+		ing, skip, werr = ingest.IngestJSONLinesParallelCfg(tn.store, body, fallback, s.parallelCfg(tn.w), &opts)
 		if werr != nil {
 			// Some or all of the rows were parsed but did not reach the
 			// store. Answering with a count alone is the silent data loss
@@ -375,13 +888,38 @@ func (s *Server) insertJSONLine(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// Small body: reuse the persistent writer, no per-request pool churn.
-		ing, skip = ingest.IngestJSONLinesOpts(tn.w, body, fallback, &opts)
-		if err := tn.w.Flush(); err != nil {
-			http.Error(w, err.Error(), 500)
+		// Mark first: that writer's buffer is shared with every other
+		// request on this tenant, so only FlushMark can say whether THESE
+		// rows landed.
+		mark := tn.w.Mark()
+		res, perr := ingest.IngestJSONLinesOpts(tn.w, body, fallback, &opts)
+		ing, skip = res.Accepted, res.Rejected
+		if perr != nil {
+			s.countRows(ing, skip, len(body))
+			s.writeErr(w, r, ndjsonSpec(), ingest.StatusFor(perr), perr.Error())
+			return
+		}
+		if err := tn.w.FlushMark(mark); err != nil {
+			// Rows added AFTER Close are dropped silently -- Add returns
+			// early once closed -- so counting them would inflate the
+			// ingested total. Rows added BEFORE it are a different case:
+			// Close flushes the shared buffer before it sets closed, so
+			// those are durable and this under-counts them.
+			//
+			// Under-counting a metric is the safe side of that trade; the
+			// alternative over-states durability, which is the claim this
+			// whole task exists to stop being wrong about. The response
+			// itself does not under-claim: the WriteError carries
+			// Partial, so the client is told a retry may duplicate.
+			if !errors.Is(err, ingest.ErrWriterClosed) {
+				s.countRows(ing, skip, len(body))
+			}
+			s.writeFlushErr(w, r, ndjsonSpec(), err)
 			return
 		}
 	}
 	s.countRows(ing, skip, len(body))
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int{"ingested": ing, "skipped": skip})
 }
 
@@ -394,19 +932,176 @@ func (s *Server) insertLogfmt(w http.ResponseWriter, r *http.Request) {
 	}
 	tn := s.tn(r)
 	lfOpts := ingestOptions(r)
-	ing, skip := ingest.IngestLogfmtOpts(tn.w, body, tn.fallbackTS(), &lfOpts)
-	s.countRows(ing, skip, len(body))
-	if err := tn.w.Flush(); err != nil {
-		http.Error(w, err.Error(), 500)
+	lfMark := tn.w.Mark()
+	lfRes, lfErr := ingest.IngestLogfmtOpts(tn.w, body, tn.fallbackTS(), &lfOpts)
+	if lfErr != nil {
+		s.writeErr(w, r, ndjsonSpec(), ingest.StatusFor(lfErr), lfErr.Error())
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]int{"ingested": ing, "skipped": skip})
+	if err := tn.w.FlushMark(lfMark); err != nil {
+		s.writeFlushErr(w, r, ndjsonSpec(), err)
+		return
+	}
+	// After the flush: a counter must not go backwards.
+	s.countRows(lfRes.Accepted, lfRes.Rejected, len(body))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int{"ingested": lfRes.Accepted, "skipped": lfRes.Rejected})
 }
 
 // selectQuery runs a parsed LogsQL query and streams matched rows as
 // NDJSON, the reference's /select/logsql/query response shape.
+// wroteSpy records whether any byte reached the ResponseWriter.
+//
+// It decides whether a failure can still be reported as a status. Once the
+// first byte is out the status line is gone and a 4xx is no longer available;
+// before that it still is, and the difference is not observable from the
+// bufio.Writer in front of it, which may hold everything written so far.
+type wroteSpy struct {
+	w     io.Writer
+	wrote bool
+}
+
+func (f *wroteSpy) Write(p []byte) (int, error) {
+	f.wrote = true
+	return f.w.Write(p)
+}
+
+// streamSelect answers a bare select without materializing it.
+//
+// Peak memory is one row group's matches (or a bounded window of them when the
+// scan fans out), not the size of the answer. See internal/query/iterator.go.
+//
+// The hard part is not the streaming, it is the failure. An NDJSON body that
+// stops early is indistinguishable from a complete one -- there is no length,
+// no terminator, and every line already written parses. So a scan that fails
+// after the first byte is out does NOT return: it aborts the connection, and
+// the client sees a broken stream rather than a short answer it would have
+// believed. Before the first byte the status is still available and the error
+// is reported properly.
+func (s *Server) streamSelect(w http.ResponseWriter, r *http.Request, q *query.Query, stopped *atomic.Bool) {
+	// Counted, and exposed. Which path answered is not visible from the body
+	// -- the two are byte-identical by construction -- so without a counter an
+	// operator cannot tell whether raising -search.maxRows moved anything, and
+	// a test cannot tell that it exercised this function at all rather than
+	// the materialized one returning the same rows.
+	atomic.AddInt64(&s.nStreamedSelects, 1)
+	spy := &wroteSpy{w: w}
+	// 64 KiB rather than bufio's default 4 KiB: this is a bulk transfer, and
+	// the syscall count is the only thing the buffer size changes.
+	bw := bufio.NewWriterSize(spy, 64<<10)
+	w.Header().Set("Content-Type", ndjsonContentType)
+
+	var buf []byte
+	err := query.ScanEach(s.tn(r).store, q, func(rows []query.Row) error {
+		for _, row := range rows {
+			buf = appendRowJSON(buf[:0], row, q.MatAll)
+			if _, werr := bw.Write(buf); werr != nil {
+				// The client hung up. Returned rather than swallowed, so the
+				// scan stops instead of filling a buffer nobody reads.
+				return werr
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		err = bw.Flush()
+	}
+	// ScanEach returns the query's own stop reason, so a budget or
+	// cancellation stop arrives as err. The atomic is checked too because it
+	// is the signal the materialized path uses and the two must not disagree.
+	if err == nil && stopped != nil && stopped.Load() {
+		if e := q.StopErr(); e != nil {
+			err = e
+		} else {
+			err = query.ErrDeadlineExceeded
+		}
+	}
+	if err == nil {
+		return
+	}
+	if !spy.wrote {
+		// Nothing is on the wire yet, so the status line is still available
+		// and the failure is reported the same way the materialized path
+		// reports it -- same codes, same remedies.
+		s.queryStoppedErr(w, r, stopped, q)
+		if stopped == nil || !stopped.Load() {
+			s.writeErr(w, r, readSpec(), query.HTTPStatus(err), err.Error())
+		}
+		return
+	}
+	// Bytes are already out. An NDJSON body that stops early parses line for
+	// line and carries no length and no terminator, so returning here would
+	// hand the client a short answer it has no way to tell from a complete
+	// one. Aborting the connection is the only signal left.
+	panic(http.ErrAbortHandler)
+}
+
+// pagedSelect answers one page of a stable total order.
+//
+// The cursor is opaque and signed; see cursor.go for why. What it costs the
+// caller is one rule: page until `More` is false, and do not edit the token.
+func (s *Server) pagedSelect(w http.ResponseWriter, r *http.Request, q *query.Query,
+	stopped *atomic.Bool, size int,
+) {
+	dir := query.Oldest
+	if v := r.FormValue("direction"); v == "newest" {
+		dir = query.Newest
+	} else if v != "" && v != "oldest" {
+		http.Error(w, "simdlogs: direction must be `oldest` or `newest`", 400)
+		return
+	}
+	// The window is resolved BEFORE the hash, because a relative window
+	// (`_time:5m`) is a different absolute window on every request and a
+	// cursor bound to the unresolved text would slide forward as the clock
+	// moves -- repeating rows the caller has seen and skipping ones it has
+	// not.
+	query.ResolveWindow(q)
+	qh := queryHash(r.FormValue("query"), q.From, q.To)
+	tenant := tenantKeyOf(r)
+
+	var after *query.RowKey
+	if tok := r.FormValue("cursor"); tok != "" {
+		k, err := s.cursors.decode(tok, tenant, qh, dir)
+		if err != nil {
+			// 400, not 403. A cursor that names another tenant is a client
+			// holding a stale or hand-edited token, not an authorization
+			// decision about this request -- the tenant middleware already
+			// made that one, and answering 403 here would tell a prober that
+			// the cursor it forged was otherwise well-formed.
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		after = &k
+	}
+
+	page, err := query.ScanPage(s.tn(r).store, q, after, dir, size)
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
+	if err != nil {
+		s.writeErr(w, r, readSpec(), query.HTTPStatus(err), err.Error())
+		return
+	}
+	if page.More {
+		// The cursor goes in a header, not in the body: the body is NDJSON,
+		// one JSON object per row, and a trailing object of a different shape
+		// is a row as far as every client that reads the stream is concerned.
+		w.Header().Set("X-Simdlogs-Cursor", s.cursors.encode(cursorPayload{
+			tenant: tenant, queryHash: qh, dir: dir, key: page.Next,
+		}))
+	}
+	w.Header().Set("Content-Type", ndjsonContentType)
+	bw := bufio.NewWriterSize(w, 64<<10)
+	defer bw.Flush()
+	var buf []byte
+	for _, row := range page.Rows {
+		buf = appendRowJSON(buf[:0], row, q.MatAll)
+		bw.Write(buf)
+	}
+}
+
 func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 { // select-router: fan out to the storage nodes and merge
+	if len(s.backendList()) > 0 { // select-router: fan out to the storage nodes and merge
 		s.federatedSelect(w, r)
 		return
 	}
@@ -431,11 +1126,52 @@ func (s *Server) selectQuery(w http.ResponseWriter, r *http.Request) {
 			q.MaxRows = s.maxRows
 		}
 	}
-	rows := query.RunPipeline(s.tn(r).store, q) // applies the pipe chain; == Run when there are none
-	if bareSelect && s.maxRows > 0 && len(rows) > s.maxRows {
-		http.Error(w, fmt.Sprintf("simdlogs: result exceeds -search.maxRows=%d; add a `| limit N`, a stats pipe, or narrow the query", s.maxRows), 400)
+	stopped := s.applyQueryBudget(r, q)
+	if n := intParam(r, "page_size", 0); n > 0 {
+		// Pagination is opt-in per request. Without page_size the endpoint
+		// answers exactly as it did -- the ordering below is a total order the
+		// old path never promised, and imposing it on every select would
+		// change answers this campaign's whole point is not to change.
+		s.pagedSelect(w, r, q, stopped, n)
 		return
 	}
+	if query.Streamable(q) {
+		// No pipes, no `limit=`, and no row cap in force -- so nothing has to
+		// see the whole answer before the first byte can go out. That is
+		// exactly the query that used to be dangerous: with
+		// -search.maxRows=-1 a bare select materialized every matching row
+		// before writing any of them, so an answer that did not fit was not
+		// slow, it was impossible.
+		s.streamSelect(w, r, q, stopped)
+		return
+	}
+	rows := query.RunPipeline(s.tn(r).store, q) // applies the pipe chain; == Run when there are none
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
+	if s.maxRows > 0 && len(rows) > s.maxRows {
+		// The belt to the scan's braces. The scan now records ErrRowLimit when
+		// it trips the cap, and queryStoppedErr above reports it -- but a pipe
+		// chain can also GROW its input past the cap without the scan ever
+		// tripping (a join that multiplies, a union that appends), and that
+		// result is as unbounded as the one the cap exists to refuse.
+		//
+		// Not `bareSelect &&` any more. That was the defect: the HTTP layer
+		// set MaxRows for every non-projecting chain and reported the overflow
+		// for exactly one of them, so `| sort`, `| offset`, `| rename`,
+		// `| format`, `| join` and `| union` each answered from an input the
+		// scan had silently cut. A sort of the first N rows is not the first N
+		// of the sort.
+		s.writeErr(w, r, readSpec(), http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("simdlogs: result exceeds -search.maxRows=%d; add a `| limit N`, "+
+				"a stats pipe, or narrow the query", s.maxRows))
+		return
+	}
+	// NDJSON, so say so: this is what the reference sends, and a client that
+	// switches on Content-Type was previously told text/plain for a stream of
+	// JSON objects. Set before the first write -- after it the header is
+	// already on the wire and Set is silently ignored.
+	w.Header().Set("Content-Type", ndjsonContentType)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	// Hand-built NDJSON: no map[string]any, no reflection. The engine
@@ -460,13 +1196,61 @@ func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 		buf = append(buf, '"')
 		first = false
 	}
-	stream := ""
+	stream, streamID := "", ""
+	sawStream, sawStreamID := false, false
+	// AT MOST ONCE, whichever source it comes from.
+	//
+	// A NoTime row can carry TWO `_time` fields -- `rename x as _time` does
+	// not overwrite an existing key and `copy x as _time` does not either --
+	// and the first version of this guard kept both, so
+	// `* | stats by (_time) count() c | copy _time as t2 | rename t2 as _time`
+	// emitted {"_time":"…","c":"1","_time":"…"}: one JSON object with a
+	// duplicate key, which every decoder resolves differently. The old
+	// unconditional skip dropped both, which was the other defect.
+	emittedTime := !row.NoTime
 	for _, f := range row.Fields {
+		// Conditional on the emit above, exactly as the pack is.
+		//
+		// THE THIRD COPY of this pattern and the one on the wire. packJSON and
+		// packLogfmt were fixed to keep a `_time` FIELD that a NoTime row
+		// carries; the serializer they are supposed to mirror still dropped
+		// it, so a response contained both answers at once:
+		//
+		//	* | stats by (_time) count() c
+		//	  VL        {"_time":"2026-08-16T03:00:00Z","c":"1"}
+		//	  this      {"c":"1"}
+		//	  ... | pack_json as p
+		//	            {"c":"1","p":"{\"_time\":\"…\",\"c\":\"1\"}"}
+		//
+		// which is verbatim the failure the pack fix existed to remove -- "a
+		// client reading `p` got a different record from a client reading the
+		// row, out of one response" -- inverted. Reachable through
+		// `stats by (_time)`, `rename x as _time`, `copy x as _time` and the
+		// router's jsonLineToRow.
 		if f.Key == "_time" {
-			continue
+			if emittedTime {
+				continue
+			}
+			emittedTime = true
 		}
-		if f.Key == "_stream" {
-			stream = f.Value
+		// A NON-EMPTY value counts as present. The store materializes a column
+		// for the whole group, so a row that never carried _stream_id comes
+		// back with "" once any row in its flush did -- and treating that as
+		// present suppressed the synthesis for every other row in the flush.
+		// One client-supplied value blanked the field group-wide, at HTTP 200,
+		// on the field a client groups and colours by.
+		if f.Key == "_stream" && f.Value != "" {
+			stream, sawStream = f.Value, true
+		}
+		if f.Key == "_stream_id" && f.Value != "" {
+			streamID, sawStreamID = f.Value, true
+		}
+		if withStream && (f.Key == "_stream" || f.Key == "_stream_id") {
+			// Emitted once, below, from the row's value or the synthesized
+			// one. Emitting it here as well is what produced the duplicate
+			// key; skipping it here and synthesizing unconditionally is what
+			// dropped the ingested value at the shard. One place decides.
+			continue
 		}
 		if !first {
 			buf = append(buf, ',')
@@ -483,25 +1267,34 @@ func appendRowJSON(buf []byte, row query.Row, withStream bool) []byte {
 	// stream -- that is still a stream, and omitting the pair left a client's
 	// stream column blank rather than uniform.
 	if withStream {
-		if stream == "" {
+		// Exactly one _stream and one _stream_id, the row's own value when it
+		// has one and the synthesized value when it does not.
+		//
+		// Both were guarded, differently, and both were wrong: _stream tested
+		// the VALUE (`stream == ""`) and duplicated the key for a row carrying
+		// an empty one; _stream_id tested PRESENCE and blanked the field for
+		// every row sharing a group with one that carried it. Four lines apart,
+		// in one function.
+		if !sawStream {
 			stream = query.EmptyStream
-			if !first {
-				buf = append(buf, ',')
-			}
-			first = false
-			buf = append(buf, `"_stream":"`...)
-			buf = appendJSONString(buf, stream)
-			buf = append(buf, '"')
 		}
 		if !first {
 			buf = append(buf, ',')
 		}
-		buf = append(buf, `"_stream_id":"`...)
-		if stream == query.EmptyStream {
-			buf = append(buf, emptyStreamID...) // hashed once, not per row
-		} else {
-			buf = append(buf, query.StreamID(stream)...)
+		first = false
+		buf = append(buf, `"_stream":"`...)
+		buf = appendJSONString(buf, stream)
+		buf = append(buf, '"')
+		if !sawStreamID {
+			if stream == query.EmptyStream {
+				streamID = string(emptyStreamID) // hashed once, not per row
+			} else {
+				streamID = query.StreamID(stream)
+			}
 		}
+		buf = append(buf, ',')
+		buf = append(buf, `"_stream_id":"`...)
+		buf = appendJSONString(buf, streamID)
 		buf = append(buf, '"')
 	}
 	buf = append(buf, '}', '\n')
@@ -529,14 +1322,73 @@ func (rs readerStore) Snapshot(_, _ int64) (*storage.Snapshot, error) {
 // polls for later ones, running the LogsQL filter over each and flushing
 // matches as NDJSON. The connection lives until the client disconnects.
 func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
+	if s.refuseInRouterMode(w, r, "live tail",
+		"a cluster tail is a long-lived stream from every shard merged by arrival "+
+			"time, and the merge has no completeness signal: a shard that stops "+
+			"answering drops out of the stream with nothing to say so") {
+		return
+	}
 	q, err := parseRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	q.From, q.To = 0, int64(1)<<62 // live: match every timestamp in the new groups
-	q.Pipes = nil                  // tail streams raw records; a stats/sort pipe would never terminate
-	q.Limit = 0
+	// Live: match every timestamp in the new groups. The lower end is
+	// defaultWindowFrom and not 0 for the same reason every other window's is
+	// -- a row a client stamps before 1970 is storable, and 0 would drop it
+	// from the stream while `?start=1000-01-01` reached it on every other route.
+	q.From, q.To = defaultWindowFrom, defaultWindowTo
+	// ROW-LOCAL PIPES STREAM; THE REST ARE REFUSED. Neither is dropped.
+	//
+	// This was `q.Pipes = nil`, with the comment "a stats/sort pipe would never
+	// terminate". True of stats and sort -- and it threw away every OTHER pipe
+	// along with them, silently, at 200. Measured, four rows of which two are
+	// level=info:
+	//
+	//	tail?query=*                       4 of 4
+	//	tail?query=* | filter level:error  4 of 4   (both info rows delivered)
+	//	tail?query=* | fields _msg         full records, every field present
+	//
+	// Someone tailing only errors got everything, and nothing said so.
+	//
+	// A row-local pipe is a function of ONE row, so it runs on a stream exactly
+	// as it runs on a batch. `ClassifyPipe` already names that set for the
+	// distributed planner and the question here is the same one, so the set is
+	// read from there rather than restated -- a pipe added to the language gets
+	// classified once.
+	//
+	// The rest are REFUSED rather than ignored: `| stats` on a tail has no
+	// answer, because its input never ends, and a 400 saying so is the only
+	// response that does not misreport what ran.
+	//
+	// "cannot run here" rather than "has no answer here", because the second is
+	// not true of every refused pipe: `| limit 2` HAS an answer per poll, and
+	// it is the wrong one. Overstating the refusal is the same fault as giving
+	// it the wrong reason, one clause earlier.
+	if bad, why := nonStreamingPipe(q.Pipes); bad != "" {
+		http.Error(w, "a live tail streams rows as they arrive, so `"+bad+
+			"` cannot run here: "+why+". Row-local pipes -- filter, fields, "+
+			"rename, delete, copy, math, format, unpack and the rest -- do work "+
+			"on a tail.", 400)
+		return
+	}
+	// BOTH ROW CAPS, because `limit=` sets LastN and not Limit.
+	//
+	// A tail has no last row to count back from, so every cap has to go. This
+	// cleared `Limit` only -- three lines below the comment in `parseRequest`
+	// that says which field `limit=` writes -- and `LastN` survived to bound
+	// EVERY POLL. Not the stream once: each poll re-ran the query and kept N,
+	// so a tail delivered N rows per poll and dropped the rest, silently, at
+	// 200, for as long as it stayed open. Measured, five rows ingested after
+	// the stream opened:
+	//
+	//	tail?query=*            5 of 5
+	//	tail?query=*&limit=1    1 of 5
+	//	tail?query=*&limit=2    2 of 5
+	//
+	// A rule applied to the wrong field, which is the shape this repo keeps
+	// hitting.
+	q.Limit, q.LastN = 0, 0
 	q.MatAll = true // whole records, like the batch select
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -550,6 +1402,11 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&s.nTails, 1)
 	defer atomic.AddInt64(&s.nTails, -1)
 	store := s.tn(r).store
+	// The store pointer is all this loop needs from here on, and every read
+	// through it takes its own lease. Holding the tenant claim for the life
+	// of the connection is what let a handful of anonymous tails fill the
+	// tenant table and 503 everyone else.
+	tenantRefOf(r).release()
 	cursor := store.TailCursor() // only groups that arrive after we subscribe
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
@@ -567,26 +1424,100 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 			offset = d
 		}
 	}
-	backlog := *q
+	// The backlog is a batch query, not a stream: start_offset is a
+	// client-supplied duration, so without a budget one request replayed the
+	// whole store, and MaxConcurrentTail (64 by default) was the only bound
+	// on how many did it at once. tailSpec drops the deadline for the
+	// STREAM, which is right; this part is not the stream.
+	// CloneResolvable, not `*q`. A shallow copy shares the Preds backing array
+	// and the Filter tree, and RunPipeline resolves a relative `_time:` in
+	// place -- so the backlog's resolve froze the LIVE query's window at the
+	// request instant and the stream delivered nothing afterwards, forever, at
+	// 200 with the connection open.
+	backlog := q.CloneResolvable()
 	backlog.From = time.Now().Add(-offset).UnixNano()
-	backlog.To = int64(1) << 62
-	for _, row := range query.RunPipeline(store, &backlog) {
+	backlog.To = defaultWindowTo
+	backlogStopped := s.applyQueryBudget(r, backlog)
+	if n := s.maxRows; n > 0 && backlog.MaxRows == 0 {
+		backlog.MaxRows = n
+	}
+	replayed := query.RunPipeline(store, backlog)
+	for _, row := range replayed {
 		buf = appendRowJSON(buf[:0], row, backlog.MatAll)
 		bw.Write(buf)
+	}
+	// MaxRows exits Run early WITHOUT setting Stopped -- that path is the
+	// one the batch select turns into a 400 by comparing len(rows). The tail
+	// has no such comparison, so the replay was silently short.
+	rowCap := backlog.MaxRows > 0 && len(replayed) > backlog.MaxRows
+	if rowCap || (backlogStopped != nil && backlogStopped.Load()) {
+		// The replay hit its budget. The headers are already sent, so this
+		// cannot be a 504 -- say so in the stream and start tailing, which
+		// is what the client asked for.
+		line, _ := json.Marshal(map[string]string{
+			".error": "the backlog replay was cut short (budget or row cap); " +
+				"narrow start_offset. Live tailing continues.",
+		})
+		bw.Write(line)
+		bw.WriteByte('\n')
 	}
 	bw.Flush()
 	flusher.Flush()
 	for {
-		readers, nc := store.GroupsAfterID(cursor)
-		if len(readers) > 0 {
-			cursor = nc
-			for _, row := range query.RunPipeline(readerStore(readers), q) {
-				buf = appendRowJSON(buf[:0], row, q.MatAll)
-				bw.Write(buf)
-			}
+		// SnapshotAfterID, not GroupsAfterID: the latter hands out raw
+		// *Reader values with no reference taken, so retention could unmap a
+		// group this loop was still decoding. Task 4.1 built the leased form
+		// and nothing called it.
+		snap, nc, serr := store.SnapshotAfterID(cursor)
+		if serr != nil {
+			// The store is closing -- shutdown, or this tenant being evicted
+			// out from under the stream. Returning silently gave the client
+			// a clean end-of-stream on a 200, indistinguishable from a
+			// normal close, with no way to know it must reconnect.
+			// Not "_stream_error": nothing reserves that name, so a stored
+			// row can carry it and a client cannot tell a marker from a log
+			// line. The leading dot is not a legal field name here, and the
+			// line is encoded rather than concatenated so an error text with
+			// a quote in it cannot break the stream's framing.
+			line, _ := json.Marshal(map[string]string{
+				".error": "the log stream ended: " + serr.Error() + "; reconnect to resume",
+			})
+			bw.Write(line)
+			bw.WriteByte('\n')
 			bw.Flush()
 			flusher.Flush()
+			return
 		}
+		// The lease is released in a closure, so the defer runs per
+		// iteration. A defer written directly in the loop body fires only at
+		// function return: the panic-safety held, but every poll pushed
+		// another closure retaining a *Snapshot, so a day-long tail at two
+		// polls a second accumulated ~172,800 of them.
+		func() {
+			defer snap.Close()
+			readers := snap.Groups
+			if len(readers) > 0 {
+				cursor = nc
+				// A FRESH RESOLVE PER POLL, against a fresh `now`.
+				//
+				// `_time:5m` on a tail means the last five minutes
+				// CONTINUOUSLY, so the window has to move with the stream.
+				// Reusing one `q` cannot do that even with the backlog fixed:
+				// resolveTimePreds is idempotent, so the first poll would
+				// freeze the window and every later poll would filter against
+				// an instant already past. The clone is a slice copy and a
+				// small tree per poll, on a path that polls at the tick
+				// interval and then decodes and encodes rows.
+				live := q.CloneResolvable()
+				live.SetNow(time.Now().UnixNano())
+				for _, row := range query.RunPipeline(readerStore(readers), live) {
+					buf = appendRowJSON(buf[:0], row, live.MatAll)
+					bw.Write(buf)
+				}
+				bw.Flush()
+				flusher.Flush()
+			}
+		}()
 		select {
 		case <-ctx.Done():
 			return
@@ -599,19 +1530,83 @@ func (s *Server) tail(w http.ResponseWriter, r *http.Request) {
 // interface VictoriaLogs does not have. Results stream as NDJSON like the
 // LogsQL select.
 func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
+	if len(s.backendList()) > 0 { // select-router: federate the row-local case, refuse the rest
+		s.federatedSQL(w, r)
+		return
+	}
 	q, err := query.ParseSQL(r.FormValue("query"))
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	q.From, q.To = timeWindow(r)
-	if len(q.Pipes) == 0 {
+	// SetWindow, not a bare assignment to From and To.
+	//
+	// The narrowing rule reads `!q.ToSet` as "the caller resolved no upper
+	// bound, so take the filter's end" -- and SQL can express one: `WHERE
+	// _time <= X` becomes a TimeRange pred. Assigning To without the flag made
+	// the filter WIDEN past the request's `end`: 30 rows here against 10 for
+	// the same window on `/select/logsql/query`, one binary, one `end`, two
+	// answers. `federatedSQL` forwards this to the shards, so every one of
+	// them widened the same way. The clause this replaced (`q.To == 0`) never
+	// fired for a real `end`, which is why the site survived the round that
+	// introduced the rule.
+	q.SetWindow(timeWindow(r))
+	// AND THE `now` THAT A RELATIVE FILTER RESOLVES AGAINST, which SetWindow
+	// does not supply and this route did not set.
+	//
+	// `SetWindow` marks the window RESOLVED (`ToSet`), and `resolveTimePreds`
+	// reads that as permission to use `q.To` as `now` when no explicit now was
+	// given. With no `end` in the request `timeWindow` returns `To = 1<<62` --
+	// a sentinel meaning "no upper bound", not an instant -- so every relative
+	// `_time` filter here resolved against the year 2116 and matched nothing.
+	// Measured, same fixture, HTTP 200 throughout:
+	//
+	//	SELECT * FROM logs WHERE _time > '5m'                   0 rows
+	//	SELECT * FROM logs WHERE _time > '5m'   (&end= given)   1 row
+	//	_time:5m on /select/logsql/query                        1 row
+	//
+	// The `end=`-given row is what names the cause: supply a real end and the
+	// answer is right, because `To` is then an instant rather than a sentinel.
+	// `federatedSQL` forwards this query to every shard, so a cluster answered
+	// 0 exactly as a node did and no differential test could see it.
+	//
+	// `parseRequest` has always done this for the LogsQL routes. Adding
+	// `SetWindow` here without it is what made the To rung reachable at all.
+	q.SetNow(time.Now().UnixNano())
+	if len(q.Pipes) == 0 || !query.PipesProject(q.Pipes) {
 		q.MatAll = true
+		// The same row cap the LogsQL select gets. SQL had none at all: a
+		// `SELECT * FROM logs` with no LIMIT materialized every matching row,
+		// and `ORDER BY` over an unbounded input is the exact shape task 6.4
+		// was about -- with the difference that nothing here even bounded it.
+		//
+		// An explicit LIMIT becomes a `| limit` pipe, which RunPipeline pushes
+		// into the scan, so a bounded query is answered rather than refused.
+		if q.Limit == 0 && s.maxRows > 0 {
+			q.MaxRows = s.maxRows
+		}
 	}
+	// The scan BEFORE the header. This handler used to set Content-Type and
+	// take a writer first, so a budget stop wrote its status into a response
+	// already committed to NDJSON -- and it used queryStopped rather than
+	// queryStoppedErr, so every cause reported the generic 504 whatever
+	// actually stopped it.
+	sqlStopped := s.applyQueryBudget(r, q)
+	sqlRows := query.RunPipeline(s.tn(r).store, q)
+	if s.queryStoppedErr(w, r, sqlStopped, q) {
+		return
+	}
+	if s.maxRows > 0 && len(sqlRows) > s.maxRows {
+		s.writeErr(w, r, readSpec(), http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("simdlogs: result exceeds -search.maxRows=%d; add a LIMIT, "+
+				"an aggregate, or narrow the query", s.maxRows))
+		return
+	}
+	w.Header().Set("Content-Type", ndjsonContentType)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	var buf []byte
-	for _, row := range query.RunPipeline(s.tn(r).store, q) {
+	for _, row := range sqlRows {
 		buf = appendRowJSON(buf[:0], row, q.MatAll)
 		bw.Write(buf)
 	}
@@ -622,6 +1617,12 @@ func (s *Server) sqlQuery(w http.ResponseWriter, r *http.Request) {
 // window comes from start/end params. Embeddings are bring-your-own (logs carry
 // a vector column).
 func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
+	if s.refuseInRouterMode(w, r, "vector search",
+		"a k-nearest-neighbour search over shards needs each shard's top k merged "+
+			"by distance, and returning one shard's neighbours or concatenating "+
+			"them both answer a different question") {
+		return
+	}
 	var body struct {
 		Field  string    `json:"field"`
 		Vector []float32 `json:"vector"`
@@ -634,11 +1635,28 @@ func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
 	if body.Field == "" {
 		body.Field = "emb"
 	}
-	from, to := timeWindow(r)
+	from, to := timeWindowURL(r) // the body is the document; see timeWindowURL
+	vq := &query.Query{From: from, To: to, ToSet: true}
+	vStopped := s.applyQueryBudget(r, vq)
+	rows := query.VectorSearch(s.tn(r).store, from, to, body.Field, body.Vector, body.K,
+		vq, query.VectorLimits{
+			MaxK:           s.limits.MaxVectorK,
+			MaxDim:         s.limits.MaxVectorDim,
+			MaxCandidates:  s.limits.MaxVectorCandidates,
+			MaxResultBytes: s.limits.MaxQueryBytes,
+		})
+	// Before the header and the first byte: a refusal has to be reportable,
+	// and this handler used to set Content-Type and take a bufio.Writer
+	// BEFORE the search ran, so a budget stop wrote its status into a response
+	// already committed to NDJSON.
+	if s.queryStoppedErr(w, r, vStopped, vq) {
+		return
+	}
+	w.Header().Set("Content-Type", ndjsonContentType)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 	var buf []byte
-	for _, row := range query.VectorSearch(s.tn(r).store, from, to, body.Field, body.Vector, body.K) {
+	for _, row := range rows {
 		buf = appendRowJSON(buf[:0], row, false)
 		bw.Write(buf)
 	}
@@ -646,8 +1664,19 @@ func (s *Server) vectorSearch(w http.ResponseWriter, r *http.Request) {
 
 // selectHits returns per-bucket counts over the time window: the
 // reference's /select/logsql/hits shape (a histogram for dashboards).
+// maxHitsBuckets bounds a histogram response.
+//
+// 10,000 buckets is more than any graph can draw -- a 1920-pixel wide chart has
+// 1920 columns -- and small enough that the dense array stays a few hundred
+// kilobytes. Past it the caller is asking for a shape no renderer uses.
+const maxHitsBuckets = 10_000
+
+// defaultHitsBuckets is the window a request with no time range gets, measured
+// in steps. Enough to draw a graph, far short of the ceiling.
+const defaultHitsBuckets = 240
+
 func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedHits(w, r)
 		return
 	}
@@ -656,19 +1685,52 @@ func (s *Server) selectHits(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	step := int64(60_000_000_000) // 1 minute default
-	if v := r.FormValue("step"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			step = int64(d)
-		}
-	}
+	step := hitsStepNs(r)
 	// `field` (repeatable in the reference, one here) splits the histogram into
 	// a series per value, which is how a dashboard draws a stacked graph.
 	by := r.FormValue("field")
 	if by == "" {
 		by = r.FormValue("fields")
 	}
+	// The bucket count is bounded BEFORE the scan.
+	//
+	// The response is dense -- one bucket per step across the whole window,
+	// present or not -- so its size is (window / step) and has nothing to do
+	// with how much data exists. With no window and the default one-minute
+	// step that is a bucket per minute since 1970: about 29 million of them,
+	// tens of megabytes of RFC3339 timestamps, from an EMPTY store.
+	//
+	// An UNSPECIFIED window is defaulted rather than refused. A caller that
+	// named no range did not ask for all of history, it just did not say; and
+	// answering an unstated question with a 413 breaks every client that was
+	// getting away with it. An EXPLICIT range too wide for its step is a
+	// refusal, because that one was asked for.
+	// ONE CEILING, `boundRangeBuckets`'s. This used to be a second copy of it,
+	// and the copy computed `(q.To - q.From) / step` raw. `to - from` is int64
+	// nanoseconds, so `?start=-4700000000000000000` against the default `to`
+	// of 1<<62 WRAPS NEGATIVE: neither the narrowing nor the 413 fired, and
+	// this endpoint answered 200 with a body over a megabyte, clamped only by
+	// `fillHits`'s own separate limit further down.
+	//
+	// The overflow fix landed in `boundRangeBuckets` when the router grew a
+	// ceiling for this route, and that function's own comment said folding the
+	// two copies "is worth doing and is not this change". Changing one of two
+	// copies is how they came to disagree:
+	//
+	//	/select/logsql/hits?query=*&start=-4700000000000000000
+	//	  node    200, >1 MB body      cluster 413
+	//
+	// so it is this change now.
+	bf, bt, okBound := s.boundRangeBuckets(w, r, q.From, q.To, step)
+	if !okBound {
+		return
+	}
+	q.SetWindow(bf, bt)
+	stopped := s.applyQueryBudget(r, q)
 	series := query.Hits(s.tn(r).store, q, step, by)
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
 	// fields_limit keeps the busiest N series and folds the rest into one
 	// unlabelled remainder, so a graph of a high-cardinality field stays
 	// readable instead of returning a series per value.
@@ -711,20 +1773,57 @@ func parseRequest(r *http.Request) (*query.Query, error) {
 	if err != nil {
 		return nil, err
 	}
-	q.Now = time.Now().UnixNano() // request time, for relative _time:<dur> filters
+	q.SetNow(time.Now().UnixNano()) // request time, for relative _time:<dur> filters
+	// The zero value of q.From is the EPOCH, and the default lower bound is
+	// not the epoch -- see defaultWindowFrom for the measurement. Set before
+	// `start` is read so an explicit one still wins.
+	q.From = defaultWindowFrom
 	if v := r.FormValue("start"); v != "" {
 		if n, ok := parseTimeParam(v); ok {
 			q.From = n
 		}
 	}
+	// `end` GIVEN and `end` absent are different things, and a zero cannot tell
+	// them apart.
+	//
+	// This used to read a zero To as "no end", which is right for the default
+	// -- q.To starts at zero -- and wrong for `end=0`, or `end=` any spelling
+	// of the epoch, which names an instant. `timeWindow` never had the
+	// collision: it starts To at 1<<62 and only overwrites it when the
+	// parameter is there. So the router and the shards read the same request
+	// two ways, and the shard's way was "your whole retention".
+	//
+	// Measured, 2 shards x 15 rows against 1 node x 30,
+	// `stats_query?start=-1&end=0&query=*|stats avg(n) a`: node `result: []`,
+	// cluster `{"a":"14.5"}`, both 200. The router resolved [-1, 0), found it
+	// non-empty, forwarded it, and every shard answered from everything it had.
+	// `rate()` came back 30000000000 against the node's zero rows.
+	//
+	// A FLAG rather than starting To at 1<<62.
+	//
+	// The first version of this said pre-seeding would clobber a To already
+	// set by a `_time:` filter, naming a function `narrowWindow` that does not
+	// exist in this repository. The real one is `resolveTimePreds`
+	// (query/time_filter.go) and it runs at EXECUTION time, after this returns
+	// -- so at this line To is only ever the zero value or what `end` set, and
+	// pre-seeding would have been narrowed rather than clobbered. The reason
+	// given was false in both halves.
+	//
+	// The flag stays because it says what it means: To is 1<<62 here because
+	// nobody named an end, and `q.ToSet` is what tells the narrowing that.
+	endGiven := false
 	if v := r.FormValue("end"); v != "" {
 		if n, ok := parseTimeParam(v); ok {
-			q.To = n
+			q.To, endGiven = n, true
 		}
 	}
-	if q.To == 0 {
-		q.To = int64(1) << 62
+	if q.To == 0 && !endGiven {
+		q.To = defaultWindowTo
 	}
+	// RESOLVED either way: an explicit end, or the sentinel standing for "no
+	// end". Both are decisions this function made, and marking them tells
+	// resolveTimePreds not to let a `_time:` filter widen past them.
+	q.ToSet = true
 	if v := r.FormValue("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			// The endpoint's `limit` is the most RECENT n, newest first -- what a
@@ -740,19 +1839,35 @@ func parseRequest(r *http.Request) (*query.Query, error) {
 // parseTimeParam accepts a unix-nanoseconds integer or an RFC3339 string
 // (the format VictoriaLogs uses), returning nanoseconds. Accepting both
 // lets the head-to-head hand both engines the identical window string.
+//
+// ALL THREE BRANCHES SATURATE. docs/wrong.md entry 129 fixed the first one
+// (`unixToNanos`) and left the other two, so one request answered correctly
+// spelled as an integer and wrongly spelled as a float or as a date:
+//
+//	?start=13000000000     0 rows      (entry 129)
+//	?start=13000000000.5   every row   (int64 of an out-of-range float64)
+//	?start=3000-01-01      every row   (UnixNano wrapped into 1918)
+//	?start=1000-01-01      no rows     (pre-1678 wraps POSITIVE)
+//
+// Each is a bound in the far future or the far past reading as its opposite,
+// at HTTP 200.
 func parseTimeParam(v string) (int64, bool) {
 	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 		return unixToNanos(n), true
 	}
 	if f, err := strconv.ParseFloat(v, 64); err == nil { // seconds with a fractional part
-		return int64(f * 1e9), true
+		// ParseFloat also accepts "NaN" and "Inf". An infinity IS the bound it
+		// saturates to; a NaN names no instant at all and is reported
+		// unreadable rather than converted, because int64(NaN) is MinInt64 on
+		// amd64 -- "the beginning of time" for a value that is not a time.
+		return satFloatNanos(f)
 	}
 	for _, layout := range []string{
 		time.RFC3339Nano, time.RFC3339,
 		"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02", "2006-01", "2006",
 	} {
 		if t, err := time.Parse(layout, v); err == nil {
-			return t.UnixNano(), true
+			return satNanos(t), true
 		}
 	}
 	return 0, false
@@ -764,16 +1879,25 @@ func parseTimeParam(v string) (int64, bool) {
 // timestamp is misread. Reading every bare integer as nanoseconds -- which this
 // did -- put a Grafana datasource's epoch-seconds window in 1970 and answered
 // every query empty.
+// The multiplications SATURATE instead of wrapping. Each branch admits
+// values whose product exceeds int64 -- seconds up to 1e11 against a cap of
+// 9.2e9, millis up to 1e14 against 9.2e12, micros up to 1e17 against 9.2e15
+// -- and the wrapped product is a NEGATIVE From, which matches everything.
+// Measured: `?start=13000000000` (epoch seconds, year 2381) answered all 30
+// rows of a store at HTTP 200, where the instant is in the future and the
+// answer is none; the millis and micros branches wrapped identically. A
+// saturated bound behaves as +infinity, which is what an instant beyond
+// representable time means for a comparison.
 func unixToNanos(n int64) int64 {
 	switch {
 	case n < 0:
 		return n
 	case n < 1e11:
-		return n * int64(time.Second)
+		return satScale(n, int64(time.Second))
 	case n < 1e14:
-		return n * int64(time.Millisecond)
+		return satScale(n, int64(time.Millisecond))
 	case n < 1e17:
-		return n * int64(time.Microsecond)
+		return satScale(n, int64(time.Microsecond))
 	default:
 		return n
 	}
@@ -801,8 +1925,8 @@ func selectQueryOf(r *http.Request) (*query.Query, error) { return parseRequest(
 var errMissingQuery = errors.New("simdlogs: missing `query` arg")
 
 func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/field_names", "values")
+	if len(s.backendList()) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/field_names")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -810,12 +1934,17 @@ func (s *Server) fieldNames(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, limitValues(query.FieldNameCounts(s.tn(r).store, q), r))
+	stopped := s.applyQueryBudget(r, q)
+	vals := query.FieldNameCounts(s.tn(r).store, q)
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
+	writeValues(w, limitValues(vals, r))
 }
 
 func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/field_values", "values")
+	if len(s.backendList()) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/field_values")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -823,7 +1952,11 @@ func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	stopped := s.applyQueryBudget(r, q)
 	vcs := query.StatsByField(s.tn(r).store, q, r.FormValue("field"))
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
 	query.SortValueCounts(vcs)
 	if n := intParam(r, "limit", 0); n > 0 && len(vcs) > n {
 		vcs = vcs[:n]
@@ -832,15 +1965,23 @@ func (s *Server) fieldValues(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
+	if len(s.backendList()) > 0 { // select-router: a facet over the router's own store is empty
+		s.federatedFacets(w, r)
+		return
+	}
 	q, err := selectQueryOf(r)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	stopped := s.applyQueryBudget(r, q)
 	facets := query.FacetList(s.tn(r).store, q,
 		intParam(r, "limit", query.DefaultFacetLimit),
 		intParam(r, "max_values_per_field", query.DefaultFacetMaxValues),
 		r.FormValue("keep_const_fields") == "1")
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
 	if facets == nil {
 		facets = []query.FieldFacet{}
 	}
@@ -851,7 +1992,7 @@ func (s *Server) facets(w http.ResponseWriter, r *http.Request) {
 // statsQuery answers a stats query at a single instant: the Prometheus vector
 // envelope, so the same dashboard panel that graphs a range can read a value.
 func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedStatsQuery(w, r)
 		return
 	}
@@ -864,10 +2005,19 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 			to = n
 		}
 	}
-	if to == int64(1)<<62 {
-		to = time.Now().UnixNano()
+	// ONE clock read for the whole handler: the sentinel resolution, the
+	// relative-filter `now` and the sample stamp are the same instant or they
+	// are three answers to one request.
+	nowNs := time.Now().UnixNano()
+	if to == defaultWindowTo {
+		to = nowNs
 	}
-	samples, err := query.StatsQueryInstant(s.tn(r).store, r.FormValue("query"), from, to, time.Now().UnixNano())
+	sq := &query.Query{From: from, To: to, ToSet: true}
+	stopped := s.applyQueryBudget(r, sq)
+	samples, err := query.StatsQueryInstant(s.tn(r).store, r.FormValue("query"), from, to, nowNs, sq)
+	if s.queryStoppedErr(w, r, stopped, sq) {
+		return
+	}
 	if err != nil {
 		// A query with no stats pipe has no series; the group-by form below is
 		// the older shape and still answers it.
@@ -879,7 +2029,14 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 			}
 			// `by=` is an extension the reference has no equivalent for, so it
 			// keeps its own key rather than pretending to be a Prometheus vector.
+			// It re-parses, so it needs its own budget: the one applied above
+			// belongs to the Query that failed, and without this the fallback
+			// answered a COMPLETE 200 with the deadline already spent.
+			byStopped := s.applyQueryBudget(r, q)
 			vcs := query.StatsByField(s.tn(r).store, q, by)
+			if s.queryStopped(w, r, byStopped) {
+				return
+			}
 			query.SortValueCounts(vcs)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{"stats": vcs})
@@ -889,10 +2046,11 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result := make([]map[string]any, 0, len(samples))
+	at := instantStamp(to, nowNs)
 	for _, sm := range samples {
 		result = append(result, map[string]any{
 			"metric": sm.Metric,
-			"value":  [2]any{to / 1e9, sm.Value},
+			"value":  [2]any{at, sm.Value},
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -901,6 +2059,13 @@ func (s *Server) statsQuery(w http.ResponseWriter, r *http.Request) {
 		Data:   promData{ResultType: "vector", Result: result},
 	})
 }
+
+// ndjsonContentType is the media type every endpoint that streams NDJSON
+// rows announces. One constant because the single-node select and the
+// router's federatedSelect answer the SAME path: they disagreed before this,
+// text/plain against application/x-ndjson, so a client's behaviour depended on
+// which deployment mode it happened to be talking to.
+const ndjsonContentType = "application/x-ndjson"
 
 // promResponse is the Prometheus query envelope both stats endpoints return.
 // A struct rather than a map so the fields keep the reference's order on the
@@ -963,8 +2128,8 @@ func intParam(r *http.Request, name string, def int) int {
 
 // streamsHandler lists the distinct _stream label sets in the window.
 func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/streams", "streams")
+	if len(s.backendList()) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/streams")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -972,13 +2137,18 @@ func (s *Server) streamsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, limitValues(query.Streams(s.tn(r).store, q), r))
+	stopped := s.applyQueryBudget(r, q)
+	vals := query.Streams(s.tn(r).store, q)
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
+	writeValues(w, limitValues(vals, r))
 }
 
 // streamIDsHandler lists the distinct stream ids in the window.
 func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/stream_ids", "stream_ids")
+	if len(s.backendList()) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/stream_ids")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -986,13 +2156,18 @@ func (s *Server) streamIDsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, limitValues(query.StreamIDs(s.tn(r).store, q), r))
+	stopped := s.applyQueryBudget(r, q)
+	vals := query.StreamIDs(s.tn(r).store, q)
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
+	writeValues(w, limitValues(vals, r))
 }
 
 // streamFieldNamesHandler lists the distinct stream label names.
 func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/stream_field_names", "values")
+	if len(s.backendList()) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/stream_field_names")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -1000,13 +2175,18 @@ func (s *Server) streamFieldNamesHandler(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, limitValues(query.StreamFieldNames(s.tn(r).store, q), r))
+	stopped := s.applyQueryBudget(r, q)
+	vals := query.StreamFieldNames(s.tn(r).store, q)
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
+	writeValues(w, limitValues(vals, r))
 }
 
 // streamFieldValuesHandler lists the distinct values of one stream label.
 func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
-		s.federatedValueCounts(w, r, "/select/logsql/stream_field_values", "values")
+	if len(s.backendList()) > 0 {
+		s.federatedValueCounts(w, r, "/select/logsql/stream_field_values")
 		return
 	}
 	q, err := selectQueryOf(r)
@@ -1014,19 +2194,157 @@ func (s *Server) streamFieldValuesHandler(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeValues(w, limitValues(query.StreamFieldValues(s.tn(r).store, q, r.FormValue("field")), r))
+	stopped := s.applyQueryBudget(r, q)
+	vals := query.StreamFieldValues(s.tn(r).store, q, r.FormValue("field"))
+	if s.queryStoppedErr(w, r, stopped, q) {
+		return
+	}
+	writeValues(w, limitValues(vals, r))
+}
+
+// boundRangeBuckets applies the hits endpoint's bucket ceiling to a stats range
+// query, and reports whether the caller may continue.
+//
+// /select/logsql/stats_query_range had NO such bound. Its loop is
+// `for bs := from; bs < to; bs += step`, and with no `end` the window runs to
+// 1<<62 -- so `?step=1m` with no time range is about 77 million iterations,
+// each one a full scan of the store. A single node did not answer; it spun. A
+// ROUTER doing the same holds every matching row of the cluster in memory
+// while it spins, which is how the exact-stats path turned a hung node into a
+// hung node plus a hung router.
+//
+// THE RULE: an UNSPECIFIED window is narrowed to the last defaultHitsBuckets
+// steps, because a caller who named no range did not ask for all of history;
+// an EXPLICIT range too wide for its step is a 413, because that one was asked
+// for. selectHits calls THIS function -- there is one copy. Two earlier
+// versions of this paragraph were each false in the opposite direction: the
+// first said the rule was "shared with selectHits" while selectHits carried an
+// inline copy, and the second still said "selectHits still carries its own
+// inline copy ... folding hits into this function is worth doing and is not
+// this change" after the round that folded it. A justification outliving its
+// condition, twice, about the same nine lines.
+//
+// AND THIS IS THE CEILING A CALLER MEETS. `internal/query` has a second
+// constant of the same name holding 100,000 -- the engine's own bound on
+// `query.Hits` -- and it was reachable straight through this one: `fillHits`
+// derived its own bucket count with an int64 subtraction that wraps over a
+// saturated window, read the wrap as "no buckets", and substituted its 100,000.
+// `?start=1970-01-01&end=9999-01-01&step=8760h` passed this 413 honestly at 292
+// buckets and then rendered 100,000, whose timestamps ran off MaxInt64. The
+// engine counts with the exact width now, so nothing gets past this line and
+// then grows.
+//
+// What IS shared is the range pair: statsQueryRange and the router's
+// exactMatrix and federatedMatrix all call this one, so they cannot apply
+// DIFFERENT CEILINGS. That is narrower than "cannot answer differently", which
+// an earlier version of this comment claimed and which is not true of them: an
+// unspecified window has the node and each shard resolving their own `now`, so
+// their bucket starts differ by whatever the clock read between the calls. The
+// router closes that for itself by resolving the window once and writing it
+// onto the shard request; a node asked directly still resolves its own.
+func (s *Server) boundRangeBuckets(
+	w http.ResponseWriter, r *http.Request, from, to, step int64,
+) (int64, int64, bool) {
+	// A NON-POSITIVE STEP IS NORMALISED HERE, NOT SKIPPED.
+	//
+	// This function opened `if step <= 0 { return from, to, true }` -- one line
+	// above the overflow-safe width written for exactly this class -- so a step
+	// of zero DISABLED the ceiling. Reaching zero took one request:
+	// `?start=1000-01-01&end=9999-01-01` saturates to [MinInt64, MaxInt64],
+	// `to - from` wrapped to -1, and `parseStepNs`'s "1/30th of the range"
+	// default came out 0. The scan then normalised the same 0 to a
+	// ONE-NANOSECOND step and walked the whole int64 domain. Measured on the
+	// tree: no answer after 20s, one core pegged, and the router forwards the
+	// same window to every shard.
+	//
+	// `parseStepNs` no longer returns a non-positive step, so this is defence
+	// in depth rather than the fix -- but it must normalise to THE SAME step
+	// the scan will use (`query.RangeStepNs`), because a ceiling computed from
+	// one step and a walk taken at another is a ceiling on a different request.
+	// That is the mistake `hitsStepNs` exists to record.
+	if step <= 0 {
+		step = query.RangeStepNs(from, to)
+	}
+	// The width is EXACT and cannot overflow.
+	//
+	// It was an int64 subtraction with a `1<<62` fallback for the wrap:
+	// `?start=-4700000000000000000` against the default `to` of 1<<62 wraps
+	// negative, so `(to-from)/step` came out negative, neither the narrowing
+	// nor the 413 fired, and both the node and the router iterated about 1.5e8
+	// times -- the router holding every fetched row. `query.RangeWidthNs` is
+	// the same guard with the true number instead of a stand-in: two's
+	// complement gives the exact width in uint64 for any to >= from, and
+	// to <= from means no buckets at all, which is 0 and not a wrap.
+	width := query.RangeWidthNs
+	ustep := uint64(step) // step > 0 by the normalisation above
+	explicit := r.FormValue("start") != "" || r.FormValue("end") != ""
+	if !explicit && width(from, to)/ustep > maxHitsBuckets {
+		to = time.Now().UnixNano()
+		from = to - satScale(step, defaultHitsBuckets)
+	}
+	if n := width(from, to) / ustep; n > maxHitsBuckets {
+		s.writeErr(w, r, readSpec(), http.StatusRequestEntityTooLarge, fmt.Sprintf(
+			"simdlogs: %d buckets requested (window %s at step %s); the maximum is %d. "+
+				"Narrow the time range or increase the step -- a range response is one "+
+				"bucket per step across the whole window, so its size is the window "+
+				"divided by the step and does not depend on how much data matched",
+			n, durationOf(width(from, to)), time.Duration(step), maxHitsBuckets))
+		return from, to, false
+	}
+	return from, to, true
+}
+
+// durationOf renders an exact nanosecond width as a Duration, saturating.
+//
+// A window's width is a uint64 (see query.RangeWidthNs) and a Duration is an
+// int64, so the widest window this build can express -- [MinInt64, MaxInt64],
+// which `?start=1000-01-01&end=9999-01-01` resolves to -- does not fit. It is
+// only ever rendered into a refusal message, and 2562047h47m16s is the right
+// thing to print there: the number the operator has to narrow.
+func durationOf(ns uint64) time.Duration {
+	if ns > math.MaxInt64 {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(ns)
 }
 
 // statsQueryRange buckets a stats query over the time range and returns a
 // Prometheus-style matrix: one series per group-by tuple, a point per step.
 func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
-	if len(s.backends) > 0 {
+	if len(s.backendList()) > 0 {
 		s.federatedMatrix(w, r)
+		return
+	}
+	// A MISSING query is refused, as it is on every other select endpoint.
+	//
+	// The raw string went through unchecked, so this route answered 200 with a
+	// fabricated matrix:
+	//
+	//	GET /select/logsql/stats_query_range          (no parameters at all)
+	//	  200 {"resultType":"matrix","result":[{"metric":{},
+	//	       "values":[[1690951540,""],[1690951540,""],[1690951540,""]]}]}
+	//
+	// A constant garbage epoch and empty-string values, from a request that
+	// asked nothing. docs/lld/api.md says `query` is required on every select
+	// endpoint and a request without one is a 400; this was the route where
+	// that was false, and it made a router (which does refuse) disagree with
+	// the node it fronts.
+	if strings.TrimSpace(r.FormValue("query")) == "" {
+		http.Error(w, errMissingQuery.Error(), 400)
 		return
 	}
 	from, to := timeWindow(r)
 	step := parseStepNs(r.FormValue("step"), from, to)
-	series, err := query.StatsQueryRange(s.tn(r).store, r.FormValue("query"), from, to, step, time.Now().UnixNano())
+	from, to, ok := s.boundRangeBuckets(w, r, from, to, step)
+	if !ok {
+		return
+	}
+	rq := &query.Query{From: from, To: to, ToSet: true}
+	rStopped := s.applyQueryBudget(r, rq)
+	series, err := query.StatsQueryRange(s.tn(r).store, r.FormValue("query"), from, to, step, time.Now().UnixNano(), rq)
+	if s.queryStopped(w, r, rStopped) {
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -1040,6 +2358,7 @@ func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
 		}
 		result = append(result, map[string]any{"metric": se.Metric, "values": vals})
 	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(promResponse{
 		Status: "success",
 		Data:   promData{ResultType: "matrix", Result: result},
@@ -1048,24 +2367,181 @@ func (s *Server) statsQueryRange(w http.ResponseWriter, r *http.Request) {
 
 // parseStepNs reads the `step` param (a duration like "5m" or bare seconds),
 // defaulting to 1/30th of the range so a graph gets ~30 points.
+// hitsStepNs is /select/logsql/hits's OWN step rule, which is not
+// parseStepNs's.
+//
+// One minute unless `step` parses as a POSITIVE Go duration. No bare-integer
+// seconds, no window-derived default, and a zero or negative duration is
+// ignored rather than passed on.
+//
+// Extracted because the router grew a bucket ceiling for this endpoint and
+// reached for `parseStepNs`, which is the OTHER rule. Two parsers for one
+// parameter, and the ceiling then refused what the node answers:
+//
+//	/select/logsql/hits?step=1&start=<t>&end=<t+24h>&query=*
+//	  node    200   1440 one-minute buckets  (ParseDuration("1") fails)
+//	  cluster 413   "86400 buckets requested ... at step 1s"
+//	?step=5   node 200, cluster 413 at step 5s
+//
+// A ceiling computed from a step the endpoint will not use is a ceiling on a
+// different request. Whether this rule or parseStepNs's is the better one is a
+// separate question; what matters here is that the ceiling and the scan agree.
+func hitsStepNs(r *http.Request) int64 {
+	step := int64(time.Minute)
+	if v := r.FormValue("step"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			step = int64(d)
+		}
+	}
+	return step
+}
+
+// IT NEVER RETURNS A STEP OF ZERO OR LESS, and that is the load-bearing
+// property rather than the ~30 points.
+//
+// It did, three ways, and all three reached `boundRangeBuckets`' `step <= 0`
+// early return and so ran the range scan with NO bucket ceiling:
+//
+//	?start=1000-01-01&end=9999-01-01   (to-from)/30 wraps: the window
+//	                                    saturates to [MinInt64, MaxInt64] and
+//	                                    the int64 subtraction is -1
+//	?step=0s                            ParseDuration succeeds, d == 0
+//	?step=-1s                           ParseDuration succeeds, d < 0
+//
+// each of which then became a ONE-NANOSECOND step in the scan and an infinite
+// walk of the int64 domain, from an unauthenticated GET. The width is exact
+// now (`query.RangeWidthNs`) and a step that is not positive falls back to the
+// window-derived default instead of being passed on. A bare integer saturates
+// rather than wrapping: `?step=99999999999` seconds is 3.1e21 nanoseconds, and
+// the raw multiply landed on an arbitrary small positive.
 func parseStepNs(s string, from, to int64) int64 {
 	if s == "" {
-		if to > from {
-			return (to - from) / 30
-		}
-		return int64(time.Minute)
+		return query.RangeStepNs(from, to)
 	}
 	if d, err := time.ParseDuration(s); err == nil {
-		return int64(d)
+		if d > 0 {
+			return int64(d)
+		}
+		return query.RangeStepNs(from, to)
 	}
 	if n, err := strconv.Atoi(s); err == nil {
-		return int64(n) * int64(time.Second)
+		if v := satScale(int64(n), int64(time.Second)); v > 0 {
+			return v
+		}
+		return query.RangeStepNs(from, to)
 	}
 	return int64(time.Minute)
 }
 
+// timeWindowURL is timeWindow for a route whose BODY is a document.
+//
+// /select/vector decodes r.Body as JSON and also wants `start`/`end`.
+// r.FormValue parses the body for a form content type, and guard's multipart
+// pre-parse consumes it outright -- measured, the same JSON document under
+// multipart/form-data went from 200 to 400 "EOF" while application/json,
+// urlencoded and text/plain all answered 200. It is the third route in the
+// class the Elasticsearch pair defines, and the one where `form` cannot be set
+// correctly either way: false consumes nothing but drops the multipart time
+// window, true consumes the document.
+//
+// The URL is the only place these can be. A caller's body IS the JSON
+// document, so it cannot also be a urlencoded form carrying start and end;
+// there is no request that loses a parameter by this. protocols.go states the
+// same rule for the ingest routes, after a line-protocol write stored nothing
+// while answering 204.
+func timeWindowURL(r *http.Request) (int64, int64) {
+	q := r.URL.Query()
+	from, to := defaultWindowFrom, defaultWindowTo
+	if v := q.Get("start"); v != "" {
+		if n, ok := parseTimeParam(v); ok {
+			from = n
+		}
+	}
+	if v := q.Get("end"); v != "" {
+		if n, ok := parseTimeParam(v); ok {
+			to = n
+		}
+	}
+	return from, to
+}
+
+// defaultWindowFrom and defaultWindowTo are the window a request that names no
+// `start` and no `end` gets. ONE definition, because two surfaces reading the
+// same store must not disagree about what "no window" means.
+//
+// THE LOWER DEFAULT WAS THE EPOCH AND THE ES SURFACE'S WAS NOT.
+// `esToQuery` starts its window at MinInt64 -- entry 131 moved it there,
+// because the lift is `if from > q.From` and a zero From could only ever be
+// raised, so an ES `range` naming a far-past `gte` left the window starting at
+// 1970 and the rows this store holds between 1677-09-21 and the epoch were
+// unreachable through /_search by any query at all. The LogsQL and SQL side
+// kept the 0. Measured on a node holding 1900, 1969 and 2026 -- all three
+// ingest at `{"ingested":3,"skipped":0}` -- with NO query string on any
+// request:
+//
+//	/select/logsql/query?query=*                     1
+//	/select/logsql/query?query=_time:[1900-01-01, 2100-01-01]
+//	                                                 1   its own stated
+//	                                                     lower bound, clipped
+//	                                                     by an unstated default
+//	/select/sql?query=SELECT * FROM logs             1
+//	/_search {"match_all":{}}                        3
+//	/_count  {"match_all":{}}                        3
+//
+// One binary, one store, two answers, and no parameter a client can send to
+// bring them together: `/_search` reads its window from the body and ignores
+// `?start`/`?end` entirely, so the two surfaces could not even be compared on
+// one window. Entry 131 recorded the epoch default as FOUND AND NOT FIXED,
+// which is what this is.
+//
+// MinInt64 rather than lowering the ES surface to 0: the upper default is
+// already an "everything above" sentinel (1<<62, the year 2116), so the
+// epoch was the asymmetric end, and a bound the caller DID state must not be
+// clipped by one it did not.
+const (
+	defaultWindowFrom = int64(math.MinInt64)
+	defaultWindowTo   = int64(1) << 62
+)
+
+// instantStamp is the unix-SECOND timestamp a Prometheus-shaped vector sample
+// carries: the instant the query was evaluated at, which is the end of the
+// window.
+//
+// A SATURATED END IS NOT AN INSTANT. `?end=9999-01-01` resolves to MaxInt64 --
+// the +infinity that a bound past the int64-nanosecond domain means, which is
+// entry 129/130's saturation working as designed -- and `to / 1e9` renders
+// that as 9223372036, the last second the domain can express
+// (2262-04-11T23:47:16Z). A Prometheus-shaped client plots the point 236 years
+// into the future for a query about rows stamped now. Measured on a three-row
+// store, `/select/logsql/stats_query?query=*+|+stats+count()+c` under
+// `start=1000-01-01&end=9999-01-01`:
+//
+//	{"status":"success","data":{"resultType":"vector","result":[
+//	  {"metric":{"__name__":"c"},"value":[9223372036,"3"]}]}}
+//
+// The count is right and the instant is a fabrication.
+//
+// THE SCAN WINDOW IS NOT TOUCHED. A client that asked for everything up to
+// year 9999 gets everything, rows stamped in the future included; only the
+// REPORTED instant falls back to the request time, which is exactly what the
+// `defaultWindowTo` sentinel already resolves to one line above each caller
+// and for the same reason -- neither value is an instant. An `end` inside the
+// domain is left alone even when it is in the future, because a Prometheus
+// instant query at `time=<future>` does return that timestamp.
+//
+// One definition for the two handlers that stamp a vector -- `statsQuery` on a
+// node and `exactVector` on a router -- because a node and the router in front
+// of it stamping the same request differently is the shape this file already
+// records under "one dispatch, two copies".
+func instantStamp(to, now int64) int64 {
+	if to == math.MaxInt64 {
+		return now / 1e9
+	}
+	return to / 1e9
+}
+
 func timeWindow(r *http.Request) (int64, int64) {
-	from, to := int64(0), int64(1)<<62
+	from, to := defaultWindowFrom, defaultWindowTo
 	if v := r.FormValue("start"); v != "" {
 		if n, ok := parseTimeParam(v); ok {
 			from = n
@@ -1104,4 +2580,623 @@ func hexdig(n byte) byte {
 		return '0' + n
 	}
 	return 'a' + n - 10
+}
+
+// storagePressureForTest describes every tenant at or past a storage threshold.
+//
+// TEST-ONLY, and named so. Its one production caller was `readiness`, a
+// superseded handler deleted with the rest of the unwired baseline; readiness
+// reaches the same facts through storagePressureConditions. The string
+// rendering is what the observed-contract tests assert against, which is why it
+// is kept rather than deleted -- but a name that does not say so is exactly
+// what made six other helpers read as production API.
+//
+// Detached, like the compaction walk: it samples every open store, and holding
+// the lock every request needs while doing that would make a readiness probe a
+// source of latency.
+// storagePressureForTest is the typed conditions rendered as one line per tenant.
+//
+// One function, not two. It and storagePressureConditions had drifted into
+// different wordings of the same facts -- which is how the dead OverQuota arm
+// survived, and how the "3 tenant(s)" count bug got in: two renderings of one
+// state, each tested against itself.
+func (s *Server) storagePressureForTest() []string {
+	conds := s.storagePressureConditions()
+	out := make([]string, 0, len(conds))
+	for _, c := range conds {
+		out = append(out, c.Detail)
+	}
+	return out
+}
+
+// The corruption policy is set through config.Config and nowhere else.
+//
+// A setter existed briefly. It was removed because the policy has to be in
+// force before any store opens and there is no moment after construction that
+// is reliably before that: NewServerConfig opens the default tenant, and every
+// other tenant opens on its first request. A setter would have worked for the
+// lazily-opened ones and silently missed the default one -- which is the shape
+// of API that is worse than none.
+
+// AcknowledgeDegraded records operator acceptance of every degraded tenant and
+// reports how many were acknowledged. A server-wide acknowledgement, because
+// that is the granularity an operator acts at: they have looked at the alert,
+// they know what is quarantined, and they are putting the replica back in
+// rotation.
+func (s *Server) AcknowledgeDegraded() (int, error) {
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.degraded))
+	for k := range s.degraded {
+		keys = append(keys, k)
+	}
+	s.mu.Unlock()
+
+	n := 0
+	var firstErr error
+	for _, key := range keys {
+		s.mu.Lock()
+		tn, open := s.tenants[key]
+		s.mu.Unlock()
+		if !open {
+			// Evicted. The acknowledgement is a file in the store's own
+			// quarantine directory, so it is written where the store will
+			// read it at its next open rather than reopening the tenant here
+			// -- reopening to acknowledge would evict something else.
+			// Skip one already acknowledged: AcknowledgeDegradedDir ran
+			// unconditionally, so a second call counted the same evicted
+			// tenant again and reported "acknowledged 1" twice.
+			s.mu.Lock()
+			known, ok := s.degraded[key]
+			s.mu.Unlock()
+			if ok && known.Acknowledged {
+				continue
+			}
+			if err := storage.AcknowledgeDegradedDir(s.tenantDir(key)); err != nil {
+				// Nothing quarantined is not a failure and is not an
+				// acknowledgement: counting it would report a tenant accepted
+				// with no marker written, and it would be unacknowledged again
+				// at the next open.
+				if storage.ErrNothingToAcknowledge(err) {
+					// The quarantine directory is empty: the operator has
+					// dealt with the evidence, which is the remediation the
+					// LLD documents. Drop the record rather than skipping --
+					// skipping left the replica at 503 and the alert metric at
+					// 1 for an empty directory, with no escape but a restart.
+					s.mu.Lock()
+					if _, open := s.tenants[key]; !open {
+						delete(s.degraded, key)
+					}
+					s.mu.Unlock()
+					continue
+				}
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			n++
+			s.mu.Lock()
+			if h, ok := s.degraded[key]; ok {
+				h.Acknowledged = true
+				s.degraded[key] = h
+			}
+			s.mu.Unlock()
+			continue
+		}
+		if h := tn.store.Health(); h.Degraded() && !h.Acknowledged {
+			if err := tn.store.AcknowledgeDegraded(); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			n++
+			s.mu.Lock()
+			h.Acknowledged = true
+			s.degraded[key] = h
+			s.mu.Unlock()
+		}
+	}
+	return n, firstErr
+}
+
+// degradedLocked records a tenant's degraded health. s.mu must be held.
+func (s *Server) degradedLocked(key string, h storage.Health) {
+	if s.degraded == nil {
+		s.degraded = map[string]storage.Health{}
+	}
+	s.degraded[key] = h
+}
+
+// listQuarantined answers what this node has quarantined and why.
+//
+// The COUNT already reached an operator through the
+// simdlogs_storage_quarantined_groups gauge, so an alert could fire and nothing
+// could say WHICH group, why, how many bytes, or when. That is the shape the
+// unwired-mechanism gate exists to surface: a mechanism built, documented with
+// the failure it prevents, and connected to nothing.
+//
+// Admin-authorized, like every other storage endpoint: the reasons name file
+// paths and checksums, which describe the shape of the data.
+//
+// Refused in router mode rather than answered empty. A router's own store never
+// quarantines anything, so an empty list there reads as "nothing is wrong"
+// about shards this node has not asked.
+func (s *Server) listQuarantined(w http.ResponseWriter, r *http.Request) {
+	// A ROUTER ASKS ITS SHARDS. This used to answer 501 because a router's own
+	// store quarantines nothing and an empty list there reads as "nothing is
+	// wrong" about shards it never asked. Asking them is the fix; see
+	// cluster_admin_surfaces.go for what an unanswerable shard does to the
+	// status.
+	if len(s.backendList()) > 0 {
+		s.federatedQuarantine(w, r)
+		return
+	}
+	recs, err := s.tn(r).store.Quarantined()
+	if err != nil {
+		s.writeErr(w, r, adminSpec(), http.StatusInternalServerError, err.Error())
+		return
+	}
+	// A NON-NIL slice, so the body is `[]` and not `null`: a client that
+	// distinguishes them reads null as "this node cannot say" and an empty
+	// list as "nothing is quarantined", and those are different answers.
+	if recs == nil {
+		recs = []storage.QuarantineRecord{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Count  int                        `json:"count"`
+		Groups []storage.QuarantineRecord `json:"groups"`
+	}{len(recs), recs})
+}
+
+// acknowledgeDegraded is the operator's accept button: POST it and every
+// degraded tenant becomes ready.
+//
+// Administrative, because it silences a readiness failure. It reports how many
+// tenants it accepted and what is still degraded, so the operator sees what
+// they just took responsibility for rather than a bare 200.
+func (s *Server) acknowledgeDegraded(w http.ResponseWriter, r *http.Request) {
+	// FORWARDED to every shard. This used to answer 501 because acknowledging
+	// on a router clears nothing on the shards that are actually degraded; the
+	// fix is to acknowledge on the shards, and to refuse to call it done when
+	// one of them did not answer.
+	if len(s.backendList()) > 0 {
+		s.federatedAcknowledgeDegraded(w, r)
+		return
+	}
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		w.Header().Set("Allow", "POST, PUT")
+		http.Error(w, "acknowledging a degraded store is a POST", http.StatusMethodNotAllowed)
+		return
+	}
+	n, err := s.AcknowledgeDegraded()
+	// Audited whichever way it went. Acknowledging corruption is a person
+	// deciding that data loss is accepted and the server may serve on -- the
+	// single most consequential administrative action here, and the one whose
+	// absence from a record would be least explicable afterwards.
+	outcome := obs.OutcomeOK
+	if err != nil {
+		outcome = obs.OutcomeFailed
+	}
+	obs.Audit(r.Context(), obs.EventCorruptionAck, subjectOf(r), outcome,
+		"tenants_acknowledged", n, "error", logErrText(err))
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "acknowledged %d tenant(s), then failed: %v\n", n, err)
+		return
+	}
+	fmt.Fprintf(w, "acknowledged %d degraded tenant(s)\n", n)
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.degraded))
+	for k, h := range s.degraded {
+		if h.Degraded() {
+			keys = append(keys, fmt.Sprintf("%s: %s", k, h))
+		}
+	}
+	s.mu.Unlock()
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintln(w, k)
+	}
+}
+
+// scanDegradedTenants records every tenant directory already holding
+// quarantined groups, without opening a store.
+//
+// A tenant is marked degraded when its store OPENS, and NewServerConfig opens
+// only the default one — every other tenant opens on its first request. So a
+// replica restarted onto a disk with a degraded tenant nobody had queried yet
+// reported ready, and only went 503 once a request happened to touch it. That
+// is the wrong way round: the probe exists to keep traffic off, and it went
+// green until traffic arrived.
+//
+// It reads directories rather than opening stores, so the cost is one ReadDir
+// per tenant and no mmap, no lock, and no manifest replay.
+func (s *Server) scanDegradedTenants() {
+	ents, err := os.ReadDir(s.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		rest, ok := strings.CutPrefix(e.Name(), "tenant-")
+		if !ok {
+			continue
+		}
+		acc, proj, ok := strings.Cut(rest, "-")
+		if !ok {
+			continue
+		}
+		dir := filepath.Join(s.dir, e.Name())
+		h, ok := storage.HealthOfDir(dir)
+		if !ok || !h.Degraded() {
+			continue
+		}
+		key := acc + ":" + proj
+		s.mu.Lock()
+		if _, open := s.tenants[key]; !open {
+			s.degradedLocked(key, h)
+		}
+		s.mu.Unlock()
+	}
+}
+
+// storageHealthTotals sums the storage-health gauges across every tenant the
+// server knows to be degraded, open or not, plus the healthy open ones.
+//
+// It reads s.degraded, which readiness reads, so the two cannot disagree. The
+// map is copied under the lock and the live stores are read outside it, for
+// the reason readiness does the same: s.mu is held across a cold tenant open.
+// degradedSnapshot is every tenant the server knows to be degraded, plus the
+// healthy open ones, with each one's current health.
+//
+// ONE implementation, because readiness and /metrics both need it and having
+// two was the shape docs/wrong.md names: a fix that changes where a fact comes
+// from has to change every reader of that fact. They differed in their
+// population -- inert, because an open tenant absent from s.degraded is Ready
+// -- and that is the next drift, not a safe difference.
+//
+// The map and the store pointers are copied under s.mu and the health is read
+// outside it: s.mu is held across a cold tenant open, which mmaps and parses
+// every group, and a readiness probe queued behind that fails and pulls the
+// pod.
+//
+// A tenant the record names but nothing has open is RE-READ from its
+// directory. That is what makes the documented remediation work: an operator
+// who empties quarantine/ has dealt with the evidence, and without the re-read
+// the startup record kept the replica at 503 and the alert metric at 1 for an
+// empty directory, with no escape but a restart. One ReadDir, the same cost
+// the startup scan already pays.
+func (s *Server) degradedSnapshot() []tenantHealth {
+	type entry struct {
+		key   string
+		h     storage.Health
+		store *storage.Store
+	}
+	s.mu.Lock()
+	// Whether this call re-reads the directories, decided once for the whole
+	// snapshot and recorded under the same lock, so concurrent probes do not
+	// each pay for it.
+	now := time.Now()
+	reread := now.Sub(s.lastDirReread) >= s.dirRereadEvery
+	if reread {
+		s.lastDirReread = now
+	}
+	snap := make([]entry, 0, len(s.degraded)+len(s.tenants))
+	seen := make(map[string]bool, len(s.degraded))
+	for key, h := range s.degraded {
+		e := entry{key: key, h: h}
+		if tn, ok := s.tenants[key]; ok {
+			e.store = tn.store
+		}
+		snap = append(snap, e)
+		seen[key] = true
+	}
+	// Open tenants the record does not name. They are healthy by construction
+	// -- an open store with anything quarantined is in s.degraded, because
+	// Degraded() reads Quarantined -- so they contribute zeros. They are here
+	// so a caller counting tenants from this snapshot sees all of them.
+	for key, tn := range s.tenants {
+		if !seen[key] {
+			snap = append(snap, entry{key: key, store: tn.store})
+		}
+	}
+	s.mu.Unlock()
+
+	out := make([]tenantHealth, 0, len(snap))
+	type staleKey struct {
+		key string
+		was storage.Health
+	}
+	type freshKey struct {
+		key      string
+		was, now storage.Health
+	}
+	var stale []staleKey
+	var fresher []freshKey
+
+	for _, e := range snap {
+		h := e.h
+		if e.store != nil {
+			// The live store is the freshest answer.
+			out = append(out, tenantHealth{key: e.key, health: e.store.Health()})
+			continue
+		}
+		// Not open: re-read the directory, skipping the read when the
+		// quarantine directory has not changed since the last one. The
+		// recorded Health is a snapshot from startup or from the last time the
+		// tenant closed, and the operator's remediation happens on disk.
+		if !reread {
+			// Inside the throttle window: the recorded answer stands. Open
+			// tenants are never throttled -- their health is in memory -- so
+			// this only delays noticing a change an operator made on disk, by
+			// at most dirRereadEvery.
+			out = append(out, tenantHealth{key: e.key, health: h})
+			continue
+		}
+		dir := s.tenantDir(e.key)
+		fresh, ok := storage.HealthOfDir(dir)
+		switch {
+		case ok:
+			h = fresh
+		case dirGone(dir):
+			// The tenant directory is GONE. Deleting a tenant is an ordinary
+			// operator action -- more common than emptying one quarantine
+			// directory -- and treating "not a store" as "keep the recorded
+			// answer" left the probe reporting a quarantined group for a
+			// directory that does not exist, recoverable only through the
+			// acknowledge endpoint, which reported acknowledging nothing
+			// while doing it.
+			h = storage.Health{}
+		}
+		if !h.Degraded() {
+			stale = append(stale, staleKey{key: e.key, was: e.h})
+		} else if h != e.h {
+			// Still degraded and CHANGED: write it back, or the record never
+			// advances past what startup recorded and every throttled probe
+			// reverts to it. Same on-disk state, back to back: the re-reading
+			// call answered 200 and the throttled one 503 -- and /-/ready and
+			// /metrics disagreed with each other, which is the invariant the
+			// one-snapshot change exists to hold.
+			fresher = append(fresher, freshKey{key: e.key, was: e.h, now: h})
+		}
+		out = append(out, tenantHealth{key: e.key, health: h})
+	}
+	// Drop the tenants whose evidence is gone, so the next probe does not pay
+	// the ReadDir again.
+	if len(stale) > 0 || len(fresher) > 0 {
+		s.mu.Lock()
+		for _, f := range fresher {
+			// Guarded the same way the delete is: the record must be the one
+			// the re-read was taken against.
+			if cur, ok := s.degraded[f.key]; ok && cur == f.was {
+				s.degraded[f.key] = f.now
+			}
+		}
+		for _, e := range stale {
+			// The record must be the SAME one the re-read was taken against.
+			// Between releasing s.mu and reacquiring it a tenant can open
+			// degraded -- repopulating the record with fresh health -- and
+			// then be evicted, at which point "is it open" answers no and a
+			// correct record would be deleted on the strength of a read that
+			// predates it. Health is comparable, so the check is exact.
+			if cur, ok := s.degraded[e.key]; ok && cur == e.was {
+				delete(s.degraded, e.key)
+			}
+		}
+		s.mu.Unlock()
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
+	return out
+}
+
+// tenantHealth pairs a tenant key with its health, for the readers of
+// degradedSnapshot.
+type tenantHealth struct {
+	key    string
+	health storage.Health
+}
+
+// storageHealthTotals sums the storage-health gauges over the same snapshot
+// readiness reads, so the two endpoints cannot disagree.
+func (s *Server) storageHealthTotals() (corrupt, quarantined, degraded, unacked int64) {
+	for _, t := range s.degradedSnapshot() {
+		corrupt += int64(t.health.Corrupt)
+		quarantined += int64(t.health.Quarantined)
+		if t.health.Degraded() {
+			degraded++
+			if !t.health.Acknowledged {
+				unacked++
+			}
+		}
+	}
+	return corrupt, quarantined, degraded, unacked
+}
+
+// dirGone reports whether a tenant directory is ABSENT, which is the only
+// condition that may drop a degraded record.
+//
+// It used to be `err == nil && fi.IsDir()`, read as "deleted" for ANY error --
+// and EACCES is an error. `chmod 000` on the data directory therefore deleted
+// every degraded record, reported the server READY, and did not recover when
+// the permissions were restored, because the record was gone and only a
+// restart rebuilds it.
+//
+// That is the same anti-pattern this task has now fixed three times:
+// countQuarantined returning 0 on any error, HealthOfDir synthesising a
+// corrupt count for an unreadable directory, and this. It is worse than
+// either, because misreporting is recoverable and destroying the record is
+// not. An unreadable directory is a problem to report, never an absence.
+func dirGone(path string) bool {
+	_, err := os.Stat(path)
+	return os.IsNotExist(err)
+}
+
+// dirRereadEvery throttles how often the readiness snapshot re-reads the store
+// directories of degraded tenants that are not open.
+//
+// A per-directory mtime cache was the first attempt and is unsound twice over.
+// Part of the cached answer is the CONTENTS of quarantine/ACKNOWLEDGED, an
+// exported operator-visible file: rewriting it in place changes the answer and
+// not the directory. And an equal mtime is not proof of an unchanged
+// directory -- one second is the natural timestamp granularity on ext3, ext4
+// with 128-byte inodes, HFS+ and many NFS servers, and two on exFAT, so "the
+// last probe and the operator's rm land in the same second" is a routine
+// coincidence. Measured by forcing the collision: 503 and a gauge of 1 for an
+// empty directory, permanently, because no probe ever re-reads.
+//
+// A time window has neither problem: it depends on no filesystem property and
+// caches nothing per file. 250ms against a probe interval of one to ten
+// seconds keeps the "the answer changes the moment the operator acts"
+// requirement -- an operator cannot observe a quarter second -- and takes the
+// steady-state cost of a degraded fleet from every probe to four per second.
+const DefaultDirRereadEvery = 250 * time.Millisecond
+
+// SetDirRereadIntervalForTest sets how often readiness re-reads the data
+// directory.
+//
+// ForTest by name: production sets it through config.DirRereadInterval
+// (-readiness-reread-interval), and every caller of this is a test that needs
+// the re-read to be immediate. It was on the unwired baseline as a dead
+// exported setter; the setter is not dead, its name was.
+func (s *Server) SetDirRereadIntervalForTest(d time.Duration) {
+	s.mu.Lock()
+	s.dirRereadEvery = d
+	s.mu.Unlock()
+}
+
+// The three reasons a pipe cannot run on a live tail, on the STREAMING axis.
+//
+// The mechanism behind all three is one fact about the handler: it calls
+// `query.RunPipeline` once PER POLL, over only the groups that arrived since
+// the last one. What differs is what that costs the caller, which is what a
+// caller can act on.
+const (
+	// The answer is a function of the whole result set: an aggregate, an
+	// ordering, a de-duplication, a count of values or blocks.
+	whyNeverFinal = "it is computed over the whole result set, and a tail's " +
+		"input never ends, so there is no point at which its answer is final"
+
+	// The pipe slices a result set. `LimitPipe.apply` is `rows[:N]` and
+	// `OffsetPipe.apply` is `rows[N:]` -- prefix operations that a stream could
+	// carry; what stops them is that each poll is its own result set.
+	whyPerPoll = "a tail re-runs its pipeline once per poll, over just the " +
+		"rows that arrived since the last one, so it would apply to each " +
+		"poll's rows rather than to the stream"
+
+	// The pipe reaches outside the rows it was given.
+	whySecondSet = "it needs a second result set -- a subquery's rows, or the " +
+		"rows around a match -- and a tail has only the rows that have arrived"
+
+	// A pipe added to the language and not named in tailRefusal. Refused,
+	// because the alternative is running it per poll and reporting the result
+	// as though it were the stream's.
+	whyNoStreamingForm = "this build has no streaming form for it, so it is " +
+		"refused rather than run over each poll's rows"
+)
+
+// nonStreamingPipe returns the LogsQL name of the first pipe that cannot run on
+// a live tail and the reason it cannot, or "", "" if every pipe can.
+//
+// WHICH pipes are refused is the distributed planner's question: a PipeRowLocal
+// pipe is a function of one row, so it works the same on a stream as on a
+// batch. Asking `ClassifyPipe` rather than listing the types again means a pipe
+// added to the language is gated in one place.
+//
+// WHY a pipe is refused is NOT that question, and taking the message from the
+// class got it wrong twice:
+//
+//   - `| limit 2` and `| offset 2` were told the query "needs the whole result
+//     set and the input never ends". `LimitPipe.apply` is `return rows[:p.N]`
+//     and `OffsetPipe.apply` is `return rows[p.N:]`; docs/lld/api.md calls
+//     `| limit N` "(first n)". They are PipeGlobalOrder because a shard's first
+//     N is not the cluster's first N -- a SHARDING property. What stops them
+//     here is that the tail runs the pipeline once per poll, so `| limit 2`
+//     would bound each poll rather than the stream (docs/wrong.md 121).
+//   - `| stats count() c` was told its input never ends while
+//     `| stats avg(d) a` was told it "runs once over a merged result set",
+//     because `ClassifyPipe` splits *StatsPipe on `mergeableAggs` -- whether a
+//     COORDINATOR can combine partial states. On a live tail there is no
+//     coordinator and no merge, so both are refused for the identical reason,
+//     and naming a cluster to a single-node operator is a message they cannot
+//     act on.
+//
+// So the class decides refusal and `tailRefusal` decides the message.
+func nonStreamingPipe(pipes []query.Pipe) (name, why string) {
+	for _, p := range pipes {
+		if query.ClassifyPipe(p) != query.PipeRowLocal {
+			return tailRefusal(p)
+		}
+	}
+	return "", ""
+}
+
+// tailRefusal names a pipe the way the language spells it, and says why a tail
+// cannot run it.
+//
+// THE NAME IS THE LogsQL TOKEN, not the Go type lowered. This used to be
+// `strings.ToLower(strings.TrimSuffix(typeName, "Pipe"))`, which is right for
+// eleven of the seventeen and wrong for the rest: `stream_context` came back as
+// `streamcontext`, `field_values` as `fieldvalues`, `field_names` as
+// `fieldnames`, `blocks_count` as `blockscount` and `block_stats` as
+// `blockstats`. A refusal that names a token the language does not have cannot
+// be pasted back into a query, which is the one thing a caller wants to do with
+// it.
+//
+// The default is unreachable for the language as it stands, and
+// TestEveryPipeInTheLanguageHasATailRefusal is what keeps it that way: it takes
+// the pipe set from the query package's source and requires a case here for
+// each, so a pipe added to the language cannot silently arrive as a lowered Go
+// type name with a generic reason.
+func tailRefusal(p query.Pipe) (name, why string) {
+	switch p.(type) {
+	// Computed over the whole result set.
+	case *query.StatsPipe:
+		return "stats", whyNeverFinal
+	case *query.SortPipe:
+		return "sort", whyNeverFinal
+	case *query.UniqPipe:
+		return "uniq", whyNeverFinal
+	case *query.TopPipe:
+		return "top", whyNeverFinal
+	case *query.RankPipe:
+		return "rank", whyNeverFinal
+	case *query.FieldValuesPipe:
+		return "field_values", whyNeverFinal
+	case *query.FieldNamesPipe:
+		return "field_names", whyNeverFinal
+	case *query.FacetsPipe:
+		return "facets", whyNeverFinal
+	case *query.BlocksCountPipe:
+		return "blocks_count", whyNeverFinal
+	case *query.BlockStatsPipe:
+		return "block_stats", whyNeverFinal
+
+	// Slices of a result set, and each poll is its own result set.
+	case *query.LimitPipe:
+		return "limit", whyPerPoll
+	case *query.OffsetPipe:
+		return "offset", whyPerPoll
+	case *query.TailPipe:
+		return "tail", whyPerPoll
+	case *query.SamplePipe:
+		return "sample", whyPerPoll
+
+	// Reaches outside the rows it was given.
+	case *query.JoinPipe:
+		return "join", whySecondSet
+	case *query.UnionPipe:
+		return "union", whySecondSet
+	case *query.StreamContextPipe:
+		return "stream_context", whySecondSet
+	}
+	n := fmt.Sprintf("%T", p)
+	if i := strings.LastIndex(n, "."); i >= 0 {
+		n = n[i+1:]
+	}
+	return strings.ToLower(strings.TrimSuffix(n, "Pipe")), whyNoStreamingForm
 }

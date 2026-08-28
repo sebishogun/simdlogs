@@ -1,0 +1,750 @@
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http/httptest"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// A router and a node over the SAME rows, so a difference is an answer and not
+// a status code.
+//
+// TestEveryFederatedReadAnswersWhatASingleNodeAnswers compares status over an
+// EMPTY store, which is "returns the same three digits over no data". This one
+// gives both sides thirty rows and compares what they say.
+func loadedPair(t *testing.T, rowsPerShard int) (node, router *httptest.Server) {
+	t.Helper()
+	node = singleNode(t)
+	var shardURLs []string
+	shards := make([]*httptest.Server, 3)
+	for i := range shards {
+		shards[i] = singleNode(t)
+		shardURLs = append(shardURLs, shards[i].URL)
+	}
+	// THREE SHARDS, not three replicas of one.
+	//
+	// wmRouter calls SetReplicas(len(backends)), which makes them replicas --
+	// so the router asks one of them and answers with a third of the data. The
+	// first version of this helper used it and the "cluster" answered 10 where
+	// the node answered 30, which looks exactly like the defect under test and
+	// is a fixture that cannot measure it.
+	rs, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rs.Close() })
+	rs.SetBackends(shardURLs)
+	rs.SetReplicas(1)
+	router = httptest.NewServer(rs.Handler())
+	t.Cleanup(router.Close)
+
+	// The node gets every row; each shard gets a third, so the cluster holds
+	// the same set and a correct merge answers the same thing.
+	for i := 0; i < rowsPerShard*3; i++ {
+		line := fmt.Sprintf(
+			`{"_time":"2026-08-16T03:00:%02dZ","_msg":"row %d","level":"%s","svc":"s%d"}`+"\n",
+			i%60, i, []string{"error", "info", "warn"}[i%3], i%3)
+		postRaw(t, node, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson", line)
+		postRaw(t, shards[i%3], "/insert/jsonline?_stream_fields=svc", "application/x-ndjson", line)
+	}
+	return node, router
+}
+
+// A facet's VALUE is the one the row serializes, so clicking it finds the row.
+//
+// TestAFieldIsFacetedOnceAndTheRouterAgrees checks that `_stream` and
+// `_stream_id` appear once. That is satisfied two ways: by emitting them from
+// Streams/StreamIDs and skipping the stored columns (what FacetList does), and
+// by keeping the stored columns and deleting the synthesized tail. Deleting
+// the tail leaves the whole suite green -- so nothing distinguished
+// "authoritative, whether or not a column exists" from "whatever the column
+// happens to hold", and the two differ:
+//
+//	`_stream_id`  from the tail: present. from the column: ABSENT, in every
+//	              store shape, because nothing writes that column.
+//	`_stream`     from the tail: `{svc="s0"}`. from the column: "", the raw
+//	              stored value, where the row serializes `{svc="s0"}`.
+//
+// The contract is click-through: a facet value pasted into a filter must find
+// the rows it was counted from. The empty value finds nothing, which is the
+// same silent-and-wrong shape as a doubled count, one step further on.
+func TestAFacetValueSelectsTheRowsItCounted(t *testing.T) {
+	node, router := loadedPair(t, 10)
+	for _, srv := range []struct {
+		name string
+		ts   *httptest.Server
+	}{{"node", node}, {"router", router}} {
+		code, body := postRaw(t, srv.ts, "/select/logsql/facets?query=%2A", "", "")
+		if code != 200 {
+			t.Fatalf("%s: facets answered %d", srv.name, code)
+		}
+		var got struct {
+			Facets []struct {
+				FieldName string `json:"field_name"`
+				Values    []struct {
+					FieldValue string `json:"field_value"`
+					Hits       int    `json:"hits"`
+				} `json:"values"`
+			} `json:"facets"`
+		}
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("%s: facets is not JSON: %v: %.300s", srv.name, err, body)
+		}
+		seen := map[string][]string{}
+		for _, f := range got.Facets {
+			for _, v := range f.Values {
+				seen[f.FieldName] = append(seen[f.FieldName], v.FieldValue)
+			}
+		}
+		for _, name := range []string{"_stream", "_stream_id"} {
+			vals := seen[name]
+			if len(vals) == 0 {
+				t.Errorf("%s: %s is not faceted at all, so a client cannot filter "+
+					"on a field every row carries: %.300s", srv.name, name, body)
+				continue
+			}
+			for _, v := range vals {
+				if v == "" {
+					t.Errorf("%s: %s is faceted with the EMPTY value, which is the "+
+						"raw stored column and not what the row serializes: %.300s",
+						srv.name, name, body)
+					continue
+				}
+				// The click-through: the value must select the rows.
+				q := name + `:` + strconv.Quote(v)
+				qCode, qBody := postRaw(t, srv.ts, "/select/logsql/query?query="+
+					url.QueryEscape(q)+"&limit=1", "", "")
+				if qCode != 200 {
+					t.Errorf("%s: filtering on the faceted %s value %q answered %d: %.200s",
+						srv.name, name, v, qCode, qBody)
+					continue
+				}
+				if strings.TrimSpace(qBody) == "" {
+					t.Errorf("%s: the faceted %s value %q selects NO rows, though it "+
+						"was counted from some", srv.name, name, v)
+				}
+			}
+		}
+	}
+}
+
+// field_names lists a synthesized name ONCE, on a store whose rows carry it.
+//
+// FacetList guards `_stream` against the stored column and appends
+// `_stream_id` unconditionally, and field_names had the same shape: `_stream`
+// guarded, `_stream_id` not. A client may send `_stream_id` as an ordinary
+// field -- nothing stops it -- and then the stored column and the synthesized
+// name are both listed. On a node that is a duplicate entry; a router SUMS the
+// shards' counts by name, so it becomes twice the rows there are. Measured,
+// six rows each carrying `_stream_id`, one shard:
+//
+//	node   [… {"value":"_stream_id","hits":6},{"value":"_stream_id","hits":6} …]
+//	router [{"value":"_stream_id","hits":12} …]
+//
+// Both at HTTP 200, and the facets endpoint over the same store was already
+// correct -- entry 77's defect, still live one endpoint over.
+//
+// The fixture SUPPLIES the field, which loadedPair's rows do not: without it
+// the stored column never exists, the guard never has anything to guard
+// against, and the test passes on the broken code.
+func TestFieldNamesListsASynthesizedNameOnce(t *testing.T) {
+	node := singleNode(t)
+	shard := singleNode(t)
+	rs, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rs.Close() })
+	rs.SetBackends([]string{shard.URL})
+	rs.SetReplicas(1)
+	router := httptest.NewServer(rs.Handler())
+	t.Cleanup(router.Close)
+
+	// HALF the rows supply the field, not all of them.
+	//
+	// With all six supplying it the stored column's count and the row count
+	// coincide, and a fix that keeps the column's number instead of the row
+	// count passes. It did: the first fix guarded the synthesized entry
+	// against the column and kept `hits: 3` where every one of the six rows
+	// serializes a `_stream_id`, disagreeing with the facets endpoint over the
+	// same store. Three of six is what tells the two numbers apart.
+	for i := 0; i < 6; i++ {
+		var line string
+		if i%2 == 0 {
+			line = fmt.Sprintf(
+				`{"_time":"2026-08-16T03:00:%02dZ","_msg":"row %d","_stream_id":"deadbeef%02d","svc":"s%d"}`+"\n",
+				i, i, i, i%2)
+		} else {
+			line = fmt.Sprintf(
+				`{"_time":"2026-08-16T03:00:%02dZ","_msg":"row %d","svc":"s%d"}`+"\n", i, i, i%2)
+		}
+		postRaw(t, node, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson", line)
+		postRaw(t, shard, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson", line)
+	}
+
+	const path = "/select/logsql/field_names?query=%2A"
+	nCode, nBody := postRaw(t, node, path, "", "")
+	rCode, rBody := postRaw(t, router, path, "", "")
+	if nCode != 200 || rCode != 200 {
+		t.Fatalf("node %d router %d", nCode, rCode)
+	}
+	for _, name := range []string{"_stream", "_stream_id", "_msg", "svc"} {
+		key := `"value":"` + name + `"`
+		if n := strings.Count(nBody, key); n > 1 {
+			t.Errorf("a single node lists %s %d times: %.400s", name, n, nBody)
+		}
+		if n := strings.Count(rBody, key); n > 1 {
+			t.Errorf("the router lists %s %d times: %.400s", name, n, rBody)
+		}
+	}
+	// Six rows exist and every one of them SERIALIZES a `_stream_id`, so 6 is
+	// the answer on both. 12 is the summed duplicate; 3 is the stored
+	// column's count, which is the number the first fix kept.
+	for _, tc := range []struct {
+		name, body string
+	}{{"node", nBody}, {"router", rBody}} {
+		for _, name := range []string{"_stream", "_stream_id"} {
+			want := `{"value":"` + name + `","hits":6}`
+			if !strings.Contains(tc.body, want) {
+				t.Errorf("%s does not report %s at 6 hits, though all six rows "+
+					"serialize one: %.400s", tc.name, name, tc.body)
+			}
+		}
+	}
+	// And the facets endpoint over the same store must agree, since it is the
+	// disagreement that made the wrong number visible.
+	fCode, fBody := postRaw(t, node, "/select/logsql/facets?query=%2A", "", "")
+	if fCode != 200 {
+		t.Fatalf("facets answered %d", fCode)
+	}
+	if got, want := facetHits(t, fBody, "_stream_id"), 6; got != want {
+		t.Errorf("facets total %d hits for _stream_id and field_names says 6; "+
+			"two endpoints over one store: %.400s", got, fBody)
+	}
+	if nBody != rBody {
+		t.Errorf("the router and a single node disagree:\n  node   %.350s\n  router %.350s",
+			nBody, rBody)
+	}
+}
+
+// jsonKeySequence is the keys of a flat JSON object IN ORDER, duplicates
+// included. encoding/json cannot report this -- unmarshalling into a map keeps
+// the last value for a repeated key and unmarshalling into a struct ignores
+// the extras -- so a duplicate key is invisible to every ordinary decode, and
+// this serializer has emitted one.
+func jsonKeySequence(t *testing.T, obj string) []string {
+	t.Helper()
+	dec := json.NewDecoder(strings.NewReader(obj))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		t.Fatalf("not a JSON object: %v: %s", err, obj)
+	}
+	var keys []string
+	for dec.More() {
+		k, err := dec.Token()
+		if err != nil {
+			t.Fatalf("reading a key: %v: %s", err, obj)
+		}
+		s, ok := k.(string)
+		if !ok {
+			t.Fatalf("a non-string key: %v: %s", k, obj)
+		}
+		keys = append(keys, s)
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			t.Fatalf("reading %s: %v: %s", s, err, obj)
+		}
+	}
+	return keys
+}
+
+func hasDuplicate(keys []string) bool {
+	seen := map[string]bool{}
+	for _, k := range keys {
+		if seen[k] {
+			return true
+		}
+		seen[k] = true
+	}
+	return false
+}
+
+// facetHits totals the hits a field's facet values report.
+func facetHits(t *testing.T, body, field string) int {
+	t.Helper()
+	var got struct {
+		Facets []struct {
+			FieldName string `json:"field_name"`
+			Values    []struct {
+				Hits int `json:"hits"`
+			} `json:"values"`
+		} `json:"facets"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("facets is not JSON: %v: %.300s", err, body)
+	}
+	n := 0
+	for _, f := range got.Facets {
+		if f.FieldName != field {
+			continue
+		}
+		for _, v := range f.Values {
+			n += v.Hits
+		}
+	}
+	return n
+}
+
+// A parameter sent in BOTH the URL and the body resolves the same way on a
+// router as on a node.
+//
+// A node's ParseForm puts PostForm before the URL query, so FormValue returns
+// the BODY's value. withFormInURL merges "under the query string", so the URL's
+// value reaches the shard -- a different question, HTTP 200 on both sides:
+//
+//	POST /select/logsql/stats_query?query=level:error | stats count() c
+//	     ct urlencoded   body query=* | stats count() c
+//	  node   ..."value":[…,"30"]
+//	  router ..."value":[…,"10"]
+//
+// Under MULTIPART the two agree, because Go appends multipart values AFTER the
+// URL query -- so the router implements multipart precedence for both
+// encodings, and a node does not.
+func TestAParameterInBothTheURLAndTheBodyResolvesTheSameWay(t *testing.T) {
+	node, router := loadedPair(t, 10)
+	for _, tc := range []struct{ name, path, ct, body string }{
+		{
+			// Node and router are separate requests. Pin the sample instant so
+			// a slow emulated run crossing a second boundary does not turn this
+			// parameter-precedence assertion into a clock comparison.
+			name: "stats_query, urlencoded",
+			path: "/select/logsql/stats_query?time=2026-08-16T03:01:00Z&query=" +
+				url.QueryEscape(`level:error | stats count() c`),
+			ct:   "application/x-www-form-urlencoded",
+			body: "query=" + url.QueryEscape(`* | stats count() c`),
+		},
+		{
+			// limit=5, NOT limit=3.
+			//
+			// The fixture is three shards, so a router applying the URL's
+			// limit=1 per shard returns 3 rows -- exactly what the body's
+			// limit=3 asks for. The two answers coincided and the subtest
+			// could not tell which limit had been used. Measured on the base
+			// commit, against the defect this was written for:
+			//
+			//	url=1 body=3   node 3 rows, router 3 rows, bodies EQUAL
+			//	url=1 body=4   node 4 rows, router 3 rows, DIFFER
+			//	url=1 body=5   node 5 rows, router 3 rows, DIFFER
+			//
+			// One digit is the difference between a test and a coincidence.
+			name: "query limit, urlencoded",
+			path: "/select/logsql/query?query=" + url.QueryEscape("*") + "&limit=1",
+			ct:   "application/x-www-form-urlencoded",
+			body: "query=" + url.QueryEscape("*") + "&limit=5",
+		},
+		{
+			// stats_query_RANGE, for the MATRIX envelope.
+			//
+			// federatedVector and federatedMatrix were both changed from a map
+			// to a struct so the router's key order matches a node's -- a map
+			// comes out of encoding/json sorted, which makes
+			// {"data":…,"status":"success"} where a node writes
+			// {"status":"success","data":…}. Only the vector one was exercised:
+			// reverting the matrix envelope to a map left the whole suite
+			// green while the router answered
+			//
+			//	node   {"status":"success","data":{"resultType":"matrix",…}}
+			//	router {"data":{"result":…,"resultType":"matrix"},"status":"success"}
+			//
+			// which is what a byte comparison is for.
+			name: "stats_query_range, urlencoded",
+			path: "/select/logsql/stats_query_range?start=2026-08-16T03:00:00Z" +
+				"&end=2026-08-16T03:01:00Z&step=30s&query=" +
+				url.QueryEscape(`level:error | stats count() c`),
+			ct:   "application/x-www-form-urlencoded",
+			body: "query=" + url.QueryEscape(`* | stats count() c`),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nCode, nBody := postRaw(t, node, tc.path, tc.ct, tc.body)
+			rCode, rBody := postRaw(t, router, tc.path, tc.ct, tc.body)
+			if nCode != rCode {
+				t.Fatalf("single node %d, router %d\n  single %.200s\n  router %.200s",
+					nCode, rCode, nBody, rBody)
+			}
+			// The BODIES, byte for byte. A status comparison is satisfied by
+			// two equally wrong sides -- both of these answered 200 while one
+			// counted thirty rows and the other ten.
+			if nBody != rBody {
+				t.Errorf("the two resolve the duplicate parameter differently:\n"+
+					"  single %.250s\n  router %.250s", nBody, rBody)
+			}
+		})
+	}
+}
+
+// A field is faceted ONCE, and a router does not sum a node's duplicate.
+//
+// `_stream` and `_stream_id` are synthesized onto every record AND are stored
+// columns once `_stream_fields` is configured, so FacetList emitted them twice:
+// once from the column in its main loop, once from Streams/StreamIDs at the
+// tail. A single node answered with two `_stream` blocks and the router summed
+// the pair:
+//
+//	30 rows, 3 streams of 10
+//	  node   "_stream" appears TWICE, 10/10/10 in each
+//	  router "_stream" once, 20/20/20
+//
+// Both HTTP 200, and the truth is 10. The duplicate on the node is odd; the
+// router's sum is a wrong number a dashboard draws.
+func TestAFieldIsFacetedOnceAndTheRouterAgrees(t *testing.T) {
+	node, router := loadedPair(t, 10)
+	const path = "/select/logsql/facets?query=%2A"
+	nCode, nBody := postRaw(t, node, path, "", "")
+	rCode, rBody := postRaw(t, router, path, "", "")
+	if nCode != 200 || rCode != 200 {
+		t.Fatalf("node %d router %d", nCode, rCode)
+	}
+	for _, name := range []string{"_stream", "_stream_id", "_msg", "level", "svc"} {
+		key := `"field_name":"` + name + `"`
+		if n := strings.Count(nBody, key); n > 1 {
+			t.Errorf("a single node facets %s %d times: %.300s", name, n, nBody)
+		}
+		if n := strings.Count(rBody, key); n > 1 {
+			t.Errorf("the router facets %s %d times: %.300s", name, n, rBody)
+		}
+	}
+	// 30 rows over 3 streams is 10 each, on both. A doubled block sums to 20.
+	if strings.Contains(rBody, `"hits":20`) {
+		t.Errorf("the router reports 20 hits where the cluster holds 10: %.400s", rBody)
+	}
+	if nBody != rBody {
+		t.Errorf("the router and a single node disagree:\n  node   %.350s\n  router %.350s",
+			nBody, rBody)
+	}
+}
+
+// A row and its pack carry the same fields, out of one response.
+//
+// `_time` is emitted from r.Time when the row has one and skipped from the
+// field list so it is not written twice. That skip has to be conditional on
+// the emit, and it is in three places: packJSON, packLogfmt and appendRowJSON.
+// Two were fixed and the third -- the serializer the packs are supposed to
+// mirror, and the one on the wire -- was not, so a single response answered
+// the question two different ways:
+//
+//   - | stats by (_time) count() c | pack_json as p
+//     row  {"c":"1"}
+//     p    {"_time":"2026-08-16T03:00:00Z","c":"1"}
+//
+// which is exactly the failure the pack fix existed to remove ("a client
+// reading `p` got a different record from a client reading the row, out of one
+// response"), inverted. victoria-logs puts `_time` in both.
+//
+// ASSERTED AS AGREEMENT between the two halves rather than against a literal,
+// because that is the invariant: whatever the row says, the pack of the same
+// row must say. A literal would go stale the first time the format moved.
+func TestARowAndItsPackAgree(t *testing.T) {
+	node := singleNode(t)
+	for i := 0; i < 4; i++ {
+		line := fmt.Sprintf(
+			`{"_time":"2026-08-16T03:00:%02dZ","_msg":"row %d","level":"%s","svc":"s%d"}`+"\n",
+			i, i, []string{"error", "info"}[i%2], i%2)
+		postRaw(t, node, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson", line)
+	}
+
+	for _, q := range []string{
+		`* | stats by (_time) count() c | pack_json as p`,
+		`* | stats by (level) count() c | rename level as _time | pack_json as p`,
+		`* | stats by (svc) count() c | copy svc as _time | pack_json as p`,
+		// TWO `_time` fields on one row: neither `rename` nor `copy`
+		// overwrites an existing key, so this is how a duplicate reaches the
+		// serializer. It emitted {"_time":"…","c":"1","_time":"…"}.
+		`* | stats by (_time) count() c | copy _time as t2 | rename t2 as _time | pack_json as p`,
+		// pack_LOGFMT, which is the third copy of the rule and the one no
+		// subtest reached: every case above packs JSON, so `hasDuplicate`
+		// never saw a logfmt pack and reverting packLogfmt's guard left the
+		// whole suite green. Its duplicate spells itself
+		// `_time=… c=1 _time=…`.
+		`* | stats by (_time) count() c | pack_logfmt as p`,
+		`* | stats by (_time) count() c | copy _time as t2 | rename t2 as _time | pack_logfmt as p`,
+	} {
+		t.Run(q, func(t *testing.T) {
+			code, body := postRaw(t, node, "/select/logsql/query?query="+url.QueryEscape(q), "", "")
+			if code != 200 {
+				t.Fatalf("answered %d: %.200s", code, body)
+			}
+			lines := strings.Split(strings.TrimSpace(body), "\n")
+			if len(lines) == 0 || lines[0] == "" {
+				t.Fatalf("no rows: %.200s", body)
+			}
+			for _, ln := range lines {
+				// KEY SEQUENCES first, because a map collapses a duplicate key
+				// to the last one -- and a duplicate key is a defect this
+				// exact serializer has shipped. The first version of this test
+				// unmarshalled both halves into map[string]string and would
+				// have compared equal while the wire carried
+				// {"_time":"…","c":"1","_time":"…"}.
+				if k := jsonKeySequence(t, ln); hasDuplicate(k) {
+					t.Errorf("the row repeats a key: %v in %s", k, ln)
+				}
+				var row map[string]string
+				if err := json.Unmarshal([]byte(ln), &row); err != nil {
+					t.Fatalf("row is not JSON: %v: %s", err, ln)
+				}
+				packed, ok := row["p"]
+				if !ok {
+					t.Fatalf("the row carries no pack: %s", ln)
+				}
+				var pack map[string]string
+				if strings.HasPrefix(strings.TrimSpace(packed), "{") {
+					if k := jsonKeySequence(t, packed); hasDuplicate(k) {
+						t.Errorf("the pack repeats a key: %v in %s", k, packed)
+					}
+					if err := json.Unmarshal([]byte(packed), &pack); err != nil {
+						t.Fatalf("the pack is not JSON: %v: %s", err, packed)
+					}
+				} else {
+					// logfmt: `k=v` pairs, space separated. Parsed by the same
+					// rule the packer writes so a repeated key is visible --
+					// a map alone would collapse it, which is the mistake the
+					// JSON half already made once.
+					pack = map[string]string{}
+					var keys []string
+					for _, kv := range strings.Fields(packed) {
+						k, v, ok := strings.Cut(kv, "=")
+						if !ok {
+							continue
+						}
+						keys = append(keys, k)
+						pack[k] = v
+					}
+					if hasDuplicate(keys) {
+						t.Errorf("the logfmt pack repeats a key: %v in %s", keys, packed)
+					}
+				}
+				delete(row, "p")
+				for k, v := range row {
+					pv, ok := pack[k]
+					if !ok {
+						t.Errorf("the row carries %s=%q and its pack does not: row %s pack %s",
+							k, v, ln, packed)
+						continue
+					}
+					if pv != v {
+						t.Errorf("%s is %q in the row and %q in its pack: %s", k, v, pv, ln)
+					}
+				}
+				for k, v := range pack {
+					if _, ok := row[k]; !ok {
+						t.Errorf("the pack carries %s=%q and the row does not: row %s pack %s",
+							k, v, ln, packed)
+					}
+				}
+			}
+		})
+	}
+}
+
+// A router answers `stats by (_time)` the same as a node.
+//
+// jsonLineToRow lifted `_time` out of the fields into Row.Time and dropped the
+// field. For `stats by (_time)` that field IS the group key, so the merge
+// grouped every row together:
+//
+//   - | stats by (_time) count() c      4 rows, 2 distinct timestamps
+//     node    {"_time":"…03:00:00Z","c":"2"} {"_time":"…03:00:01Z","c":"2"}
+//     router  {"c":"4"}
+//
+// both at HTTP 200. Fixing the serializer to keep the field made the node
+// right and left the router wrong, which is worse than both being wrong: a
+// cluster and a node now disagreed about a number.
+//
+// Compared against a node over the same rows rather than against a literal,
+// which is what makes it a parity test rather than a snapshot.
+func TestARouterGroupsByTimeAsANodeDoes(t *testing.T) {
+	node, router := loadedPairAtTimes(t)
+	for _, q := range []string{
+		`* | stats by (_time) count() c`,
+		`* | stats by (_time, level) count() c`,
+		`* | stats by (_time) count() c | pack_json as p`,
+	} {
+		t.Run(q, func(t *testing.T) {
+			path := "/select/logsql/query?query=" + url.QueryEscape(q)
+			nCode, nBody := postRaw(t, node, path, "", "")
+			rCode, rBody := postRaw(t, router, path, "", "")
+			if nCode != 200 || rCode != 200 {
+				t.Fatalf("node %d router %d", nCode, rCode)
+			}
+			if sortedLines(nBody) != sortedLines(rBody) {
+				t.Errorf("the router and a node disagree:\n  node   %s\n  router %s",
+					sortedLines(nBody), sortedLines(rBody))
+			}
+			// And the group key has to be THERE: two identical empty answers
+			// would satisfy the comparison above.
+			if !strings.Contains(nBody, `"_time"`) {
+				t.Errorf("neither carries the group key, so this compares nothing: %s", nBody)
+			}
+		})
+	}
+}
+
+// loadedPairAtTimes is a node and a one-shard router over four rows at two
+// distinct timestamps, so a grouping that collapses them is visible.
+func loadedPairAtTimes(t *testing.T) (node, router *httptest.Server) {
+	t.Helper()
+	node = singleNode(t)
+	shard := singleNode(t)
+	rs, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rs.Close() })
+	rs.SetBackends([]string{shard.URL})
+	rs.SetReplicas(1)
+	router = httptest.NewServer(rs.Handler())
+	t.Cleanup(router.Close)
+	for i := 0; i < 4; i++ {
+		line := fmt.Sprintf(
+			`{"_time":"2026-08-16T03:00:%02dZ","_msg":"row %d","level":"%s"}`+"\n",
+			i/2, i, []string{"error", "info"}[i%2])
+		postRaw(t, node, "/insert/jsonline", "application/x-ndjson", line)
+		postRaw(t, shard, "/insert/jsonline", "application/x-ndjson", line)
+	}
+	return node, router
+}
+
+// sortedLines normalizes the row ORDER, which a stats result does not fix.
+func sortedLines(body string) string {
+	lines := strings.Split(strings.TrimSpace(body), "\n")
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
+}
+
+// A store where SOME rows have a stream reports the empty stream too.
+//
+// The empty-stream fallback was all-or-nothing: it fired only when nothing was
+// in a named stream, so a store ingested partly with `_stream_fields` and
+// partly without reported only the named half. The rows with no stream vanished
+// from /streams, /stream_ids and the `_stream` facet, while /query returned
+// them and field_names counted them — one store, two answers about how many
+// rows exist.
+//
+// Measured against the staged victoria-logs binary on the same six rows, three
+// named:
+//
+//	                 simdlogs before          victoria-logs
+//	/streams         [{svc="s0"}:3]           [{svc="s0"}:3, {}:3]
+//	/stream_ids      one value                two values
+//	/field_names     _stream:6                _stream:6      (already agreed)
+//
+// The stream IDS are this server's own hashes and are not expected to equal
+// VL's; the value COUNT and the hit counts are.
+func TestAMixedStoreReportsTheEmptyStream(t *testing.T) {
+	node := singleNode(t)
+	// ONE REQUEST, both kinds of row.
+	//
+	// Six separate requests land in six flush groups, so the streamless rows
+	// have no `_stream` column at all and the store only ever exercises one of
+	// the two ways a row reaches the empty stream. In one request they share a
+	// group, the column is materialized to "" for the rows that lack the
+	// field, and both paths run -- which is where the remainder was counting
+	// those rows twice, reporting nine hits over six rows.
+	var sb strings.Builder
+	for i := 0; i < 3; i++ {
+		fmt.Fprintf(&sb, `{"_time":"2026-08-16T03:00:0%dZ","_msg":"row %d","svc":"s0"}`+"\n", i, i)
+	}
+	for i := 3; i < 6; i++ {
+		fmt.Fprintf(&sb, `{"_time":"2026-08-16T03:00:0%dZ","_msg":"row %d"}`+"\n", i, i)
+	}
+	postRaw(t, node, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson", sb.String())
+	// And the separate-request shape too, on its own store, since that is the
+	// other way to reach the empty stream and the two took different branches.
+	sep := singleNode(t)
+	for i := 0; i < 3; i++ {
+		postRaw(t, sep, "/insert/jsonline?_stream_fields=svc", "application/x-ndjson",
+			fmt.Sprintf(`{"_time":"2026-08-16T03:00:0%dZ","_msg":"row %d","svc":"s0"}`+"\n", i, i))
+	}
+	for i := 3; i < 6; i++ {
+		postRaw(t, sep, "/insert/jsonline", "application/x-ndjson",
+			fmt.Sprintf(`{"_time":"2026-08-16T03:00:0%dZ","_msg":"row %d"}`+"\n", i, i))
+	}
+	for _, srv := range []*httptest.Server{node, sep} {
+		checkMixedStreamStore(t, srv)
+	}
+}
+
+func checkMixedStreamStore(t *testing.T, node *httptest.Server) {
+	t.Helper()
+
+	var streams struct {
+		Values []struct {
+			Value string `json:"value"`
+			Hits  int    `json:"hits"`
+		} `json:"values"`
+	}
+	_, body := postRaw(t, node, "/select/logsql/streams?query=%2A", "", "")
+	if err := json.Unmarshal([]byte(body), &streams); err != nil {
+		t.Fatalf("streams is not JSON: %v: %s", err, body)
+	}
+	got := map[string]int{}
+	for _, v := range streams.Values {
+		got[v.Value] = v.Hits
+	}
+	for _, want := range []struct {
+		value string
+		hits  int
+	}{{`{svc="s0"}`, 3}, {"{}", 3}} {
+		if got[want.value] != want.hits {
+			t.Errorf("/streams reports %s at %d hits, want %d: %s",
+				want.value, got[want.value], want.hits, body)
+		}
+	}
+	// The hits must add up to the rows that exist, or a stream is being
+	// counted twice or not at all.
+	total := 0
+	for _, v := range streams.Values {
+		total += v.Hits
+	}
+	if total != 6 {
+		t.Errorf("/streams hits total %d over six rows: %s", total, body)
+	}
+
+	// /stream_ids derives from /streams, so it must have the same cardinality.
+	var ids struct {
+		Values []struct {
+			Value string `json:"value"`
+			Hits  int    `json:"hits"`
+		} `json:"values"`
+	}
+	_, idBody := postRaw(t, node, "/select/logsql/stream_ids?query=%2A", "", "")
+	if err := json.Unmarshal([]byte(idBody), &ids); err != nil {
+		t.Fatalf("stream_ids is not JSON: %v: %s", err, idBody)
+	}
+	// The HITS, not the count. StreamIDs builds one entry per Streams entry,
+	// so comparing the lengths is structural -- it cannot fail whatever
+	// Streams returns, and reverting the fix left it green while three other
+	// assertions went red.
+	idTotal := 0
+	for _, v := range ids.Values {
+		idTotal += v.Hits
+	}
+	if idTotal != 6 {
+		t.Errorf("/stream_ids hits total %d over six rows: %s", idTotal, idBody)
+	}
+	if len(ids.Values) != 2 {
+		t.Errorf("/stream_ids lists %d ids where the store has two streams "+
+			"(one named, one empty): %s", len(ids.Values), idBody)
+	}
+
+	// And the `_stream` facet, over the same store, must agree with /streams.
+	_, fBody := postRaw(t, node, "/select/logsql/facets?query=%2A&keep_const_fields=1", "", "")
+	if n := facetHits(t, fBody, "_stream"); n != 6 {
+		t.Errorf("the _stream facet totals %d hits where /streams totals 6: %.400s", n, fBody)
+	}
+}

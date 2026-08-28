@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"runtime"
 	"time"
 )
 
@@ -34,7 +35,73 @@ type Limits struct {
 	// Concurrency and tenancy.
 	MaxConcurrentQuery int
 	MaxConcurrentWrite int
-	MaxOpenTenants     int
+	// MaxConcurrentTail bounds live tails. They are not charged the query
+	// budget -- an open tail is an idle connection, and charging it meant a
+	// few of them returned 429 for every other read including /metrics --
+	// but "not charged" is not "unbounded": each one holds a connection, a
+	// goroutine and a poll timer, and with no bound an anonymous client
+	// opened as many as it liked.
+	MaxConcurrentTail int
+	MaxOpenTenants    int
+
+	// MaxQueriesPerTenant bounds reads in flight for ONE tenant.
+	// MaxConcurrentQuery is process-wide and cannot express this: with only
+	// that, the tenant with the most aggressive dashboard takes every slot and
+	// every other tenant is refused work the server had room to do. 0 is
+	// unbounded.
+	MaxQueriesPerTenant int
+
+	// QueryQueueWait is how long a read may wait for a slot before being
+	// refused. 0 refuses immediately, which is right for an interactive
+	// endpoint: a client that would have waited would rather be told now, and
+	// a queue deeper than the client's patience does work nobody collects.
+	QueryQueueWait time.Duration
+
+	// MaxGroupKeys bounds an aggregate's distinct `by` keys. Nothing else
+	// measures it: MaxQueryRows counts the scan's rows, of which a
+	// high-cardinality aggregate may read few, and MaxQueryBytes counts
+	// materialized row bytes, which an aggregate does not accumulate. The map
+	// it builds is proportional to the key space and to nothing else. 0 is
+	// unbounded.
+	MaxGroupKeys int
+
+	// MaxPipeRows bounds the rows one pipe may produce. Joins are why: a left
+	// join on a key that is not unique on the right multiplies, so two results
+	// each inside MaxQueryRows become an output no budget covered. 0 is
+	// unbounded.
+	MaxPipeRows int
+
+	// MaxVectorK, MaxVectorDim and MaxVectorCandidates bound a vector search.
+	// Three numbers because they bound three quantities: how big the answer
+	// is, how expensive one comparison is, and how many comparisons run. The
+	// top 10 of a billion vectors is a small answer and a billion
+	// comparisons, so MaxVectorK says nothing about the cost. 0 is unbounded.
+	MaxVectorK          int
+	MaxVectorDim        int
+	MaxVectorCandidates int
+
+	// MaxScanWorkers bounds the goroutines every concurrent scan draws from,
+	// in total rather than each. 0 means GOMAXPROCS, which is the right number
+	// for the machine and was previously the number taken by each query.
+	MaxScanWorkers int
+}
+
+// Storage is the disk budget. The zero value enforces nothing, which is the
+// behaviour a deployment had before these fields existed.
+//
+// Bytes to keep free rather than a percentage used: a percentage is the wrong
+// unit for what is being protected. 5% of a 40 TB array is 2 TB of slack
+// nobody needs; 5% of a 20 GB volume is less than one large group plus the
+// manifest rewrite that follows it. What matters is that the RECOVERY -- a
+// retention pass, which has to write a manifest record before it can unlink
+// anything -- still has room.
+type Storage struct {
+	// ReserveWarnBytes degrades readiness while still accepting writes.
+	ReserveWarnBytes int64
+	// ReserveRejectBytes refuses new writes. Must be below the warn level.
+	ReserveRejectBytes int64
+	// MaxTenantBytes bounds one tenant's own bytes on disk.
+	MaxTenantBytes int64
 }
 
 // Unlimited is the explicit opt-out for a numeric bound. It is negative so it
@@ -60,7 +127,36 @@ func DefaultLimits() Limits {
 
 		MaxConcurrentQuery: 32,
 		MaxConcurrentWrite: 32,
+		MaxConcurrentTail:  64,
 		MaxOpenTenants:     1024,
+
+		// Half the process-wide read limit: one tenant may take half the
+		// server's concurrent reads and no more, so a second tenant always has
+		// room. A per-tenant limit at or above the process-wide one is not a
+		// per-tenant limit.
+		MaxQueriesPerTenant: 16,
+		// The machine's parallelism. Not a constant: the right number of scan
+		// workers is a property of the host, and a constant would be wrong on
+		// every machine but one. Snapshotted here rather than read at scan
+		// time so `-max-scan-workers` and the default go through the same
+		// validation.
+		MaxScanWorkers: runtime.GOMAXPROCS(0),
+
+		// A million distinct `by` keys is a stats result no dashboard renders
+		// and an accumulator map of hundreds of MB. Ten million pipe rows is
+		// the same judgement for a join's fanout.
+		MaxGroupKeys: 1_000_000,
+		MaxPipeRows:  10_000_000,
+
+		// A thousand nearest neighbours is far past what any ranking UI shows;
+		// 16384 dimensions is the hard ceiling ingest enforces, so the query
+		// side cannot be asked for a vector the store could never hold; ten
+		// million candidates is roughly a second of brute-force cosine on this
+		// class of machine, which is the point past which a query should be
+		// narrowed rather than waited on.
+		MaxVectorK:          1000,
+		MaxVectorDim:        16384,
+		MaxVectorCandidates: 10_000_000,
 	}
 }
 
@@ -76,7 +172,14 @@ func TestLimits() Limits {
 	l.MaxQueryDuration = 2 * time.Second
 	l.MaxConcurrentQuery = 4
 	l.MaxConcurrentWrite = 4
+	l.MaxConcurrentTail = 4
 	l.MaxOpenTenants = 8
+	l.MaxQueriesPerTenant = 4
+	l.MaxScanWorkers = 4
+	l.MaxGroupKeys = 10_000
+	l.MaxPipeRows = 100_000
+	l.MaxVectorK = 100
+	l.MaxVectorCandidates = 100_000
 	return l
 }
 
@@ -97,9 +200,24 @@ func fields() []field {
 		{"max-field-name-bytes", func(l *Limits) int64 { return int64(l.MaxFieldNameBytes) }, func(l *Limits, v int64) { l.MaxFieldNameBytes = int(v) }},
 		{"max-field-value-bytes", func(l *Limits) int64 { return int64(l.MaxFieldValueBytes) }, func(l *Limits, v int64) { l.MaxFieldValueBytes = int(v) }},
 		{"max-query-rows", func(l *Limits) int64 { return int64(l.MaxQueryRows) }, func(l *Limits, v int64) { l.MaxQueryRows = int(v) }},
+		// Added late and forgotten by this table, which is the failure the
+		// table exists to prevent -- its own doc says "so a new limit cannot
+		// be added to the struct and forgotten by both". Until this line,
+		// -max-scan-workers=-5 silently became GOMAXPROCS and
+		// -max-queries-per-tenant=-5 silently disabled admission, while
+		// Normalize's doc said "silently turning -5 into a default hides the
+		// bug".
+		{"max-queries-per-tenant", func(l *Limits) int64 { return int64(l.MaxQueriesPerTenant) }, func(l *Limits, v int64) { l.MaxQueriesPerTenant = int(v) }},
+		{"max-scan-workers", func(l *Limits) int64 { return int64(l.MaxScanWorkers) }, func(l *Limits, v int64) { l.MaxScanWorkers = int(v) }},
+		{"max-group-keys", func(l *Limits) int64 { return int64(l.MaxGroupKeys) }, func(l *Limits, v int64) { l.MaxGroupKeys = int(v) }},
+		{"max-pipe-rows", func(l *Limits) int64 { return int64(l.MaxPipeRows) }, func(l *Limits, v int64) { l.MaxPipeRows = int(v) }},
+		{"max-vector-k", func(l *Limits) int64 { return int64(l.MaxVectorK) }, func(l *Limits, v int64) { l.MaxVectorK = int(v) }},
+		{"max-vector-dim", func(l *Limits) int64 { return int64(l.MaxVectorDim) }, func(l *Limits, v int64) { l.MaxVectorDim = int(v) }},
+		{"max-vector-candidates", func(l *Limits) int64 { return int64(l.MaxVectorCandidates) }, func(l *Limits, v int64) { l.MaxVectorCandidates = int(v) }},
 		{"max-query-bytes", func(l *Limits) int64 { return l.MaxQueryBytes }, func(l *Limits, v int64) { l.MaxQueryBytes = v }},
 		{"max-concurrent-query", func(l *Limits) int64 { return int64(l.MaxConcurrentQuery) }, func(l *Limits, v int64) { l.MaxConcurrentQuery = int(v) }},
 		{"max-concurrent-write", func(l *Limits) int64 { return int64(l.MaxConcurrentWrite) }, func(l *Limits, v int64) { l.MaxConcurrentWrite = int(v) }},
+		{"max-concurrent-tail", func(l *Limits) int64 { return int64(l.MaxConcurrentTail) }, func(l *Limits, v int64) { l.MaxConcurrentTail = int(v) }},
 		{"max-open-tenants", func(l *Limits) int64 { return int64(l.MaxOpenTenants) }, func(l *Limits, v int64) { l.MaxOpenTenants = int(v) }},
 	}
 }
@@ -142,8 +260,40 @@ func (l Limits) BodyLimit() int64 { return l.MaxBodyBytes }
 type Config struct {
 	Dir          string
 	Limits       Limits
+	Storage      Storage
 	StreamFields []string
 	Compact      bool
+
+	// CorruptionPolicy is what a tenant store does with a committed group it
+	// cannot read: "fail" (the default) refuses to open it, "quarantine" moves
+	// the group aside and opens degraded.
+	//
+	// A string rather than the storage package's enum, because config must not
+	// depend on storage -- the dependency runs the other way -- and because
+	// this value comes from a flag or a file, where it is a string anyway. The
+	// server parses it once at startup, so a typo is a startup failure and not
+	// a silent fall back to the default.
+	CorruptionPolicy string
+
+	// VectorFields declares which record fields are embeddings, as `name:dim`
+	// pairs. Empty means the deployment stores no vectors, and a JSON array in
+	// a payload is ignored rather than guessed at.
+	//
+	// A string rather than the ingest package's type, for the same reason
+	// CorruptionPolicy is a string: config must not depend on ingest -- the
+	// dependency runs the other way -- and this value comes from a flag or a
+	// file, where it is a string anyway. The server parses it once at startup,
+	// so a typo is a startup failure and not a field silently stored as text.
+	VectorFields string
+
+	// DirRereadInterval is how often the readiness probe re-reads the store
+	// directories of degraded tenants that are not open, to notice that an
+	// operator has dealt with the evidence.
+	//
+	// Zero means the built-in default (250ms); negative means every call. A
+	// deployment probing every 30 seconds can afford a larger window, and one
+	// running a recovery drill wants no window at all.
+	DirRereadInterval time.Duration
 }
 
 // Default returns a Config with production limits and no data directory.
@@ -154,5 +304,17 @@ func (c *Config) Validate() error {
 	if c.Dir == "" {
 		return fmt.Errorf("config: no data directory")
 	}
+	// The corruption policy is NOT checked here at all.
+	//
+	// storage.ParseCorruptionPolicy owns the accepted set, and config must not
+	// import storage -- the dependency runs the other way. Two checks meant
+	// two answers: first they duplicated the set, so a third policy would have
+	// been accepted by one and rejected by the other; then a shape check here
+	// rejected the surrounding whitespace the parser deliberately trims, so
+	// `-corruption-policy=" quarantine "` was a startup error for a value
+	// storage considers valid.
+	//
+	// NewServerConfig calls Validate and then the parser, so an unknown policy
+	// is still a startup failure -- from the one place that knows the set.
 	return c.Limits.Normalize()
 }

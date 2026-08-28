@@ -1,6 +1,7 @@
 package api
 
 import (
+	"github.com/sebishogun/simdlogs/internal/config"
 	"runtime"
 	"testing"
 	"time"
@@ -30,10 +31,12 @@ func TestBackgroundLoopsDoNotLeak(t *testing.T) {
 		}
 		stopR := srv.StartRetention(time.Hour, 10*time.Millisecond)
 		stopT := srv.StartTiering(time.Hour, 10*time.Millisecond, false)
-		if err := srv.AddAlertRule("a", "*", ">", 1, 10*time.Millisecond); err != nil {
+		if err := srv.AddAlertRule(config.AlertRule{Name: "a", Query: "*", Op: ">", Threshold: 1,
+			Window: config.Duration(time.Hour), Interval: config.Duration(time.Second)}); err != nil {
 			t.Fatal(err)
 		}
-		if err := srv.AddMetricRule("m", "*", "", 10*time.Millisecond); err != nil {
+		if err := srv.AddMetricRule(config.MetricRule{Name: "m", Query: "*",
+			Window: config.Duration(time.Hour), Interval: config.Duration(time.Second)}); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(30 * time.Millisecond) // let the loops tick

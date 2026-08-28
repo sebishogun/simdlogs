@@ -2,23 +2,37 @@
 
 Status: **planned**. Nothing in this document ships today. Current behavior is
 in the LLDs (`docs/lld/`) and the README; implemented compatibility is in
-`docs/vl-parity.md` (status: complete, tiers 0–5, measured 40/40 against the
-real VictoriaLogs binary).
+`docs/vl-parity.md` (status: complete, tiers 0-5; the current parity count is
+machine-checked in the README by `internal/bench/readmeclaims_test.go`).
 
 The design document for this direction is
 [`docs/plans/2026-08-13-simdlogs-production-design.md`](plans/2026-08-13-simdlogs-production-design.md);
-the task-by-task plan is
-[`docs/plans/2026-08-13-simdlogs-production.md`](plans/2026-08-13-simdlogs-production.md).
+the completed implementation record is
+[`docs/plans/2026-08-13-simdlogs-production.md`](plans/2026-08-13-simdlogs-production.md);
+current task status lives in [`docs/release-readiness.md`](release-readiness.md).
 
 Each stage has measurable exits and no promises. A stage is "done" only when
 its exits pass on a quiet machine with the gates run bare or under
 `set -o pipefail`. Work that argues against a change lands in `docs/wrong.md`
 whether or not code changed.
 
+## Summary
+
+Repository maturity: **R3** (release candidate) - phases 0-10 of the
+production plan are committed locally; what remains is release evidence,
+stabilization, and rehearsal, all staged in the task ledger in
+[`docs/release-readiness.md`](release-readiness.md). The header's `planned`
+status is this roadmap's own - the stage sections below are the plan, not a
+description of the shipped state - so the two statuses do not contradict. The
+high-level blocker is the ledger's standing benchmark item: the published
+benchmark table has no machine-checked provenance. The hosted `ci` and `cross`
+workflows have now been observed green; per-task statuses live in the ledger,
+not here.
+
 ## Stage 0 — Compatibility hardening
 
-Where we are: the LogsQL surface is 40/40 against the real VL binary on the
-committed corpus (`internal/bench/compat_test.go`); the API-surface suite
+Where we are: the LogsQL parity count in the README is machine-checked against
+the committed corpus (`internal/bench/compat_test.go`); the API-surface suite
 proves each query argument changes the answer on both engines
 (`apisurface_test.go`, `perops_test.go`); the four findings from that work
 (status-code probe gaps, double timestamp storage, per-value dict inflation,
@@ -72,22 +86,23 @@ Exits:
 
 ## Stage 3 — Cluster protocol
 
-The current router surface is experimental and not production-safe: the
-`streams`, `stream_ids`, plain `stats_query`, and `hits` merges decode stale
-envelopes and answer empty/bogus results, and `facets`, `tail`, `/select/sql`,
-`/select/vector`, `/admin/backup`, `/metrics`, and `/alerts` are not
-federated (router-local). The exact envelope mismatches are recorded in
-[`lld/cluster.md`](lld/cluster.md); this stage fixes them tests-first.
+The envelope mismatches this stage was written for are fixed and tested
+(8.4), every route is classified and gated (8.6), and the distributed query
+path has been through an adversarial review whose findings are landed. What
+remains for the cluster is listed in
+[`release-readiness.md`](release-readiness.md): repair refuses rather than
+resolves a compaction or retention divergence because there is no lineage to
+tell a missed write from a deliberate delete, and there is no single command
+that restores a cluster archive.
 
 Exits:
 
-- Shard-shape fixture tests, written before the fixes: for each broken merge,
-  a fixture shard answers the CURRENT backend envelope — the shared
+- Shard-shape fixture tests cover each corrected merge: a fixture shard
+  answers the current backend envelope - the shared
   `{"values":[...]}` envelope for `streams`/`stream_ids`, the Prometheus
   stats vector for plain `stats_query`, the dense `timestamps`/`values` hits
   series for `hits` — and the test asserts the router's merged answer matches
-  a single-node store with identical data. These tests fail on today's code;
-  the fixes land only when the fixtures pass.
+  a single-node store with identical data (`cluster_envelope_test.go`).
 - The select-router behavior (LLD: cluster) becomes a documented wire
   contract with a multi-node integration test: N storage nodes + 1 router,
   writes replicated per shard, reads merged exactly (counts and value counts
@@ -129,30 +144,26 @@ Exits:
   headline) is rewritten from the fresh measurements — never from the
   historical tables.
 
-## Known implementation-doc defects (source comments; code task, not docs)
+## Resolved implementation-doc defects
 
-Stale source comments contradict the shipped code and are recorded here for
-a later code task that fixes the comments (no source edit comes from a docs
-session):
+`LOGS-V1-04` reconciled the stale source and record text previously tracked
+here:
 
-- `internal/api/es.go`: the package comment lists "terms/range/exists" as
-  part of the mapped DSL and the exists handler comment says exists clauses
-  "become predicates" — neither is true (see `docs/wrong.md` entry 37).
-- `internal/bench/scale_test.go`: the header comment says "there is no mmap
-  yet" — mmap shipped long ago; the test builds readers in RAM, but the
-  comment is stale.
-- `cmd/simdlogs/main.go`: the `-recompact-after` help claims ~17% smaller
-  for flate-only recompaction, disagreeing with the 8% in the
-  `-recompact-drop-postings` help and the measured -8.1%
-  (`docs/wrong.md` tiering entry).
-- `docs/wrong.md` entry 37 and the gofmt blocker on
-  `internal/storage/group.go` are likewise implementation-side work queued
-  from documentation sessions.
+- `internal/api/es.go` names the full supported Elasticsearch clause subset;
+  the clauses it names are mapped and contract-tested.
+- `internal/bench/scale_test.go` describes the warmed mmap/page-cache regime
+  the test actually measures.
+- The source-reading note before `docs/wrong.md` entry 37 is explicitly
+  unnumbered; the real entry 37 and every later historical number are intact.
+- `cmd/simdlogs/main.go` says ~8% for both recompaction flags, matching the
+  measured -8.1%, and
+  `TestTheRecompactionFlagsAgreeOnTheMeasuredFigure` holds the pair together.
+- The active fuzzing documents agree with the source-discovered count of 23
+  targets, and the source-count gate reads each copy.
 
-The production plan maps them: `es.go`'s comment drift is owned by Task B.2
-(the exists work rewrites those comments and lands entry 37), and the
-scale-test comment, the recompact help, and the gofmt blocker are Task G.1 —
-see `docs/plans/2026-08-13-simdlogs-production.md`.
+The former lettered task references were not IDs in the production plan's
+numeric task scheme. The active ownership record is the `LOGS-V1-04` row in
+`docs/release-readiness.md`; the completed production plan remains historical.
 
 ## Stage 5 — Release
 

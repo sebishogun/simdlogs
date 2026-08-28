@@ -15,6 +15,7 @@ import (
 // client subscribes, filtered by the query: a pre-existing record is never
 // seen, a later matching one is, a later non-matching one is not.
 func TestTailLive(t *testing.T) {
+	t.Parallel()
 	srv, err := NewServer(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

@@ -1123,7 +1123,7 @@ measures:
     IngestParallel            162.6ms -> 145.9ms -10.3%
     Ingest                    685ms  -> 640ms     -6.6%
 
-## 37. Accepted `exists` changes no answer -- decoded, not shipped (source reading)
+## Unnumbered source-reading note before entry 37: accepted `exists` changes no answer
 
 `internal/api/es.go` decodes an `exists` clause (the `esClause.Exists` JSON
 field) but `esToQuery` never walks it: only `Bool`, `Term`, and time
@@ -1141,6 +1141,13 @@ implementation-doc defects (recorded in `docs/roadmap.md`); a future TDD
 task either implements exists as a real predicate or rejects the clause
 with an explicit error -- acceptance-without-effect is not a supported
 state.
+
+**Correction (2026-08-27).** This source-reading note was accidentally given
+the number 37; the actual entry 37 follows, and no later entries have been
+renumbered. The implementation subsequently mapped `terms`, `match`, `prefix`
+and `exists`, added strict refusal for unsupported clauses, and added contract
+tests that exercise the mappings. The original text above remains the record
+of the defect before that work landed.
 
 ## 37. The point-read threshold was a fraction when the cost is absolute
 
@@ -1200,3 +1207,10028 @@ against one store. It failed on the first run, before any of the code it
 was written to test had been reviewed. A structural mutex serializing
 recompaction against demotion would not have caught it: retention does
 not take that mutex, and does not need to.
+
+## Ten reviewed commits, eighteen findings: what self-assessment missed
+
+**Believed.** Tasks 3.1-3.3, 4.1-4.4, 1.1, 1.2 and 1.4 were each written
+test-first, passed their own tests, `-race`, vet and gofmt, and were
+committed. Task 2.2 had been reviewed by a subagent and its fourteen
+findings fixed; the ten after it were not reviewed.
+
+**Actually.** An adversarial review of those ten commits returned
+eighteen findings, most reproduced with working probes:
+
+- `/_search` and `/_count` were registered with no auth wrapper. An
+  anonymous POST returned another tenant's `_source` documents. The
+  hand-written route matrix in `auth_test.go` listed routes by hand and
+  did not enumerate the mux, so it could not see them.
+- Router-mode write forwarding returns before the mux, so none of the
+  per-route wrappers ran: an anonymous 4 MiB POST was relayed to a
+  backend on a server configured with a 64 KiB body limit.
+- `Recompact` never took `structMu`, although the field's own comment
+  claimed it serialized recompaction. Its cleanup path then deleted a
+  *live committed* group's file, after which `OpenStore` failed with
+  "group N is committed but its file is missing" -- the tenant unopenable.
+- The live tail still called `GroupsAfterID`, which hands out raw
+  readers. `SnapshotAfterID`, written for task 4.1, had zero callers.
+- The v8 "bounds-safe" parser validated the footer and nothing else.
+  Column decodes are driven by `Rows`, which was never checked against
+  the column's data span: a group claiming a million rows over a
+  512-byte span sliced past the blob. `parseDictSec` had no bounds check
+  at all, and `needsRecompact` reaches it from the tiering goroutine,
+  which has no recover -- one corrupt file killed the process.
+- `dropGroups` filtered with `kept := s.groups[:0]`, overwriting the
+  backing array before the manifest commit was known to succeed. A failed
+  commit turned index `[0 1 2]` into `[1 2 2]`: one group invisible until
+  restart, another counted twice by every query.
+- A write racing `Server.Close` sent on a closed channel. The panic
+  unwound past a bare `w.mu.Unlock()`, so the mutex was never released
+  and every later `Close` blocked forever.
+- `manifest.commit` had no torn-tail recovery, so after a short write an
+  acknowledged, fsynced append vanished at the next restart with no error
+  anywhere.
+
+**How it surfaced.** A reviewer that was told not to be agreeable, given
+the task specs, and asked for `file:line` plus a reproduction. Nothing
+here was visible from inside: every one of these commits was green.
+
+The rule that follows is not "review before committing" -- task 2.2 was
+reviewed. It is that the reviewer must not be the author, and after
+fixing a reviewer's findings a *different* reviewer signs off, because a
+reviewer grading its own feedback is grading its own work.
+
+## An OTLP metrics payload whose Metric carries no name is stored as a log row
+
+**Believed.** The wire-type discriminator in `internal/ingest/otelproto.go`
+tells logs from metrics and traces by looking at each record's field 1:
+`LogRecord.time_unix_nano` is field 1 wire type 1 (fixed64), while
+`Metric.name` and `Span.trace_id` are field 1 wire type 2. A record whose
+field 1 is length-delimited is the wrong signal and is rejected.
+
+**Actually.** proto3 omits an empty `string`, so a `Metric` with no name has
+no field 1 at all and the discriminator has nothing to key on. Measured:
+
+```
+NAMED metric            -> accepted=0 rejected=1 err=records carry no log timestamp...
+UNNAMED metric          -> accepted=1 rejected=0 err=<nil>
+description-only metric -> accepted=1 rejected=0 err=<nil>
+traces payload          -> accepted=0 rejected=1 (Span.trace_id is always present)
+```
+
+The row lands with a fabricated fallback timestamp.
+
+**The first version of this entry got the reasoning wrong**, and review
+caught it. It claimed the only discriminator left was
+`res.Accepted > 0 && !sawLogShape`, whose cost would be rejecting a legal
+`LogRecord` batch where every record omits both timestamps. Three more
+discriminators exist, each unambiguous, and none of them touches that case:
+
+| field | Metric | LogRecord | wire types |
+|---|---|---|---|
+| 1 | `name` (string) | `time_unix_nano` (fixed64) | 2 vs 1 |
+| 2 | `description` (string) | `severity_number` (enum) | 2 vs 0 |
+| 7 | `sum` (message) | `dropped_attributes_count` (uint32) | 2 vs 0 |
+| 11 | `summary` (message) | `observed_time_unix_nano` (fixed64) | 2 vs 1 |
+
+A length-delimited value at any of those four field numbers cannot be a
+`LogRecord`. Measured before the fix, each stored as a log row:
+
+```
+description-only metric (field 2 wire 2)  accepted=1  STORED
+unit-only metric        (field 3 wire 2)  accepted=1  STORED as severity=ms
+sum-only metric         (field 7 wire 2)  accepted=1  STORED
+summary-only metric     (field 11 wire 2) accepted=1  STORED
+timestampless LogRecord (sev 2 wire 0)    accepted=1  must keep working -- does
+body-only LogRecord     (field 5 wire 2)  accepted=1  must keep working -- does
+```
+
+**Fix: all four rejected.** `wrongShape` now fires on
+`fw == 2 && (fn == 1 || fn == 2 || fn == 7 || fn == 11)`.
+
+**Residual risk, accepted -- and the first count of it was wrong.** This
+entry said two field numbers stay ambiguous. It is five. Every `Metric`
+field is wire type 2, and `Metric` intersects `LogRecord` at wire 2 on
+`{3, 5, 9, 10, 12}`:
+
+```
+field 3  (unit)                   -> accepted=1   (was documented)
+field 5  (gauge)                  -> accepted=1   (was documented)
+field 9  (histogram)              -> accepted=1   UNDOCUMENTED
+field 10 (exponential_histogram)  -> accepted=1   UNDOCUMENTED
+field 12 (metadata)               -> accepted=1   UNDOCUMENTED
+field 2 / 7 / 11                  -> rejected     correctly caught
+```
+
+`Metric.metadata` = 12 (OTLP v1.2.0) collides with `LogRecord.event_name`
+= 12 (v1.5.0), which is why 12 cannot join the reject list without
+rejecting a legal log record. Same for 3 and 5. Fields 9 and 10 CANNOT be added, and the first
+version of this paragraph gave the opposite reason -- it said they had no
+`LogRecord` counterpart at wire 2. They do: `LogRecord.trace_id` is field 9
+and `LogRecord.span_id` is field 10, both `bytes`, both wire type 2, and
+both present on every trace-correlated log line. `wrongShape` fires on
+field number and wire type alone, before the record is stored, so acting on
+the stated reason would have rejected exactly the logs an OpenTelemetry
+deployment cares most about.
+
+A metric posted to `/v1/logs` carrying only one of those five is still
+stored as a log row. The four discriminators that ARE applied
+(`fw == 2 && fn in {1, 2, 7, 11}`) reject no legal `LogRecord`: fields 1
+and 11 are `fixed64`, 2 is an enum, 7 is `uint32`, and none is `repeated`
+in any OTLP version from v0.7.0 on, so no packed encoding puts them at
+wire 2.
+
+## The allocation sweep: four measurements that pointed the wrong way
+
+An allocation sweep of `internal/query` and `internal/storage` landed five
+changes, each with both arms compiled into ONE binary and benchmarked
+interleaved (`-count=6`, compared on the minimum). None was rejected. What
+follows is the part worth keeping: the measurements that supported a
+conclusion nobody should have drawn.
+
+**A benchmark shape that measured a two-entry dictionary and called it
+65536.** The first `BenchmarkDictSectionAllArena` built its high-cardinality
+row from an LCG's LOW nibble:
+
+    seed = seed*1664525 + 1013904223
+    b[j] = hexChar(byte(seed & 0xf))
+
+An LCG's low four bits have period 16. The 65536 "distinct" values
+deduplicated to a two-value dictionary, and the row measured 56 B/op in 3
+allocations on both arms — reported as "no difference at high cardinality",
+which is exactly the shape the change was for. The high nibble
+(`seed >> 28`) gives the shape its name claimed, and the arms differ by 32x:
+
+    highcard-64k  arena       562,277 ns   3,538,945 B/op    2,049 allocs/op
+    highcard-64k  per-value 1,133,369 ns   3,538,945 B/op   66,561 allocs/op
+
+A benchmark shape is a claim about the data, and it needs checking like any
+other claim. The allocs/op column was the tell: 3 allocations cannot decode
+a thousand blocks.
+
+**"The decoder fills the buffer" is not the same as "the decoder writes
+every byte."** `flateDecompress` discards `io.ReadFull`'s error, so a
+truncated block leaves the tail of its output unwritten. With a fresh
+allocation per call that tail read as zero. Reusing one buffer across a
+section's blocks returns the PREVIOUS block's bytes there instead —
+characters from another dictionary value, at a place the offset table says
+is a value. Disabling the added `clear(out[n:])` and re-running the
+poisoning test returned a block whose tail was 0xDE repeated where the
+allocating form returned zeros. The reuse is worth having:
+
+    lz4/reuse   5,254 ns   22,784 B/op   12 allocs/op
+    lz4/fresh   5,856 ns   30,208 B/op   17 allocs/op
+    hex/reuse   3,348 ns   22,272 B/op   10 allocs/op
+    hex/fresh   4,569 ns   36,096 B/op   17 allocs/op
+
+but it is worth having only with the zeroing, and no wall-clock or
+allocation number would ever have shown the difference.
+
+**A pool removed 5.6 MB per operation and moved allocs/op by nothing.**
+Pooling the per-group timestamp decode, on the ten-group full scan:
+
+    pooled  min 2,329,783 ns   26,245,153 B/op   286 allocs/op
+    make    min 2,407,044 ns   31,874,165 B/op   286 allocs/op
+
+The 3.2% on wall-clock is inside the 8.3% layout noise floor, and allocs/op
+is identical at the minimum: a `sync.Pool` miss allocates too, so the pool
+trades many large allocations for fewer large allocations plus some small
+ones, and the COUNT barely moves while the BYTES fall 17.7%. Read on
+allocs/op alone this change looks like nothing. `perf stat` on the same
+binary, 500 iterations each, is what settles it:
+
+    pooled  127,578,211,079 instructions:u   32,858,150,947 cycles:u
+    make    145,627,151,353 instructions:u   35,285,059,549 cycles:u
+
+12.4% fewer instructions retired, 6.9% fewer cycles, layout- and
+load-independent.
+
+**A red `-race` gate that was not a regression.** `go test -race -short
+./...` failed on `TestGetU32LengthAndReuse` — "a 600-element request did not
+reuse the 600-element buffer just returned" — and kept failing with nothing
+else running. Nothing in the pool had changed. `sync.Pool.Put` drops the
+value at random one time in four when the race detector is enabled
+(`go/src/sync/pool.go:103`, "Randomly drop x on floor"), so a test that
+asserts reuse across a single round trip is red in a quarter of all race
+runs, by design of the runtime. The test now takes reuse within a few
+attempts. The assertion is the same; the flake is gone.
+
+**Cross-build wall-clock disagreed with itself.** Comparing the sweep's
+before and after end-to-end runs, three benchmarks looked worse and one
+looked implausibly better:
+
+    EngineNeedle         13,220 ns before    7,537 ns after   (identical 96 allocs, 40,360 B)
+    EngineFullScanCount 339,525 ns before  445,964 ns after   (+1 alloc)
+
+Five samples of the SAME build put both inside one distribution:
+
+    EngineFullScanCount  269,631 .. 390,944 ns   3,457,371 .. 3,568,654 B/op   659 .. 671 allocs/op
+    EngineCount           85,216 .. 107,873 ns     266,997 ..   276,338 B/op    34 .. 35 allocs/op
+
+A parallel group scan's allocation count is not deterministic — which
+worker gets which group decides which buffers grow — so ±1 alloc/op and a
+30% ns spread are the floor of what a single end-to-end sample can say.
+The per-change interleaved runs are the evidence; the end-to-end table is
+read for the exact columns (B/op, allocs/op) and only where the change is
+large.
+
+## A process kill cannot test the fsync boundary: the page cache outlives it
+
+Task 3.4's crash matrix SIGKILLs a child at eleven persistence phases and
+reopens the store. The `manifest-append` phase — the commit record written but
+deliberately **not** fsynced — was written expecting the batch to be
+INVISIBLE after recovery. It is visible, at `-count=20`, every time.
+
+That is not a defect. SIGKILL destroys the **process**; it does not destroy the
+**page cache**. A `write()` that returned put the bytes in the kernel's cache,
+and the next `open()` reads them straight back. Only a power loss or a kernel
+crash discards those pages. The expectation was wrong, not the store.
+
+What the matrix therefore does and does not establish:
+
+| Claim | Established by a process kill? |
+|---|---|
+| No partial group adopted | yes |
+| No leftover `.tmp` adopted | yes |
+| No acknowledged batch lost | yes |
+| No batch duplicated | yes |
+| A group file with no commit record stays invisible | yes |
+| **An unsynced commit record is discarded on replay** | **no** |
+
+The last row needs the unsynced writes actually dropped: `dm-flakey` with
+`drop_writes`, a filesystem image discarded at the block layer, or an
+`LD_PRELOAD` that turns `fsync` into a no-op and then crashes the process.
+None of those are in this repository, so the claim is not made.
+
+The phase stays in the matrix with the corrected expectation, because the other
+three clauses still apply to it and because a change that made this batch
+invisible after a process kill WOULD be a regression — it would mean replay
+discarded a record the kernel still held.
+
+The cost of getting this wrong the other way is the reason it is recorded: a
+matrix that asserted invisibility here would have failed for a correct store,
+and the obvious "fix" — making replay drop unsynced-looking records — would
+have been a data-loss bug shipped to satisfy a bad test.
+
+## Recompaction has no commit record, so its crash contract is stronger
+
+Extending the matrix to `manifest.compact` and `Store.Recompact` (task 3.4
+step 4) started from the assumption that they would need the same per-phase
+expectation table as `AppendGroup`: some phases before the commit point, some
+after. They do not, and the reason is worth writing down.
+
+`Store.Recompact` re-encodes a group file **under the same path and the same
+ID** and writes **no manifest record at all**. There is no commit point to be
+on either side of — the rename is the entire commit, and it swaps one encoding
+of the same rows for another. `manifest.compact` is the same shape: it folds
+the record log down to a single record naming exactly `visibleIDs()`.
+
+So the contract is not per-phase, it is uniform: **visibility-neutral at every
+phase**. All batches present, each exactly once, no partial group, no duplicate
+rows, wherever the kill lands. That is a sharper assertion than the append
+matrix's, and it is cheaper to state.
+
+Four things nearly made it vacuous, and an adversarial review found the last
+three after the first was already fixed:
+
+- The hook closure reads the outer `crashOnBatch`, and the clean setup loop
+  leaves `batch` past it — so the hook could never match during the operation
+  under test. Every rewrite subtest would have passed without a single crash.
+  Caught because the subtest fails when the child does not crash.
+
+- "The child did not crash" was not the same as "the child ran to completion".
+  `runCrashChildOp` classified the exit two ways, signalled or not, and
+  discarded the code — so every `CHILD_*` error exit read as "did not crash",
+  which is exactly what `TestRewritePhaseCoverageIsComplete` asserts. With
+  `Recompact` stubbed to return an error immediately, all four of its subtests
+  PASSED, with a `t.Logf` line as the only evidence. The test written to stop
+  the matrix going vacuously green was itself vacuous. It now fails on any
+  non-zero exit that is not a SIGKILL and reports the code and the child's
+  last line.
+
+- The append matrix's expectation was derived entirely from what the child
+  acknowledged, which left it with no lower bound. With the crash moved to
+  batch 0, `acked` is empty, the presence loop runs zero times, and **eight of
+  the eleven subtests passed** — `buffering`, `temp-create`, `partial-write`,
+  `file-sync`, `file-close`, `rename`, `dir-open`, `dir-sync`; only the three
+  manifest-side phases failed. The acknowledged set is now asserted exactly,
+  and the same break fails **eleven**.
+
+  An earlier revision of this bullet said fifteen. Measured: 11 with the guard,
+  8-of-11 passing without it. It also said the eight passed "against a
+  directory holding a 0-byte MANIFEST and nothing else", which is true of
+  `buffering` and `temp-create` only — four phases leave a `.tmp` alongside,
+  and two leave a group file.
+
+- A partial batch fired neither branch of the presence loop. `countOf` returns
+  `-1` for a batch present in part, which is neither `0` nor `> 1`, so the
+  `if n == 0 / else if n > 1` pair let a torn group adopted for an
+  ACKNOWLEDGED batch pass in silence — clause one of the contract the file
+  opens with. The interrupted-batch check had the mirror hole: `count(...) > 0`
+  read `-1` as absent, which passes at the eight phases where absence is what
+  is wanted. Both are three-way now, the way the rewrite matrix already was.
+
+- Whether the fixture qualifies for recompaction at all. The first version of
+  this entry said the 4-row fixture "never qualifies", so `writeFileAtomic` was
+  never reached and no phase was live. That was written from reading
+  `Recompact`, not from running it, and it is false: the child passes
+  `dropPostings=true`, and a group carrying postings is a candidate on that
+  alone, whatever its size. Measured, three batches, `Recompact(1<<62, drop)`:
+
+  | rows | dropPostings | groups rewritten | bytes |
+  |---|---|---|---|
+  | 4 | false | 0 | — |
+  | 4 | true | 3 | 1110 → 942 |
+  | 256 | false | 3 | 13725 → 11948 |
+  | 256 | true | 3 | 13725 → 10868 |
+
+  The fixture stayed at 256 rows, for the reason the table shows rather than
+  the one first claimed: at 4 rows only the postings check makes it a
+  candidate, so the size test `Recompact` applies to every candidate is never
+  reached; at 256 the flate rewrite is itself smaller and that test runs.
+  `TestCrashRecompactFixtureIsActuallyRecompacted` fails if it stops
+  qualifying. The byte figures are totals across three groups, not one fixture.
+
+  An entry in this file recording a non-measurement is the exact failure the
+  file exists to prevent. The correction is appended rather than edited over
+  the original, because the original is the finding.
+
+## The manifest's bootstrap gate adopted uncommitted groups, and no crash phase could reach it
+
+`OpenStore` adopts every group file on disk when a directory predates the
+manifest — a one-time migration for stores written before commit records
+existed. The gate was:
+
+```go
+if len(man.visible) == 0 && len(onDisk) > 0 {   // -> bootstrap(everything on disk)
+```
+
+"The visible set is empty" is true of a legacy directory. It is also true of
+two states that are its exact opposite, and both were adopted. Measured:
+
+| Setup | MANIFEST | Result |
+|---|---|---|
+| `OpenStore`+`Close`, then a valid `group-0.bin` with no commit record | 0 bytes | **adopted** — an unacknowledged batch became readable |
+| Append id 0, `CommitRemoval(0)`, file left on disk | 72 bytes, visible empty | **resurrected** — a committed removal came back |
+
+The second is verbatim the failure `manifest.go`'s own header says the manifest
+was introduced to prevent. It is reached by a crash between retention's
+commit-remove and its unlink, or by an unlink that failed and left a tombstone,
+whenever the victims are the last live groups.
+
+**Why eleven crash phases could not see it.** `crashBatches` is 3 and the crash
+always lands on the last batch, so batches 0 and 1 commit first and the visible
+set is never empty at recovery. `TestCrashUncommittedGroupFileIsInvisible`
+missed it for the same reason — it commits batch 0 before planting the orphan.
+Set the batch count to 1 and `dir-open` and `dir-sync` fail immediately, with
+no other change. A matrix can be green across every phase and still never
+construct the state the defect needs.
+
+**The fix, and the trap inside the fix.** The gate is now "the MANIFEST file
+was not there", recorded by `openManifest` before it touches anything. That
+needs the file NOT to be created during the decision, so the append handle
+became lazy — and that first attempt was wrong in the other direction: with
+nothing creating the file, a fresh store that wrote its first group and crashed
+before committing it is byte-identical on disk to a legacy directory. Adopting
+came straight back, and `TestUncommittedGroupIsInvisibleWhenNothingElseIsCommitted`
+caught it.
+
+The ordering that satisfies both: read the file's existence, decide, and only
+then create it — last in `OpenStore`, but still before any group file can be
+written. A legacy directory whose previous open died mid-validation still has
+no manifest and is still adopted; a store that has been opened once always has
+one, so its uncommitted groups are never mistaken for legacy data.
+
+**And the fix's own second defect, found by the review of the fix.** `bootstrap`
+reported failure through `m.reopen()`, and `reopen` opens with `O_CREATE`. On a
+legacy directory the MANIFEST does not exist, so a FAILED bootstrap created a
+0-byte one -- precisely the fact the new gate reads. Measured, two valid legacy
+groups, an error injected at `faultWrite`:
+
+```
+first open failed as designed: injected ENOSPC
+MANIFEST now EXISTS, 0 bytes, after the FAILED bootstrap
+legacy batch 0 present 0 times, want 1
+legacy batch 1 present 0 times, want 1
+```
+
+Every later open saw a manifest that existed, skipped the bootstrap, replayed
+nothing, and returned a store with zero groups **and no error**, on a directory
+holding the only copy of the data. Under the old gate the next open
+re-bootstrapped and recovered; the fix turned a transient, self-healing disk
+error into permanent silent loss. The `reopen()` call is deleted -- every
+writer goes through `ensureOpen`, so it was redundant as well as harmful --
+and `TestFailedBootstrapLeavesTheLegacyDirectoryRecoverable` injects the fault
+and fails without it.
+
+That is three consecutive wrong answers on one gate: the original
+empty-visible-set test, the lazy-handle fix that made a fresh store
+indistinguishable from a legacy directory, and the error path that created the
+file the gate reads. Each was found by a reviewer who did not write it.
+
+Three tests pin it, and all three fail against the old gate:
+`TestUncommittedGroupIsInvisibleWhenNothingElseIsCommitted`,
+`TestRemovedGroupStaysRemovedWhenItWasTheLastOne`, and
+`TestCrashRecoveryMatrixFirstBatch` (at `dir-open` and `dir-sync`).
+`TestLegacyDirectoryWithNoManifestIsAdopted` passes both ways and exists to
+stop the fix from being an over-correction.
+
+## A corruption policy whose own crash window made the store permanently unopenable
+
+Task 3.5 added a `quarantine` policy: move an unreadable group aside, open with
+what remains. The move writes the record, renames the file, then commits the
+manifest removal — and the missing-file check ran BEFORE the policy check, so
+a crash in that window left the manifest naming a group now in `quarantine/`
+and every later open returned:
+
+```
+storage: group 1 is committed but its file is missing
+```
+
+Under **both** policies, forever. Quarantine could not recover from its own
+crash window, which is the one failure it exists to survive. Reproduced with
+the package's own fault injector at `faultManifestWrite`, which is exactly that
+window. A committed group whose file is absent and which has a record in
+`quarantine/` is now treated as a completed quarantine and removed from the
+manifest; a missing group with no record is still a hard error.
+
+The comment justifying the ordering was also false. It said the reverse order
+would leave "the state OpenStore's legacy-directory gate has already been wrong
+about twice" — but that gate is `!man.preexisted && len(onDisk) > 0`, and in
+every quarantine scenario the manifest exists, so the gate cannot fire. The
+order is right for a different reason, which is now the one written down: a
+quarantined file with no record is evidence destroyed, and the record is the
+entire point of quarantining rather than deleting.
+
+## A degradation signal that read zero one restart after permanent data loss
+
+`Degraded()` was `Corrupt > 0`. `Corrupt` is what *this* open found, and the
+quarantining open removes the group from the manifest — so the next open sees a
+consistent store, finds nothing corrupt, and reports healthy. Measured through
+the API, after a restart following a quarantine:
+
+```
+simdlogs_storage_corrupt_groups 0
+simdlogs_storage_quarantined_groups 1
+simdlogs_storage_degraded_tenants 0
+simdlogs_storage_degraded_unacknowledged_tenants 0
+/-/ready = 200
+```
+
+`_degraded_unacknowledged_tenants` is documented as "the one to alert on", and
+it read 0 with a group permanently gone. The degradation was process-lifetime
+while the loss was durable.
+
+Compounding it, acknowledgement was deliberately NOT persisted, on the
+reasoning that a restart should re-ask the operator. It never re-asked: the
+restart cleared the degradation too, so instead of being asked again the
+operator was told the store was healthy.
+
+`Degraded()` is `Corrupt > 0 || Quarantined > 0` now, and the acknowledgement
+is a marker in the quarantine directory carrying the count it accepted — same
+count, still acknowledged; one more quarantined group, unacknowledged again.
+
+## Four more ways the surface was reachable only in tests
+
+None of these is subtle, and all four survived writing the feature and its
+thirteen tests:
+
+- **No flag.** `config.Config.CorruptionPolicy` had no `-corruption-policy`
+  flag, so an operator running the shipped binary could only get `fail`. The
+  policy was configurable for embedders and tests.
+- **No endpoint.** `Server.AcknowledgeDegraded` had no route. The only way to
+  clear a 503 was a restart — which, per the entry above, also erased the
+  degradation.
+- **Eviction reset it.** Readiness walked the OPEN tenants, so evicting an idle
+  degraded tenant turned 503 into 200 while the data was still missing.
+  Measured with `MaxOpenTenants: 2`. Degradation is recorded on the server now,
+  keyed by tenant, and survives eviction.
+- **`/insert/ready` answered 503.** A quarantined group is old data and the
+  store takes writes normally, so failing the ingest probe converted a
+  read-side loss into an ingest outage and took the node out of the ingest
+  Service. It also contradicted two documents that call it a 200 probe. Only
+  `/-/ready` reflects storage health.
+
+The pattern across all four: the feature was built and tested from the inside,
+where every surface is reachable by calling the method.
+
+## The `fail` policy did not fail on a legacy directory
+
+`OpenStore`'s bootstrap loop — the one-time migration for directories written
+before the manifest existed — excluded any group it could not read, silently.
+The group never reached the loop that applies the policy, so `fail` neither
+failed nor reported. Measured on a three-group directory with the MANIFEST
+removed and one group corrupted:
+
+```
+OpenStore (default policy) succeeded
+Health: "healthy: 2 groups"   Corrupt: 0   Ready: true
+```
+
+A silent drop with a clean health report, from the policy whose entire purpose
+is to refuse rather than serve short.
+
+## Three mutations that left the suite green, and one that still does
+
+A reviewer broke the feature three ways and ran the full suite:
+
+| Mutation | Before | Now |
+|---|---|---|
+| invert the quarantine order: rename, then write the record | green | caught |
+| flip the server's default policy from `fail` to `quarantine` | green | caught |
+| delete both `syncDirNamed` calls from the quarantine path | green | caught |
+
+The first two are pinned by `TestQuarantineWritesTheRecordBeforeMovingTheFile`
+and `TestServerDefaultPolicyRefusesACorruptTenant`.
+
+The third was recorded here as uncatchable — "proving a directory sync needs
+the unsynced entries actually dropped, which is a power-loss rig this
+repository does not have". That conflated two claims. Proving the KERNEL drops
+something does need a rig; proving the CALLS HAPPEN does not, and `syncDir`
+already carries `fault(faultDirSync)`, the same injection point the crash
+matrix uses one entry above. `TestQuarantineSyncsBothDirectories` counts the
+calls and requires an error from one to reach the caller, and goes red with
+either `syncDirNamed` deleted.
+
+Recorded because it is the second time in this task that "cannot be tested"
+turned out to mean "I did not look for the injection point that was already
+there".
+
+Also caught by the same review: group ids are reused, so two quarantines of one
+id renamed onto one name and one record wrote over the other — destroying the
+evidence quarantine exists to keep. Quarantined files carry the checksum in
+their name now, and `nextID` advances past a quarantined id.
+
+## Six more, four of them in the code that fixed the last four
+
+The review of the round above found six new defects. Four are in the code
+written to fix findings from the round before it, which is the part worth
+recording: a fix made under time pressure to close a hole is written by someone
+thinking about that hole, and it opens adjacent ones.
+
+**A filename check authorized dropping a committed group.** The recovery gate
+for an interrupted quarantine matched `group-<id>-*.json` and never opened the
+file. One empty `quarantine/group-1-00000000.bin.json` dropped into a store,
+with `group-1.bin` deleted:
+
+```
+degraded (unacknowledged, policy fail): 2 groups serving, 1 corrupt,
+0 quarantined: group 1: quarantined by an earlier open
+QuarantinedGroups lists 0 records
+```
+
+Under the **default** policy. A store reporting a completed quarantine with
+nothing quarantined has laundered a missing group into a clean state, and the
+token that authorized it is invisible to the operator listing. The gate reads
+the record now, requires it to name that id, and requires the file it says it
+moved to be there — which also makes it agree with `QuarantinedGroups` and
+`countQuarantined`, which read the same directory and disagreed with it.
+
+**A quarantined id was reissued, and the stale record then laundered a real
+loss.** `nextID` advanced past every id in `visibleIDs()`, and the quarantining
+open REMOVES the id from the manifest — so the next open regressed past it.
+Entirely from the store's own behaviour:
+
+```
+quarantine the top id (2) -> restart -> AppendGroup returns id 2 again, real data
+-> that file goes missing behind the manifest's back
+-> OpenStore (DEFAULT policy): "degraded ... 1 corrupt, 1 quarantined:
+   group 2: quarantined by an earlier open"
+```
+
+A genuine loss reported as an old quarantine. The LLD's claim that "`nextID`
+advances past a quarantined id so the store does not reissue it" was true only
+inside the open that quarantines. It is now the maximum over the group files on
+disk and the quarantine directory, both of which carry every id ever issued.
+
+**`fail` still did not fail when the file could not be MAPPED.** One line above
+the `ReadGroup` branch that had just been fixed, `mmapFile`'s error was a bare
+`continue`. Measured with mode 000 on one group of a three-group legacy
+directory: `OpenStore` under `fail` returned `healthy: 2 groups`, `Corrupt: 0`.
+The mirror in the main loop was a hard error under **both** policies, so
+quarantine could not quarantine the one kind of damage most likely to need it.
+Both take the policy now, and the record's checksum became best-effort —
+refusing to move a group because its bytes cannot be read leaves the store
+unopenable under the policy chosen to keep it open.
+
+**Concurrent acknowledgement returned 500.** `writeFileAtomic` uses a fixed
+`path + ".tmp"`, so two writers race on one temp name and the loser's rename
+finds nothing. Through HTTP, three runs of 100 concurrent POSTs returned 9, 22
+and 25 failures:
+
+```
+500: acknowledged 0 tenant(s), then failed: rename .../ACKNOWLEDGED.tmp
+     .../ACKNOWLEDGED: no such file or directory
+```
+
+The contents were never wrong — every writer writes the same bytes — so this
+was availability, on the one endpoint whose job is clearing a readiness
+failure.
+
+**Readiness still missed a tenant no request had touched.** Degradation is
+recorded when a store OPENS, and `NewServerConfig` opens only the default
+tenant. `/-/ready` answered 200 at startup with a degraded tenant on disk and
+503 after one request to it — a probe whose job is keeping traffic off, going
+green until traffic arrived. Every tenant directory is scanned at startup now,
+one `ReadDir` each, no store opened.
+
+**`Sscanf("%d")` ignored trailing input**, so an `ACKNOWLEDGED` marker reading
+`"1 and whatever else"` acknowledged 1. Empty, `"yes"`, `"-1"` and a 23-digit
+overflow were already refused. `strconv.Atoi` on the trimmed contents closes
+it.
+
+And the config check, wrong for the third time in three rounds: it duplicated
+storage's policy set (round one), then rejected the surrounding whitespace the
+parser deliberately trims (round two), so `-corruption-policy=" quarantine "`
+was a startup error for a value storage considers valid. It is gone. The parser
+owns the set, `NewServerConfig` calls it, and an unknown policy is still a
+startup failure — from the one place that knows the answer.
+
+## The readiness fix left /metrics behind, so the alert metric was blind to exactly the case it was added for
+
+The round above moved readiness onto the server's own record of degraded
+tenants, so an evicted or never-opened one still counts. `/metrics` was left
+walking `forEachTenant`, which is open tenants only — the same walk that was
+just replaced. Measured on a server whose `tenant-7-0` is degraded on disk and
+untouched in this process:
+
+```
+/-/ready: 503
+NOT READY: 1 degraded tenant(s)
+7:0: degraded (unacknowledged, from the store directory): 1 quarantined
+
+/metrics:
+simdlogs_storage_corrupt_groups 0
+simdlogs_storage_quarantined_groups 0
+simdlogs_storage_degraded_tenants 0
+simdlogs_storage_degraded_unacknowledged_tenants 0
+```
+
+The probe pulls the pod out of rotation and the alert never fires.
+`docs/lld/storage.md` names `_degraded_unacknowledged_tenants` as "the one to
+alert on", so an operator following the LLD is blind to the failure the whole
+scan exists to surface — and two endpoints on one server disagree about one
+tenant.
+
+Both now read `s.degraded` through one function.
+`TestMetricsAgreeWithReadinessAboutAnUntouchedTenant` asserts they agree before
+and after acknowledgement, and fails against the old walk.
+
+The shape is the one this task keeps producing: a fix that changes where a
+fact comes from has to change **every** reader of that fact, and the one that
+gets missed is the one nobody was looking at while fixing the bug.
+
+### Three smaller ones from the same review
+
+- **`HealthOfDir` reported unknowns as zeroes.** It reads a store directory
+  without opening it, so Groups, Corrupt and Policy are unknown — and
+  `Health.String()` printed them anyway: `0 groups serving, 0 corrupt, policy
+  fail` for a store with several groups on a server running `quarantine`. It
+  carries a `FromDirectory` flag now and prints only what it knows.
+
+- **The `nextID` justification overclaimed.** The comment and the LLD said the
+  group files and the quarantine directory "carry every id ever issued".
+  Retention unlinks: three groups, `DropGroupsBefore` removes all three,
+  reopen, and the first new id is 0. The property that matters is narrower and
+  does hold — a *quarantined* id is never reissued, because a quarantined file
+  is always in `quarantine/` — and a retention-removed id cannot be laundered
+  either, since it leaves no record and the recovery gate requires one. The
+  claim was wrong, not the code.
+
+- **The best-effort checksum duplicated its own error.** A group that cannot be
+  mapped usually cannot be read either, so the reason read `permission denied
+  (checksum unavailable: permission denied)`. And the comment on `ackMu` said
+  cross-process races are "prevented by the store lock", which is false in the
+  one case that matters: `AcknowledgeDegradedDir` never takes the lock, and it
+  exists for directories whose store is not open.
+
+## The documented remediation stranded the replica, and "one function" was two
+
+Two more from the review of the round above, both in the code that fixed it.
+
+**Emptying the quarantine directory did not clear anything.** `docs/lld/storage.md`
+says degradation "clears when the quarantine directory is emptied, which is an
+operator deciding the evidence has been dealt with". Doing exactly that, for a
+tenant not currently open:
+
+```
+after emptying the quarantine directory: AcknowledgeDegraded = 0, <nil>
+/-/ready = 503
+7:0: degraded (unacknowledged, from the store directory): 1 quarantined
+metrics: degraded=1 unacked=1 quarantined=1
+```
+
+No escape but a process restart. It is the interaction of three fixes that are
+each right on their own: the server's record was made to survive without an
+open store, so eviction and restart could not hide a degraded tenant; "nothing
+quarantined" was made a skip rather than an acknowledgement, so a store
+degraded by Corrupt alone could not go ready with no marker; and the gauges
+were pointed at that same record so they could not disagree with readiness.
+Together they made a stale record unclearable.
+
+The snapshot re-reads the directory for any tenant it names that is not open —
+one ReadDir, the cost the startup scan already pays — and drops the record when
+the evidence is gone. `AcknowledgeDegradedDir` returning "nothing to
+acknowledge" now deletes the key rather than skipping it.
+
+No test could have caught this from any one of the three changes. It needed the
+question "what does the remediation this document promises actually do", asked
+against all three at once.
+
+**And the claim that readiness and /metrics "now read `s.degraded` through one
+function" was false when I wrote it.** There were two implementations of the
+snapshot — one inline in `readiness`, one in `storageHealthTotals` — differing
+in their population. The difference was inert, because an open tenant absent
+from the record is `Ready()` and readiness would ignore it either way. That is
+the same "inert difference" the entry above this one calls the next drift
+waiting to happen, written one entry later by the same hand.
+
+One helper now, and both derive from it.
+
+**Two smaller ones.** `simdlogs_tenants` counts open tenants while the degraded
+gauges count open plus evicted plus scanned, so a dashboard dividing one by the
+other can exceed 1 — recorded in the LLD rather than unified, because the two
+denominators are both wanted. And `HealthOfDir` synthesised `Corrupt = 1` for a
+quarantine directory it could not read, which `/metrics` summed into a gauge
+documented as "committed groups that could not be read at open". A permissions
+problem on one directory is not one corrupt group; it is an `Unreadable` marker
+now, and `Degraded()` reads it.
+
+## A flaky gate that measured the wrong thing, and the button that 429s under load
+
+**The concurrency test was red one run in three, for a reason unrelated to what
+it tested.** `TestConcurrentAcknowledgementDoesNotFail` fired 50 POSTs and
+required all 200. `/admin/acknowledge-degraded` went through `adminSpec()`,
+which is charged the QUERY semaphore, and the default budget is 32:
+
+```
+MaxConcurrentQuery = 32
+200 requests -> map[200:184 429:16]
+body: "too many concurrent requests; retry after a moment"
+```
+
+So it did not pin the fix it was written for: on a machine where 50 requests
+never collided it passed whether or not the serialization existed, and where
+they did it failed for the budget. It asserts no 500 now — the failure mode the
+fix is about — and separately that nothing is throttled.
+
+**And the endpoint really was charged the budget.** 32 in-flight queries is
+enough to make the button that puts a replica back in rotation answer 429 —
+the same class of failure as the temp-name race, from a different cause, on the
+same endpoint. `/metrics` already carries `nosem` with the argument written
+out: "a scraper that gets 429 under load takes away the telemetry that explains
+the load". One word changes: an operator who gets 429 under load loses the
+button that ENDS it, and the replica it would have restored is the one under
+that load.
+
+## Three more from the same review
+
+**A deleted tenant directory stranded the probe.** The re-read added for the
+emptied-quarantine case treats "not a store" as "keep the recorded answer", and
+a deleted tenant has no MANIFEST:
+
+```
+after rm -rf tenant-7-0:
+/-/ready = 503
+7:0: degraded (unacknowledged, from the store directory): 1 quarantined
+metrics: degraded=1 unacked=1 quarantined=1
+```
+
+`simdlogs_storage_quarantined_groups` reporting 1 for a directory that does not
+exist. Deleting a tenant is a more ordinary operator action than emptying one
+quarantine directory. "Absent" and "present but not a store" are distinguished
+now.
+
+**The probe did a ReadDir plus a ReadFile per degraded tenant, per request, on
+an unauthenticated path with no concurrency budget.** Measured at 200 probes:
+5.34 ms for one degraded tenant against 67.3 ms for eighty, 12.6x, on tmpfs —
+a cold dentry cache is worse. The quarantine directory's mtime changes exactly
+when the answer changes, so one `Stat` now decides whether the read is needed.
+
+A time-based TTL was the other option and is worse here: the answer has to
+change the moment the operator acts, and any TTL long enough to save work is
+long enough to leave the replica out of rotation after the fix.
+
+**The stale-record guard was not airtight.** It dropped a record when the
+tenant was "not open", and between releasing the lock and reacquiring it a
+tenant can open degraded — repopulating the record with fresh health — and then
+be evicted, at which point a correct record is deleted on the strength of a
+read that predates it. Not reproduced in 16 tenants racing three probe loops,
+and one line to close: `storage.Health` is comparable, so the delete requires
+the record to be the same value the re-read was taken against.
+
+## An mtime cache that was unsound twice, and an error read as an absence
+
+Three more, all in the two fixes from the round above.
+
+**`os.Stat` failing is not "the tenant was deleted".** The check added to
+distinguish a deleted tenant from a directory that is not a store was
+`err == nil && fi.IsDir()`, and EACCES is an error. `chmod 000` on the DATA
+directory:
+
+```
+with the data directory unreadable: /-/ready = 200 "OK"
+metrics: degraded=0 unacked=0 quarantined=0
+after permissions are restored:     /-/ready = 200 "OK"
+```
+
+The record was DELETED, so restoring the permissions did not bring the signal
+back — only a restart rebuilds it. This is the third time in this task that an
+error has been read as a clean answer (`countQuarantined` returning 0, then
+`HealthOfDir` synthesising a corrupt count) and the first where it destroyed
+state rather than misreporting it. Misreporting is recoverable.
+
+Only `os.IsNotExist` may drop a record now. Worth noting for anyone writing the
+test: `os.Stat` on a mode-000 DIRECTORY still succeeds — stat needs `+x` on the
+parent, not read on the thing itself — so a test that chmods the tenant
+directory exercises none of this, and passes against the broken version.
+
+**The mtime cache was unsound twice.** It skipped the directory read when the
+quarantine directory's modification time was unchanged.
+
+Part of the cached answer is the *contents* of `quarantine/ACKNOWLEDGED`, an
+exported, documented, operator-visible file holding a plain integer. Rewriting
+it in place changes the answer and not the directory:
+
+```
+mtime before 22:33:50.492873315, after the in-place rewrite 22:33:50.492873315
+/-/ready = 200, though the marker no longer accepts the quarantined count
+```
+
+And an equal mtime is not proof of an unchanged directory. One second is the
+natural timestamp granularity on ext3, ext4 with 128-byte inodes, HFS+ and many
+NFS servers; two on exFAT. Forcing the collision those produce on their own:
+
+```
+quarantine emptied, mtime unchanged: /-/ready = 503, quarantined=1
+```
+
+Permanently, because no probe ever re-reads — the same stranding the cache was
+layered on top of a fix for, reintroduced conditionally on the filesystem.
+
+Replaced by a time window on the whole snapshot: 250ms, no per-file staleness
+and no dependence on any filesystem property. It is a `Server` field rather
+than a constant, so the tests that assert the remediation takes effect set it
+to zero and measure the semantics, and one test measures the throttle. A test
+that sleeps out a window measures the clock.
+
+The general point, which is the fourth time this task has produced it: **a
+cache is a claim that two things are equivalent.** Here the claim was "the
+directory's mtime determines the answer", and the answer depended on a file's
+bytes and on a timestamp with coarser resolution than the events it was
+distinguishing. Neither is visible from the call site.
+
+## The throttle read the disk and never wrote it down
+
+One defect, one line, and it broke an invariant this task already has a test
+for.
+
+The re-read that replaced the mtime cache fed its result to the response and
+never wrote it back into the server's record, so the record stayed at whatever
+startup found. The answer then depended on which side of the throttle window a
+probe landed on. Same on-disk state, back to back:
+
+```
+re-read:   /-/ready = 200, unacknowledged = 0
+throttled: /-/ready = 503, unacknowledged = 1
+```
+
+And the two endpoints disagreed with each other, which is the invariant the
+one-snapshot change exists to hold:
+
+```
+/-/ready = 200 (ready), metrics unacknowledged = 1
+```
+
+It needs no setter to reach: with the 250ms default, any two snapshot calls
+closer than that where the disk differs from the record — a Prometheus scrape
+shortly after a kubelet probe, two load balancers probing. The trigger is a
+marker written by something other than this process, which is the ordinary case
+where the record and the disk diverge, because the acknowledge endpoint is the
+only thing that updates the record.
+
+Written back now, in the same second-lock pass that drops the stale keys and
+guarded the same way: the record must be the one the read was taken against.
+
+**And the knob was exported and unreachable.** `SetDirRereadInterval` had no
+flag, no config field, and no caller but the tests — the shape the round-one
+entry above already names ("the feature was built and tested from the inside,
+where every surface is reachable by calling the method"), reproduced four
+rounds later in the fix for something else. It runs through
+`config.Config.DirRereadInterval` and `-readiness-reread-interval` now.
+
+**What the throttle actually bought, stated plainly.** At any probe interval
+above 250ms it saves nothing in steady state — every probe re-reads — so the
+12.6x cost measured for the per-tenant read is unchanged for an ordinary
+deployment. What it closes is the sharp half: the unauthenticated
+amplification. 2000 unauthenticated `/-/ready` probes cost 19.4µs each instead
+of scaling with the degraded-tenant count on every request. Worth not recording
+the steady-state cost as solved.
+
+## A failed write kept the file it could not commit
+
+Task 3.6. `AppendGroup` writes `group-N.bin` durably, mmaps it, re-reads it,
+then commits the id to the manifest. Every step after the first can fail with
+the file already on disk, and none of them removed it.
+
+The manifest never names it, so `OpenStore` ignores it and no retention pass
+ever considers it. Invisible and undeletable is the whole shape of the bug: the
+only way to reclaim that disk is a human deleting files by hand.
+
+It is at its worst under exactly the failure it follows most often. On a full
+disk the group's own bytes can fit while the manifest record does not, so a
+retry loop leaves one full-size file per attempt — consuming the disk faster
+than the operator frees it.
+
+```
+--- FAIL: TestFailedAppendLeavesNoOrphanFile (0.00s)
+    orphan_test.go:68: a failed append left 1 group files behind, was 1:
+        [group-0.bin group-1.bin]
+```
+
+The fix is not an unconditional remove. `manifest.commit` truncates its record
+away on every failure **before** the sync, so the id is invisible and the file
+is genuinely an orphan — but the fault point **after** the sync returns an
+error with the record already durable and the id visible. Removing there would
+leave a committed group with no bytes, which is worse than the leak. So the
+removal is gated on `isVisible`, and the directory is fsynced so a crash cannot
+resurrect the orphan.
+
+## One 503 for every storage failure answered neither question a shipper has
+
+Also 3.6. Every write failure produced `503` plus the underlying error's text.
+A log shipper reading that cannot answer either of the two things it needs to
+decide:
+
+- **Is retrying worth anything?** A full disk clears when someone frees space.
+  A group that fails its own checksum the instant after being written is a pure
+  function of the payload and fails identically forever. Both were 503, so a
+  shipper retried the second one until someone noticed.
+- **Does a retry duplicate?** There is no idempotency key on the ingest path.
+  If part of a payload landed and part did not, resending stores the landed
+  part twice — and nothing said so.
+
+The second one could not even be computed before this change. `flushBatch`
+recorded the *first* error and nothing else, so "all three groups failed" and
+"one of three failed" were the same state. They are the opposite answer: the
+first means a retry is clean, the second means it duplicates. Counting per job
+(`jobs`/`failed`) is what makes the distinction exist.
+
+The classification's default is `RetrySoon`, not `RetryNever`, and that
+direction is deliberate. An unrecognised failure is one this table has not met
+yet; telling a client to give up on something transient loses data, while a
+needless retry only duplicates it.
+
+## "It cannot be tested from here" was again "the seam is one export away"
+
+Third time in this repository (see the earlier two). The plan asked for fault
+tests covering disk full, short write, sync failure, mmap-after-rename and
+manifest failure at the **writer** level, and `setFaultHook` was package-private
+to `internal/storage`.
+
+The reflex is to reach for a build tag and a separate lane. That was rejected:
+a lane outside `make verify` goes stale, and this repository has already paid
+for one vacuously-green tagged lane. `SetFaultHookForTest` is exported and
+guarded by `flag.Lookup("test.v") == nil` instead — true in every test binary
+and no production one, one map lookup at arm time, and the failure suite runs
+in the default lane.
+
+The sweep enumerates `FaultPointNames()` rather than listing points. A
+hand-written list is a list the next write step quietly falls out of, and a
+write step whose failure is not surfaced is a write step that loses data behind
+a 200.
+
+## The batch a caller marked aged out, and FlushMark answered nil
+
+Review round on 3.6. `FlushMark` answered from a 64-entry ring of batches, and
+every `Flush`/`FlushMark` installed a new batch **whether or not the old one
+carried anything**. So 64 flushes from any other caller on the tenant — other
+requests, a syslog connection flushing per line, the `FlushEvery` timer, `Close`
+at shutdown — evicted the batch a marked caller's rows were in. That batch was
+then never waited on, its error never seen, and the caller was told success.
+
+```
+--- FAIL: TestEvictedBatchIsNotReportedAsSuccess
+    FlushMark reported success; the store holds 0 groups
+```
+
+At `MaxConcurrentWrite` 32, 64 slots is about two completed request cycles.
+
+The ring predates 3.6, but 3.6 made it the authority for two new affirmative
+claims, and the second one fails in the worse direction:
+
+```
+--- FAIL: TestEvictedBatchStillReportsPartial
+    a failed group reported success after its batch aged out
+```
+
+With the batch holding a *landed* group evicted, `failed == total` over what
+remained, so `duplicateOnRetry` came back false and the client was told a retry
+was clean. It resends and stores those rows twice — the exact outcome the field
+exists to prevent. Before the change no such claim was made; the change added a
+statement the window could not support.
+
+Three things close it. An outgoing batch with **no jobs** is dropped rather than
+aging a real one out, so an idle flush costs nothing. A batch that did carry
+jobs leaves a four-word outcome behind — seq, jobs, failed, error — which
+`FlushMark` folds in. And past even that log, `FlushMark` returns
+`ErrDurabilityUnknown` with `Partial` set rather than nil.
+
+The shape worth keeping: **a bound chosen against the expected interleaving,
+where exceeding it is silent and reads as success.** "64 is far past any real
+interleaving" was in the comment. It was not, and nothing said so when it was
+exceeded.
+
+## The orphan cleanup drew its own window one step too late
+
+Same round. The fix for the orphaned-group leak said its window was "every step
+of AppendGroup **after** `writeFileAtomic` returns". Two steps *inside*
+`writeFileAtomic` are already past the point of no return: opening the parent
+directory and fsyncing it both run after `os.Rename` has landed.
+
+```
+--- FAIL: TestReviewDirSyncFailureLeavesOrphan/dir-open
+    a failed append left [group-0.bin] behind; the manifest names none of them
+--- FAIL: TestReviewDirSyncFailureLeavesOrphan/dir-sync
+    a failed append left [group-0.bin] behind; the manifest names none of them
+```
+
+Both errno shapes classify retryable, so the retry loop left one full-size file
+per attempt — precisely the pathology the cleanup was written to stop.
+
+The sweep over every fault point ran `dir-open` and `dir-sync` and passed: it
+asserted the caller got an error, never that the directory was clean. A test
+that covers a code path is not a test that covers the property.
+
+## `isVisible` answered from memory a question about durability
+
+Same round, found by inspection with no seam to test it. `discardUncommitted`
+deletes an uncommitted group file, gated on `m.visible` not holding the id. That
+gate is an in-memory fact standing in for a durability one.
+
+`manifest.commit` rolls a failed record back with `truncateTo`, which swallowed
+every error. If the record was fully written and the **sync** failed — a dying
+disk returning EIO — and the rollback's own `Truncate` or `Sync` then failed
+too, the record stays in the page cache and the kernel writes it back with no
+crash involved. Memory says invisible; disk ends up saying committed; the file
+is deleted; the next `OpenStore` fails with *group N is committed but its file
+is missing* and the store never starts.
+
+Before the orphan fix the file survived and the group was adopted intact. So the
+fix converted a recoverable leak into an unopenable store, in a narrow case.
+`truncateTo` now reports, `commit` wraps a failed rollback in
+`ErrRollbackFailed`, and `discardUncommitted` keeps the file when it sees it. A
+leaked file is recoverable; a store that refuses to start is not.
+
+## A never-retry class that told shippers to drop data a disk had corrupted
+
+Same round. 3.6 classified `storage.ErrCorruptGroup` — a group that fails its
+own bounds and checksum checks the instant after being written — as never-retry:
+HTTP 500, `retryable: false`, no `Retry-After`. The stated reason was that the
+bytes are a pure function of the payload, so every attempt reproduces it.
+
+`ReadGroup` validates a CRC32C over a blob handed to the filesystem seconds
+earlier. A mismatch there is at least as likely to be the storage returning
+different bytes than the ones written — not deterministic, and fixed by a retry
+or by replacing the disk. The answer told a shipper to give up on data a media
+error had corrupted.
+
+It also inverted the classification's own stated bias, three functions higher in
+the same file: an unrecognised failure defaults to retryable *because* telling a
+client to give up on something transient loses data while a needless retry only
+duplicates it. The class is gone rather than misapplied, and the table in
+`docs/lld/ingest.md` said so as a fact, which made it a documentation defect as
+well as a classification one.
+
+## And a test that passed with the fix it appeared to guard fully reverted
+
+*(Name correction, 2026-08-15: the test named here never reached a commit under
+this name -- it was rewritten before the entry's own change landed, and is
+`TestPostRenameFailureLeavesNothingReadable` in
+`internal/ingest/writer_failure_test.go`. The entry below stands as written;
+only the name was wrong.)*
+
+`TestShortWriteLeavesNothingReadable` injected at `partial-write`, which fires
+**before** the rename — so `writeFileAtomic`'s own pre-existing deferred
+temp-file removal is what made it green. With all three `discardUncommitted`
+calls commented out it still passed. It tested something real and nothing the
+change added. It now injects at `dir-sync`, which is the post-rename case above,
+and goes red without the fix.
+
+Two others from the same file were checked the same way and are sound:
+`TestFailedAppendLeavesNoOrphanFile` and
+`TestPartialBatchFailureIsReportedAsDuplicating` both go red when their fix is
+reverted, and the second does produce two real jobs in one mark window.
+
+## The outcome log reproduced the defect it was added to fix
+
+Second review round on 3.6. The first fix for "FlushMark returns nil once a
+caller's batch ages out of the ring" was to leave a small outcome record behind
+when a batch is retired. It froze the counters at the wrong moment.
+
+`FlushMark` waits only on batches at or after its own mark, so a later caller
+never blocks on an older one — and enough later flushes retire a batch whose
+job is still in flight. The snapshot then said *one job, none failed* for a job
+that went on to fail with ENOSPC:
+
+```
+b0 still in hist: false; outcomes: 10; b0's frozen outcome: jobs=1 failed=0 err=<nil>
+b0 after its job finished: jobs=1 failed=1
+FlushMark(mark) = nil for a row whose only group failed with ENOSPC
+```
+
+Same 200-for-lost-rows failure, moved from the ring into the log. A batch is
+now retired only at zero outstanding jobs, and the ring is allowed to run over
+its nominal length until then.
+
+Two things about the round are worth more than the defect:
+
+**Both tests written for the first fix were vacuous, and vacuous in the
+direction that hid this.** They looped `w.Flush()` with an empty buffer — and
+the same fix's empty-batch drop means an empty flush retires nothing, so
+`len(hist)=2, len(outcomes)=0` after eighty of them. Nothing was evicted,
+nothing was retired, and **nothing anywhere exercised the retired-outcome
+fold-in**, which is precisely where the new defect lived. A test that cannot
+reach the code it is named for is worse than no test: it is a claim of
+coverage.
+
+**A plain `Flush` was never exposed.** It waits on every live batch, so it
+blocks on the stalled one. Only `FlushMark` — the function added to make
+per-caller durability answerable — could skip it. The mechanism built to
+answer the question precisely was the only way to get the wrong answer.
+
+## The backup's time filter dropped a group at the top of the range
+
+Task 5.1, found in the same round. `BackupTarWith` took
+`Snapshot(math.MinInt64, math.MaxInt64)`, reading "the whole range". The
+overlap test is `TimeMin < to && TimeMax >= from` — half-open at the top — so a
+group whose `TimeMin` is `math.MaxInt64` fails it.
+
+```
+TestReviewBackupDropsMaxTimestampGroup: store holds 2 groups, the backup manifest names 1
+TestReviewBackupDropsTimelessGroup:     store holds 1 groups, the backup manifest names 0
+```
+
+`VerifyBackup` passed, because the manifest is built from the same filtered
+snapshot. A self-describing archive that describes itself as smaller than it
+should be is worse than a bare tar: the manifest is what an operator would
+trust. `parseTime` on the ingest path is `strconv.ParseInt(s, 10, 64)` with no
+upper clamp, so the timestamp is a number a client sends.
+
+The replacement is `SnapshotAll`, with a `SnapshotAllWithSeq` variant that also
+reads the manifest sequence under the SAME lock acquisition — the second
+acquisition it replaced could see an `AppendGroup` land in between, making the
+archive declare a watermark covering a group it does not contain.
+
+## One disk failure, two different answers, decided by request size
+
+Also that round. A body at or above `ingest.MinParallelBytes` is sharded across
+several writers, and that path answered a flat 500 with no `Retry-After` and
+none of the retry metadata every other route reports:
+
+```
+body 1049666 bytes (>= MinParallelBytes 1048576)
+status 500, Retry-After ""
+{"durable":0,"error":"ingest: 10 of 10 shard writers failed to persist: ..."}
+```
+
+Underneath it, `errors.As` on a `ParallelWriteError` unwrapped to **one shard's**
+`*WriteError`. A request where shard 1 landed and shard 2 failed reported
+`1 of 1 failed, duplicateOnRetry: false` — the opposite of the truth, since
+shard 1's rows are durable and resending the body stores them twice.
+
+Fixed by an `As` method that aggregates the shards, and by `failIngest` reading
+the same metadata as every other route. The counts on that path are shard
+writers rather than groups, which `WriteError.Unit` now says rather than
+leaving the reader to assume.
+
+## Four more from the same round, each small and each the same shape
+
+- **`joinRollback` used `%v` where it needed `%w`.** The commit error was
+  flattened to text, so `errors.Is` could no longer reach its errno: a
+  rollback-failed ENOSPC classified as unrecognised and was answered "retry in
+  a second" instead of "someone has to free space". The wrapping was added in
+  the *previous* round specifically so a caller could tell these apart.
+- **`DisallowUnknownFields` ran before the format check**, so a format-2 backup
+  manifest carrying a new field was reported as `json: unknown field "codec"`
+  rather than as an unsupported format — while the function's own comment said
+  "the format check comes first". The comment described the intent; the code
+  did the other thing.
+- **`ErrCorruptGroup`'s doc still carried the never-retry reasoning** that the
+  same round had removed from `classify`, and `writeFlushErr`'s doc still
+  promised "a 500 instead of a 503" that `HTTPStatus` no longer returns. A
+  deleted behaviour leaves its justification behind in every comment that cited
+  it.
+- **`TestBackupIsCompleteUnderConcurrentRetention` was a measured no-op.** (Name
+  correction, 2026-08-15: never committed under this name; the replacement
+  described below is `TestBackupIsCompleteUnderConcurrentStoreChanges` in
+  `internal/storage/backup_contract_test.go`.) Over
+  40 runs it captured 12 groups every time: retention always won the start, the
+  snapshot was always taken after the drop, and the streaming-under-retention
+  path was never entered. A blocking writer that stalls the archive mid-stream
+  replaces it, with retention, an append and a recompaction each run against it
+  — the three the plan asked for and one of which existed. The no-op was
+  *deleted*; an earlier version of this bullet said it had been replaced while
+  it was still sitting in the same file beside its replacement.
+
+## Round three: the same misreport, twice more, in the paths the first two rounds did not reach
+
+Third review round on 3.6 and 5.1. The two data-loss defects round two found are
+gone — an independent pass confirmed the counter pairing sound under `-race`
+across 20 runs of 320 interleaved operations, and the backup's time filter with
+it. What it found instead were two more instances of the same class, in code the
+first two rounds had not looked at.
+
+**A shard other than the first could land rows and go unreported.**
+`ParallelWriteError` keeps only `firstErr`, so the aggregation could inspect
+exactly one shard. With every shard failed and the *partial* one not the one
+that won the mutex, `duplicateOnRetry` came back false:
+
+```
+--- FAIL: TestZZAggregationMissesNonFirstPartialShard
+    aggregated: partial=false duplicateOnRetry=false (4 of 4 shard writers)
+    a shard with rows on disk was reported as duplicateOnRetry=false
+```
+
+Partial-ness is now collected in the shard loop, from every shard, rather than
+read back off one error. The comment claiming it already covered "any failing
+shard that was itself partial" was false for more than one shard.
+
+**A closed writer claimed a retry was clean while its rows were durable.**
+`Close` flushes the shared buffer *before* it sets `closed`, so an in-flight
+handler — the case `ErrWriterClosed`'s own doc names, `http.Server.Shutdown`
+letting one request finish — got `Partial: false`:
+
+```
+--- FAIL: TestZZClosedWriterClaimsRetryIsClean
+    store holds 1 group(s)/1 row(s); FlushMark says partial=false duplicateOnRetry=false
+```
+
+Before this work that path returned a bare error and made no claim. The change
+turned "no claim" into a false one, which is the recurring shape: a new
+affirmative statement is a new thing that can be wrong, and every path that
+reaches it has to be checked, not the one it was written for.
+
+## The gate that removed the unbounded freeze made the ring unbounded
+
+Same round. Retiring only at zero outstanding jobs fixed the frozen counters and
+made `hist` grow without limit: the pool bounds outstanding *jobs*, not
+*batches*, and every later job-carrying flush appends one more while a stalled
+one pins the front.
+
+```
+after 5000 client requests with one job pinned: len(hist)=5002 (batchHistory=64)
+```
+
+Per tenant, proportional to request rate times stall duration, and `FlushMark`
+walks the whole slice under the writer's lock on every request. Per-request
+latency did not move at 5002 entries — the fsync dominates — so this was memory
+and lock-hold growth rather than a measured slowdown.
+
+The comment was the worse half: *"bounded by the flush pool and its channel, not
+by anything a client sends."* It is bounded by neither. There is a hard ceiling
+now, and past it a stalled batch is dropped as **unanswerable** rather than
+retired with counters that are not final — `ErrDurabilityUnknown` for any mark
+at or below it. Refusing to answer is the only safe thing to do with a number
+that can still change; recording it is the frozen-zero defect again.
+
+## A test that stopped being vacuous in one way and stayed vacuous in another
+
+Round two showed `TestEvictedBatchIsNotReportedAsSuccess` evicted nothing,
+because its eighty flushes were empty and an empty batch is dropped rather than
+retired. Fixed by giving them rows. Round three showed it *still* proved nothing:
+the fault hook failed **every** `temp-create`, so all eighty later batches
+carried the same ENOSPC and `FlushMark` found an error in a live ring entry
+without ever consulting the outcome log. Deleting the fold-in entirely left it
+green.
+
+Two more things had to be true for it to bite, and both are behaviours worth
+writing down. The marked row has to become its own flush job before anyone
+else's traffic starts, or the shared buffer carries it into the first foreign
+flush. And the foreign traffic has to use `FlushMark` with its own mark, not
+`Flush` — a plain `Flush` waits on every live batch and would see the marked
+caller's error, which is correct and is not what the test is about.
+
+It now asserts, before the call it is testing, that the marked batch is out of
+the ring. That is the difference between a test that exercises a mechanism and a
+test that is merely in the same file as one.
+
+## Four smaller ones, same round
+
+- **The JSON body labelled shard counts as groups.** `groupsFailed`/`groupsTotal`
+  went out with no unit, so a client parsing the body could not tell shard
+  writers from groups; the distinction survived only in the message string,
+  while `docs/lld/ingest.md` claimed `WriteError.Unit` carried it. It is a
+  `unit` field now.
+- **`/admin/backup`'s 429 and its pre-flush shipped with no test and no
+  mention in any document.** A change that turns a request which used to
+  succeed into a rejection is exactly the kind that needs one.
+- **`BackupManifest.TotalBytes` had no caller and `Store.SnapshotAll` was a
+  verbatim copy of `SnapshotAllWithSeq`** minus a return value, carrying a doc
+  comment arguing a rationale for a use it did not have. The first is gone; the
+  second delegates.
+- **`docs/architecture.md` still said the archive was "a consistent snapshot
+  because groups are immutable"** — the argument `docs/lld/storage.md` had
+  already repudiated two sections earlier, since the old path copied paths out
+  and skipped what had gone. Immutability is why a group's bytes are stable, not
+  why the archive is complete.
+
+## Round four: the watermark went backwards, and the fix for one branch skipped its sibling
+
+Fourth review round. Both of round three's fixes were correct where applied and
+both left a hole one step away.
+
+**`oldestAnswerable` was assigned unconditionally.** Two paths move it — the
+outcome log's overflow and the new ceiling drop — and only the second guarded
+the assignment. A normal retire following an unanswerable drop lowered it again
+and un-hid a batch that is in neither the ring nor the log:
+
+```
+--- FAIL: TestProbeOldestAnswerableNeverMovesBackwards
+    oldestAnswerable 5001 -> 2
+--- FAIL: TestProbeSecondStallIsUnhiddenEndToEnd
+    markB=3501 oldestAnswerable=3114 inRing=false inLog=false
+    FlushMark(markB=3501) -> <nil>
+```
+
+Nil for lost rows, reintroduced by the fix that was written to stop it. It
+takes two stalled workers to reach through the real path — one pinning the
+front, a second landing inside the newest slice of the drop window. It is a
+watermark, and a watermark that can go backwards is not one.
+
+**The serial fallback discarded `Partial`.** `IngestJSONLinesParallelCfg` takes
+a one-writer branch whenever the shard count is below 2 — `runtime.NumCPU()/3`,
+so **every host with fewer than six cores** — and that branch built its
+`ParallelWriteError` without the field the loop eleven lines below it had just
+been fixed to collect. `As` then replaced an accurate inner `*WriteError`
+("1 of 3 groups, partial") with a synthesized one ("1 of 1 shard writers, not
+partial"), so the client was told a retry was clean with a group on disk.
+
+The record said "partial-ness is now collected in the shard loop, from every
+shard". True, and the sentence stopped one branch short of the function it
+described.
+
+## Five fixes with no test, in a round whose subject was untested fixes
+
+The same review reverted each of the previous round's fixes in turn and ran the
+suite. Five stayed green: the shard-partial collection, `Partial: true` on a
+closed writer, the `unit` field, the `maxHistory` ceiling, and
+`ParallelWriteError.As` — the last of which both LLDs describe at length.
+
+That is the failure mode this file has been recording for four rounds, arriving
+as a property of the *process* rather than of any one change: every round fixed
+what the previous round's reviewer found, and shipped the fix the way the
+previous round had — without the test that would catch its regression.
+
+All five now have one, and each was verified by reverting its fix:
+
+```
+hist grew to 4354 with a stalled job; the ceiling is 4096
+the store holds 1 groups and the caller was told a retry is clean
+parallel units "groups", want shard writers
+duplicateOnRetry=false, want true (4 of 4 failed, shardPartial=true)
+oldestAnswerable fell to 1 from 5000 at flush 1087
+the writer's error was partial and the wrapper did not collect it
+Flush on a closed writer said a retry is clean; Close flushed those rows
+```
+
+The last one needed two attempts to bite. Its first version drove
+`outcomeHistory+8` flushes, and the first `batchHistory` of those only fill the
+ring without retiring anything — so the overflow branch it was written for
+never ran, and it passed against the unguarded assignment. A test that does not
+reach its own mechanism is the thing this entry is about, written into the test
+for it.
+
+## The archive's ordering was documented and never enforced
+
+Same round. `readBackup` validates a group only inside `if man != nil`, and
+nothing required the manifest to come first. A manifest-LAST archive therefore
+validated nothing — every group read with no size, checksum or parse check —
+and the completeness loop afterwards passed, because those groups *had* been
+seen:
+
+```
+--- FAIL: TestProbeManifestOrderIsNotEnforced
+    VerifyBackup on a manifest-last archive with a wholly corrupt group: err=<nil>
+    RestoreTar -> <nil>; wrote 2 files
+```
+
+Two properties had to be separated to fix it, and conflating them was the first
+attempt: an archive with **no** manifest is a pre-format-1 backup and must
+still restore, returning `ErrBackupUnverified`; an archive whose manifest
+arrives **after** its groups is refused. The distinction is only decidable at
+the end of the stream, so it is made there.
+
+The unverified branch also read entries with an unbounded `io.ReadAll` on an
+attacker-declared size — the allocation `maxBackupManifestBytes` exists to
+prevent, one entry type over, which is the "bound that exists in two of three
+places" shape this file has now recorded three times.
+
+And `/admin/backup`'s pre-flush was unbounded. It waits on every live batch,
+including one pinned by a stalled fsync — the scenario `maxHistory` exists for
+— while holding `backupBusy`, so a stalled writer disabled that tenant's
+backups entirely. It is bounded now, and a timeout takes the archive anyway,
+which is the "stops at the last durable group" case the comment already
+accepted.
+
+## Round five: the ceiling bounded the ring and not the stall
+
+Fifth review round. Round 4's `maxHistory` fix dropped a stalled batch out of
+the ring and left it in `w.live`, which kept both of the problems it was added
+to solve.
+
+Its counters — final by the time anyone read them — were folded into the next
+unrelated plain `Flush`, so a caller whose own rows all landed was handed
+someone else's *"1 of 2 groups failed, partial"*. The owner got
+`ErrDurabilityUnknown` on the stated grounds that those counters "can still
+change"; the information existed and went to the caller not entitled to it.
+
+And because `Flush` waits on all of `live`, every `Flush`, every
+`Writer.Close` and every tenant eviction still blocked on the stalled job. The
+ceiling bounded the slice; the thing it was written to survive was untouched.
+Dropping the batch from `live` alongside the ring closes both — **past the
+ceiling, and only there.**
+
+That qualifier is the correction to the first version of this paragraph, which
+said "closes both" flat. The drop is bounded by TRAFFIC, not by time: it needs
+`maxHistory` job-carrying flushes on that tenant to fire at all. Below the
+ceiling, and for a tenant that receives nothing further, `Flush` and `Close`
+block exactly as before, and a `Flush` already parked is never released. Two of
+those are recorded as open below.
+
+## The archive's refusals arrived after the bytes did
+
+Same round. Two orderings were documented and one of them was newly enforced;
+the other was not, and the enforced one fired too late.
+
+**The terminator.** `backup_manifest.go` says "a terminator goes LAST" and
+`docs/lld/storage.md` says "always last". Only its PRESENCE was checked, so an
+archive carrying `BACKUP-COMPLETE` as its FIRST entry verified clean and
+restored. The manifest-ordering entry two above this one is the same sentence
+about a different entry type, written in the round that missed this one.
+
+**The manifest-last refusal.** It fires when the manifest finally arrives — by
+which point every group before it is already on disk, and none of them had been
+checked, because validation runs inside the manifest branch:
+
+```
+RestoreTar -> storage: the archive carries groups before its BACKUP-MANIFEST
+  wrote group-0.bin (379 bytes, wholly 0xFF: true)
+  wrote group-1.bin (381 bytes, wholly 0xFF: true)
+  wrote group-2.bin (382 bytes, wholly 0xFF: true)
+```
+
+That is materially different from the truncation case already recorded, where
+every written group had passed size, CRC and `ReadGroup`. Every group is parsed
+on the way in now whether or not a manifest has been seen, so what lands is at
+least a readable group. It is still not atomic — a refused restore leaves a
+partial destination, and making it all-or-nothing is Task 5.2.
+
+## A timeout that bounded the handler and not the goroutine
+
+Round 4 bounded `/admin/backup`'s pre-flush with a ten-second timeout, in a
+goroutine. `backupBusy` is released when the HANDLER returns, so polling the
+endpoint against a stalled writer spawned one permanently parked goroutine per
+request:
+
+```
+backup 0: status 200 after 10.004s
+backup 1: status 200 after 20.013s
+goroutines 7 -> 9; parked in the backup pre-flush: 2
+```
+
+Counted by nothing: `Server.Close` waits on the background loops and on
+`inFlight`, and this is neither. At most one parked pre-flush per tenant now —
+a second would wait on the same batches, so skipping it costs nothing.
+
+## Thirty fixes with no test, and a record that said otherwise
+
+The same review reverted every fix in the uncommitted diff one at a time.
+**Thirty stayed green**, including both of round 4's own.
+
+Worse than the number: the round-4 entry above says "All five now have one, and
+each was verified by reverting its fix." Two of the five were not. The
+shard-partial collection got a test that builds a `ParallelWriteError` by hand
+and asserts the aggregation's `|| e.Partial` arm — deleting the loop that SETS
+`Partial` left the suite green. And `Partial: true` on a closed writer was
+covered at the `FlushMark` site while the `Flush` site stayed green.
+
+Both now have a test that drives the real function, and the sharded loop has
+one too. Each needed a body over `FlushRows` per shard, because a shard cannot
+be partial with fewer: one group per shard means every shard is wholly failed
+or wholly durable. Three earlier attempts passed for the wrong reason — a
+four-shard version whose fault never landed and skipped; a version where one
+shard survived, so `Failed < Shards` answered instead of the collection; and a
+watermark test the outcome log's own advance covered. Each was found by
+deleting the line it was named for and watching it stay green.
+
+Three comments in the same sweep claimed coverage that does not exist, and each
+is now corrected on the source side:
+
+- `store.go`'s "the check is what keeps it that way under the fault matrix" —
+  the matrix drives `manifest.commit` directly and never reaches
+  `discardUncommitted`.
+- `writer_failure_test.go`'s "And the file is still there" — followed by code
+  that checks the error type and nothing about the file.
+- `BackupManifest.Tenant`'s "so a restore can refuse an archive taken from a
+  different one" — nothing reads the field; `RestoreTar` takes no tenant. A
+  property described, not implemented, until Task 5.2.
+
+And two branches of `writeFlushErr` are unreachable — every call site passes a
+`*WriteError` and an `errJSON` spec — while `docs/lld/ingest.md` claimed the
+second as a cross-protocol guarantee clients observe. Both are now labelled as
+written for a route that does not exist yet.
+
+## Two stalls the ceiling cannot reach, recorded rather than fixed
+
+Round 6 measured what the ceiling actually buys, and it is less than the entry
+above first claimed.
+
+**The drop is bounded by traffic, not by time.** It fires only once the ring
+exceeds `maxHistory`, which needs 4096 job-carrying flushes on that tenant. A
+tenant with a stalled writer and no further requests never reaches it, so
+`Flush` and `Close` block indefinitely there; and a `Flush` already parked on
+the batch's WaitGroup is never released by the drop.
+
+```
+Flush is still blocked after 2s with one stalled job (the ceiling is not reached)
+Close is still blocked after 2s with one stalled job and no further traffic
+after 4352 FlushMarks: hist=64 live=0
+Flush returned promptly past the ceiling: <nil>
+```
+
+**Tenant eviction wedges the server-wide lock.** `evictIdleLocked` calls
+`victim.w.Close()` with `s.mu` held, so a stalled writer blocks every request
+for every tenant:
+
+```
+tenant B is still blocked after 3s: the eviction is inside victim.w.Close(),
+holding s.mu
+a later tenant lookup for an ALREADY-OPEN tenant is blocked too
+```
+
+And because no request can pass `s.mu`, the stalled writer receives no further
+flushes, the ring never reaches the ceiling, and the drop never runs. Permanent
+and server-wide.
+
+Not fixed here, and the reason is scope rather than difficulty: the Close is
+inside the lock because the store must be shut before another `OpenStore` on
+the same directory, so moving it out needs a per-key closing state that a
+concurrent open waits on. That is a change to tenant lifecycle, which is Task
+1.5's area and not this task's. It is pre-existing — this work did not
+introduce it — but the ceiling's own entry claimed eviction no longer blocks,
+which was true only past a threshold eviction cannot reach.
+
+## Round six: the correction was itself wrong about Close
+
+Sixth review round. Round 5's entry above says dropping the abandoned batch
+from `live` closes the `Flush`, `Close` and eviction stalls "past the ceiling,
+and only there". Measured, for `Close` the right qualifier is **never**:
+
+```
+past the ceiling: hist=64 live=0
+Flush returned promptly past the ceiling: <nil>
+Close is STILL BLOCKED 3s past the ceiling, with the ring drained
+Close returned once the stalled worker was released: <nil>
+```
+
+`Writer.Close` runs `Flush` and then joins the flush workers. A worker parked
+inside `AppendGroup` has not returned, so `Close` blocks on a stalled writer
+with `live` empty and the ring drained. The drop unblocks `Flush` and nothing
+else; eviction inherits `Close`'s behaviour one level up.
+
+The stated CAUSE was wrong, not just the scope — "because Flush waits on all of
+`live`" is true of `Flush` and irrelevant to a join — and it was wrong in three
+places at once: the source comment, the LLD, and this record. Writing the same
+sentence into three files is how one measurement error becomes three.
+
+## Two more tests that passed for a reason they were not written for
+
+Same round.
+
+**`TestManifestMustComeFirst` did not test manifest ordering.** Its archive
+carried wholly-corrupt groups, and the unverified branch's own `ReadGroup`
+parse refused the first one before the manifest was ever read — so deleting the
+ordering rule left it green. It was a second test of the parse wearing the
+ordering rule's name. The groups are valid now, the terminator is last so the
+terminator rule cannot answer either, and the assertion names the message.
+
+**`TestTerminatorMustComeLast` tested the pair, not the line.** Placing the
+terminator first puts both the manifest and the groups after it, and there are
+two checks; green with either deleted, red only with both. It now runs two
+placements, and the group check is individually covered. The manifest check is
+not, and cannot be by this route: any archive with a manifest after the
+terminator also has groups after it, unless the groups precede the manifest —
+which trips the manifest-first rule instead. Redundant by construction, and
+recorded as such rather than chased.
+
+**And `writeFlushErr`'s `duplicateOnRetry` could be hardcoded `false`** on
+every non-parallel ingest route — jsonline, logfmt, ES bulk, OTLP — with the
+suite still green. The only test that read the field asserted it was FALSE,
+which is the safe case. A test asserting TRUE existed nowhere, for the field
+this whole task exists to make trustworthy.
+
+Its first version posted to `/insert/jsonline`, which hands a body over
+`MinParallelBytes` to the sharded path and answers through `failIngest` — the
+other copy of the field, which was already covered. So it passed with
+`writeFlushErr`'s copy hardcoded, which is exactly the hole it was written for.
+It uses `/insert/logfmt` now, which has no parallel branch.
+
+## Still open, and what it would take
+
+- **`Writer.Close` and tenant eviction block on a stalled writer, always.**
+  Close joins the workers; eviction calls Close with the server-wide `s.mu`
+  held, so one stalled fsync blocks every request for every tenant. Fixing the
+  second needs a per-key closing state a concurrent open waits on, because the
+  Close is inside the lock so the store is shut before another `OpenStore` on
+  the same directory. That is tenant lifecycle, Task 1.5's area.
+- **The `ErrRollbackFailed` chain is tested only at its leaf.** `joinRollback`
+  has a direct test; nothing drives `commit → truncateTo → discardUncommitted`,
+  because there is no fault point on `Truncate`. Six single-line reverts across
+  that chain each leave the suite green, and any one of them reintroduces the
+  unopenable-store defect. It needs a fault seam inside `truncateTo`.
+- **Neither archive size ceiling is tested** — the unverified branch's or the
+  manifested one's. Both are DoS bounds rather than durability answers.
+- **The backup pre-flush is entirely untested.** Removing it, unbounding its
+  timeout, or removing the one-parked-goroutine guard each leaves the suite
+  green. `TestBackupReleasesItsAdmission` looks like it covers the first and
+  does not: the ingest request's own `FlushMark` already made the row durable.
+- **The worker's `failed`-before-`outstanding` ordering is uncovered.**
+  Decrementing `outstanding` before `failed.Add(1)` but after the error CAS
+  lets a batch retire with `failed=0` and an error set, reporting "0 of N
+  failed" with `Partial=false`. The `err` half of that ordering IS covered; the
+  `failed` half needs a hook inside the worker.
+- **`SnapshotAllWithSeq`'s single-acquisition property is uncovered** — an
+  `AppendGroup` between two lock acquisitions would make the archive declare a
+  watermark covering a group it does not hold, and nothing catches a regression
+  to two acquisitions.
+- **The manifest FORMAT refusal is uncovered.** A format-2 archive decoding as
+  format 1 and restoring while ignoring whatever the new field required is the
+  case `decodeBackupManifest`'s own comment calls "the only answer that cannot
+  be wrong".
+- **`TestCorruptGroupInBackupIsRejected` is answered by `ReadGroup`'s own v8
+  CRC, not by the manifest checksum.** Removing the manifest's size check, its
+  CRC check, or both leaves it green. That matters for one case: a **v7** group
+  has no checksum of its own, so the manifest CRC is the only integrity check
+  it gets in an archive, and nothing tests it.
+
+## The seventh one-side-only claim, on the function the retraction was about
+
+Round 8, and the last blocker in this task. `discardUncommitted`'s own doc
+comment still opened with:
+
+> The window is every step of AppendGroup after writeFileAtomic returns.
+
+That is verbatim the sentence three other places in this repository record as
+the reasoning error — the call site 43 lines above it, `docs/lld/ingest.md`, and
+the entry "The orphan cleanup drew its own window one step too late". Corrected
+on three sides, alive on the fourth: the one a reader of the function actually
+reads, and the one whose wrongness produced the round-3 defect.
+
+Seven rounds, seven instances, and the shape has not varied: a claim is
+corrected where the reviewer pointed and left standing wherever else it was
+copied. The lesson that finally sticks is not "check the other side" — it is
+that a sentence worth writing twice is a sentence that will be wrong in one
+place, so the second copy should be a pointer.
+
+Alongside it, the round-5 finding reproduced in a file written after it:
+`TestBackupAdmitsOneAtATime`'s comment said the 429 and the pre-flush "neither
+had a test" and now both do. The 429 does. Deleting the entire pre-flush block
+leaves both backup tests green — `TestBackupReleasesItsAdmission` asserts the
+posted row is in the archive, and the ingest request's own `FlushMark` put it
+there. Two sentences claiming coverage that a one-line deletion disproves, in a
+file whose subject is claims of coverage.
+
+## The restore that deleted the store it was restoring into
+
+Task 5.2 shipped a staged restore whose whole claim was that the destination
+ends up holding the archive's store or holding nothing. Review found the claim
+false in three ways, two of them destructive, and found that not one of the
+nine tests carrying "staged" or "atomic" in its name tested staging at all.
+
+**The emptiness check and the removal are an archive-read apart.** The check
+ran at the top of `Restore`; `os.RemoveAll(dst)` ran at the bottom, after every
+group had been read. A server that opened a store at that path in between had
+its `LOCK`, its manifest and every group deleted, the archive renamed over the
+top, and the call returned nil. The measured aftermath is the part worth
+keeping:
+
+```
+live AppendGroup after the swap SUCCEEDED
+dst now holds: [group-0.bin group-1.bin]
+re-open of the restored dir: err=<nil>
+the reopened store reports 2 groups / 7 rows
+```
+
+The live writer's id counter is independent of the archive's, so its next group
+**overwrote the archive's `group-1.bin`**. The result opened clean and answered
+with 7 rows where the archive held 8 — a silent mixture of two stores, from the
+tool whose entire reason to exist is that the moment it runs is the moment
+there is nothing to compare against.
+
+**Two concurrent restores were the same defect in a different dress.** Both
+derive `<dst>.restoring`, so the second one's `os.RemoveAll(staging)` deleted
+the first one's staged files mid-stream and both wrote into the same directory.
+Measured with two archives from two tenants:
+
+```
+A err=<nil>  B err=open .../store.restoring/group-2.bin.tmp: no such file
+dst holds 4 entries: [group-0.bin group-1.bin group-2.bin group-3.bin]
+WRONG BYTES group-0.bin: 436 bytes, the manifest says 379
+```
+
+Two groups from each archive, one call reporting success, cross-tenant
+contamination produced by the function `RequireTenant` exists to prevent.
+
+Both are closed by one mechanism: take the store's own exclusive lock on the
+destination before reading the archive and hold it through the rename, then
+re-check emptiness **under the lock**. A server cannot open the directory while
+it is held, a second restore cannot start, and the re-check is what makes the
+removal safe — it proves the directory holds nothing but the lock this process
+created.
+
+**Every restore test passed against a build with no staging at all.** With
+`staging := dst` and the rename pair deleted — i.e. exactly `RestoreTar` plus a
+cleanup defer, the design the task exists to replace — all nine tests stayed
+green. `TestRestoreIsAtomic` truncates an archive and finds the destination
+absent, which the error-path `defer` produces just as well as staging does. The
+difference between the two designs only shows on a **crash**, where no defer
+runs, or **mid-stream**, where the destination can be looked at while the
+archive is still being read. The replacement asserts mid-stream, through a
+reader that runs a hook halfway:
+
+```go
+r := &pausingReader{r: bytes.NewReader(archive), at: int64(len(archive)/2),
+    hook: func() { midDst = dirNames(dst); midStaging = dirNames(dst+".restoring") }}
+```
+
+and the lock's test opens a store at the destination from that same hook and
+requires `ErrLocked`.
+
+### The same mistake, made again, in the fix
+
+The first replacement test for the lock was
+`TestRestoreRefusesALiveStoreAndLeavesItIntact`: open a store at `dst`, restore
+into it, assert the refusal and the store's survival. It passes with the lock
+deleted **and** the under-lock re-check deleted, because the start-of-call
+emptiness check refuses an already-occupied directory on its own. It was a test
+of the check that was never the problem, written to guard the lock, and it took
+a revert probe to see it — the same probe discipline that found the original
+defect, applied to its fix, catching the fix's test one round later.
+
+The lesson is not "write better tests". It is that a test for a
+time-of-check-to-time-of-use defect **cannot** be written as a before-and-after
+assertion, because the whole defect lives in the middle. It has to make its
+assertion during the window or it is testing something else.
+
+### The rest of the round
+
+- **`DryRun` applied none of the three limits.** It called `VerifyBackup`,
+  which is `readBackup` with no callback, and every limit lived in that
+  callback. `-max-files 1 -max-bytes 1 -dry-run` accepted a four-group archive.
+  The one mode an operator is told to point at an untrusted archive was the one
+  mode that checked nothing.
+- **The manifest is decoded before any limit can apply**, and it is what sizes
+  everything after it: a 24 MiB manifest cost 339.6 MiB of live heap from an
+  archive declaring `MaxFiles: 1, MaxBytes: 1`. Bounding it needed a limit
+  inside `readBackup`, not in the callback — hence `backupReadLimits`.
+- **The tenant check ran after every group was on disk.** The manifest is the
+  archive's first entry and `readBackup` enforces that, so nothing forced it to
+  be last; a 1 TiB wrong-tenant archive filled the volume before the refusal,
+  and a SIGKILL in that window left the wrong tenant's groups in a
+  `<dst>.restoring` sibling of the victim's directory.
+- **`-dry-run` without `-dst`** cleaned `""` to `"."` and read the current
+  directory, so a scheduled backup check succeeded or failed depending on where
+  it was run from. A dry run now touches no destination at all.
+- **`dst` as a symlink**: `os.ReadDir` follows it, `os.RemoveAll` unlinks the
+  link itself, so the store landed in the link's parent and the target kept
+  what it had — with success reported. `dst` as `"."`: `os.RemoveAll` rejects
+  any path ending in one, so the restore failed *after* writing the whole
+  archive. Both are refused up front now.
+- **A post-rename `syncDirNamed` failure returned a plain error** with the
+  store fully in place, sending an operator to retry into a destination that is
+  now occupied. `ErrRestoredButUnsynced` says which it is.
+- **The escape test proved nothing.** Its four crafted names are all rejected
+  by `groupIDFromName` before the flattening matters, so deleting
+  `filepath.Base` left the whole suite green while `../group-9.bin` landed in
+  the destination's parent. The flattening is only reachable for an entry that
+  gets as far as being written, which needs a manifest-less archive.
+- **The `total bytes` limit subtest was a second per-entry test**: `MaxBytes:
+  64` against 379-byte groups trips on the first entry, so `total +=` could be
+  `total =` and it still passed. The accumulation is the only thing that
+  distinguishes `MaxBytes` from `MaxFileBytes`.
+- **A comment on the most dangerous line in the file was wrong about Go and
+  argued the line was unnecessary.** It said `os.RemoveAll(dst)` was redundant
+  on Linux because a rename onto an empty directory succeeds. Raw `rename(2)`
+  does; `os.Rename` `Lstat`s the destination and returns `EEXIST` for any
+  existing directory. The line is load-bearing on the platform CI runs, and it
+  is also the line that turned the missing lock from a safe abort into
+  destruction.
+- **`cmd/simdlogs` had no tests at all**, which is how a usage message
+  claiming "the destination is the whole store or is untouched" shipped over an
+  implementation where it was not. The command now returns an exit code instead
+  of calling `os.Exit`, and has seven.
+
+Eight of the nine new guards were revert-probed; the ninth (the lock) needed
+its test rewritten first, which is the entry above.
+
+### Round two: that claim did not survive either
+
+Reviewer B deleted the guards one at a time and found three of them left the
+whole suite green:
+
+- **the tenant-timing hook** -- `TestRestoreRefusesTheWrongTenant`'s
+  `os.Stat(dst)` assertion passes whether the check runs before the first
+  write or after the last, because the cleanup removes the destination either
+  way. It tests the deferred cleanup, not the timing.
+- **the under-lock re-check** -- deleting it changed nothing, and the reason
+  turned out to be worse than a missing test: the re-check ran *before* the
+  archive read, so it could not protect the `os.RemoveAll(dst)` that runs
+  after it. A file appearing in the destination during the read -- which the
+  lock does not prevent, since a lock stops a process opening a STORE, not one
+  dropping a file in -- was deleted with no error. The check now sits against
+  the removal it guards, and the test writes the file from inside a
+  `pausingReader` hook.
+- **the dry-run "writes nothing" sentinel** -- `staging == ""`, and
+  `filepath.Join("", name)` is `name`. Deleting the guard left every package
+  green while the dry runs wrote eight stray `group-*.bin` files into
+  `internal/storage/`, `cmd/simdlogs/` and `internal/api/`. No test looked at
+  the working directory. The signal is a nil function now, which has no such
+  failure mode.
+
+And seven more defects, of which two matter:
+
+- **A SIGKILLed restore made the destination unrestorable.** `lockDir` creates
+  `dst/LOCK` and nothing unlinks it when the process dies, so the next attempt
+  counted it as an occupant and refused. A disaster-recovery tool that cannot
+  recover from its own crash without a manual `rm` is the wrong end of that
+  trade; `unlock` closes the descriptor and never removes the file, so a
+  cleanly stopped store leaves one too. The listing no longer counts it, and
+  `lockDir` -- the only thing that can tell a running process from a file it
+  left behind -- decides.
+- **`os.RemoveAll(dst)` unlinks the lock two syscalls before the rename.**
+  From that instant another process can create the destination and take a
+  fresh lock on a new inode; the rename then fails with EEXIST, and the
+  deferred cleanup removed `dst/LOCK` -- *that* process's lock. Two writers
+  with independent id counters, reached through the cleanup of the mechanism
+  that exists to prevent them. The cleanup now skips the lock removal once the
+  removal has run.
+
+The rest: the README's own restore command failed on a fresh machine
+(`os.Mkdir`, not `MkdirAll`, and the parent is created by the *server*);
+`ErrBackupUnverified` was swallowed when the sync also failed, so an operator
+was told the store landed and not that nothing had checked it (`errors.Join`);
+`MaxManifestBytes` could only be lowered, so an operator whose own manifest
+exceeded the built-in 64 MiB could not restore their own backup; a pre-created
+destination's mode was replaced; the library read a negative limit as "give me
+the default" where the CLI refused it; `os.RemoveAll(staging)` destroyed a
+same-named directory that had nothing to do with a restore; and
+`simdlogs restore -h` exited 2.
+
+**And the worst of the round was mine and was not code at all.** The script
+that added the "Staged restore" section to `docs/lld/storage.md` ended with
+`s = s[:start] + new` -- it truncated the file. `## Disk` and the entire
+`## Corruption policy and storage health` section, ~186 lines documenting a
+subsystem shipped two commits earlier, were deleted: quarantine ordering, the
+recovery gate, the record format, `quarantine/ACKNOWLEDGED` persistence, four
+metrics, `DirRereadInterval`, the disk-footprint baselines. `go test ./...`
+was green, `gofmt` was clean, `go vet` was clean, and this repository has no
+link or count gate over the LLDs. Nothing but reading the diff would have
+caught it, and I did not read the diff -- I read the section I had added.
+
+The rule that follows is narrow and absolute: **a scripted edit to a document
+is reviewed by its diffstat.** `+102 -2` is an insertion; `+89 -170` is not,
+whatever the section you were looking at says. `git diff --stat` takes one
+second and is the only thing that sees what a truncating splice did.
+
+### Round three: the window was narrowed, not closed
+
+Reviewer C reproduced the original catastrophe against the FIXED code.
+`os.RemoveAll(dst)` unlinks the lock file the call has been holding, two
+syscalls before `os.Rename` re-establishes anything. Hammering `OpenStore` +
+`AppendGroup` against a loop of restores for fifteen seconds, four runs:
+
+```
+restores ok=63552 failed=179697  short-destinations=6  partial-visible=1065
+restores ok=70483 failed=202267  short-destinations=9  partial-visible= 940
+restores ok=82525 failed=265367  short-destinations=4  partial-visible= 582
+restores ok=75717 failed=238429  short-destinations=6  partial-visible= 511
+a successful restore left [group-1.bin group-2.bin group-3.bin];
+  stat: group-0.bin=no such file or directory
+```
+
+`Restore` returned nil with a group missing, and `partial-visible` counts opens
+that saw one to three group files -- a partial store visible mid-restore, which
+staging exists to make impossible. Isolated deterministically, the mechanism is
+plain:
+
+```
+AppendGroup err=<nil>
+the restored group-0.bin was OVERWRITTEN by the live writer: 379 bytes -> 348
+```
+
+A writer that gets in allocates ids from its own counter, and
+`discardUncommitted` unlinks `dst/group-<id>.bin` **by path** on a failed
+commit -- after the rename, that path is the archive's file.
+
+The window went from "the whole archive read" to "two syscalls", which is a
+real improvement and is not what four documents asserted. The fix is to make
+the lock survive the swap rather than to shrink the gap further: the STAGING
+directory is locked too, just before the swap, and that lock file is the one
+the rename installs as `dst/LOCK`. After the rename this process holds the
+restored store's own lock; before it, a server that creates `dst` makes the
+rename fail with `EEXIST`, which is a safe abort. There is no ordering left in
+which someone else writes into the result.
+
+Testing it needed a seam. The assertion is about the instant between the rename
+and the return, so `restore-renamed` joins the fault points -- used as a
+notification rather than an injection, with the test opening the destination
+from the hook and requiring `ErrLocked`.
+
+**And the fix for the lock introduced a lock defect of its own.** The deferred
+cleanup ran `lock.unlock()` and then `os.Remove(dst/LOCK)`. Between them the
+inode is linked and unheld; a process that flocks it in that gap has its lock
+file unlinked out from under it, and a third process then creates a new inode
+and also succeeds. Two holders of a lock whose entire purpose is that there is
+one:
+
+```
+restores=4 competing lock acquisitions=5 DOUBLE-HELD=1
+restores=2 competing lock acquisitions=3 DOUBLE-HELD=1
+restores=5 competing lock acquisitions=8 DOUBLE-HELD=2
+restores=3 competing lock acquisitions=4 DOUBLE-HELD=2
+restores=2 LOCK-UNLINKED-UNDER-A-HOLDER=2
+```
+
+The unlink goes first, while the flock is still held. That ordering has no gap
+to inject into, so it is recorded here rather than guarded by a test -- the
+same placement as simdparquet's int64 wrap.
+
+### The rest of round three
+
+- **The tenant-timing guard was still untested**, and round two's own entry had
+  named it as one of three that left the suite green. The other two got tests;
+  this one did not. It has one now, and it counts `temp-create` faults rather
+  than looking at what survives -- 0 writes for the wrong tenant, 4 for the
+  right one, so the counter is measuring something.
+- **"Before the first group is written" was false for a manifest-last
+  archive.** `readBackup` enforces manifest-first *retroactively*: groups
+  arriving first are read, parsed and emitted, and the ordering error is raised
+  when the manifest turns up. All four groups landed on the destination's own
+  volume from an archive whose manifest had been moved to the end, bounded only
+  by `MaxBytes` -- a terabyte by default. A restore that names a tenant now
+  refuses any group that precedes the manifest.
+- **A fresh destination came out wider than the server would make it.** The fix
+  for "a pre-created destination's mode was replaced" chmodded unconditionally
+  to the hard-coded 0755, so under umask 077 a restore produced 0755 where
+  `OpenStore` gives 0700: log data made world-readable by the fix for the
+  opposite defect. The mode is applied only to a destination that already
+  existed, and the test now runs at umask 077 -- 022, where it used to run, is
+  the one umask at which the two branches agree and nothing shows.
+- **`clearStaging` destroyed a legacy store at the staging path.** Keying on
+  "does it hold only group files" cannot tell crashed staging from a
+  pre-MANIFEST store, and `-dst /srv/logs` derives `/srv/logs.restoring`. A
+  `.simdlogs-restoring` marker, written first and removed before the rename, is
+  present in exactly one situation.
+- **Two CLI branches had no test**: the `ErrRestoredButUnsynced` message, which
+  is the entire operator-facing reason that error exists, and the usage
+  refusal for a missing `-dst`.
+- **Three stray `group-*.bin` files** were sitting in `internal/storage/`,
+  residue of round two's dry-run-sentinel probe, one `git add -A` from being
+  committed.
+- Two stated rationales were wrong. "unlock closes the descriptor and never
+  removes the file" is unix-only -- on Windows the lock IS the open handle and
+  `unlock` removes it, so a stale LOCK there means a crash and `lockDir`
+  refuses it with `O_EXCL` whatever the destination listing does. And
+  `os.RemoveAll` rejects a path ending in `.`, not `..`; the kernel refuses
+  that one, with a different errno arriving just as late.
+
+Adding `restore-renamed` broke `TestEveryWriteFaultReachesTheCaller`, which
+sweeps `FaultPointNames()` and requires each to fail a write. That test is
+right and the fix is not a skip: the exclusion list moved into the storage
+package as `NonWriteFaultPointNames`, inverted so that a new WRITE step is
+covered the day it exists. A write-path list would have silently missed the
+next one, which is the failure the sweep exists to prevent.
+
+### Round five: the round that fixed it re-opened it
+
+Round two closed a defect by skipping the lock-file unlink "once the removal
+has run". Round four, rewriting the same function, moved that flag from
+*before `os.RemoveAll(dst)`* to *after `os.Rename`*:
+
+```go
+if err := os.RemoveAll(dst); err != nil { return man, err }   // this call's dst/LOCK is gone
+if err := os.Rename(staging, dst); err != nil { return man, err }  // lock still non-nil here
+lock = nil                                                     // guard moved to here
+```
+
+On the rename-failure path the lock is still considered ours, and the deferred
+cleanup unlinks `dst/LOCK`. But the ONLY way `os.Rename` returns `EEXIST` is
+that another process created `dst` -- so on that path the lock file is theirs.
+The failure condition and the ownership are the same event, not a race.
+
+Measured with generation-counter attribution, 30-second runs under contention:
+
+| build | LOCK-STOLEN | DOUBLE-HELD |
+|---|---|---|
+| as shipped | 38, 47 | 31, 37 |
+| flag before the removal | 0, 0 | 0, 0 |
+
+Identical EEXIST pressure in both. The failure it produces is two writers with
+independent `nextID` counters in one directory -- the thing `lockDir` exists to
+prevent, reached through the cleanup of the mechanism that prevents it. The
+flag is back before the removal, where round two put it, and
+`TestALostRenameDoesNotTakeTheWinnersLock` now creates the winning process from
+a new `restore-removed` fault point and requires its lock to survive.
+
+**On Windows every successful restore produced a store nobody could open.**
+`dirLock` captures its path at lock time, and the rename moves the file from
+the staging directory to `dst/LOCK`. The release then did `os.Remove(dst/LOCK)`
+-- which on Windows *must* fail, since the lock IS the open handle and this
+repo's own comment says an open file cannot be deleted -- and then `unlock`,
+which removes the path captured earlier: `staging/LOCK`, long gone. Net:
+`dst/LOCK` survives, and `lockDir`'s `O_EXCL` refuses that directory forever.
+The unlink-before-unlock invariant this file recorded as universal one round
+earlier is unix-only for exactly that reason. `dirLock` grew `movedTo` and a
+per-platform `release`: unix unlinks while holding, Windows unlocks and lets
+`unlock` do the removal.
+
+**The dry-run guard was unguarded, and the test written to close it could not
+fire.** Reverting the nil-function signal to the empty-path sentinel left
+`go test ./...` at exit 0 while writing the same eight stray `group-*.bin`
+files into the same three directories that round two's entry records --
+reproduced against the fix for it. The test compared the working directory
+before and after its own dry run, and any earlier dry run in the package put
+the strays into the "before" snapshot: it failed alone and passed in the suite.
+It runs in its own `t.Chdir(t.TempDir())` now. That is round one's recorded
+lesson -- *a defect that lives in the middle cannot be tested by a
+before-and-after assertion* -- made again on a different property.
+
+**A kill in the marker-less window made the destination unrestorable.** The
+marker was written inside the staging directory, so it had to be removed before
+the rename or it would land in the restored store -- and between those two
+points sit an fsync of the whole staged store, a lock, a readdir and the
+removal of the old store. Seconds on a real store. A kill there left a
+complete, marker-less staging directory that every later restore refused, and
+if it landed after the removal the old store was gone too. The marker is a
+sibling now, `<dst>.restoring.marker`, removed after the rename: it can never
+reach a store and there is no window.
+
+Also: the staging directory was created 0755 while the destination was 0700,
+leaving group names and sizes world-listable for the length of the restore;
+four documents and comments asserted properties the code did not have (the
+"safe abort", "no server can open that directory", "a LOCK is named in the
+error", and the manifest-first reasoning that round three had already corrected
+360 lines below in the same file -- the eighth one-side-only claim, re-added in
+the round that wrote the lesson down); and the umask helper justified itself
+with "none calls t.Parallel" in a package with nine such call sites.
+
+**What this round is really about.** Every defect above was introduced by the
+fix for the defect before it, and two of them are the earlier defect returning
+in the same function. Rewriting a function that a previous round hardened
+re-opens what that round closed unless every guard it added is carried across
+deliberately -- and a guard whose reason lives only in a comment, or only in a
+`docs/wrong.md` entry, is one nobody carries. The three that survived five
+rounds are the ones with a test that dies when they are deleted.
+
+### Round six: a lock file cannot be handed over by unlinking it
+
+Round five ordered the unlink before the unlock and recorded that ordering as
+having "no gap to inject into". Review measured the gap on the other side: a
+competitor whose `open(2)` precedes the unlink acquires the flock on the
+now-unlinked inode after the unlock, while the next competitor creates a fresh
+inode at the path and flocks that. One lock, two holders. Thirty-second hammer,
+`OpenStore`+`AppendGroup` against a restore loop:
+
+| build | restores | LOCK-STOLEN | DOUBLE-HELD |
+|---|---|---|---|
+| unlink-then-unlock (round five) | 321257 | 24 | 268 |
+| same, second run | 315989 | 44 | 211 |
+| `dstRemoved` late (round four control) | 305638 | 197 | 276 |
+| **no unlink at all** | 315639 | **0** | **0** |
+
+Both orderings have a gap; the mistake was thinking one of them did not. **A
+lock file whose inode can change cannot be handed over safely by ordering.** So
+the file is never unlinked -- which is what `unlock` and `Store.Close` have
+always done, and what the destination check was already written to tolerate.
+`release` is now `unlock` on unix, and a restored store carries a `LOCK` exactly
+as a store the server created does.
+
+That has a visible consequence and it is the right one: a failed restore into a
+path that did not exist leaves an empty directory holding a lock nobody holds.
+The next restore accepts it. Six tests that asserted "the destination does not
+exist" as a proxy for "nothing landed" now assert the property itself -- no
+group files -- which is what they were always about.
+
+**Windows could never have completed a restore.** `lockDir(dst)` keeps
+`dst/LOCK` open, and `os.RemoveAll(dst)` must then fail with a sharing
+violation: Go opens without `FILE_SHARE_DELETE`, and `removeall_at.go`'s
+`Deleteat` needs `DELETE` access. That is the premise `lock_windows.go` and the
+LLD both state -- "a file opened without FILE_SHARE_DELETE cannot be deleted
+while open… holding the handle is itself the lock" -- so the design was
+internally inconsistent: either the rule holds and the removal cannot succeed,
+or it does not and the Windows lock is not a lock. Every restore would have
+failed after staging, validating and fsyncing the whole archive, leaving a
+`LOCK` that `O_EXCL` refused forever. The destination's lock is released
+explicitly before the removal now, which is what makes the removal possible
+there at all. REASONED, not measured: there is no Windows host here, and
+`GOOS=windows go vet ./...` does not even compile the test files (a pre-existing
+`syscall.Kill` in a helper).
+
+**The conditional release skipped the close, not just the unlink.** Round two's
+rule was "do not remove the lock file once the removal has run"; round three
+merged remove and unlock into one function, so the guard began skipping the
+unlock too -- 75 leaked descriptors per 200 restores, and on an `os.RemoveAll`
+failure a held lock that made the destination unopenable for the life of the
+process. The release is unconditional now, and it has nothing left to guard
+against.
+
+**The marker-less window was moved, not closed.** The marker was written after
+`os.Mkdir(staging)`, so a kill between them left an empty marker-less staging
+directory that `clearStaging` refused forever -- the same non-retryable
+destination, two syscalls wide instead of an fsync-and-readdir wide, in a round
+whose entry said "there is no window". The marker goes down first now. Like the
+two lock orderings, that is reasoning and not a test: the orderings differ only
+on a kill, where no defer runs.
+
+Three claims in three documents were also wrong: the LLD still described round
+three's marker (wrong name, wrong location, wrong timing) in the document round
+five rewrote; `docs/architecture.md` said "no server can open it mid-restore",
+which is false and measured -- a server DID open the destination in the
+removal-to-rename gap, appended a group, and the restore aborted with `EEXIST`,
+which is safe but is not what the sentence says, and the accurate version is in
+two other files; and the LLD restated the `..`/`os.RemoveAll` error that round
+three had already corrected in the code beside it.
+
+### Round seven: the Windows fix cost the unix platform its data
+
+Round six released the destination's lock immediately before
+`os.RemoveAll(dst)`, because Windows cannot remove a directory holding an open
+handle. On unix that release is not merely unnecessary, it is the original
+catastrophe again -- and it is round six's OTHER change that makes it so.
+
+Since the lock file is never unlinked, after an early release `dst/LOCK` is
+still there and is UNHELD. A server flocks the file that already exists, opens
+the store, and then: `os.RemoveAll(dst)` deletes that live store, and
+`os.Rename` **succeeds** -- because the winner never had to create the
+directory, so there is no `EEXIST` to abort on. Instrumented, one run:
+
+```
+Restore returned nil; the manifest names 4 groups
+a store OPENED at the destination inside the release-to-removal window
+the ghost's AppendGroup SUCCEEDED, taking id 0
+THE ARCHIVE'S group-0.bin WAS OVERWRITTEN: 353 bytes, want 379
+the reopened store answers with 4 groups / 13 rows; the archive held 16
+```
+
+Round one's paragraph, word for word, six rounds later, on the fix for it.
+Hammered, thirty seconds:
+
+| build | restores ok | displaced holders | over a restored store | archive group overwritten |
+|---|---|---|---|---|
+| as shipped | 560 | 3739 | 7 | **1** |
+| again, 60 s | 1055 | 7096 | 5 | **1** |
+| pre-removal release deleted | 544 | 192 | **0** | **0** |
+
+The control's 192 are `RemoveAll` racing a competitor that recreates `dst`;
+none reached a restored store, because the rename fails `EEXIST`. That is the
+safe abort the documents describe, and it is the argument the early release
+destroys: **the abort depends on the winner having to CREATE the directory.**
+Leave the directory there for them to open and the argument is gone.
+
+The repair is `releaseBeforeRemoval`, per-platform: `release()` on Windows,
+nothing on unix. Round six put a Windows-only requirement in shared code and
+the shared platform is the one that lost data.
+
+Round six's own table -- "no unlink at all: 0 steals, 0 double-holds" -- is
+true of what it measured, two holders of the same INODE, and says nothing
+about two holders of the same DIRECTORY. A metric that answers a narrower
+question than the prose around it is how a round certifies its own regression.
+
+### Three more, and one guard that turned out to be two
+
+- **Nothing tested that the marker is written at all.** Two rounds hardened its
+  timing and its location; deleting the `os.WriteFile` left the suite green,
+  and `clearStaging` then refuses EVERY leftover staging directory -- the
+  non-retryable destination both of those rounds wrote an entry about. Both
+  crash tests wrote the marker by hand, and the fault-injected ones take the
+  error path where the deferred cleanup makes it irrelevant. It is asserted
+  mid-restore now, from a reader hook.
+- **The per-entry `MaxFiles` counter was unguarded.** The subtest named "group
+  count" trips the MANIFEST bound; the per-entry counter is the only
+  entry-count bound an unverified archive can get, and nothing exercised it.
+  Same shape as round one's "the total-bytes subtest was a second per-entry
+  test", two rounds after that was recorded.
+- **`RequireTenant` on an unverified archive is guarded by two rules, and the
+  test only reached one.** An archive WITH groups is refused by the
+  groups-before-manifest rule on its first entry, so the refusal at the end of
+  `readRestore` never runs -- which is why deleting it changed nothing. It is
+  reachable for an archive with no entries at all, and without it an empty
+  manifest-less archive restores under a tenant it does not name. Both rules
+  now have a case, and deleting either fails one.
+
+And the ninth one-side-only claim, this time in the text an operator reads:
+round six corrected "no server can open it mid-restore" in
+`docs/architecture.md` while `simdlogs restore -h` went on printing "the
+store's own lock is held for the whole run, so no server can open the
+destination while it is in progress" -- false twice over. Six more sites said
+"for the whole run"; the lock is held until the removal, and that is the
+sentence that has to be everywhere, because the safe-abort argument depends on
+it.
+
+### Round eight: the protocol holds, and three residues
+
+The swap was hammered with `OpenStore`+`AppendGroup` ghosts and with concurrent
+restorers, and the harness proved sensitive by reproducing the round-seven
+defect on demand:
+
+| build | restores | ghost opens | displaced | archive group overwritten |
+|---|---|---|---|---|
+| as shipped, 30 s, 4 ghosts | 30636 | 173578 | 0 | **0** |
+| as shipped, 30 s, 12 ghosts | 3825 | 132006 | 0 | **0** |
+| control (unix `releaseBeforeRemoval` = `release()`), 10 s | 12314 | 89636 | 203 | **4364** |
+
+The control's thirty-second run did not finish: `fatal error: fault / SIGBUS`
+inside `binary.littleEndian.Uint32`, a reader's mmapped group replaced under
+it. Restore-against-restore, 163k and 139k rounds at four and eight
+concurrent restorers, destination verified byte for byte against the winning
+archive: zero two-winner outcomes, zero mixtures, zero wrong bytes.
+
+**The per-entry limits bounded the write, not the allocation.** `readBackup`
+reads a whole entry with `io.ReadAll` sized from the manifest's declared size,
+and every per-entry limit lived in the emit callback that runs after it:
+measured, an archive declaring one 128 MiB group cost 268.5 MiB of live heap
+with `MaxFileBytes` set to 1 -- in a DRY RUN, the mode the documents point an
+operator at for an untrusted archive. That is the argument this file already
+makes three times about the manifest, one entry type over, with the mechanism
+to fix it (`backupReadLimits`) already in place. The ceiling is pushed down
+now, and the test asserts the ERROR MESSAGE rather than the allocation: a
+truncated tar is bounded by the bytes it carries, so a buffer sized from the
+declaration and one sized from the stream look identical on that fixture, and
+only the wording says the refusal came before any read.
+
+**The descriptor-leak test's own rationale went false when round seven made
+the release per-platform.** Its comment says "the success path releases the
+lock explicitly before the removal, so only a failure exercises the deferred
+release" -- true on Windows and false on unix since `releaseBeforeRemoval`
+became a no-op there, where the deferred release is now the ONLY one. The test
+drove twenty failing restores and no successful ones, so with the conditional
+release restored, twenty successful restores leak twenty descriptors and the
+suite stays green. Round six's own recorded number, uncovered again by the
+round that fixed something else.
+
+**And the eleventh one-side-only claim.** Round seven corrected "the lock is
+held for the whole run" in eight places including the CLI help, and left
+paragraph five of `docs/lld/storage.md` stating the round-six design outright:
+"the destination's own lock is released explicitly before the removal". That is
+the sentence whose wrongness produced the round-seven catastrophe, sitting
+twenty-eight lines below the paragraph that says the early release exists "there
+and only there". A reader who goes to the lock-protocol paragraph reads the
+design that lost the data.
+
+Two smaller ones. "A second restore cannot start" is false in the
+removal-to-rename gap: one can, and it deletes this call's staging directory on
+its way out, because both derive their paths from `dst`. Contained -- the
+winner's next write fails `ENOENT` and it reports an error, zero mixtures in
+302k rounds -- and the sentence now says so. And `FaultPointNamed`'s doc
+enumerated eleven names, three behind, directly above the paragraph explaining
+why `FaultPointNames()` exists so that a hand-written list cannot go stale.
+
+## The lock that excluded nobody, and the fix that was aimed at the wrong window
+
+Round nine came in as a data-loss finding against the uncommitted restore:
+`os.RemoveAll(dst)` unlinks `dst/LOCK`, then re-reads the directory until it
+reads empty, then `rmdir`s -- so in the middle of its own loop the destination
+is present and lockless, a server opening it there creates a second `LOCK`
+inode, and the loop's next pass deletes what that server wrote before the
+rename goes on to succeed. Measured against twelve writers over thirty
+seconds: 24 of the archive's groups overwritten in one run and 3 in another,
+against 0 for the same harness with `Restore` never called.
+
+The finding was right that data was being lost. It was wrong about which
+window was losing it, and the fix aimed at the named window did nothing.
+
+Replacing the removal walk with `os.Rename(dst, dst+".restoring.old")` -- one
+syscall, so the directory and the lock inode inside it leave together, with
+the sibling removed afterwards off a path no opener can reach -- and running
+the same harness:
+
+| build | ghost groups lost | archive groups overwritten |
+|---|---|---|
+| removal walk (as found) | 13 | 27 |
+| one-syscall rename | 7 | 17 |
+
+Within noise of each other. Both fail.
+
+**What was actually firing** came out of a syscall trace rather than an
+argument. `lockDir` opens the lock file and then flocks it, which is two
+syscalls, and a staged restore replaces the whole directory in one. The
+descriptor then names an inode that has left the path -- unlinked with the
+directory it lived in, contended by nobody, so the flock ALWAYS succeeds:
+
+```
+077219 R renameIn ok dstDirIno=113001475 stagedLockIno=113001480
+077220 R stagedRelease lockIno=113001480
+077230 R rmDisplaced ino=113001475            <- inode 480's directory destroyed
+...
+077252 R lockDst ok  lockIno=113001501 dirIno=113001496
+077256 G open        lockIno=113001480 dirIno=113001496   <- locked the corpse
+077261 G append id=0 err=<nil>                <- writes into 496 BY PATH
+```
+
+Six directory generations after inode 113001480 was released and deleted, a
+store opened on it and appended `group-0.bin` into the live directory whose
+lock was 113001501. Two processes, one path, one of them holding a dead file.
+That is not a restore defect at all -- every `OpenStore` in the product has it,
+and the restore is merely the thing that swaps directories fast enough to
+expose it.
+
+Checking the flocked inode against the path afterwards, and retrying a bounded
+number of times, closes it. Interleaved in one session:
+
+| build | ghost groups lost | archive groups overwritten | |
+|---|---|---|---|
+| as found | 13 | 27 | FAIL |
+| inode check + rename, 60s / 24 ghosts | 0 | 0 | PASS |
+| inode check + rename, 45s / 16 ghosts | 0 | 0 | PASS |
+
+**Then the rename had to justify itself, because the check alone might have
+been enough.** Reverting to the removal walk with the inode check kept, 45
+seconds and 16 ghosts: 0 lost, 0 overwritten, PASS. By that measurement the
+rename is dead weight.
+
+It is not, and the reason is that the walk's window is real but a great deal
+narrower than the finding implied. `checkRestoreDestinationLocked` guarantees
+the destination holds nothing but this call's own lock file, so the walk is
+always exactly one unlink, one readdir, one rmdir -- a window no competitor
+reaches at production speed. Widen only the width, keeping the shape and the
+inode check, and it opens:
+
+| build | foreign entries in the gap | archive groups overwritten | ghost groups lost | restores landing incomplete |
+|---|---|---|---|---|
+| removal walk, gap widened to 200us | **56,434** | 692 | 519 | 85 |
+| one-syscall rename | 0 | 0 | 0 | 0 |
+
+56,434 times in twenty-five seconds a file belonging to another process
+appeared inside a destination the removal had already emptied. So both changes
+ship: the inode check closes what fires at production speed, the rename closes
+what only amplification reaches.
+
+**The lesson is about the amplification.** The finding's evidence -- 2,432
+foreign `LOCK` files and 508 foreign manifests and groups unlinked -- came from
+an instrumented removal that was deliberately slower per entry. That
+measurement proved a hole existed. It did not prove which hole was firing, and
+the diagnosis attached to it named the window the instrument had widened rather
+than the one the product was losing through. Slowing a suspect down finds holes
+near the suspect; it cannot rank them against holes somewhere else. The trace
+could, because it recorded what the losing writer actually held.
+
+Recorded because none of it was reasoning: three rounds of argument about
+rename orderings and `EEXIST` were all consistent with the code and all beside
+the point, and the sixty-second trace answered it in one read.
+
+## Four things the round-nine sign-off found, and the one measurement that was more useful than the argument
+
+The sign-off reviewer could not lose data against the shipped build — 60 s,
+24 ghosts, both windows widened to 200 µs, zero double-holds and zero groups
+lost or changed. Four other things did not survive.
+
+**The rename was independently load-bearing after all.** The round's own probe
+B (removal walk restored, inode check kept) lost nothing at production speed,
+which made the rename look like dead weight justified only by amplification.
+Deleting the inode check while KEEPING the rename — the probe nobody ran —
+produces 8 double-holds in 30 seconds at production speed. Both changes carry
+their own weight; the earlier entry's framing of the rename as
+"amplification-only" was an artefact of testing one direction.
+
+**The marker died before the staging directory it vouches for.** Deferred
+calls run in reverse, and the marker's removal was inside the cleanup
+registered last, so it ran before the staging cleanup. Sampled from another
+goroutine during the unwind after an abort between the renames:
+
+| archive | samples | saw (marker gone, staging present) |
+|---|---|---|
+| 4 groups | 212 | 13 |
+| 40 groups | 967 | 58 |
+| 400 groups | 9,323 | 690 |
+
+Six to seven per cent of every unwind, on an invariant `restore.go` and
+`docs/lld/storage.md` both state in words — *"a kill between them would leave a
+staging directory a later restore refuses"*. A kill in that window produces
+exactly that, refused forever.
+
+The end state is identical whichever order they go in, which is why nothing
+caught it and why the fix needed a fault point rather than an assertion: the
+marker's removal is registered with its WRITE now, so reverse order puts it
+last, and `faultRestoreCleanup` lets a test stand inside the cleanup and check
+that both directories are already gone.
+
+**The `os.Remove(dst)` on the failure path could only ever remove somebody
+else's directory.** Its own residue it cannot touch: `lockDir` has put a LOCK
+in the directory, the file is never unlinked, and rmdir refuses a non-empty
+directory — measured after a truncated restore into a path that did not exist,
+`dst` holds `[LOCK]` and the rmdir fails every time. A competitor's it can: a
+server creating the destination in the gap between the two renames has an empty
+directory for as long as it takes to open its lock file, and the rmdir takes it.
+Deleted. It was also the last thing making *"aborts without touching
+anything"* false.
+
+**Four guards were unguarded** — deletable with the whole suite green: the
+rename itself, the marker ordering, `clearStaging`'s displaced arm, and that
+rmdir. Now five test functions and six cases -- the marker ordering needs two,
+one per path -- each verified to fail against its own reversion.
+
+**And four doc claims did not match the code.** *"Two restores cannot
+interleave"* in README.md and verification.md, which round eight had already
+recorded as false and corrected in the LLD and in `restore.go` — the same
+sentence left standing in the two documents an operator actually reads. The
+`EEXIST` claim in architecture.md and verification.md, which is one of two
+orderings: Go's `os.Rename` `Lstat`s and returns EEXIST for an existing
+directory, but a directory created between that `Lstat` and the raw
+`rename(2)` is empty and gets replaced — safe by the staging lock, not by
+EEXIST. `lockedFileIsAtPath` claimed `os.SameFile` was stronger than comparing
+device and inode; on unix it *is* that comparison, and what makes the check
+sound is the held descriptor pinning the inode. And `movedTo`'s comment on the
+unix file described the Windows consequence as if it were unix's, where
+`release` never reads the path at all.
+
+Five of these are the one-side-only shape this file has now recorded twelve
+times. The new one is the third: **a correction that lands in the reference
+document and not in the README.** The LLD was fixed in round eight, the entry
+was written in round eight, and the false sentence survived in the two files
+with the widest audience — because the round's diff touched the LLD and the
+grep that would have found the others was never run.
+
+## Two restores in each other's gap, and the sentence that said it could not happen
+
+The round-ten sign-off could not lose data on any path a deployment reaches:
+61,425 committed groups under four concurrent restore loops with none vanished
+or changed, 20,000 barrier rounds of six workers with six distinct archives and
+exactly one winner each, 11.6 million overlapping attempts with 104,479
+successful restores and no foreign group in any of them. A ghost `OpenStore`
+at every one of the five fault points loses nothing either.
+
+It did find an ordering the code said did not exist. Two restores, each parked
+in its own gap between `os.Rename(dst, displaced)` and `os.Rename(staging,
+dst)`: the first returns **nil**, with a manifest naming its own three groups,
+over a destination holding the other's six. Two ordinary `Restore` calls, no
+hand-made filesystem state, parked with this package's own `restore-removed`
+point. `simdlogs restore` would exit 0 and print the archive it read.
+
+Reachability is the reason this is recorded rather than fixed:
+
+| harness | occurrences |
+|---|---|
+| 20,000 barrier rounds, 6 workers, 6 archives | **0** |
+| 11.6M overlapping attempts, 104,479 successful restores | **0** |
+| same, re-run: 6.8M attempts, 95,600 restores | **0** |
+| with a concurrent `os.RemoveAll(dst)` from outside any restore | 267 of 85,686 in-lock samples |
+
+It needs something that is not a restore to widen the window. Closing it needs
+a lock that outlives the swap on a path neither restore owns, which is a
+different design; the documented answer is that two restores must not target
+one destination, and the four places that said otherwise now say this.
+
+**The claim is the finding.** `restore.go` said *"There is no ordering left in
+which someone else writes into the result"*, and the LLD said *"leave no
+ordering in which someone else writes into the result"*. Both were reasoned
+from the server case, which is genuinely closed, and stated over all cases.
+That is the thirteenth instance of the one-side-only shape this file has now
+recorded twelve times — and the first where the untrue half is a claim of
+completeness rather than a claim about a platform or a branch. "No ordering
+left" is a quantifier, and a quantifier is exactly the kind of sentence that
+cannot be true of the case you had in mind and false nowhere else.
+
+Four smaller things from the same review, all text: a garbled sentence shipped
+in `docs/verification.md` (a splice that duplicated half a clause and lost the
+other half — the diffstat was insertion-shaped and the sentence was still
+broken, so a numstat check does not catch this class); the pre-fix comment left
+standing on the very cleanup this round rewrote, four lines above the line that
+contradicts it; *"no crash can leave a staging directory a later restore
+refuses"*, which holds for a process kill and is not established for a power
+loss, because the marker is written with no fsync of the file or its parent;
+and the refusal of `.`, `..` and symlinks justified by what `os.RemoveAll(dst)`
+does, which is the call this round deleted.
+
+And `TestTheMarkerOutlivesTheDirectoriesItVouchesFor` asserted on the success
+path, where the staging directory has already been renamed away — so its
+staging check could never fire, on a fix whose defect was on the abort path.
+It is two subtests now, and the abort one fails against the pre-fix ordering.
+A test that cannot fail is the shape entry 33 records; this one could fail, on
+the half of the invariant that was never broken.
+
+## A retraction that landed in one paragraph and left the claim standing twice in the same file
+
+The previous entry retracted "there is no ordering left in which someone else
+writes into the result" and rewrote the four places that stated it. The
+verification round found the claim still standing in two more —
+`docs/lld/storage.md` and `restore.go` — each of them **forty lines above the
+paragraph retracting it**, so both files asserted the claim and its correction
+at once. A third site, a test's own comment, had never been on the list.
+
+The reason is worth more than the fix. The retracted sentence was reworded
+where it appeared as a *conclusion*, and left where it appeared as a *passing
+mention* inside a paragraph about something else — the lock's release timing in
+one case, the emptiness re-check in the other. A grep for the sentence would
+have found all six; the round searched for the paragraph instead, because that
+is what it had just rewritten. Correcting a claim means finding every place it
+is asserted, not every place it is argued.
+
+Four smaller things from the same round, all text: `entry 44` cited for the
+value-count bomb where the ordinal is 45; the `.`/`..`/symlink refusals still
+justified by what `os.RemoveAll(dst)` does, which is the call this design
+replaced — measured with each refusal removed, `.` now fails the emptiness
+re-check and a symlinked destination SUCCEEDS, replacing the link with a real
+directory and leaving the target holding a `LOCK`; "four guards in five tests"
+against a file holding five functions and six cases; and a paragraph whose
+"Asserted mid-stream, not after the fact" had drifted twenty lines from the
+claim it qualifies.
+
+And one the round introduced while fixing the first: **"reachable only when
+something outside a restore widens the window"**. Four harnesses observed it
+zero times without such a widener, which bounds how often it happens and does
+not establish that nothing else reaches it. That is a universal negative
+inferred from bounded runs — the same shape as the quantifier the previous
+entry was written to retract, reappearing in the sentence retracting it. It now
+says what was measured.
+
+Also settled, because it is what makes one branch of the three-outcome answer
+reachable: Go's `os.Rename` returns `EEXIST` for an existing directory, but
+having found one it `Lstat`s OLDNAME and reports THAT error first — so a
+staging directory another restore already deleted yields `ENOENT` even though
+the destination exists.
+
+## Compaction: a zero value that rewrote the store, and a transaction with no test
+
+Fifteen findings from the compaction review. The ones that were not the code
+being wrong are the ones worth keeping.
+
+**`CompactOptions{}` merged a 500-group store into one group.** `minGroups()`
+floored at 2, and three documents plus the field's own comment read that floor
+as a refusal: *"the zero value compacts nothing"*. A floor is not a switch. The
+zero value is off now, and the test that was supposed to cover this was named
+`"the zero value compacts nothing beyond the floor"` and asserted only that the
+rows survived — the name conceded the gap and nobody read it as one.
+
+**The central transaction had no test, and the missing lane was the reason.**
+The design says the output's add and the inputs' removes go in one manifest
+record. Mutating that into two records left the entire suite green. It could
+not have done otherwise: `TestCompactionCrashMatrix` injects an ERROR, an error
+unwinds every defer, and a store that unwinds looks consistent whatever the
+manifest holds. A SIGKILL does not unwind. Under a process-kill lane the same
+mutant duplicates **every batch** at `manifest-append` and `manifest-sync`.
+Thirteen phases now, and the error matrix stays for what it does test.
+
+**Three thresholds were checked at the wrong granularity, twice over.** The
+byte budget was first checked only between runs — forty groups produced ten
+outputs against a one-byte ceiling. Fixed to check between batches, which the
+shipped test then passed only because it set a row cap of 4: a batch runs to
+`MaxRows` rows, so a store that fits in one batch was still read in full,
+184,845 bytes against a limit of 1. It bounds the batch as it accumulates now.
+And the group-count floor was applied per batch rather than per run, so
+`MinGroups: 10` with a row cap of 8 compacted nothing, ever, with no error and
+no stat.
+
+**One unmergeable group refused its whole batch.** Discovering unmergeability
+inside `mergeGroups` throws away everything alongside it: one vector column
+among sixty left all sixty unmerged, permanently. It is a candidacy question,
+so it belongs in `compactCandidate`, where such a group breaks the run like any
+other ineligible one.
+
+**Four data races for an early return.** An unlocked `len(s.groups)` pre-check,
+to skip a mutex acquisition on a path about to do file I/O, raced `Close`,
+`AppendGroup` and a second pass. Deleted.
+
+**A pass blocked every HTTP request for its duration.** `forEachTenant` holds
+the lock every request takes to resolve its tenant; a query during a
+50,000-group pass took 250.7 ms, and a 200,000-group pass takes 1.33 s. The
+tenants are snapshotted and marked in-flight now, and the pass runs outside the
+lock.
+
+**And a kill between the commit and the unlink leaked most of a store.**
+Tombstones live in memory; a restart drops them, and `OpenStore` deliberately
+ignored files the manifest does not name. For a failed append that residue is
+one file. For compaction it is every input of the batch — measured, 1 live
+group and 8 orphans after two reopens. `OpenStore` reclaims them now, which is
+safe there and nowhere else: it holds the exclusive lock and has not written a
+group yet.
+
+Two smaller ones with a shape worth naming. A merge that GREW the store was
+allowed, and the operator log printed "saved -0.0 MB" — `Recompact` has refused
+that since it was written, and the new code did not inherit the rule because
+nothing made it. And `mergeGroups` called the caching `DictIndices` on every
+column of every group it was about to unlink, filling a 256 MB query cache that
+is incremented in one place and decremented nowhere: ~32M merged rows retire
+the cache for the life of the process.
+
+**The measurements were wrong and the reason is the instrument again.** The
+first version claimed 582x from three runs at a 200-300x benchtime, whose
+spreads were 1.65x and 2.2x — at this repo's 8.3% floor a 2.2x spread makes a
+minimum-of-three meaningless, and its small-groups figure was four times what a
+2000x run measures. Six interleaved runs give 411x on the minimums and 252x on
+the least favourable pairing; an independent measurement at another load gave
+284x and 274x. What survives two sessions is a band of 250-410x, not a number.
+The disk figure, being deterministic, reproduced exactly.
+
+The table also mixed two fixtures: its group column was n=5,000, its byte
+column n=20,000, and it said "1 group" where n=20,000 gives 3. One table, two
+experiments, and the caption named only one of them.
+
+## The fix for the leak deleted committed data, and the doc comment argued the wrong precondition
+
+`reclaimOrphanGroups` was added last round to stop a killed compaction leaking
+its whole input set. It unlinked every `group-*.bin` the manifest did not name.
+The sign-off review measured what that does to a store whose manifest is torn:
+
+| fixture | group files before | after one open | health reports |
+|---|---|---|---|
+| one flipped byte in the 5th of 10 records | 10 | **5** | `healthy: 5 groups` |
+| MANIFEST truncated to zero, 20 groups | 20 | **0** | `healthy: 0 groups` |
+| the first record's CRC corrupted, 12 groups | 12 | **0** | clean |
+
+Replay stops at the first record that fails its checksum -- by design, and
+documented one file over -- so every group committed after a torn record is
+invisible. "Invisible" was read as "never committed", and the difference is
+data. It also destroyed the documented recovery: remove the MANIFEST and let
+the legacy path adopt the directory returns 20 of 20 rows without the reclaim
+and 0 of 20 with it, because there was nothing left to adopt. The repo had
+already identified this state as reachable -- `backup.go` carries a paragraph
+about a truncated manifest making a full directory read as empty -- and the
+reclaim upgraded that consequence from "invisible" to "gone".
+
+**The doc comment argued the wrong precondition, at length.** It has a careful
+paragraph about why the unlink is safe: the process holds the exclusive lock,
+it has not written a group yet, no concurrent writer can be mid-way through a
+file. All true, all verified, and none of it the precondition that fails. The
+one it never stated is that **the manifest must be a complete record of what
+was committed** -- which is exactly the assumption a checksummed append-only
+log with a documented stop-at-first-bad-record replay does not give you.
+
+The fix is to reclaim only ids a record explicitly REMOVED. An id in no record
+at all -- an append that crashed before its commit, or anything past a torn
+record -- is in neither the visible set nor the retired one, and only the
+retired set licenses an unlink. `manifest.compact()` folds the log to one Add
+record and drops the retired set, so a removal folded away stops being
+reclaimable: a leak, not a loss, and stated rather than fixed because carrying
+a forever-growing retired list in a file is its own problem.
+
+**The shape.** A leak was traded for a loss, and the trade was invisible
+because the change was tested against the failure it fixed and not against the
+failures it created. Every test written for it -- the crash matrix, the orphan
+count, the row oracles -- exercised a HEALTHY manifest, which is the one input
+for which the two rules agree.
+
+Three smaller ones from the same review. A batch was required to have *a*
+timestamp column but not to agree on WHICH: two groups, one with `_time` and
+one with `ts`, each got 0 in the other's column, so the output spanned from
+zero and a window that matched nothing returned every row -- the same failure
+the timestamp-less refusal exists for, reached through a second door. The
+detached tenant walk marked every tenant in-flight for the whole pass, and
+eviction skips in-flight tenants, so a long pass turned a would-be blocking
+request into `503 all are in use` -- a 250 ms stall traded for a hard
+rejection. And of the fifteen fixes the previous round claimed, five had no
+test: re-adding the deleted race, marking in-flight after the unlock, dropping
+the batch byte bound, restoring the caching decode, and taking the id before
+the size decision all left the suite green.
+
+Two findings are recorded and NOT fixed here, both outside this change's
+surface and neither reachable from a shipped path: `Store.Promote` re-adds a
+cold copy of a group compaction merged away (19 of 40 row shapes visible twice,
+serial and deterministic), and `Promote` overwrites the file of a reissued id.
+`Demote`/`Promote`/`ColdStore` have no non-test callers.
+
+## A budget in the middleware is not a budget on the machine
+
+The storage budget shipped with a check in the HTTP middleware and the argument
+that a single shared check beats one per handler -- "a check written into each
+is a check that will be missing from the seventh". A background review found
+the seventh. The native syslog listeners take bytes off a socket with no
+middleware anywhere near them: with the filesystem past the reject reserve and
+every HTTP insert answering 507, one RFC 5424 frame over TCP and one datagram
+over UDP each landed a row and the rejection counters stayed at zero. The
+argument was right and was applied to one transport.
+
+The same commit's `QuotaState` returned at the `statfs` error before it reached
+`MaxTenantBytes`, so an unmeasurable filesystem disabled BOTH budgets. Measured
+on a hook returning an error: 1776 bytes stored against `MaxTenantBytes: 1`
+gave `OverQuota=false`, `Err=nil`, `CheckWrite()=nil`. `quota_windows.go`
+always returns that error, so every platform it covered enforced nothing -- and
+that file's own comment, `QuotaState`'s comment, and `docs/lld/api.md` all said
+the tenant quota still applied there. Three statements of a claim, one code
+path, no test.
+
+**The cap is advisory at rate.** With `MaxTenantBytes` at 64 KiB, one client
+over HTTP pushed **119-125 MB (1816x-1916x the cap)** before the first 507. The
+store's own size is sampled at most once per 10 s and the free-space sample
+once per 2 s; between samples the cap is a number nothing reads. That is the
+same deliberate staleness the reserve is named for, applied to a budget that is
+not expressed as a reserve. Also measured: a store with zero groups is under
+any positive cap, so the first write is always accepted whatever its size
+(349,669 bytes against a cap of 1024). Recorded, not fixed -- shortening the
+interval puts a locked directory walk on the write path, which is what the
+cache exists to avoid.
+
+**Smaller ones from the same review.** `storagePressure`'s `case st.OverQuota`
+arm was dead: `QuotaState` sets `Err` whenever it sets `OverQuota`, so the
+`Err != nil` arm always won and "N bytes used, at its quota" could never print
+-- deleting the arm left every test green. `diskUsageFn` was a plain global
+read on the write path and written by `SetDiskUsageForTest`; `-race` reported
+it three ways against the SHIPPED tests, whose `defer restore()` runs with an
+httptest server still serving. `quota_unix.go` was tagged `!windows` against a
+syscall that does not exist on illumos, so `GOOS=illumos go build ./...`
+succeeded at the parent commit and failed at this one. A tenant whose store
+could not be opened answered 400 with the server's absolute path in the body --
+a permanent-looking code for a transient storage condition, which an agent
+responds to by dropping the batch. And the LLD's new prose was inserted inside
+the flags table, so twelve rows rendered as literal pipe text; the same
+paragraph said "six HTTP write entry points reaching four functions" where the
+mux registers fourteen routes reaching eight handlers. No docs gate covers that
+file, so nothing caught either.
+
+## The fix for a one-side-only shape reintroduced it, three times
+
+The previous entry's fixes were reviewed adversarially. Four of them were
+right; five created new defects, and each new defect is the SAME shape as the
+one it fixed.
+
+**Readiness counted findings, not tenants.** `storagePressure` had a `switch`
+whose `OverQuota` arm was unreachable, so a store over its quota AND below the
+reserve reported only the disk. Splitting it into three independent `if`s fixed
+that. Its only caller prints `len(pressure)` as "N tenant(s) under storage
+pressure", so one tenant tripping all three budgets became **"3 tenant(s)"** --
+the operator-facing number the change set out to improve, now wrong by 3x. One
+line per tenant, causes joined, is the answer; both halves of the original bug
+were invisible because nothing asserted either number.
+
+**The syslog refusal was counted in three wrong places.** `syslogAdmits` called
+`countRows(0, 1, n)` on the argument that a refused message is data that did
+not land and has to show up somewhere. It showed up as `vl_bytes_ingested_total
++n` for bytes never ingested, `vl_rows_dropped_total +1` ("rejected as
+malformed") for a well-formed message, and `vl_http_errors_total +1` for a UDP
+datagram. Measured, one refused TCP frame: `+68` bytes ingested, `+1` malformed.
+The HTTP path counts none of those for the identical event -- so the transport
+parity the fix existed to create was broken by the fix, in the metrics instead
+of the writes. `NoteRejectedWrite` was already on the line above and is the
+counter for this.
+
+**The status classification was backwards in both directions.** `isStorageErr`
+mapped `EACCES`, `EPERM` and `EROFS` to 507 -- a data directory the process may
+never write to, or a read-only mount, told to retry forever -- and left
+`EMFILE`, `ENFILE`, `ENOMEM`, `EAGAIN`, `EBUSY`, `EINTR` and `ESTALE` at 400,
+which is the set by which a per-tenant store open actually fails under load and
+the code on which an agent drops the batch. The defect being fixed was "a
+transient condition reported as permanent"; the fix reported permanent ones as
+transient and left the realistic transient ones alone. The new test enshrined
+it: `chmod 0555` is permanent, and it asserted 507.
+
+**A copied build tag is a claim that has never been compiled.**
+`quota_unix.go` moved from `!windows` to `internal/api/diskfree_unix.go`'s
+platform list, which was itself wrong: netbsd has no `syscall.Statfs` and
+openbsd spells the fields `F_bsize`/`F_blocks`/`F_bavail`. Two files then
+carried the broken list. Corrected to `linux || darwin || freebsd ||
+dragonfly`, both platforms build for the first time -- and `lock_unix.go`, the
+file with the same `!windows` shape two doors down, was split behind a
+`flock`-narrow tag, which is what solaris was failing on. Nothing gates any of
+this: CI's cross job is `GOOS=linux` with five GOARCHes.
+
+**A failing `statfs` was never cached.** `cachedUsage` returned at the error
+without stamping, so an unmeasurable filesystem was re-measured on every write
+rather than every two seconds -- the syscall storm the cache exists to prevent,
+reached through the one condition that makes the syscall slow.
+
+**Claims in the previous entry that do not hold.** "Twelve rows rendered as
+literal pipe text" is **fourteen**. "Three statements of a claim" is **two** --
+`QuotaState`'s comment never mentioned the tenant cap. "`-race` reported it
+three ways against the shipped tests" does not reproduce at the parent commit:
+`-race -count=2` and `-count=4` on `./internal/api/` report zero races, and the
+new race test only trips at `-count=50`, so it is a window rather than a guard
+at CI's `-count=1`. "1776 bytes stored" is 1053 on the same code. The
+`MaxTenantBytes` overshoot was measured again at **705,385,424 bytes accepted
+on the wire against a 64 KiB cap (10,763x)** in 10 s -- the 119-125 MB figure
+was the on-disk size, not what the server accepted.
+
+**The shape.** Every one of these is the same failure as the bug it replaced,
+committed while writing the fix for it: a count nobody counts, a claim nobody
+compiles, a parity fixed on one side, a classification asserted in the
+direction that was already believed. The review that found them is the only
+reason any of them is in this file rather than in production.
+
+## Two reviews of the same three commits, and the shape they share
+
+Reviewer A took 6.2/6.3 and reviewer B refused sign-off on the storage-budget
+fixes. Between them: one reproduced memory-unsafety, one regression that made a
+failure worse than the thing it replaced, one whole feature that nothing ever
+configured, and four claims in shipped source that are false.
+
+**`wg.Wait()` was a statement, not a defer.** Its own comment says *"not
+tidiness: the snapshot is unmapped when ScanEach returns, and a producer still
+reading a group's blob after that is a use-after-unmap"* — and it was skipped
+on the one return path that does not reach it, a panic or `runtime.Goexit` out
+of the sink, while `defer sn.Close()` still ran. Reproduced at 64 groups ×
+4000 rows: **SIGSEGV 5/5 runs** in `lz4BlockDecodeAVX512`, and 2/3 via
+`t.Fatalf` inside a sink. Deleting the line entirely left the whole suite
+green, so the invariant the comment describes had **zero** coverage. One
+keyword.
+
+**Streaming made the byte budget worse than materializing.** `emitter.bytes`
+accumulated across groups while the walk held one. A scan holding 8,156 B at a
+time was refused by a 32,624 B ceiling; over HTTP, where the same counter is
+`-search.maxQueryBytes`, a 6.6 MB answer got **200, 4.5 MB and `unexpected
+EOF`** where the materialized path returned a clean 413 with nothing on the
+wire. `engine.go` had predicted it in a comment — *"when a streaming sink lands
+this has to become the live figure rather than the running one"* — and the sink
+landed without it.
+
+**Half of `Admission` was never configured.** `NewAdmission` was called with
+`MaxPerTenant` and `Wait`, never `MaxConcurrent`, so the global channel was
+always nil: `Stats` reported `len(nil chan)` = 0 in flight however many queries
+were admitted, `-query-queue-wait` was read only on the branch that returned at
+`global == nil` (a refusal in **7.1 µs** with the wait set to an hour), and
+`ErrQueueTimeout` could not be produced by the server at all. The
+documentation described a path with no flag behind it. This is the repo's own
+named failure — "a limit that is configuration nothing reads" — shipped in the
+commit whose subject was governing limits.
+
+**Four false claims in source, not just in commit messages.**
+*"The other order deadlocks"*: `acquireKey` never blocked, so the deadlock
+described could not occur, and swapping the order left the suite green.
+*"lock_unix.go handles exactly this errno"* about EAGAIN: `lockDir` wraps it
+into `storage.ErrLocked` and **drops** the errno, so the one case the errno
+list was written for was the one it did not catch — `ErrLocked` answered 400,
+the code an agent drops the batch on. *"the literal boxed six syscall.Errno
+values to the heap on every call"*: measured **0.00 allocs/op** both ways, with
+no `runtime.newobject` site in either disassembly — the constants are below 256
+so the conversions resolve through `runtime.staticuint64s`. *"the server's
+absolute path in the body"* written in the past tense while the body still
+carried it: only the status code had changed.
+
+**Caching a statfs failure opened a two-second hole in the reject reserve.**
+`s.usage.Store(nil)` discarded the last good sample, and `QuotaState` treats an
+unmeasurable filesystem as "do not refuse writes" — so one failed statfs turned
+the reserve off for the whole interval on a full disk. Measured **2.0 s against
+0 s** before the caching. Keeping the last reading gets the syscall fix without
+the hole.
+
+**Smaller, all measured:** an aborted stream was counted as a successful
+streamed select and as no error (`panic(http.ErrAbortHandler)` bypasses the
+`sw.code >= 400` accounting); three of five new metrics were absent from a
+default server while two documents listed them unconditionally; a cancelled
+client was counted as a rejection; live tails were exempt from admission on a
+clause justified by the argument for exempting *writes*, which is the opposite
+of true for the longest-lived read there is; the `if workers > len(groups)`
+clamp was dead at all four sites; and `MaxQueriesPerTenant`, `QueryQueueWait`
+and `MaxScanWorkers` were absent from `config.fields()` — whose own doc says
+*"so a new limit cannot be added to the struct and forgotten by both"* — so
+`-5` passed `Normalize()` for all three.
+
+**The shape.** Every one of these is a claim that was written and never
+executed: a comment that describes a guarantee the code does not make, a
+config field nothing reads, a count nobody counts, a platform tag nobody
+compiles. The tests were green throughout. What found them was two independent
+adversaries running mutations — and the single most useful signal in both
+reports is the revert-probe list, because a guard you can delete with the suite
+still green is a guard that was never doing anything.
+
+## 38. A test fixture that agreed with the defect, and column order decided by a map seed
+
+Task 8.5 split LogsQL execution between shards and coordinator. Two things
+turned up that were not the planner, and both were found by measurement rather
+than by reading.
+
+**The differential test passed one case for the wrong reason.** The fixture
+built 30 rows, assigned `level` as `i%3`, and sent row `i` to shard `i%3`. Both
+moduli are 3, so each level lived entirely on one shard — and a router that
+aggregated per shard and concatenated therefore produced *exactly* the right
+answer for `| stats by (level) count()`: three rows, ten each. The subtest was
+green with the planner disabled. Changing the level to `(i/3+i)%3` puts all
+three levels on all three shards and keeps ten rows per level; the same subtest
+then reports **9 rows where a single node reports 3**. With the planner
+disabled, **10 of 15 pipe shapes fail; before the fixture fix, 9 did**.
+
+A group-by key that is a function of the shard index cannot test a cross-shard
+merge. The fixture has to disagree with the defect, and this one agreed with it.
+
+**A group's column order was Go's map iteration order.** `Writer.addVec`
+registered a new column the first time it saw the name, iterating the record's
+`map[string]string`. Go randomises that per process, so:
+
+- two storage nodes given identical records built groups whose columns were in
+  different orders;
+- the same row read back from two shards came out with its fields permuted, and
+  a client reading NDJSON from a router saw the shape change by shard;
+- a group's bytes were not reproducible for identical input.
+
+Measured directly: eight identical queries in one process returned a byte-identical
+first row, and three separate `go test` processes over the same input returned
+`{"_time","n","_msg","level","user"}` once and `{"_time","_msg","level","user","n"}`
+twice. Stable within a process, a coin flip across processes — which is why no
+test had ever seen it.
+
+Fixed by registering only the names that are NEW, sorted, so column order is a
+function of the data. Sorting the whole list per record would cost more and give
+a worse order (a field first seen in record 900 ahead of one from record 1), so
+the sort is per record and the order between records stays first-seen.
+`BenchmarkAddSteadyState`: **0 allocs/op, 287–308 ns/op over three runs** — the
+scratch slice is reused, and a row that introduces no column sorts nothing.
+
+**The shape.** Both are the same failure as entry 37's, one level down: a
+property nobody executed. The fixture asserted an equality that held for a
+reason unrelated to the code under test, and the column order was never compared
+across two processes because a test only ever runs in one.
+
+**Reference correction (2026-08-27).** The `entry 37` references in entries
+38-40 name the unnumbered review note immediately before entry 38, not the
+numbered point-read entry 37. That note contains both the "claim that was
+written and never executed" shape and the "two-second hole" measurement. The
+original references remain above and below as part of the historical record.
+
+## 39. Counting the handlers that federate cannot find the ones nobody wrote
+
+Task 8.6 asked for every router surface to be complete or explicitly refused.
+The obvious way to audit that is to count `len(s.backends) > 0` branches: 13 of
+42 routes have one. That number is useless. It lists the handlers somebody
+remembered to federate, which is the complement of what the audit is looking
+for.
+
+The test that works sends the same request to a router and to a storage node
+that HAS the data, and fails when the storage node answers with something and
+the router answers with nothing. It found three routes reading the router's own
+empty store:
+
+| Route | Storage node | Router |
+|---|---|---|
+| `/select/logsql/facets` | 30 faceted values | `{"facets":[]}` |
+| `/select/logsql/stats_query` | `{"result":[{"value":[…,"30"]}]}` | `{"count":0}` |
+| `/select/sql` | the matching rows | empty body |
+
+The `stats_query` one is the sharpest: `federatedStatsQuery` decoded a
+`{"count":N}` field, and no backend has ever emitted it — the handler answers
+the Prometheus instant-vector envelope. So the router answered **`{"count":0}`
+for every query against every cluster**, whatever the shards held. A confident
+zero, in the response shape a client is least likely to question.
+
+**Two more surfaces were worse than empty.** `/select/logsql/tail` tailed the
+router's empty store and streamed **forever** without yielding a row — the first
+run of this test took 240 s and reported nothing at all, because an unbounded
+client on a streaming endpoint hangs the package until `go test -timeout` kills
+it. `/select/vector` returned no neighbours. Both now answer 501 with the
+reason.
+
+**Two fixtures were skipping, and a skip reads as covered.** The hits request
+used the default time window, which does not cover the corpus, so the storage
+node answered empty too and the comparison was between two empty answers. The
+`stream_field_*` endpoints ran against a node with no stream fields configured,
+same result. Neither subtest could have failed. After fixing both, every read
+subtest bites.
+
+**One claim in the test itself was never executed:** the read test skipped
+writes with a comment naming `TestARouterStoresNothingItself`, which did not
+exist. It does now, per route — all 13 — under the name
+`TestARouterForwardsWritesAndStoresNothing` (name correction, 2026-08-15: this
+entry gave the intended name, not the one that landed) — because each ingest
+handler decides for
+itself whether to forward, and "kept nothing" is observed by removing the
+backends and asking the same process again rather than by reading its store.
+
+**The shape.** Entry 37 called this "a claim that was written and never
+executed". This is the audit-level version: a metric that counts the wrong
+population. If the question is "what did we forget", no count of what we
+remembered can answer it — only a comparison against something that knows the
+right answer.
+
+## 40. A peer's 4xx was success, and a quota that measured a store's size from before the writes
+
+Task 8.7 built anti-entropy between replicas. Three defects turned up, none of
+them in the anti-entropy design; all three were found by a test failing rather
+than by reading the code.
+
+**A peer's 4xx was merged as an answer.** `clusterClient.do` classified 401/403
+(unauthorized), 429/503 (overloaded) and 5xx (unavailable), and let every other
+4xx fall through as success — so the peer's error body became part of the merged
+result. The repair pass made it visible: the adopt POST was arriving without its
+`?digest=`, the destination refused it with 400, and the router reported the
+group as **copied**. Two rounds of "copied 2, still 1 row" before the cause was
+the classification rather than the copy.
+
+The missing query string was its own bug: `do` appended `r.URL.RawQuery` only
+for GET, which is fine for a read fan-out and wrong for anything that addresses
+a resource in the query and sends it in the body.
+
+**The tenant quota measured every write against a size from before them.**
+`DiskBytes()` caches for ten seconds so the check stays cheap on the write path.
+Cached alone, it made the check wrong there. Measured directly:
+
+| MaxTenantBytes | write 1 | write 2 | write 3 | write 4 |
+|---|---|---|---|---|
+| 1 (before) | 200 | 200 | 200 | 200 |
+| 1 (after) | 200 | **507** | **507** | **507** |
+
+The first 200 is correct — the store really was empty when it was checked, and a
+bound smaller than one group cannot be enforced before the group exists. The
+next three were the cache. The fix updates the cached size at the append, which
+knows exactly how many bytes it committed, so the check stays cheap and becomes
+correct for growth; shrink is left to the interval refresh, because a size
+briefly too high refuses writes for a moment and a size briefly too low accepts
+writes that should have been refused.
+
+This is entry 37's "two-second reserve hole" again, five times longer and on the
+other threshold.
+
+**The LIFO cleanup deadlock, a second time.** A stalled-peer test registered
+`close(block)` before `httptest.Close`. Cleanups run last-registered-first, and
+Close waits for in-flight handlers — so Close ran first and waited forever on a
+handler nothing would release. The package ran to its 450-second `-timeout` and
+reported nothing about the code. The unblock must be registered LAST so it runs
+FIRST, and the comment above it now says why, since the correct order reads
+backwards.
+
+The same run showed the stalled-peer bound is real: with a client patient enough
+to outlast it, the router answers in **10.01 s**, which is
+`ResponseHeaderTimeout`. The first version of the test used an 8-second client
+and concluded the router never answered — measuring its own impatience.
+
+**Two gates caught what nothing else would have.** The route-contract test and
+the surface-classification test both failed on each newly added route until it
+was classified and given a contract. That is the pair working exactly as
+written: three anti-entropy routes and a cluster-backup route could not be
+merged while invisible to either.
+
+**The shape.** The peer-4xx one is the sharpest: a classification that handles
+the interesting cases and lets the rest fall through to the success path. Every
+status nobody thought about became "fine", and the failure only surfaced when
+something downstream depended on the operation having actually happened.
+
+## 41. A position field filled with a constant, and a 400 whose rows arrived later
+
+Task 9.1 added 22 fuzz targets. Four of them failed on their seed corpus before
+any generated input ran, which is the useful kind of failure: the seeds are
+hand-written normal cases.
+
+**`Result.RejectedAt` was populated by half the ingest envelopes.** There is a
+`Result.Reject(ordinal)` helper that records the position and sets
+`RejectedTruncated` past the bound; logfmt, journald, Loki, Datadog and the OTLP
+protobuf path all bypassed it with a bare `res.Rejected++`. So a result reported
+`Rejected: 1` with no position and `RejectedTruncated: false`, and the field's
+own documentation says a caller must read that as "there were no more
+positions", not "the positions are unknown.
+
+**Five `res.Warn(0, ...)` calls passed a constant where an offset was meant**, so
+every warning from those envelopes blamed byte 0. Datadog's was in the same
+`if` as its missing rejection position.
+
+Fixing this needed the two fields kept apart, and the first attempt got it
+wrong: `RejectedAt` is a **record ordinal**, `Warning.Offset` is a **byte
+offset**. Journald's three warnings already passed real byte offsets and were
+correct; converting them to ordinals — which is what "make the units consistent"
+suggests — would have replaced right with wrong. The units differ because the
+questions differ, and the fix is per site.
+
+**A 400 whose rows arrived under someone else's request.** The journald parser
+keeps entries that parsed before a truncation, deliberately, with tests that say
+so. But `ingestBody` returned on a parse error **without flushing**, and the
+rows sit in the tenant's shared writer buffer. Measured:
+
+| Step | Response | Rows in store |
+|---|---|---|
+| journald upload, 2 entries then a cut field | 400 | 0 |
+| one unrelated jsonline write | 200 | **3** |
+
+The client was told 400 and its two records were committed moments later, by a
+request that had nothing to do with them. The 400 also said nothing about them,
+so re-sending the upload — the only thing a client can do with a bare 400 —
+duplicates exactly the part that landed, and a log store cannot tell a duplicate
+from a line that happened twice. Now the error path flushes under its own mark
+and the body carries `accepted`, `rejected` and `rejectedAt`.
+
+**CI asserted a platform that cannot compile.** `ci.yml`'s cross matrix listed
+`386`. `GOARCH=386 go build ./...` fails at `github.com/sebishogun/simdjson`,
+whose `marshal.go` writes `math.MaxUint32` as an untyped constant that overflows
+a 32-bit int. That job has never been able to pass. 386 removed from both
+workflows with the reason recorded; the upstream fix is task #424.
+
+**Three of the fuzz failures were the harness, not the code**, and saying so
+matters as much as the real findings: a `From > To` window is the empty range
+the query asked for and the scan returns zero rows (checked, not assumed); a
+cursor spliced into a URL unescaped made the *client* refuse a control
+character; and creating an `httptest` server per fuzz iteration exhausted the
+ephemeral port range across 32 workers. A fuzz target that fails for its own
+reasons is worse than none, because the next person reads it as a defect.
+
+**The shape.** Entry 40's peer-4xx was a classification that let unhandled cases
+fall through to success. This is the same thing in a data field: a position
+nobody filled in, defaulting to a value that means something specific and wrong.
+
+## 42. A soak that reported 172,037 writes while every request was refused
+
+Task 9.2's soak found four defects, all of them in the soak.
+
+**The load generator counted refusals as successes.** `post` treated any status
+below 500 as fine. Every request was coming back 400 — `AccountID` must be
+numeric and the generator was sending `t0` — so the first run reported:
+
+    writes=172037 reads=57887 churns=45741 backups=13 restarts=3 failures=0
+    baseline  goroutines=40 mappings=155 rss=33MB files=2 disk=0MB
+    final     goroutines=10 mappings=155 rss=35MB files=2 disk=0MB
+
+Flat, clean, and entirely meaningless. `files=2` was the only thing on the page
+that said so: 172,037 writes and two files on disk.
+
+**The bounds could only pass if nothing happened.** They compared raw numbers
+against a warm-up baseline, so the first run with real load failed every one of
+them — mappings 1060 to 6585 against a bound of 2184 — while the store had gone
+from 1028 group files to 7602. That is the system working: a store holding more
+data maps more groups. An absolute bound on a quantity that grows with the data
+passes exactly when the test is broken, which is what had just happened.
+
+Rewritten as ratios: mappings per 100 groups, KB resident per MB stored,
+manifest bytes per group. Goroutines stay absolute, because they are the one
+measurement here that does not grow with the data.
+
+**Two of the four rewritten bounds were then skipped in silence.** The manifest
+was measured in kilobytes and every manifest was under one, so it read as 0 on
+every sample; and the mapping bound was a difference (`mappings - files`) that
+went negative, because not every file is mapped. Both returned 0, both were
+skipped by the `from == 0` guard, and the run printed PASS. A skipped bound
+reads as a passing bound, so the summary now names every bound it could not
+measure. In bytes, against group files only, the manifest bound reads **36 bytes
+per group at both ends of a 45-second run** — flat, which is what it should be.
+
+**Unbounded tenant churn.** A fresh tenant id from a 2^20 space every iteration
+created 92,589 tenants, 92,601 files and 92,798 mappings in twenty seconds. That
+is not a leak test. Tenants have to RECUR for eviction and reopen to happen at
+all, so churn now walks a ring of 64.
+
+**The shape.** Every one of these is the same failure as the fixture in entry 38
+and the vacuous subtests in entry 39: a test that cannot fail. What is new here
+is that three of them were passing *loudly* — printing six-figure counters and a
+clean resource table — which is more convincing than silence and exactly as
+empty.
+
+## 43. A merge that skipped the shard it could not read, and a graph drawn out of order
+
+**The claim under test.** `fanOutChecked` refuses a cluster read when a shard
+did not answer or answered from an incomplete store — the completeness rule
+that entry 30 exists for. So a clustered read is either complete, or refused,
+or explicitly 206 with the missing shards named.
+
+**What the code did.** Eight merges unmarshalled each shard's body and, on
+failure, `continue`d. A shard that answered **200 with a complete envelope and
+an unreadable body** was therefore dropped, and the read returned the other
+shards' rows with HTTP 200 and no marker anywhere. The completeness rule cannot
+see that case: as far as the fan-out is concerned, the shard answered fine. The
+rule was one layer above the only layer that knew.
+
+The reason the two were ever confusable is that `bodiesOf` returned a
+`[][]byte` indexed by shard with `nil` for any shard that did not answer — and
+`nil` is exactly what `json.Unmarshal` fails on. "Absent, and the caller opted
+into a partial answer" and "present but unreadable" arrived at the merge as the
+same value. Absent shards are now absent from the slice (`shardAnswer` carries
+the shard number so a refusal can name the node), and anything in the slice is
+an answer that has to parse.
+
+**The second defect, in the same function.** `/select/logsql/hits` merged its
+buckets into a `map[string]int` keyed by the shard's RFC3339Nano text and
+emitted them `sort.Strings`-ordered. RFC3339Nano drops trailing zeros in the
+fractional second, so the format is not fixed-width, and `'.'` (0x2E) sorts
+before `'Z'` (0x5A):
+
+    "2026-01-01T00:00:00.5Z"  <  "2026-01-01T00:00:00Z"     // lexicographic
+     2026-01-01T00:00:00.5     >   2026-01-01T00:00:00      // actual
+
+`step` is a `time.Duration` off the query string, so `step=500ms` produces
+exactly that mix — whole-second buckets with no fraction interleaved with half
+seconds that have one. The two arrays are indexed together by the client, so
+the points were plotted in the wrong order. Buckets are now keyed by
+nanoseconds and formatted only on the way out.
+
+Two more shapes in the same merge were being absorbed rather than reported: a
+series whose `timestamps` and `values` arrays are different lengths (the old
+code truncated to the shorter one, dropping a bucket's count), and a bucket
+timestamp that will not parse (unorderable against the other shards'). Both are
+now refused.
+
+**Also here.** `federatedEndpoints`, the table driving the one-shard-down and
+all-shards-down suite, was hand-kept and had drifted to nine of the fourteen
+federated reads — while `docs/lld/cluster.md` said "all nine federated
+endpoints are covered". Both statements were true of the *table* and neither
+was true of the *router*. The set is now derived from `surfaceRoutes()`, which
+the mux-count test already ties to the real mux, and the gate fails in both
+directions.
+
+**The shape.** Entry 42 was tests that cannot fail. This is the same thing one
+level up: a *rule* that cannot fire, because the layer that enforces it cannot
+observe the case it is meant to catch. A completeness check above the merge is
+not a completeness check — it is a check on the transport.
+
+## 44. 147 allocations to decode one row, and the differential that found the bug in the replacement
+
+**Measured, `internal/api`, ten-field NDJSON row (Zen 5, load average 26 — the
+timing is indicative, the allocation counts are exact and layout-independent):**
+
+| implementation | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| `encoding/json` Decoder | 4881–5277 | 4448 | 147 |
+| byte scanner | 383–450 | 576 | 2 |
+
+`jsonLineToRow` is the coordinator's per-row cost for any clustered query with
+a coordinator half: a `json.Decoder` over a `bytes.Reader` per row, its
+512-byte read buffer, and an `any` box plus a string per token. The replacement
+scans the line directly and allocates twice — one byte buffer that every key
+and value aliases via `unsafe.String`, and one `Field` slice sized from a count
+taken over the line rather than guessed.
+
+**What the differential caught.** The scanner was tested against the Decoder as
+the specification, the way `internal/ref` is used in the sibling repositories,
+and the first run failed on *every ordinary row*: the `_time` lift `continue`d
+without recording that a pair had been consumed, so the separator check used
+`len(row.Fields) > 0` — which is still 0 after a lifted `_time` — and the comma
+before the second key was read as the start of a key. Every row whose first
+field is `_time`, which is every row a storage node emits, fell back to
+`rawRow`. A hand-written test over a few lines would very likely have used a
+row starting with `_msg`.
+
+The fuzz differential then found two more in 28M executions: invalid UTF-8 in a
+string, which `encoding/json` coerces to U+FFFD and the scanner was copying
+raw; and `{"":{0}}`, where the brace-balancing composite scanner accepted a
+nested value that is not JSON.
+
+**Three places the Decoder was looser, which the scanner deliberately is not.**
+A truncated object returned the fields read so far (`{` alone was an empty
+row); trailing bytes were ignored (`{"a":1} garbage` and `{"a":1}{"b":2}` both
+decoded to the first object); and a nested value was flattened by the token
+stream, so `{"a":{"b":1}}` became a field `a` with value `"{"` followed by a
+field `b` — a row that exists nowhere. The contract is now two-sided and
+pinned: a valid JSON object decodes to exactly what the Decoder produced, and
+anything else is the whole line as `_msg`.
+
+## 45. Eight wrong answers a second reviewer reproduced against a live cluster
+
+Reviewer B ran a router over two storage nodes and a single node holding the
+same rows, and asked both the same questions. Every finding below came back
+HTTP 200 and looked like a smaller right answer.
+
+**`min()` and `max()` were SUMMED.** `mergeableAggs` has always listed
+`AggMin` and `AggMax`, and the comment above it says "Additive **or extremal**
+only" -- but all three federated stats merges added unconditionally. Only the
+additive half was ever implemented.
+
+| query, n = 100..111 split 100-105 / 106-111 | single node | router |
+|---|---|---|
+| `* \| stats min(n) m` | 100 | **206** |
+| `* \| stats max(n) m` | 111 | **216** |
+| `* \| stats count() c` (control) | 12 | 12 |
+
+206 is not a plausible wrong answer, it is an impossible one: no row has
+n = 206. And `/select/logsql/query | stats min(n)` answered 100 correctly on
+the same binary, which is the one-aggregate-two-answers inconsistency
+`rejectNonMergeableStats` exists to eliminate. Fixed with `MergeOps`, which
+reads the operator per output name from the query's stats pipe; a series a
+shard names that the pipe does not is refused rather than assigned one.
+
+**`stats_query&by=` answered `{"stats":[]}` for every query with a stats
+pipe.** A storage node emits that shape *only* in its error fallback -- when
+`StatsQueryInstant` fails, which it does exactly when there is no stats pipe --
+and the router switched on `by=` alone. The Prometheus vector envelope
+unmarshals cleanly into `struct{ Stats []vc }` with a nil slice, so
+`mergeDecode` cannot see it. A dashboard panel grouped by a label drew nothing.
+The router now switches on `HasStatsPipe`, which is what actually decides the
+shape.
+
+**A backup was well-formed and short with a replica down.** `completeReplica`
+builds its union from *reachable* replicas only, so an unreachable replica's
+groups can never make the chosen source look incomplete, and the only check was
+`reachable == 0`. One shard, two replicas, one row written only to replica 2:
+
+    both up        HTTP 200  groups:3 rows:3
+    replica 2 down HTTP 200  groups:2 rows:2
+
+The second is a valid tar that passes `ValidateClusterBackup`. `repairCluster`
+marks a shard incomplete on exactly this condition; the backup path did not.
+Now refused, and `ShardBackup.ReplicasConsulted` records what was asked.
+
+**One malformed unrelated parameter changed the answer.** `withoutLimits`
+returned the request unchanged when `url.ParseQuery` failed, so `&x=%zz`
+forwarded the caller's `limit` to every shard and the cluster's top-N became a
+merge of shard-local top-Ns. The value that was #1 cluster-wide (6 hits) and
+#11 on each shard vanished from a 200 response.
+
+**`limit` meant two different things on facets, and "without limits" meant "at
+the default".** On a node it truncates values within a field; at the
+coordinator it truncated *fields*, so `?limit=2` gave five fields of top-2
+values on one node and two fields of everything on a cluster. And facets reads
+`intParam(r, "limit", DefaultFacetLimit)`, so DELETING the parameter means 10,
+not unlimited -- `withoutLimits` bought nothing there and the merge still summed
+shard-local top-10s. Both fixed; the shards are now sent `limit=0` explicitly.
+
+**The federated ES `_search` accepted what a single node rejects.** It decoded
+into `want` and discarded the error (`_ = dec0.Decode(&want)`), so
+`{"from":-1,"size":3}` -- a 400 on one node -- came back 200 with the WRONG
+DOCUMENTS: `need = from+size = 2` made each shard return two hits, rows 2-5
+were never fetched, and `"total":12` said they existed.
+
+**The primary read path took a shard's garbage as data.** `mergeDecode` covers
+the eight envelope merges; `/select/logsql/query` and `/select/sql` go through
+`mergeRows`, which had nothing. A proxy's HTML error page in a 200 body came
+back to the caller as a log line.
+
+**A hits bucket outside 1677-09-21 .. 2262-04-11 wrapped.** `time.Parse`
+accepts any year and `UnixNano` is undefined outside that range:
+`2600-01-01T00:00:00Z` became `2015-06-13T00:25:26.290448384Z`, and its count
+was filed on -- and summed into -- a real 2015 bucket. The refusal added one
+commit earlier caught only a parse failure, which is not this.
+
+**Two more, found by tracing rather than reproduction.** A repair counted a
+group as copied when the destination answered `{"adopted":false}` (it already
+had it), so a pass could report `copied: N, complete: true` having moved
+nothing. And `askReplicaState` treated any body that *parses* as a state, so
+`null` or `{}` from a same-version peer read as an empty replica -- which
+`ReplicaState.Err`'s own doc says must never happen, because it makes repair
+copy the whole shard into a node that already holds it.
+
+**The shape.** Entry 43 was a rule enforced above the layer that can see the
+case. These are the same thing generalised: `mergeableAggs` said extremal
+aggregates were mergeable and no merge implemented extremal; `withoutLimits`
+documented a guarantee its error path abandoned; `ReplicaState.Err` documented
+a distinction its guard did not draw. In each one the correct behaviour was
+WRITTEN DOWN, in the same file, and the code did something else -- which is
+why reading did not find them and asking the cluster did.
+
+## 46. Round three: two of the fixes were the defect, and a gate its own reviewer bypassed on the first try
+
+Three reviewers went over the round-two commits. Two ran live two-shard
+clusters against a single node holding the same rows; one had reading only and
+said so. Between them they found that **two of the fixes had introduced the
+thing they were fixing**, and that one new guard was bypassable in one line.
+
+**The facets fix made every cluster answer carry fields a node drops.** The
+shards are sent `keep_const_fields=1` so a field constant on ONE shard survives
+to be judged over the union — sound, and the coordinator then applied only the
+cardinality half of `facetKeep` and never `distinct > 1 || keepConst`.
+Measured, two nodes of six rows against one node of twelve, `?query=*`:
+
+    cluster  _msg _stream _stream_id _time konst level n svc   8 fields
+    single   _msg                    _time       level n svc   4 fields
+
+`_stream_id` is a 48-hex-character value. Every field constant over the queried
+window — `_stream` and `_stream_id` whenever the filter selects one stream,
+`host` on a single-host cluster, the field just filtered on — appeared in a
+cluster facet list and not a node's, and facets drives the UI.
+
+**The three-replica repair fix made repair stop converging.** `overlapping`
+uses a CLOSED interval deliberately: a group whose `TimeMax` equals the next
+one's `TimeMin` shares a timestamp, and a duplicate row at the boundary is
+still a duplicate. That is right for a compacted group against its pieces and
+wrong for two ordinary pieces of ONE store, which by this file's own invariant
+cannot hold the same rows. Growing `spans` mid-pass made it reachable, and the
+block is recomputed identically every pass, so it never clears:
+
+    source: 72e6653f[t0,t0]  0f0565fe[t1,t2]  b621a270[t2,t3]
+    before  copied 3, blocked 0, complete true   -> destination 6 of 6 rows
+    after   copied 2, blocked 1, complete false  -> destination 3 of 6 rows
+            pass 2: copied 0, blocked 1          PERMANENTLY STUCK
+
+Rows sharing one nanosecond split across a size-triggered flush produce exactly
+that, on any client timestamping at second or millisecond granularity — syslog,
+most of them. Not silent (`complete: false`), but a hard stall on an ordinary
+shape, and the operator is told to investigate a compaction that never
+happened. Fixed by provenance: two groups held by one replica are known
+non-duplicates, so the guard skips them, and the union is walked in TIME order
+so the narrowest spelling wins rather than whichever hash sorted first.
+
+**The `_stream_id` fix turned a duplicate-key bug into a differing-value bug.**
+The skip was put on the field loop, and a shard runs the bare `*` with
+`withStream` true — so the ingested value was dropped AT THE SHARD and never
+crossed the wire, while a node's projection (`withStream` false, nothing
+synthesized) kept it. `| filter _stream_id:="CLIENT-SUPPLIED"` matched on a
+node and could not match on a cluster. The skip belongs on the SYNTHESIS.
+
+**The not-a-state guard was bypassed in one line.**
+`bytes.Contains(body, []byte("\"groups\""))` matches the quoted token anywhere,
+including inside a value: `{"note":"groups"}` passed it and read as an empty
+replica — the exact state `ReplicaState.Err`'s doc says must never be inferred.
+Its reviewer broke it on the first attempt. It unmarshals into
+`map[string]json.RawMessage` and tests for the KEY now.
+
+**And one that was fixed correctly but incompletely.** `release.yml` has FOUR
+checkout steps; three were given the input ref and the one that COMPILES was
+not, so a dry run of `v1.2.3` from `main` still built `main` and stamped it
+`v1.2.3`. Counting is not reviewing.
+
+**Measured, on the byte budget the same round made real.** Two routers over
+the same two shards, 200,000 rows, four coordinator pipes, interleaved eight
+times, minimum of each: 0.4009 s with the budget on, 0.3647 s off — 36.2 ms,
+9.9% of the request, for a bound that genuinely did nothing before (the same
+query at 1 MB answered 200 with 200,000 lines and now answers 413). The
+measurement was two passes per pipe where one suffices, because the post-pipe
+size of pipe k is the pre-pipe size of pipe k+1; carried forward now. And
+`measure` was `MaxBytes > 0` where `exceeded` also checks `maxMemory` against
+the same argument — the engine already has `countsBytes()` for that decision,
+and using anything else is the same limit-nothing-reads shape one layer down.
+
+**The shape.** Entry 45 said the correct behaviour was written down in the same
+file and the code did something else. This is the next turn of that: the FIX
+was written down correctly in its own commit message, and the code did
+something else — three times, in one sitting, by the person who had just
+written the rule. Reading did not find any of it. Two live clusters and an
+adversarial reader did.
+
+## 47. Round four: a fix that was only in the commit message, and an exemption broken by a retried ingest
+
+**A claim with no code.** Entry 46 says the not-a-state guard "unmarshals to
+`map[string]json.RawMessage` and tests the KEY now". It did not. The edit was
+one half of a script whose first assertion failed; only the second half was
+re-run, and the commit message described the whole thing. Three reviewers
+found it independently — two by reading the file, one by running
+`{"note":"groups"}` against a live router and getting `copied=2,
+complete=true` on both binaries.
+
+There is no interesting lesson about the guard. The lesson is that a commit
+message is not evidence, and this one had been read twice by me before it
+shipped.
+
+**The exemption was broken by an ordinary retried ingest.** Entry 46's repair
+fix rests on "two groups held by one replica came from one store and cannot
+contain the same rows". False. Ingesting one time range twice without a write
+id leaves a store holding, at once:
+
+    fccec81c [T0,T0]  rows=1
+    121191e6 [T0,T9]  rows=10      <- the re-ingest
+    9e36b98a [T1,T9]  rows=9
+
+With that replica in the union, `holdersShare` is true for every pair, the
+guard's candidate list empties, and a CLEAN replica is copied onto:
+
+    HEAD    R1=20 R2=10 -> copied 1, blocked 0, complete TRUE  -> R2=20,
+                           10 distinct rows, all ten duplicated
+    BEFORE  R1=20 R2=10 -> copied 0, blocked 1, complete false -> R2=10
+
+Worse than what it replaced in the exact dimension that matters: the stall was
+loud and left data intact; this was silent and destroyed it. Fixed by checking
+the premise instead of assuming it — a replica may certify a pair only if its
+own inventory is internally non-overlapping, verified once per pass, and one
+that fails is reported and still used as a source and destination.
+
+**And the same asymmetry, twice, four lines apart.** `_stream` tested the
+VALUE and `_stream_id` tested PRESENCE, so a row carrying an empty `_stream`
+got the key twice, and — because the store materializes a column for the whole
+group — one client-supplied `_stream_id` anywhere in a flush blanked the field
+for every other row in it. Entry 46 fixed one direction of this and shipped
+the other. Both fields are emitted exactly once now, from the row's value when
+it has one.
+
+**Measured, and a cost that had to be put back.** `looksLikeJSONObject`'s
+brace balancing is correct and costs 19× on 90-byte lines, 232× on 980-byte
+ones, +186.6% instructions and +24.4% wall on a 60,000-row bare select — the
+path whose whole point is not parsing. Truncation can only be at the END of a
+response, so the balance check now runs on the last line of a shard body and
+the O(1) shape check on every line, which is what catches an HTML error page.
+
+`ApplyPipes` measured 9.9% → 6.2% after carrying the size forward: four pipes
+cost five passes rather than eight, and 5/8 = 62.5% against 22.4/36.2 = 61.9%
+measured. The remaining pass is the one that cannot be removed.
+
+`max_values_per_field` was still DELETED rather than overridden, so each shard
+fell back to its default of 1000 — a field with 1200 distinct values per shard
+disappeared from a cluster answer that a single node answered with 2400, at
+HTTP 200. That is the identical defect entry 45 documents for `limit`, left on
+the sibling parameter by the commit that wrote the rule.
+
+**The shape.** Entry 45: the correct behaviour was written down and the code
+did something else. Entry 46: the FIX was written down and the code did
+something else. This one: the fix was written down, the code did nothing at
+all, and the fix that WAS written rested on an invariant a retried ingest
+breaks. Four rounds, and every round's defects were found by running a cluster
+or by an adversary reading with intent — never by the person who wrote them
+reading them again.
+
+## 48. Three ways to decide one thing, each broken by the reviewer who broke the last
+
+Repair must not copy a group whose rows a destination already holds under
+different bytes. The router decides that from `[TimeMin,TimeMax]` alone, and
+two shapes are indistinguishable that way:
+
+    two adjacent flushes        [T0,T1] [T1,T2]   different rows
+    a re-ingest of one instant  [T1,T1] [T1,T1]   the same rows twice
+
+Three variants shipped in one session. Each was broken by the reviewer who had
+broken the previous one, and each break was a live reproduction:
+
+| | duplication | convergence |
+|---|---|---|
+| no self-check (entry 46) | **silent**, a clean replica's every row doubled at `complete: true` | fine |
+| closed self-check (entry 47) | none | **permanent stall** on ordinary adjacency |
+| half-open self-check | **silent**, same as the first | fine |
+
+The half-open attempt is the instructive one. It looked obviously right — a
+shared boundary instant is what a flush produces, a real overlap is what
+duplication produces — and it is wrong because a re-ingest of a SINGLE instant
+produces two groups with identical `[T,T]` spans, which share exactly one
+endpoint and are structurally identical to a legitimate adjacency. I checked
+that against the reviewer's three-group reproduction, found it still caught by
+a different pair, and shipped it. The two-group case defeats it and I had not
+constructed one.
+
+**Sufficiency, settled.** If two groups share a row at time *t* then *t* lies
+in both spans, so the CLOSED test always fires: it is sufficient, and it is not
+necessary. Every failure above is the unnecessary direction.
+
+What ships is the closed test: no duplication, and a permanent stall that is
+reported (`SelfOverlapping`, `complete: false`, an error naming the pair and
+saying what to check). Repair's stated promise is that it never makes a replica
+worse, so a loud stall beats silent duplication — but it is the least bad of
+three, not an answer. The answer needs evidence the router does not have and
+cannot be given by a peer's report: whether the rows AT the overlapping instant
+are the same rows. `AdoptGroup` at the destination parses the group and holds
+the store's index. Task 428.
+
+**A fourth break, in the same pass.** `union[g.Digest] = g` was
+last-writer-wins, so the guard compared a span taken on one peer's word. A peer
+reporting a real digest with a fabricated far-future span made the check miss,
+and a clean replica had every row duplicated — `selfOverlapping: 0`, complete,
+because the fabricated spans were disjoint. The union now keeps the WIDEST span
+any holder reports, which is fail-safe: a lie can only cause more blocking, and
+more blocking is a reported stall.
+
+**Two more measured this round.**
+
+`looksLikeJSONObject` was restricted to a shard body's last line on the
+reasoning that a response is truncated at its end. Both reviewers rejected it
+independently, with the same constructed input: it is a WELL-FORMEDNESS check,
+not a truncation check, and a middle line ending in a nested value's `}` passes
+the cheap check and reaches the client as a row. One of them also showed the
+restriction was defeated by a single trailing newline, since `last` was
+computed on byte position. Truncation is caught a layer above anyway — a cut
+response fails `io.ReadAll` and is classified `PeerUnavailable` — so the
+restriction dropped the only case that could reach the check. Full check on
+every line again, at a measured +188.5% instructions on a 60,000-row bare
+select.
+
+Two attempts to buy that back:
+
+| | narrow (~90 B) | wide (~980 B) |
+|---|---|---|
+| byte at a time | 51,744 ns | 425,872 ns |
+| `bytes.IndexAny` to jump between structural bytes | 171,182 ns | 478,139 ns |
+| shipped: byte at a time, string skip inlined | 53,184 ns | 434,764 ns |
+
+`IndexAny` is **3.9× slower** on the narrow shape — it decodes a rune and scans
+the cutset per byte, which is worse than a five-way switch. Measured, reverted,
+recorded. Inlining `skipStringRaw` into the walk (Go does not inline a function
+containing a loop) closed the remaining 1.26× to within the 8.3% noise floor.
+
+`max_values_per_field=0` meant "unlimited" to `facetKeep` and "1000" to
+`timeFacet` — so the coordinator sending shards `0` to get their whole
+distribution bounded each shard's `_time` scan to 1000 ROWS, not distinct
+values, and `_time` vanished from every cluster facet answer on any tenant with
+more than 1000 matching rows per shard. Fixing the parameter for one field
+exposed the same trap one layer down, in the function that reads the same
+value with the opposite convention.
+
+## 49. The gate that stops the counts going stale ran nowhere but a developer's clone
+
+`TestTheChangelogCommitCountsAreReal` (entry: added with the pinned-sha
+changelog counts) resolves the sha `CHANGELOG.md` names and recomputes every
+count from history. It has a skip branch for a source tarball, which genuinely
+has no `.git`.
+
+Every `actions/checkout@v4` in this repository — ten of them, across `ci.yml`,
+`cross.yml`, `fuzz.yml` and `release.yml` — used the default `fetch-depth: 1`.
+A depth-1 clone cannot resolve a sha that is not its tip, so the gate took the
+tarball branch in **every CI run since it was written**. Proved directly:
+
+```
+$ git clone --depth 1 file:///…/simdlogs shallow
+$ go test -run TestTheChangelogCommitCountsAreReal ./internal/tests/docs/
+    changelog_test.go:42: 7efa127 is not in this repository (shallow clone or tarball)
+--- SKIP
+```
+
+Two changes, and the second matters more.
+
+`fetch-depth: 0` on the seven checkouts whose job runs the suite. That makes
+the gate able to run.
+
+And a shallow checkout now FAILS rather than skips. A tarball has no `.git` and
+legitimately cannot run this; a shallow clone is a CI configuration that could
+have had the history and was not asked for it, which is a misconfiguration
+wearing a skip's clothing. The two are now distinguished by
+`git rev-parse --is-shallow-repository`, and the failure says which flag to
+set.
+
+**The shape.** Every previous entry in this record is a test or a check that
+could not fail. This one could — it simply never ran, and announced that fact
+in a line nobody reads, in the one status (`SKIP`) that looks like success in
+every summary view. A gate that skips is worth less than no gate, because it
+occupies the place where somebody would otherwise notice one is missing.
+
+## 50. Three ways to make the line check faster, all slower than the byte loop
+
+`looksLikeJSONObject` runs on every line of every shard body on the
+bare-select path — the one structural walk a clustered read cannot skip, and
+the path whose whole design is to avoid parsing. It was measured at +188.5%
+instructions against the O(1) shape check it replaced, so the question is
+whether that can be bought back.
+
+**The disassembly first.** `go tool objdump -s 'api\.scanComposite'`: the hot
+loop is `MOVZX 0(AX)(DI*1), DX` with the length compared once at the top — no
+bounds check inside, no spills, the switch compiled to a compare tree, five to
+seven instructions per byte. There is nothing to reclaim in the scalar shape;
+it is already at ~2.1 GB/s, which for a per-byte compare tree is close to what
+the loads cost.
+
+So the question becomes bulk, which is what this family is for. Three
+candidates, measured interleaved in one session, minimum of four runs of 500,
+1000 lines per operation:
+
+| | narrow (~90 B) | wide (~980 B) | B/op |
+|---|---|---|---|
+| **byte loop, string skip inlined (shipped)** | **56,891 ns** | **469,180 ns** | **0** |
+| `bytes.IndexAny` to jump between structural bytes | 171,182 ns | 478,139 ns | 0 |
+| `simd.IndexAllAny` structural index, then walk positions | 77,200 ns | 572,165 ns | 0 |
+| `simdjson.Valid` (whole-line validity) | 176,315 ns | 451,244 ns | 13 |
+
+Every one loses on the narrow shape, which is the common one: 3.0×, 1.36× and
+3.1× respectively. On the wide shape `simdjson.Valid` is 4% faster — inside the
+8.3% floor, so not a difference — and it allocates 13 bytes per line, on a
+per-line path, which the tenets rule out on its own.
+
+**Why the SIMD kernels lose here.** They are not being used wrongly; the work
+is wrong for them. A structural index has to WRITE every structural position to
+memory, and the walk that follows still has to read them back; the byte loop
+writes nothing and branches on a value already in a register. The lines are
+also short — a per-call kernel entry has a floor (this family measured ~1.4 ns
+for a non-inlinable call), and at 90 bytes that floor is a meaningful share of
+the whole check. `simdjson.Valid` does strictly more than is needed: full
+validity where balance-and-terminate is the question.
+
+**What would change the answer.** Amortising the kernel over a whole shard
+BODY rather than a line — one structural index for 60,000 rows, then a walk
+that never re-reads the bytes — is the shape that would win, because it pays
+the entry once and the write once. That is a different function with a
+different interface, and it is not written.
+
+Recorded rather than left as folklore: "we should use the SIMD kernels here" is
+the obvious suggestion for this code, and on this shape, at this granularity,
+it is measurably wrong three ways.
+
+## 51. Five store-aware pipes answering cluster queries from the wrong set
+
+`ApplyPipes` refuses `join`, `union` and `stream_context` at a coordinator,
+with the reasoning that skipping a store-aware pipe "would answer the query as
+if the pipe were not there, which is the silent-wrong-answer shape this whole
+area is about". Five more pipes are store-aware and were not in that list.
+
+On a storage node each is answered by a LEADING fast path over the store's own
+footers and index — `runBlocksCount` and its siblings. `apply` is the fallback
+for the non-leading case, and at a coordinator it is what runs, over the merged
+WIRE rows. Measured against a single node holding the same twelve rows:
+
+| query | node | router |
+|---|---|---|
+| `* \| blocks_count` | `{"blocks_count":"2"}` | `{"blocks_count":"12"}` |
+| `level:error \| blocks_count` | `{"blocks_count":"1"}` | `{"blocks_count":"3"}` |
+| `* \| block_stats` | two block-stat rows | all twelve log rows |
+| `* \| field_names` | 7 names | 8, including `_stream_id` |
+
+`BlocksCountPipe.apply` is `len(rows)` — a ROW count wearing a block count's
+name, and a number a reader has no way to question. `BlockStatsPipe.apply` is
+`return rows`: a silent no-op that answers the query as if the pipe were not
+there, which is the sentence four lines above the refusal it was missing from.
+`field_names` counts `_stream_id`, which the SHARD synthesized on the wire and
+no store holds.
+
+All five refused now, naming the endpoint that does federate — the
+`/select/logsql/` forms of `field_names`, `field_values` and `facets` fan out
+and merge correctly, and have done throughout.
+
+**Why five rounds of review did not find them.** Every round concentrated on
+the functions the previous round's findings named. These sit one call away from
+all of it, behind a type switch that already had the right shape and the wrong
+membership, and the first reviewer to enumerate cluster reads BY PIPE rather
+than by endpoint found all five in one pass. Attention follows the last defect,
+which is exactly where the next one is not.
+
+## 52. Every JSON boolean was stored as "false", and the switch that did it was dead code
+
+`internal/ingest/jsonline.go`, the `simdjson.Bool` case:
+
+```go
+case simdjson.Bool:
+    if val.Int() != 0 { fields[key] = "true" } else { fields[key] = "false" }
+```
+
+`simdjson`'s `Value.Int()` returns 0 for every kind that is not a `Number`
+(`value.go:220-222`), so on a `Bool` the condition was always false and the
+branch was unreachable. **Every JSON boolean ever ingested — `true` and
+`false` alike — was stored as the string `"false"`**, at HTTP 200 with
+`{"ingested":1,"skipped":0}`. `v:=true` matched no row in the store and
+`v:=false` matched all of them.
+
+`Value.Bool()` is declared four lines below `Value.Int()` in the same
+dependency file and was called nowhere in this repository.
+
+**The same line lost integer digits.** Every number went through `Float()`, so
+`9007199254740993` — one past the last integer a float64 holds exactly — came
+back `9007199254740992`. A snowflake id, a trace id and an epoch-nanosecond
+timestamp are all in that range, and the row is off by one with nothing to say
+so. An integer literal now keeps the wire's own digits.
+
+**And the refusal I shipped one commit earlier answered 429.** The five
+store-aware pipes were refused with `ErrRejected`, which `HTTPStatus` maps to
+`429 Too Many Requests` — the code for "try again later" on a query no amount
+of waiting will make answerable. The `join`/`union`/`stream_context` refusals
+had the same status for the same reason and had had it all along.
+`ErrNotDistributable` answers 400.
+
+**What found all three.** A reviewer told to enumerate cluster reads BY PIPE
+rather than by endpoint, and to sweep the ingest protocols, which five previous
+rounds had not touched at all. The boolean bug is not subtle and is not new; it
+is in the first `switch` of the most-used ingest path. Nothing had looked
+there, because every round looked where the last round's findings were.
+
+## 53. The facets fix removed a bound instead of narrowing it, and could OOM a shard
+
+Entry 48 changed `max_values_per_field` from deleted to `0` on the shard
+request, and made `timeFacet` read `<= 0` as unlimited. Both halves were wrong
+in the same way: `limit` is a RESULT SHAPE and unlimited is cheap;
+`max_values_per_field` is a CARDINALITY BOUND, and `_time` has roughly one
+distinct value per row in a log store.
+
+Measured on one shard, the default cluster dashboard path, no special
+parameter:
+
+| rows in window | shard body | wall | allocated |
+|---|---|---|---|
+| 40,000 | 3,389,259 B | 27.9 ms | +30 MiB |
+| 160,000 | 13,649,261 B | 114.7 ms | +127 MiB |
+| 640,000 | 54,929,263 B | 482 ms | +496 MiB |
+
+85.8 bytes of response per row, dead linear. `peerMaxBodyBytes` is 256 MiB and
+an over-cap body is discarded as `PeerMalformed`, so **above ~3.1M rows in the
+queried window every cluster facets request fails** — after every shard has
+allocated ~2.4 GiB building a body the router throws away. The same request
+measured 3,389,259 B through the cluster path against 113 B direct: 29,993×
+body amplification, for an answer that kept one field.
+
+The shards are sent the CALLER's value now. That fixes the defect entry 48 was
+written for — a caller asking 5000 was capped at each shard's 1000 and got
+`{"facets":[]}` — without removing the bound: ask 5000 and every shard uses
+5000, ask nothing and every shard uses its default, and the coordinator applies
+the same number again over the union. An explicit `0` is bounded at 100,000
+rows in `timeFacet` rather than being infinite, and the field is dropped past
+it, which is what it always did past 1000.
+
+**And the test entry 48 shipped for this could not fail.** It stubbed the
+shard's facets body with `facetShard`, so `timeFacet` — the function it names —
+never executed. A reviewer reverted the fix completely and the test stayed
+green. Replaced with one that runs against a real storage node; it goes red
+with the fix reverted, and it caught a second defect while being written:
+`timeFacet` inherited `q.LastN` from the endpoint's `limit`, so one response
+carried a `_time` distribution summing to 25 beside an `svc` distribution
+summing to 30.
+
+**The shape, again.** Entry 48's own last line says the closed test "is the
+least bad of three, not an answer". This entry is the same lesson one file
+over: a bound was in the way of a fix, and removing it was easier than
+narrowing it. Both the removal and its test shipped in one commit, and neither
+the removal nor the test had been run against a real shard.
+
+## 54. The mechanism that closes the idempotency window has never been called
+
+`Store.AppendGroupIdempotent` commits the write id in the SAME manifest record
+as the group, and its own doc comment says exactly why:
+
+> The id is committed in the SAME manifest record as the group, because one
+> record is one transaction. Written separately there would be a window in which
+> the rows are visible and the receipt is not -- and a retry landing in that
+> window duplicates every row, which is the exact failure this exists to
+> prevent, made rarer and therefore harder to find.
+
+It has no production caller. It never has. The path production takes is
+`Writer.FlushWithReceipt`, which is:
+
+```go
+if err := w.Flush(); err != nil { return err }
+return w.store.CommitReceipt(id)
+```
+
+Two separate operations — precisely the shape the doc warns about, written four
+files away from the warning.
+
+**Measured, not argued.** Ingest ten rows under a write id, flush, and stop
+before the receipt, which is what a crash there leaves behind. Reopen the store:
+
+    10 rows durable, receipt remembered = false
+
+The rows are on disk and the id is not, so a client retry of the same id is
+treated as a first attempt and duplicates all ten. That is the failure
+`AppendGroupIdempotent` exists to prevent, live on the only path that runs.
+
+**Why it is not a small fix.** `AppendGroupIdempotent` cannot simply replace
+`FlushWithReceipt`, because the writer batches: `Flush`'s own doc says "the
+buffer is shared by every request and every syslog connection on the tenant, so
+a row added here is routinely carried away by another goroutine's Flush". One
+write id therefore does not correspond to one group, and the
+one-record-one-transaction property is unavailable through that path by
+construction.
+
+Nor do the obvious variants work:
+
+- Commit the receipt BEFORE the flush: a crash between them then loses the rows
+  and reports success. Strictly worse — a duplicate is recoverable, a silent
+  loss is not.
+- Stamp the id onto every group the flush writes: a PARTIAL flush then leaves
+  some groups carrying the receipt, so on restart the id is remembered, the
+  client's retry is refused as a duplicate, and the rows in the groups that were
+  never written are lost. Also worse, for the same reason.
+- Align the flush boundary with the request when a write id is present: correct,
+  and it gives up the cross-request batching that the ingest throughput numbers
+  are built on. That is a real design decision with a measurable cost, not an
+  edit.
+
+So the entry is the deliverable. The window is narrow — a crash inside one
+process's microsecond gap per request — and it is real, and it is now measured
+by a test that FAILS if it ever closes, rather than asserting the current
+behaviour forever. Task #433 holds the design decision.
+
+**Closed for the common case, at no cost. See entry 68.** The fourth variant
+above — "align the flush boundary with the request" — was priced as giving up
+cross-request batching, and it does not have to: the id can ride the group the
+flush ALREADY enqueues, without changing when the flush happens or what it
+contains.
+
+**The shape, again.** Round six's closing note was "the mechanism was built and
+never wired to a reader", and named four. The gate written for it found sixteen
+more. This is the most expensive one so far: not an unused helper, but the
+correct implementation of a guarantee, sitting beside the incorrect one that
+production calls, with a doc comment on the correct one describing the defect in
+the other.
+
+## 55. A one-node cluster reported `version_mismatch`, and POST had stopped being bigger than a URL
+
+Two defects on one request, found by asking what a 1.2 MB query does.
+
+`withFormInURL` folds a POST form into the peer's URL, which is right for the
+ordinary case and, past a point, takes away the reason POST exists. A request
+line and its headers are bounded together by net/http's `MaxHeaderBytes`, 1 MiB
+by default, and a peer over it answers **431 from the server** — before the
+handler, so with no protocol-version header and no error class.
+
+The client checks the version FIRST, deliberately: a peer on an unknown version
+may have produced a body that parses and means something else. That reasoning is
+about a body a *handler* produced. Against a 431 it read the silence as a version
+statement. Measured, one router, one shard, one build, one binary:
+
+```
+POST /select/logsql/hits   query=_stream:{app="x"} AND level:in(v,v,…)   1,200,031 bytes
+
+503 simdlogs: 1 of 1 shards could not answer completely (0(version_mismatch)).
+```
+
+There is no version mismatch in a one-node cluster. The remedy that message
+asks for — check node versions, upgrade the odd one out — has nothing to act on.
+The same query against a **non-router** node is answered, so clustered mode had
+quietly lost a capability single-node has, and said something false about why.
+
+At 120 KB it answers 200. The transition is at net/http's limit, which is why
+this was never seen: every query anyone had tried fit in a URL.
+
+**Both halves are load-bearing, and each was probed alone.** Reverting the
+overflow path alone: 503 again, now `0(unavailable)` — correctly classified and
+still refused. Reverting the classification alone: `version_mismatch` returns.
+Neither fix covers for the other.
+
+**The precedence test guards less than it looked like it guarded.** The overflow
+travels as a form body, and Go's `ParseForm` copies `PostForm` *first* — so on
+the peer a body value beats a query value, the opposite of the ordering the
+small path relies on (the `stats count()` defect, which answered 10 by GET and 2
+by POST -- recorded in the commit that introduced withFormInURL, not as a
+numbered entry here; an earlier draft of this paragraph cited "entry 108", and
+this file's entries run 1-55). What actually holds is that the two sets are **disjoint**: a key already
+in the query is never put in the body. Sending the body unconditionally at every
+size leaves `TestTheRouterPlanStillWinsOverALargeForm` **green**; only removing
+the skip turns it red. The test is a guard on the disjointness and on nothing
+else, and its comment says so now rather than claiming the threshold.
+
+The threshold is 60 KiB rather than something near the 1 MiB ceiling, so the
+ordinary GET path is untouched — no dashboard emits 60 KB of parameters — and
+only the case that cannot work in a URL at all changes shape.
+
+
+## 56. The fix reached eleven endpoints and missed the twelfth — the one it was written for
+
+Entry 55 moved a large POST form into a request body so a query bigger than a
+URL could reach the shards. It moved the FORM's contribution and left the query
+string alone. `federatedSelect` writes the planned query into the shard **URL**
+before that runs (`shardQueryURL` -> `vals.Set("query", ...)`), so on
+`/select/logsql/query` the key was already a URL key, was skipped, and could not
+move; with nothing else in the form there was no body at all.
+
+Measured, one router and one shard, `level:in(v,v,…)`:
+
+| raw query | encoded shard URL | result |
+|---|---|---|
+| 520,001 | 1,039,993 | 200 |
+| 560,001 | — | **503 `0(unavailable)`**, the shard never reached |
+| 1,200,001 | — | **503 `0(unavailable)`** |
+| 1,200,001, **single node** | n/a | **200** |
+
+The sweep found eleven delivering the whole query as a form body and one
+failing. It was described as "all twelve fan-out endpoints"; `surfaceRoutes()`
+classifies **fourteen** federated reads, and the sweep -- like the test written
+from it -- covered nine of them. The committed tests used
+`/select/logsql/hits` and `/select/logsql/facets`. The repository already
+recorded why that endpoint is different — `cluster_postform_test.go:19-20`:
+"that one survives because planQuery rebuilds the shard URL from the parsed form
+itself." **The property that saved it from the previous defect is the property
+that broke it under this one.**
+
+The fix resolves the merged set first and sends all of it one way, with
+`RawQuery` cleared. That also removes the precedence argument the first version
+leaned on: `ParseForm` copies `PostForm` before the URL query, so a set split
+across both has the body winning, and "the two are disjoint by construction" is
+a property one refactor away from being false.
+
+## 57. A limit the router strips over GET reached the shards over POST
+
+`withoutLimits` deletes `limit` and `max_values_per_field` from the shard
+request so each shard answers unbounded and the coordinator bounds the merged
+set once. It deleted them from `r.URL.RawQuery`. On a POST they are in the
+**body**, so the deletion removed nothing.
+
+Measured, three shards, 30 rows, `query=*&field=user&limit=2`:
+
+```
+GET  200 {"values":[{"value":"u0","hits":5},{"value":"u1","hits":5}]}
+POST 200 {"values":[{"value":"u0","hits":4},{"value":"u1","hits":4},
+                    {"value":"u2","hits":2},{"value":"u3","hits":2}]}
+```
+
+`u0` has five hits cluster-wide and the POST answer says four: each shard
+truncated to its own top 2 and the coordinator summed the truncated lists. Six
+endpoints affected, on both the small and the large path. Pre-existing, and
+found because the new test was *named* for this property and had picked the one
+endpoint (`facets`) where the plan **sets** `limit=0` rather than deleting it.
+
+**Two attempts at the fix, and a test that could not see the first one fail.**
+Deleting from `out.Form`/`out.PostForm` after the clone does nothing: on a POST
+that nothing has parsed yet, both are nil, and `withFormInURL` later parses the
+body fresh and puts the caller's limit back. `ParseForm` has to run first.
+
+The test that missed it compared the GET and POST **answers**. With ties in the
+fixture, two differently-truncated shard-local lists sum to the same visible
+number, so it stayed green with the fix reverted. Asserting on what the **shard
+receives** failed immediately, and fails on 8 of 9 cases for either half of the
+fix.
+
+## 58. Three more gates that could not fail, in the commit that was about gates
+
+- **`TestTheClusterBackupCarriesItsOwnSpread` populated the field it checked.**
+  It did `man.SpreadNanos = man.Spread()` itself and then marshalled, so
+  commenting out the production assignment left the whole `internal/api` package
+  green — while the test's own doc said it "has to fail if the field stops being
+  marshalled". Both probes that were run (broken arithmetic, dropped json tag)
+  tested the test's own arithmetic. It is driven through
+  `/admin/cluster/backup` now and reads `spreadNanos` out of the tar; the
+  reviewer's mutation gives `spreadNanos=0` against a 172800000000000 span.
+
+- **`buildExcluded` dropped three files that ARE compiled on linux.**
+  `strings.Contains(line, plat) && !strings.Contains(line, "linux")` excludes
+  every `//go:build !windows` file. Three in `internal/storage`, and two
+  documented declarations became invisible to the gate. 254 -> 256 documented
+  declarations, which reproduces exactly.
+
+  **The other numbers in the first version of this entry do not.** "18
+  production names lost their readers, `dirLock` 15 down to 1, `errLockHeld` 3
+  to 0" was recomputed by running `countReads` over the tree under each rule:
+  **59** names gain readers, **15** cross the gate's threshold, `dirLock` goes
+  **1 -> 8** (the direction inverted) and `errLockHeld` **0 -> 2**. And the new
+  rule also EXCLUDES three files the old one wrongly included --
+  `diskfree_other.go`, `quota_other.go`, `mmap_other.go` -- costing fourteen
+  names their readers, `errNoStatfs` 2 -> 0. Harmless today and the opposite of
+  the one-directional story the entry told.
+
+  **The replacement was wrong too, in the other direction.** A small recursive
+  evaluator treated an unmodelled tag as SATISFIED, which is safe until the tag
+  appears under a NEGATION: `!purego` evaluated false and excluded a file the
+  compiler includes -- the exact failure its own comment said it avoided. Its
+  test asserted `{"!purego", false}` and `{"(linux || darwin) && !cgo", false}`,
+  both contradicted by `go/build/constraint`, the second under `CGO_ENABLED=0`,
+  which is this repository's stated posture. It also hardcoded linux/amd64, so a
+  test named "agrees with the compiler" was false on every cross-architecture
+  lane.
+
+  It calls `build.Default.MatchFile` now -- the compiler's own answer -- and
+  reads the LEADING comment block only. Scanning every comment made a
+  `//go:build windows` line quoted inside a doc comment the file's constraint;
+  `unwired_test.go` contains two such lines and they survived only by not
+  starting their line.
+
+- **The founding shape is no longer detected, and three places said otherwise.**
+  Treating a composite-literal key as a read — necessary, because treating it as
+  a write failed on correct code — means a field written only inside a composite
+  literal is missed. `PeerResponse.HighWatermark` and `ReplicasConsulted` are
+  both of that kind, and `ReplicasConsulted` left the exempt baseline because
+  the detector was weakened, not because anything was wired. The commit
+  disclosed the weakening; the file header and `countReads`' own doc still
+  asserted the opposite in two places. Both corrected, with the disclosure where
+  the code is rather than only in a commit message.
+
+Also corrected: `maxPeerQueryBytes` is 60 KiB of **encoded** parameters, and
+percent-encoding a LogsQL query roughly doubles it, so the raw budget is about
+half what the comment claimed.
+
+**Three drafts of the switch point were wrong, and the third argued the second
+was wrong for a reason that applied to itself.** "30,001 against 31,001" is a
+1,000-wide bracket, not a switch point. "30,719 / 61,439 in the URL against
+30,720 / 61,442 in the body" was called one raw byte and two encoded bytes off.
+Its replacement — "30,720 raw / 61,440 encoded still in the URL against 30,721 /
+61,443 in the body … 61,442 is not an attainable length in this shape's sequence
+at all (…61,439, 61,440, 61,443…)" — names four lengths this generator cannot
+emit, including both of its own published boundaries, and asserts a sequence
+containing a Δ1 and a Δ3 where the real step is a constant 4. `bigQuery` appends
+`,v` per iteration: +2 raw, +4 encoded, because `,` becomes `%2C`.
+
+Measured, by feeding each n to `withFormInURL` and recording which side it came
+back on — not by arithmetic, which is what produced all three wrong versions:
+
+| shape | last in URL | first in body |
+|---|---|---|
+| `query` alone | n=30722, raw 30,723, enc **61,437** | n=30723, raw 30,725, enc **61,441** |
+| `query` + `step=1h` | n=30718, raw 30,719, enc **61,437** | n=30719, raw 30,721, enc **61,441** |
+
+Attainable encoded lengths across the bound: …61,433, 61,437, 61,441, 61,445….
+`maxPeerQueryBytes` is 61,440 and the comparison is `len(enc) > maxPeerQueryBytes`,
+strict — but 61,438, 61,439 and 61,440 are not attainable in this shape, so the
+bound itself cannot be observed exactly with this generator and the switch is
+only ever seen as the gap between 61,437 and 61,441. A boundary quoted to the
+byte from a shape whose step is 4 is a boundary nobody measured.
+
+`PeerUnavailable`'s "remedy —
+another replica — is the one that can actually help" is false for the 431 that
+motivated the change: the refusal is deterministic and every replica gives the
+same answer; what the class buys is an accurate name. `docs/wrong.md` cited an
+"entry 108" in a file whose entries run 1-55.
+
+## 59. A bare `pack_json`'s packed value is short, and the row beside it is right
+
+Entry 58's `MatCols` split fixed the leak on a projected pack. Measured against
+the staged `victoria-logs` binary, one row with `svc` as a stream field:
+
+```
+VL  * | pack_json as p
+    row {"_msg":"hello","_stream":"{svc=\"api\"}","_stream_id":"0000…aa07…",
+         "_time":"2026-08-16T03:00:00Z","lvl":"info","p":"…","svc":"api"}
+    p   {"_time":…,"_stream_id":…,"_stream":…,"_msg":…,"lvl":…,"svc":…}
+```
+
+So `MatAll = true` for a bare pack is **correct** — VictoriaLogs does return the
+full record — and the two projected shapes match this server exactly:
+
+```
+VL  * | fields lvl | pack_json as p             {"lvl":"info","p":"{\"lvl\":\"info\"}"}
+VL  * | stats by (svc) count() n | pack_json as p  {"svc":"api","n":"1","p":"{\"svc\":…,\"n\":…}"}
+```
+
+What differs is the packed VALUE on the bare shape. Measured field by field
+rather than as a group -- the first version of this entry said VL's `p` carries
+"`_time`, `_stream_id` and `_stream`" and this server's carries none of them,
+and that is wrong about `_stream`:
+
+```
+VL  p keys  [_msg _stream _stream_id _time lvl svc]
+SL  p       {"_msg":"hello","_stream":"{svc=\"api\"}","lvl":"info","svc":"api"}
+```
+
+`_stream` is present on both. The gap is `_time` and `_stream_id`. `pack_json` runs in the
+query layer and those three are synthesized at serialization
+(`appendRowJSON`), so the pack cannot see them. The row is right and the packed
+value is short — the mirror image of the defect entry 58 fixed, and the reason
+that test's three rows all happened to carry a projecting pipe.
+
+Recorded rather than fixed: making them agree means putting `_time` and
+`_stream_id` onto the record before the pipes run, which changes what every pipe
+sees. Task #437. Not "the pair" -- naming `_stream`/`_stream_id` there would
+have added a field that is already present and still left `_time` missing.
+
+Two latent ones closed alongside it. `applyCoordinatorPipes` set `MatAll: true`
+into a `Query` that `ApplyPipes` never reads either flag from — inert, and
+inert on a flag whose meaning had just changed to "synthesize the stream pair",
+so the day the coordinator writes with `withStream=true` it would put the pair
+back on merged stats rows. Removed. And `FacetList`'s sub-query cleared `MatAll`
+and not `MatCols`, so an inherited `MatCols` would make a timestamps-only scan
+read every column of every matching row, against a 256 MiB budget it shares with
+the parent request. Unreachable today, which is why it would have been found
+late.
+
+
+## 60. The fix reached eleven of fourteen, and the test written to prove it covered nine
+
+Entry 56 fixed the large-POST path and said "eleven fan-out endpoints", "all
+twelve". `surfaceRoutes()` classifies **fourteen** federated reads.
+`TestEveryFanOutEndpointCarriesALargeQuery` listed ten, one of which
+(`/select/logsql/hits_count`) is not a route at all and skipped forever on its
+404 — so it covered **nine of fourteen** and missed `/select/logsql/stats_query`
+and `stats_query_range`, the Grafana-dashboard shape the whole change is about.
+
+This repository had already learned that and written it down:
+`TestEveryFederatedReadIsInTheCompletenessSuite` exists because *"federatedEndpoints
+was a hand-kept list that had drifted to nine of the fourteen federated reads"*.
+A hand-kept list drifted to nine of fourteen again, in a test written to prove
+coverage.
+
+The set is derived from `surfaceRoutes()` now, with each route's own parameters
+and its own query language — `/select/sql` gets a large `SELECT ... OR ...`
+chain rather than LogsQL, and the two Elasticsearch routes are **skipped with
+the reason** (a JSON body never enters the form path) rather than fed LogsQL and
+counted. Twelve exercised, two skipped, and the count itself is asserted.
+
+## 61. A limit the plan DELETED came back over a POST form, on the endpoint the change was named after
+
+`shardQueryURL` removes `limit` from the shard request when the plan has a
+coordinator half: the shards must return everything and the bound is applied
+once over the merged rows. `withFormInURL` merges form keys "not already in the
+shard URL" — and a key the plan **deleted** is not in the URL. Measured, three
+shards of ten rows, `&limit=5`, HTTP 200 throughout:
+
+| | single node | cluster GET | cluster POST form |
+|---|---|---|---|
+| `* \| stats count() c` | 30 | 30 | **15** |
+| `* \| stats by (level) count() c` | 10/10/10 | 10/10/10 | **5/5/5** |
+
+It reproduces before entry 56 as well, so that commit did not introduce it — it
+rewrote the function around it and added a comment asserting the opposite:
+*"with RawQuery cleared there is one source and the plan wins because the plan
+is what was merged in"*. A union merge does not preserve a deletion.
+
+Fixed by recording **which parameters the plan owns**, set or deleted, rather
+than by deleting this one from `r.Form` as well — that would fix `limit` and
+leave the next deleted parameter to be found the same way. Two of the three
+pieces are load-bearing; `withoutLimits`'s marking is redundant with its own
+form deletion and says so.
+
+Found alongside it and left open: a cluster and a single node disagree on which
+rows `sort ... | limit` keeps. Both cluster methods agree with each other, so it
+is not this defect. Task #438, and the case stays in the test with the
+comparison switched off and a pointer, rather than dropped.
+
+## 62. Two subtests could not fail, and a 400 named the wrong half
+
+`TestALimitInAPostFormDoesNotReachTheShards`'s two `facets` rows pass with
+either half of the fix deleted: facets passes `limit` through `unlimited`
+(`vals.Set("limit","0")`), so the key is always already in the URL and never
+enters `extra`. They were immune before the fix. Kept for the
+`max_values_per_field` half, which is real, and labelled `limitImmune` so the
+pass is not read as coverage. The other seven rows fail on both mutations.
+
+And `withoutLimits`' new `ParseForm` fails on a malformed **Content-Type** too —
+`parsePostForm` runs `mime.ParseMediaType` first — while the refusal said "this
+request's query string could not be parsed". Measured: `Content-Type: text/plain;
+charset` on a request whose query string is perfectly correct, answered 200
+before and 400-blaming-the-query-string after. It names the half that is
+actually unreadable now.
+
+Also closed: `fanOutChecked` dropped `formBody` when the caller had built a body
+of its own. Impossible today — the two endpoints that build a body send JSON, so
+`withFormInURL` returns before it looks at anything — but that is a statement
+about what clients send, not a property of the code, and `RawQuery` is now
+cleared so a dropped `formBody` would hand the shard **neither**. It is refused
+with an explanation instead of reasoned away.
+
+## 63. The fix that suppressed a shard limit the plan deliberately keeps
+
+Entry 61 recorded which parameters the plan owns so a POST form could not
+re-add a deleted one. It marked `limit` **unconditionally**, and
+`shardQueryURL` deletes it only when there is a coordinator half — its own
+comment says *"with no coordinator half the shard limit is exactly right and
+stays"*. Over a POST it stopped staying. Measured, one shard,
+`POST query=*&limit=5`:
+
+```
+before   shard received  limit=5&query=%2A
+after    shard received  query=%2A
+GET      shard received  limit=5&query=%2A     (unchanged)
+```
+
+The answer stayed correct — `mergeRows` applies the bound from the original
+request — so this is blast radius, not a wrong number.
+
+**The first published triple — 3,808,890 / 955 / 190.4 B/row — had no recorded
+fixture, and the number is a property of the rows.** Re-measured twice it gave
+3,493,317 / 877 / 174.7 and 3,762,650 / 944 / 188.1: same order, same
+conclusion, different digits every time, because nothing said what a row was.
+The fixture, written down so the number means something:
+
+```
+20,000 rows of NDJSON, 2,184,890 bytes in (109.2 B/row), one storage node:
+  {"_time":"2026-08-14T00:00:SS.mmmZ","_msg":"request N completed",
+   "level":"info","svc":"api","user":"uK"}     SS=i%60 mmm=i%1000 K=i%50
+
+  query=*          3,762,650 bytes   188.1 B/row out
+  query=*&limit=5        944 bytes
+  ratio            3,985.9x  (the other two runs: 3,988.4 and 3,983.3)
+  peerMaxBodyBytes 268,435,456 -> ~1.43M rows per shard before the read fails
+```
+
+Every shard streamed its whole matching set to the router, on the exact path
+POST exists for. What is stable across all three measurements is the ratio —
+about four thousand — and the order of the per-row cost; the digits are not,
+and quoting them to seven figures without the fixture claimed a precision the
+measurement never had.
+
+Marked only when the plan deletes it now. `query` is not marked at all:
+`shardQueryURL` always `Set`s it, so it is always a URL key and the existing
+rule covers it — that marking was inert, and an inert marking reads as a
+load-bearing one.
+
+**And the both-bodies refusal fired on a request with no body.** The guard read
+`body != nil`, and both Elasticsearch handlers pass `io.ReadAll(r.Body)`, which
+never returns nil — an empty body is an empty non-nil slice. Measured,
+`POST /_count?q=<70 KiB>` with a form content type and no body: **200 before,
+400 after**, with a message saying the request carried two bodies when it
+carried none.
+
+## 64. Three labels that labelled nothing, and a 400 on half the routes
+
+- **`limitImmune` was a struct field with no reader.** Entry 62 said the immune
+  rows were "labelled rather than left to read as coverage"; the label was a
+  field nothing consulted, and the repo's unwired gate skips `_test.go` so
+  nothing could catch it. It gates the `limit` assertion now.
+- **The coverage count could not fire.** `n++` ran *before* the JSON-body skip,
+  so `n` was always 14 and `if n < 12` was unreachable — two more routes could
+  start skipping in silence. Worse, the log line then said *"14 federated reads
+  carried a 1200001-byte query"* immediately after two SKIP lines. Twelve
+  carried it.
+- **The same malformed request was 400 on six routes and 200 on six.**
+  `withoutLimits` called `ParseForm` for any POST/PUT regardless of content
+  type, and `ParseForm` runs `mime.ParseMediaType` first — so a malformed
+  `Content-Type` failed on a body the router was never going to read, and only
+  on the six routes that reach it. `facets` escaped by argument-evaluation
+  order alone: `maxValuesParam` primes `ParseForm` and swallows the error first.
+  It parses only a form content type now and all twelve answer 200.
+
+  Which retires entry 62's own fix: naming the Content-Type in the refusal was
+  the right answer to the wrong defect — the refusal should not have happened.
+
+Two stale claims corrected. `pack_test.go` still carried *"VL's `p` CONTAINS
+`_time`, `_stream_id` and `_stream`, and this server's does not"* — the sentence
+entry 59 was corrected to remove; `_stream` is on both and the gap is `_time`
+and `_stream_id`. The switch point published here was wrong for the third time
+and is corrected in entry 58 with the measurement that produced it.
+
+## 65. The fix for "an empty body is not two bodies" changed one arm of a switch, and the other arm made it a silent wrong number
+
+Entry 62 changed `body != nil` to `len(body) > 0` on the refusing arm of a
+two-arm switch, on the premise — correct — that `io.ReadAll` never returns nil.
+The premise falsifies the OTHER arm too, and that one was left as
+`body == nil`. For an empty body `len(body) == 0` **and** `body != nil`, so
+**neither arm ran**: the switch was non-exhaustive at exactly the value the
+commit was about. `withFormInURL` has already executed `out.URL.RawQuery = ""`
+by then, so the shard was handed an empty query string and an empty body.
+
+Measured, spy shard answering `count:3` when it sees `q` and `count:1000` when
+it does not:
+
+```
+POST /_count?q=<1 KiB filter>   form content type, no body
+  -> 200 {"count":3}      shard saw q of 1025 bytes    correct
+POST /_count?q=<70 KiB filter>  same headers, no body
+  -> 200 {"count":1000}   shard saw q of 0 bytes       WRONG, silent
+```
+
+A/B with that one line reverted to `body != nil`: the 70 KiB case answers 400.
+**The fix turned a loud refusal into a silent wrong number at exactly the size
+the large-form path exists for.** Also reproduces with
+`application/x-www-form-urlencoded; charset=UTF-8` and `Content-Length: 0`.
+
+The comment three lines above it states the consequence verbatim — *"dropping
+it would hand the shard neither, and the answer would be a smaller one at HTTP
+200"* — and so does entry 62. `TestAnEmptyBodyIsNotTwoBodies` passed at that
+commit while the shard was asked nothing: it asserted `!= 400` and the absence
+of one phrase, and neither is affected by what the shard receives. It now
+asserts the shard was asked the caller's query, and the non-exhaustive switch
+reddens it.
+
+The switch is gone. One `if formBody != nil` with the length test inside it is
+total in `len(body)` by construction, which is the property that was missing.
+
+## 66. Gating on the content type did not remove the six-vs-six split; it moved it one character along
+
+Entry 64 closed with *"it parses only a form content type now and all twelve
+answer 200"*. Measured on the neighbouring content type,
+`application/x-www-form-urlencoded; charset` — jQuery's default header with the
+value lost — it was **7 refused / 5 answered**:
+
+```
+query 200 | hits 400 | facets 200 | field_names 400 | field_values 400
+stream_field_names 400 | stream_field_values 400 | streams 400 | stream_ids 400
+stats_query 200 | stats_query_range 200 | sql 200
+```
+
+`mime.ParseMediaType` returns the media type **and** `ErrInvalidMediaParameter`,
+so `parsePostForm` reads and parses the body perfectly and `ParseForm` returns
+the correct values with a non-nil error. `isFormPost` accepts; `withoutLimits`
+then refuses a form it has just parsed correctly. Whether it refuses at all
+depends on whether an earlier `FormValue` primed `r.PostForm` — the same
+argument-evaluation-order accident entry 64 said it had removed, now covering
+five routes.
+
+The obvious repair is the wrong one. `errors.Is(err, mime.ErrInvalidMediaParameter)`
+and carry on looks right and is not, because `parsePostForm` keeps the header's
+error and **discards** `url.ParseQuery`'s:
+
+```
+ct "...urlencoded; charset", body "query=%zz&limit=2"
+  err      = mime: invalid media parameter     the body error is gone
+  PostForm = map[limit:[2]]                    `query` is gone with it
+```
+
+A dropped `query` forwarded at HTTP 200 — the defect class, reintroduced by the
+fix for it. So the header is CORRECTED before parsing instead
+(`normalizeFormContentType`), which restores the precedence: `ParseForm` then
+fails on `%zz` and the request is refused, naming the body.
+
+`withFormInURL` carried a second copy of `isFormPost`'s rule and disagreed with
+it on what a `ParseForm` error means, which is why `hits` was the last route
+still answering 400. It calls the predicate now.
+
+## 67. A header fault reported as a shard fault, and a counter that counted its own failures
+
+Three smaller findings from the same round.
+
+**The diagnosis regression.** `POST /select/logsql/field_values`,
+`Content-Type: text/plain; charset`, parameters in the body. Before the content
+-type gate: `400 this request's Content-Type ("text/plain; charset") could not
+be parsed`. After it, against real storage nodes:
+`503 2 of 2 shards could not answer completely (0(rejected),1(rejected))`.
+Consistent across the twelve routes, and it sends an operator to inspect the
+storage nodes for a fault in their own request's header. A body under a content
+type no form parser will read is now refused at the router on all twelve,
+naming the Content-Type — `/select/sql` included, which reached its own "SQL
+must start with SELECT" on the empty string and blamed a statement the caller
+did send.
+
+**`carried` counted failures as successes.** `carried.Add(1)` sat after a
+`t.Errorf`, and `t.Errorf` does not stop a subtest. Under a mutation appending
+one byte to every shard query, all twelve subtests failed AND the summary line
+printed *"12 of 46 federated reads carried a 1200001-byte query"* — asserting
+the thing that had just failed. It reads `12 of 14` now (the federated count,
+not every route the mux registers) and the guard fires at 1.
+
+**`limitImmune` was a reader that gated nothing.** Entry 64 turned a struct
+field with no reader into a field with a reader — and deleting the three lines
+changed no result, because facets' shard `limit` is `0` and the assertion looked
+for `limit=2`. A field with no reader had become a reader with no effect. It is
+`limitSetTo string` now and asserts what the shard WAS told (`limit=0`), which
+reddens when the plan stops setting the unlimited value.
+
+**The shape, twice more.** Two of the three defects in entries 65 and 66 are the
+previous round's fixes, and both were shipped with a test that passed through
+them. The round before that said the same. What distinguishes the fixes that
+held from the ones that did not is not care taken: it is whether the assertion
+names what the SHARD RECEIVED. Every test that asserted a status code passed
+through its own defect; every test that asserted the shard's parameter set
+caught it.
+
+## 68. The idempotency window closed by moving the id, not the flush
+
+Entry 54 measured a window between a flush and its receipt, listed four
+variants, rejected three as strictly worse, and priced the fourth — align the
+flush boundary with the request — as *"correct, and it gives up the
+cross-request batching that the ingest throughput numbers are built on. That is
+a real design decision with a measurable cost, not an edit."*
+
+That priced the wrong thing. `FlushWithReceipt` was ALREADY `Flush()` per
+replicated write, so the batching a request-aligned boundary would give up is
+only the batching among *concurrent* replicated writes — and none of it has to
+be given up, because the question is not WHEN the flush happens or WHAT it
+contains. It is which manifest record the id goes in.
+
+`flushLocked` enqueues exactly one job, and one job is one group. So when
+
+- there are rows buffered (there is a group for the id to ride), and
+- `len(w.live) == 0` (nothing else in flight, so every group this writer has
+  already handed out is committed, and manifest records are appended in order —
+  "this record is durable" implies "every earlier one is"),
+
+the id goes to that job and the worker commits it through
+`AppendGroupIdempotent`: **one record, one transaction, no window**. The group
+is still whatever was buffered, from however many requests. Neither condition
+can be relaxed: dropping the second is entry 54's rejected "stamp the id on
+every group", which commits a receipt for rows a partial flush never wrote.
+
+Measured as the manifest sequence delta across one `FlushWithReceipt` of ten
+rows under a write id:
+
+```
+before   seq +2   group record, then receipt record   -- two fsyncs, one window
+after    seq +1   one record carrying both            -- one fsync, no window
+```
+
+The delta is the measurement, not a reopen: both designs have the same end
+state when no crash happens, and the record count is what "one transaction"
+means. It is also one `Sync()` less per replicated write, because `man.commit`
+syncs once per record.
+
+Under concurrency the conditions fail and `CommitReceipt` runs as before, so
+the window narrows rather than moving. `AppendGroupIdempotent` returning
+`ErrDuplicateWrite` — two retries of one id racing past the middleware's check
+— falls back to a plain `AppendGroup`: the group holds every row buffered on
+the tenant, and dropping it would lose other callers' rows to a duplicate that
+is not theirs.
+
+**The gate found its own stale exemption.** `AppendGroupIdempotent` was on
+`TestDocumentedMechanismsHaveCallers`' exempt list with a note explaining that
+production deliberately took the other path. Wiring it reddened the gate, which
+is what an exemption list is for when the reason behind it stops being true —
+*"an exemption nobody removes is how the next unwired mechanism gets in under
+it"*, and this one removed itself.
+
+Each of the four tests replacing the old window test was probed by mutation:
+forcing the two-step path reddens the record-count test, deleting the
+`ErrDuplicateWrite` fallback reddens the racing-duplicate test, and forcing
+`rode` true reddens the nothing-left-to-flush test.
+
+## 69. The refusal written for a header fault refused what a single node answers
+
+Entry 67 added `unreadableBody`: a POST with a non-empty body under a non-form
+content type was refused with 400 naming the Content-Type, because the
+parameters in that body are unreadable and the shards would be asked the URL
+query alone.
+
+It refuses requests that have no problem. Every parameter can already be in the
+URL, and then the body is irrelevant — a single node ignores it:
+
+```
+POST /select/logsql/query?query=*   body {}   ct application/json
+  single node  200 (the rows)
+  router       400 this request's Content-Type ("application/json") is not a form…
+```
+
+Same for `null`, `" "`, `text/plain`, an empty `Content-Type` with a body,
+chunked framing and `Expect: 100-continue`. It also stayed **order-dependent**,
+which is the accident it was written to remove: the check asks whether bytes
+remain in the body, and `ParseMultipartForm` — reached through an earlier
+`FormValue` on four of the twelve routes — drains a multipart body first. So
+`multipart/form-data` split 4 answered / 8 refused, and three of the four
+answering routes produced entry 67's own `503 … (0(rejected))` against real
+storage nodes.
+
+**The refusal was papering over the real defect one level down.** `planQuery`
+defaulted a blank `query` to `*`, where `parseRequest`'s own comment says the
+reference requires one and *"defaulting to match-all answered a client's bug
+with the entire store"*. Measured, a three-row store and a filter matching one
+row:
+
+```
+GET /select/logsql/query            single 400   router 200, 3 of 3 rows
+GET /select/logsql/query?query=     single 400   router 200, 3 of 3 rows
+GET /select/logsql/query?query=%20  single 400   router 200, 3 of 3 rows
+POST form, body junk=1              single 400   router 200, shard asked `*`
+```
+
+That is the amplifier under every "the shards were asked the empty query"
+finding in entries 55-68: on this route a dropped filter was never a smaller
+answer, it was the **entire store at HTTP 200**.
+
+So the refusal is deleted and the default is gone. A body the router cannot
+parse as a form is ignored, exactly as a single node ignores it, and the request
+is then refused for the reason that is true — there is no `query`. Every case
+above now answers identically on a router and a single node, and the test
+asserts that equality rather than a status code someone chose.
+
+Also corrected: entry 63's derived ratio, published as `~3,990x`. 3,762,650 /
+944 = **3,985.9**.
+
+## 70. `q` in a form body, on `/_count`: the shard was asked nothing and counted everything
+
+`federatedESCount` read the body unconditionally. `withFormInURL`'s `ParseForm`
+then found it drained, saw no form, and returned `formBody == nil` — and
+`fanOutChecked` forwarded the caller's raw `q=level%3Aerror` bytes with no
+content type, which `clusterClient.do` relabels `application/json`. A shard's
+`ParseForm` will not read a JSON body, so it was asked no filter at all.
+
+Measured, spy shard answering 3 when it sees `q` and 1000 when it does not:
+
+```
+POST /_count?q=level:error   form CT, empty body  -> 200 {"count":3}     shard q="level:error"
+POST /_count                 form CT, q in body   -> 200 {"count":1000}  shard q=""
+POST /_count?pretty=1        form CT, q in body   -> 200 {"count":1000}  shard q=""
+```
+
+Wire-level the shard saw `ct="application/json" rawquery="" body="q=level%3Aerror"`.
+
+The body is left unread when the content type says it is a form, so
+`withFormInURL` parses it and folds `q` into the shard URL — the path the
+large-form case already takes. `/_search` under the same shape was loud
+(`400 invalid character 'q'`) and is unchanged.
+
+## 71. The fix for a 503 traded 16 cells for 31, and the test could not see it
+
+Entry 69 deleted `unreadableBody` and stopped `planQuery` defaulting a blank
+query to `*`. Measured across twelve federated reads × thirteen framings,
+router against a real storage node, that commit **fixed 16 cells and regressed
+31**: nine to eleven routes moved from a 400 naming the caller's own header to
+`503 … 2 of 2 shards could not answer completely (0(rejected),1(rejected))` —
+verbatim the answer entry 67 exists to remove, and one a client retries forever
+because a retry re-fans-out and can never succeed.
+
+```
+curl -F 'query=*'             node 200:12    router 200:1  502:1  503:10
+text/plain, params in body    node 400:11    router 400:2  502:1  503:9
+```
+
+**Three causes, all "the router does not read what the node reads".**
+
+`isFormPost` matched only `application/x-www-form-urlencoded`. A single node
+parses multipart — `FormValue` calls `ParseMultipartForm` — so the router never
+folded a multipart form into the shard URL and the shards were asked nothing. It
+matches both encodings now, through a `parseFormBody` that calls the right
+parser. A multipart body that will not PARSE is ignored rather than fatal, which
+is also what a node does: `FormValue` discards that error and reads the URL
+query.
+
+The router fanned out an empty selector where a node refuses. `parseRequest`
+refuses a blank `query` on every select endpoint; `fanOutChecked` now applies
+the same rule before any shard is asked, so the caller gets the node's own 400
+instead of a 5xx pointing at the storage nodes.
+
+And `/select/logsql/stats_query_range` on a NODE answered 200 to a request with
+no parameters at all, fabricating a matrix:
+
+```
+GET /select/logsql/stats_query_range
+  200 {"resultType":"matrix","result":[{"metric":{},
+       "values":[[1690951540,""],[1690951540,""],[1690951540,""]]}]}
+```
+
+A constant garbage epoch and empty-string values. `docs/lld/api.md` says `query`
+is required on every select endpoint; this was the route where that was false,
+and it was the only pair of cells where the router's refusal was RIGHT and the
+node's answer was wrong.
+
+**The test could not see any of it.** It used a recording shard — a spy that
+answers 200 to anything — and one route. Against that spy, 11 of 12 federated
+reads answered 200 with the shard asked `query=""` for the multipart,
+`text/plain` and no-Content-Type framings: the defect class entries 55-70 exist
+to remove, hidden by the fixture. The matrix now runs every federated read
+against a REAL storage node and compares to that same node. Removing multipart
+support reddens 11 cells, removing the missing-query guard reddens 20, and
+accepting a blank query on `stats_query_range` reddens 2.
+
+## 72. A parameter no storage node reads, bought with a working capability
+
+Entry 70 stopped `federatedESCount` reading the body when the content type is a
+form, so `withFormInURL` could fold `q` into the shard URL.
+
+`curl -d` sends `Content-Type: application/x-www-form-urlencoded` **by
+default**, so a real Elasticsearch document took that path: `ParseForm` turned
+the JSON into one URL key and the shard got an empty body.
+
+```
+curl -d '{"query":{"term":{"level":"error"}}}' <router>/_count
+  before  200 {"count":1}          after  503
+  shard   url ".../_count?%7B%22query%22...%7D=" ct="" body=""
+  and with ?allow_partial_response=1: 206 {"count":0}
+```
+
+A silently wrong number on the partial path, and `/_search` — which still read
+its body unconditionally — answered 200 to the identical request, so the two ES
+endpoints disagreed with each other.
+
+**And `q` is not a parameter any storage node reads.** `esCount` decodes the
+JSON body; there is no `q` handling in `es.go` at all, so
+`/_count?q=level:error` with a valid body answers about the whole store on a
+single node too. The test that passed was passing against a recording shard
+that called `FormValue("q")` itself — a spy asserting a contract the real thing
+does not have.
+
+Reverted. The replacement test compares the router to a single node across three
+content types, which is the only claim there was to make.
+
+**Two of the three `normalizeFormContentType` calls were inert, and that was
+measured rather than assumed.** `ParseForm` caches: the first call populates
+`r.Form` and returns the error, every later call sees `r.Form` non-nil and
+returns nil. So correcting the header only matters where an error from THAT
+first parse is treated as fatal — `withoutLimits`, and nowhere else.
+
+```
+delete it from withoutLimits    2 tests red
+delete it from withFormInURL    nothing red
+delete it from fanOutChecked    nothing red
+```
+
+The matrix that establishes the second and third rows covers
+`application/x-www-form-urlencoded; charset` across all twelve federated reads,
+so "nothing red" is a statement about coverage that exists rather than coverage
+that does not. Both copies deleted: an inert guard reads as a load-bearing one,
+which is how three rounds' worth of dead code got in.
+
+## 73. The bare pack, fixed — and the first fix put the fields on rows that never had them
+
+Entry 59 measured a bare `pack_json`'s value as short: `_time`, `_stream` and
+`_stream_id` are synthesized at serialization (`appendRowJSON`) and `pack_json`
+runs in the query layer, so it could not see them. The row beside the packed
+value was right, which is what makes it hard to see — a client reading `p` and a
+client reading the row got different records out of one response.
+
+```
+VL  p keys  [_msg _stream _stream_id _time lvl svc]
+SL  p       {"_msg":"hello","_stream":"{svc=\"api\"}","lvl":"info","svc":"api"}
+```
+
+The rule is one sentence: **a bare pack packs the row as it will be
+serialized.** So `_time` comes from `r.Time` when the row has one, and the
+stream pair from the row's own values.
+
+**The first version of it was wrong in the mirror direction.** `rowStreamPair`
+synthesized the EMPTY stream when a row carried none — which is what
+serialization does, because a full record is always in some stream — and that
+put two fields onto every projected and stats row:
+
+```
+VL    * | fields lvl | pack_json as p   ->  p {"lvl":"info"}
+first fix                                   p {"lvl":"info","_stream":"{}",
+                                               "_stream_id":"0000…55b5"}
+```
+
+Those are the two shapes entry 59 had already measured as CORRECT, broken by
+the fix for the third. A projection is not a record: the pair is emitted only
+when the row carries a non-empty `_stream`.
+
+**And the second version dropped a field the row did carry.** A row whose
+`_stream` column is present but EMPTY — which happens because the store
+materializes the column for a whole flush — had `_stream` skipped from the loop
+(to be emitted once from the pair) and then no pair emitted, so the field
+vanished. The skip is now conditional on the pair being emitted: the pack's job
+is to pack the row, not to improve it.
+
+Measured on the built binary, all four shapes:
+
+```
+* | pack_json as p                        {_time,_msg,lvl,svc,_stream,_stream_id}
+* | fields lvl | pack_json as p           {"lvl":"info"}
+* | stats by (svc) count() n | pack_json   {"svc":"api","n":"1"}
+* | fields _time, _msg | pack_json as p    {"_time":…,"_msg":"hello"}
+```
+
+The three projected shapes are byte-identical to the reference. The bare one
+matches its key SET; the ORDER differs — VL emits
+`_time, _stream_id, _stream, _msg, …` and this server emits
+`_time, <row fields>, _stream, _stream_id`, because matching VL's order means
+matching its internal field ordering, which this server does not have. The test
+asserts the set for that reason and says so.
+
+## 74. "Inert, measured" — measured with the two routes it mattered for filtered out
+
+Entry 72 deleted `normalizeFormContentType` from `withFormInURL` on the ground
+that nothing reddened. Nothing reddened because the parity matrix filters
+`rt.body != ""`, and that excludes exactly the two Elasticsearch routes — the
+ones that pass a NON-NIL body to `fanOutChecked`, so its missing-query guard
+(whose `FormValue` is what primes `r.Form` for every other route) is skipped and
+`withFormInURL`'s parse becomes the FIRST parse of the request.
+
+With `; charset` that parse returns `ErrInvalidMediaParameter`, `withFormInURL`
+returns nil, and the router refuses what a node answers:
+
+```
+POST /_count   ct "…urlencoded; charset"  body {"query":{"match_all":{}}}
+  single node 200 {"count":30}
+  router      400 the request body is not a readable form
+POST /_search  same content type          200 / 400 the same way
+```
+
+jQuery's spelling, on the two routes whose body IS a document. Restored, and the
+matrix now runs the ES routes with their own framings — a JSON body under four
+content types — so deleting the call again reddens two cells instead of none.
+
+**Two more claims in that entry were wrong.** There were TWO call sites, not
+three, and one was deleted — so "two of the three are deleted" and "both copies
+deleted" describe a change that did not happen, and the row
+`delete it from fanOutChecked → nothing red` measures deleting a call
+`fanOutChecked` never had. And the surviving row is off: deleting it from
+`withoutLimits` reddens **four** top-level tests, not two.
+
+```
+TestAMalformedContentTypeAnswersTheSameOnEveryFederatedRead
+TestAMalformedMediaParameterDoesNotChangeWhatTheShardIsAsked
+TestAMalformedBodyIsStillRefusedUnderAMalformedMediaParameter
+TestEveryFederatedReadAnswersWhatASingleNodeAnswers
+```
+
+An "inert, measured" claim is worth exactly what its coverage is worth, and this
+one's coverage had a filter in it.
+
+## 75. Multipart temp files were never removed
+
+`net/http` removes them itself — `finishRequest` calls
+`w.req.MultipartForm.RemoveAll()` — but it checks the request the SERVER holds,
+and every `r.WithContext(...)` in this server's chain (the query deadline in
+`guard`, the tenant middleware, the write-id middleware) hands the handler a
+COPY. `ParseMultipartForm` then sets `MultipartForm` on a copy the server never
+sees, so nothing removes anything.
+
+```
+40 MiB multipart to /select/logsql/query, node and router:
+  /tmp/multipart-* grows by one 41,943,040-byte file per request, and they
+  persist. 32 files = 1.25 GiB left behind.
+```
+
+Bounded per request by `MaxBodyBytes`, unbounded in total, on a server whose job
+is to run for months. `guard` parses the multipart form itself now, before any
+copy is made, and defers `RemoveAll` — so every copy shares the pointer and the
+cleanup reaches the form the handler used. A second `ParseMultipartForm`
+downstream returns nil immediately, so no handler changes.
+
+**Two versions of the test could not fail.** The first posted to a real route on
+a test server that happens to make no copy — `MaxQueryDuration` unset, no
+tenancy — so `net/http` cleaned up correctly and the test passed with the fix
+removed: it measured a configuration in which the defect does not exist. The
+handler now makes a copy deliberately, which is the condition.
+
+The second still created no files, because the padding part had no `filename`.
+`multipart.ReadForm` keeps VALUE parts in memory and returns
+`ErrMessageTooLarge` past the budget; only FILE parts spill. With
+`filename="pad.bin"` the fix removed leaves three files behind for three
+requests, and the fix leaves none.
+
+## 76. A parameter sent twice asked the cluster a different question than it asked a node
+
+`withFormInURL` merged the caller's form UNDER the query string, so a key
+present in both took the URL's value. A node does the opposite for a urlencoded
+form: `ParseForm` puts `PostForm` before the URL query and `FormValue` reads the
+first, so the BODY wins. Both answered 200:
+
+```
+POST /select/logsql/stats_query?query=level:error | stats count() c
+     ct urlencoded, body query=* | stats count() c
+  node   "30"      router  "10"
+same shape, limit=1 in the URL and limit=5 in the body:
+  node   5 rows    router  3 rows
+```
+
+**Correction (entry 79).** This entry originally read "limit=1 in the URL and
+limit=3 in the body: node 3 rows, router 1 row". That is not what a three-shard
+router does, and the test shipped with the same numbers. Re-measured on this
+entry's own base commit: `url=1 body=3` gives node 3 rows and router 3 rows,
+**equal**, because the router applies the URL's limit=1 per shard and there are
+three shards. "router 1 row" is the ONE-shard result -- it came from the
+one-shard fixture this entry elsewhere says cannot see the defect, and was
+carried into both the prose and the test unchanged. `url=1 body=5` is the
+version that discriminates: node 5, router 3.
+
+Under MULTIPART the two already agreed — Go appends multipart values AFTER the
+URL query — so the router was implementing multipart precedence for both
+encodings.
+
+`r.Form` already encodes the right precedence for each encoding, so the merge
+forwards its values verbatim and the shard gets the node's answer either way,
+multi-valued parameters included.
+
+**What the URL must still win is the plan's own rewrite**, and that is now
+MARKED rather than inferred from "it is in the URL". `federatedSelect` marks
+`query` — a mark entry 63 removed as inert, which it was under the old rule and
+is not under this one: removing it now reddens
+`TestAPostFormDoesNotOverwriteTheRoutersOwnQuery` and
+`TestALimitThePlanDeletedDoesNotComeBackOverAPostForm`.
+
+**And the obvious companion marking is inert.** Marking `withoutLimits`' bounds
+the same way reddens nothing, because that function deletes them from the
+clone's `Form` and `PostForm` too — and a key absent from `r.Form` cannot be
+re-added by the merge. Not kept: third time this session that "mark it too, for
+safety" turned out to be inert.
+
+Two envelopes were maps where a node writes a struct, so `encoding/json` sorted
+their keys and the router answered `{"data":…,"status":…}` against a node's
+`{"status":…,"data":…}`. Structs now, which is what makes a byte comparison
+possible at all.
+
+**The fixture had to be repaired twice before it could measure anything.** The
+first `loadedPair` built the router with `wmRouter`, which calls
+`SetReplicas(len(backends))` — three REPLICAS of one shard, not three shards —
+so the router answered from one node holding a third of the data: 10 against the
+node's 30, which looks exactly like the defect and is a fixture that cannot see
+it. And the assertion compared line counts and a substring until both sides
+agreed on the number, at which point it still passed on two different
+envelopes; it compares bodies byte for byte now.
+
+## 77. A field faceted twice on a node became a doubled number on a router
+
+`FacetList` iterates the stored column names and then appends `_stream` and
+`_stream_id` at the tail, because they are synthesized onto every record. Once
+`_stream_fields` is configured they are ALSO stored columns — so both were
+faceted twice, once from the column and once from the tail.
+
+```
+30 rows, 3 streams of 10
+  node   "_stream" appears TWICE, 10/10/10 in each
+  router "_stream" once, 20/20/20
+```
+
+Both HTTP 200, and the truth is 10. The duplicate on the node is merely odd; the
+router's merge sums the pair by (field, value), so it becomes a **number twice
+the size of the data**, on the endpoint a dashboard uses to draw a distribution.
+
+The main loop skips them now: they are emitted once, from `Streams`/`StreamIDs`,
+which is the authoritative source for a field that exists whether or not a
+column was materialized for it.
+
+Found by giving the router/node differential REAL DATA. The parity matrix it
+grew out of compares status codes over an empty store, which is "returns the
+same three digits over no data" — both sides answered 200 here, and the
+difference is entirely in the body.
+
+
+## 78. Three fixes, three new defects: a lost field, a consumed body, and a buffered one
+
+Reviewer round on `9b5bcf4..3bd502f` — the range that fixed entries 73–77.
+
+**`pack_json` and `pack_logfmt` dropped a `_time` the row carried.** Entry 73
+records getting exactly this right for `_stream`: "the skip is conditional on
+the pair being emitted now". The same conditional was not applied to `_time`,
+so a `NoTime` row carrying a `_time` FIELD lost it from both halves — nothing
+emitted it from `r.Time` and the loop skipped the field. Measured, four rows:
+
+| query | before 39e5716 | after | victoria-logs |
+|---|---|---|---|
+| `… \| stats by (_time) count() c \| pack_json as p` | `{"_time":"…00Z","c":"1"}` | `{"c":"1"}` | `{"_time":"2026-08-16T03:00:00Z","c":"1"}` |
+| `… \| rename level as _time \| pack_json as p` | `{"_time":"error",…}` | `{"c":"2"}` for both rows | — |
+
+Reachable through `stats by (_time)`, `rename … as _time`, `copy … as _time`
+and the router's `jsonLineToRow`. Uncovered: the existing table's
+"projection that KEPT `_time`" case has `NoTime` false, so `_time` comes from
+`r.Time` and its key set is right either way. That fixture also disagreed with
+itself — `r.Time` said 2026-08-06 and its `_time` field said 2026-08-16 — and
+nothing checked the value, so it did not matter which won. The table now
+asserts values as well as keys, and carries the two rows that reach the defect.
+
+**`guard`'s multipart parse consumed the body of the two routes that read it
+themselves.** Entry 75 claimed "a second `ParseMultipartForm` downstream returns
+nil immediately, so no handler changes" — true of handlers that parse a form,
+false of handlers that read `r.Body`:
+
+| | before entry 75 | after |
+|---|---|---|
+| `/_count`, multipart, body `{"query":{"match_all":{}}}` | node 200 `{"count":12}` | node **400** `simdlogs: EOF`, router **503** |
+| `/_search`, same | 200 | **400** |
+
+And it buffered the body of routes that read nothing at all. 40 MiB multipart
+POST, server-side `TotalAlloc` delta: `/metrics` 0 → **128 MiB**, `/` 0 → 128
+MiB, `/alerts` 0 → 128 MiB, plus a temp file written and removed per request.
+`/metrics` is deliberately exempt from the query semaphore, so this is 3.2× the
+body in heap churn on the one route that must answer under load.
+
+The parse is now per route (`routeSpec.form`). An opt-in list gets one entry
+wrong silently, so it is not trusted: `TestNoRouteLeavesAMultipartTempFileBehind`
+posts a spilling multipart body to **every** path `Handler()` registered and
+fails on any file left behind.
+
+Two things had to be got right for that gate to mean anything:
+
+- **A positive control.** The check is an absence, and an absence has two
+  causes. The first version lowered the spill threshold to 1 KiB to make the
+  sweep cheap — but a handler's own `r.FormValue` calls `ParseMultipartForm`
+  with net/http's `defaultMaxMemory`, also 32 MiB and not ours, so nothing
+  spilled and the gate would have passed on a leaking server. A deliberately
+  leaking handler now runs first and the test fails outright if it leaves no
+  file.
+- **Two phases.** A file that exists *while* a request is in flight is the
+  mechanism working. `/select/logsql/tail` is meant to stay open, and checking
+  right after the request reported its in-flight file as a leak. Files are
+  attributed per route in phase one and judged after `ts.Close()`, which waits
+  for every handler.
+
+**It found one.** `/internal/replica/group` answered 400 and left a temp file:
+`serveReplicaGroup` reads `digest` with `r.FormValue` *before* the method
+switch, and its POST branch then `io.ReadAll`s the same body to adopt the group.
+`protocols.go` already states the rule — "Read from the URL, never
+`r.FormValue`: FormValue parses the BODY" — recorded after a line-protocol write
+stored nothing while answering 204. Same defect on the anti-entropy path, where
+the consequence is a shard that can never converge. `cluster_client` sends
+`?digest=`, so the URL is where it already was.
+
+**`_stream_id` was still doubled in `FieldNameCounts`.** Entry 77 fixed
+`FacetList` and not the endpoint beside it: `_stream` guarded against the stored
+column, `_stream_id` appended unconditionally. Six rows each carrying a
+client-supplied `_stream_id`, one shard:
+
+```
+node   [… {"value":"_stream_id","hits":6},{"value":"_stream_id","hits":6} …]
+router [{"value":"_stream_id","hits":12}, …]
+```
+
+Word for word entry 77's shape, both at HTTP 200. The new test supplies the
+field, which `loadedPair`'s rows do not — without it the stored column never
+exists and the test passes on the broken code.
+
+## 79. Four tests that could not fail, one of which put a wrong number in the record
+
+Same review round. None of these is a code defect; each is a check that was
+green for a reason other than the one claimed.
+
+**The limit subtest was a coincidence.** `limit=1` in the URL and `limit=3` in
+the body, over the three-shard fixture: a router applying the URL's limit=1 per
+shard returns 3 rows, which is what the body's limit=3 asks for. Measured on
+entry 76's own base commit:
+
+```
+url=1 body=3   node 3 rows, router 3 rows, EQUAL
+url=1 body=4   node 4 rows, router 3 rows, DIFFER
+url=1 body=5   node 5 rows, router 3 rows, DIFFER
+```
+
+**And entry 76 published the wrong number.** It read "node 3 rows, router 1
+row". That is the ONE-shard result — it came from the one-shard fixture the same
+entry says cannot see the defect, and was carried into the prose and the test
+unchanged. Corrected in place, in entry 76.
+
+**The matrix envelope was never compared.** `federatedVector` and
+`federatedMatrix` were both changed from a map to a struct so the router's key
+order matches a node's; only the vector one was exercised. Reverting the matrix
+envelope to a map left the whole suite green while the router answered
+`{"data":{"result":…,"resultType":…},"status":…}` against a node's
+`{"status":…,"data":{"resultType":…,"result":…}}`. A `stats_query_range` case
+now goes through the same byte comparison.
+
+**The facets test could not tell the synthesis from the column.** "Appears
+once" is satisfied both by emitting `_stream`/`_stream_id` from `Streams`/
+`StreamIDs` and skipping the stored columns — what `FacetList` does — and by
+keeping the columns and deleting the tail. Deleting the tail left every package
+green, while `_stream_id` vanished from facets entirely and `_stream` reported
+the raw column value `""` where the row serializes `{svc="s0"}`. The contract is
+click-through: the new test pastes each faceted value back into a filter and
+requires it to select rows.
+
+**A contradictory comment shipped.** Two adjacent paragraphs on the same line of
+code, one saying `query` is not marked because marking it was inert, the next
+saying it is marked always and load-bearing. The first was true before the rule
+it depended on was removed in the same range. Deleted.
+
+## 80. The `_time` fix reached two of the three copies, and missed the one on the wire
+
+`packJSON` and `packLogfmt` were fixed to keep a `_time` FIELD that a `NoTime`
+row carries. `appendRowJSON` — the serializer the packs exist to mirror, and
+the one that writes the response — still dropped it. So one response answered
+the question both ways:
+
+```
+* | stats by (_time) count() c | pack_json as p
+  row  {"c":"1"}
+  p    {"_time":"2026-08-16T03:00:00Z","c":"1"}
+```
+
+against victoria-logs, which puts `_time` in both. That is verbatim the failure
+entry 73 says the pack fix existed to remove — "a client reading `p` got a
+different record from a client reading the row, out of one response" — inverted
+and still live. The whole suite was green with the fix and without it.
+
+The test asserts the two halves **agree**, not that either matches a literal:
+whatever the row says, the pack of the same row must say. Three shapes reach
+it: `stats by (_time)`, `rename x as _time`, `copy x as _time`.
+
+## 81. Three more routes on the wrong side of the form/document line
+
+Entry 78 split routes into "parses a form" and "reads its own body" and got the
+set wrong three ways.
+
+**`/select/vector` is a third document route.** It decodes a JSON body, and the
+pre-parse consumed it: 200 at the commit before the pre-parse, 400 `EOF` after,
+while `/_count` was fixed in the same commit. It is also the only route that
+reads parameters *and* a document, so `form` cannot be set correctly for it
+either way — `true` eats the document, `false` drops a multipart `start`/`end`.
+Its time window now comes from the URL, which is where it can only ever have
+been: the body is the document.
+
+**`/health`, `/-/healthy` and `/-/ready` leaked a temp file per request**, and
+the gate could not see it. They are registered bare — outside `guard`, so no
+pre-parse, no `RemoveAll` and **no `MaxBytesReader`** — and `health.go` called
+`r.FormValue("format")`. The leak needs a middleware that replaced the request
+first, and with authentication OFF `withTenant` makes no copy for these paths,
+so net/http cleans up and the gate passes. `withPrincipal` does copy. On an
+authenticated server, a 33 MiB multipart POST to each:
+
+```
+/health     200  multipart-105144472
+/-/healthy  200  multipart-842413133
+/-/ready    200  multipart-920247530     all three survive the close
+```
+
+Unbounded, on routes that answer unauthenticated callers by design. `format`
+reads the URL now, and the gate runs a second time against an authenticated
+server — the configuration in which the defect exists was the one it never
+built.
+
+**`adminSpec().form = true` was justified by a reader that did not exist.** The
+comment said "serveReplicaState reads `digest` through `r.FormValue`", which
+the same change had just made untrue by moving that read to the URL. No admin
+handler reads a form. It cost six routes exactly what entry 78 had removed from
+three — 128.2 MiB against 0.2 MiB of `TotalAlloc` for a 40 MiB multipart POST —
+including `/admin/acknowledge-degraded`, which is `nosem` and therefore chosen
+to stay answerable under load.
+
+## 82. A doubled count replaced by a wrong one, on the endpoint next to the one that was right
+
+Entry 78 stopped `FieldNameCounts` listing `_stream_id` twice by guarding the
+synthesized entry against the stored column. That kept the wrong number: the
+column counts rows that **supplied** the field, while every returned row
+**serializes** one. Six rows, three carrying `_stream_id`:
+
+| | `_stream_id` |
+|---|---|
+| `field_names` | 3 |
+| `facets` | 3 + 3 = **6** |
+| the rows themselves | all six carry one |
+
+So it went from disagreeing with itself to disagreeing with `facets` over the
+same store — which is the shape entry 77 was about, one step along.
+
+`FacetList` had already resolved the identical collision the other way: skip
+the stored column, emit from the authoritative source. `FieldNameCounts` does
+that now, so the two endpoints agree by construction rather than by both
+happening to be right.
+
+The fixture had to change too. Entry 78's gave the field to **all six** rows,
+which makes the column count and the row count coincide — the one ratio at
+which a fix that keeps the column's number passes. Three of six tells them
+apart, and both mutations (count the column; drop the synthesized entry) are
+red.
+
+## 83. The `_time` fix emitted it TWICE, and the test's own comparison hid it
+
+Entry 80 made the `_time` field survive on a `NoTime` row. A `NoTime` row can
+carry **two** `_time` fields — neither `rename x as _time` nor `copy x as _time`
+overwrites an existing key — and the new guard kept both:
+
+```
+* | stats by (_time) count() c | copy _time as t2 | rename t2 as _time
+
+before entry 80  {"c":"1"}
+after            {"_time":"…00Z","c":"1","_time":"…00Z"}
+victoria-logs    {"_time":"2026-08-16T03:00:00Z","c":"1"}
+```
+
+One JSON object with a duplicate key, which every decoder resolves differently.
+Reachable on the plain wire row, not only inside a pack.
+
+**And the test could not see it.** `TestARowAndItsPackAgree` unmarshalled both
+halves into `map[string]string`, and a map keeps the last value for a repeated
+key — so its comparison method erased precisely the failure the change enabled.
+It reads key SEQUENCES now, through `json.Decoder`, because neither a map nor a
+struct can report a duplicate. Both directions are probed: keeping duplicates
+reddens it (`the row repeats a key: [_time c _time p]`), and dropping `_time`
+again reddens it the other way.
+
+The rule in all three copies is now "emit that key at most once, whichever
+source it comes from".
+
+## 84. Making the node right made the node and the router disagree
+
+Entry 80 fixed `appendRowJSON`, and the router's `jsonLineToRow` lifts `_time`
+out of the fields into `Row.Time` and **dropped the field**. For
+`stats by (_time)` that field is the group key, so the merge grouped every row
+together:
+
+```
+* | stats by (_time) count() c      4 rows, 2 distinct timestamps
+  node    {"_time":"…03:00:00Z","c":"2"} {"_time":"…03:00:01Z","c":"2"}
+  router  {"c":"4"}
+```
+
+Both at HTTP 200. The router was wrong before the fix too, but so was the node —
+so this converted "both wrong" into "a cluster and a node disagree about a
+number", which is worse.
+
+The field is kept as well as lifted now. It costs nothing on the way out,
+because the serializer emits `_time` at most once, so an ordinary log row
+serializes byte for byte as before; and it costs no allocation, because the
+field slice is already sized by `countFields(line)`, which counts `_time`.
+
+Four tests encoded the old contract — including the reference decoders that
+`TestRowScannerMatchesTheDecoder` and `FuzzJSONLineToRow` compare against — and
+were updated with it. The new parity test compares a router against a node over
+the same rows rather than against a literal, and checks the group key is present
+at all, since two identical empty answers would satisfy a comparison.
+
+## 85. Three more from the same round
+
+**`timeWindowURL` had no test, and reproducing the defect needed a preamble.**
+The first attempt put the multipart envelope directly after the JSON document
+and passed against the defect. The reason is that `json.Decoder` reads AHEAD
+into its own buffer and those bytes never return to `r.Body`, so a boundary
+placed right after the document is swallowed and the later parse finds nothing.
+Everything before the first boundary is a legal multipart preamble, so 64 KiB of
+it puts the boundary past the read-ahead — and then reverting `/select/vector`
+to `r.FormValue` leaves one temp file per request, which is what the fix
+prevents.
+
+Entry 81 also had the mechanism backwards: it said `form: false` "drops the
+multipart `start`/`end`". Measured, `form: false` with an `r.FormValue` in the
+handler *reads* that tail and leaks, because there is no pre-parse and therefore
+no deferred `RemoveAll`. Reading the URL is what stops it.
+
+**`adminSpec().form = false` was unpinned.** No admin handler parses a form, so
+the leak gate cannot see the flag either way; what is visible is the cost.
+A 4 MiB multipart POST, server-side `TotalAlloc` delta:
+
+| route | `form: true` | `form: false` |
+|---|---|---|
+| `/flags` | 16.96 MB | 0.16 MB |
+| `/admin/backup` | **8.56 MB** | 0.14 MB |
+| `/admin/acknowledge-degraded` | 16.95 MB | 0.15 MB |
+
+Asserted with a wide margin rather than an exact number — half the body size
+separates them by an order of magnitude, so it is a check and not a benchmark.
+
+**Correction (entry 87).** This table first published `/admin/backup` at 16.97
+MB, which is the other two rows' number copied across; re-measured over five
+runs it is 8.56 MB. The test's own comment gave a third figure, "~13 MiB", which
+matches none of them and is now the measured range. All three answer 200 in both
+configurations, so the difference is the buffering and nothing else.
+
+**Prose that stayed behind the code.** Four places still said "the two
+Elasticsearch routes" after the set became three; and the LLD said the leak gate
+"runs twice … with a positive control", where they are two separate functions
+and only the plain one has a control. What establishes the authenticated one is
+the mutation — reverting `format` to `r.FormValue` reddens it naming all three
+health routes — and the LLD says that now instead.
+
+## 86. The empty stream was reported only when it was the ONLY stream
+
+`Streams` fell back to "every row is in the empty stream" when nothing was in a
+named one. A store ingested partly with `_stream_fields` and partly without has
+both, and the empty half was dropped. Measured against the staged
+victoria-logs binary, six rows, three named:
+
+| | simdlogs | victoria-logs |
+|---|---|---|
+| `/select/logsql/streams` | `[{svc="s0"}:3]` | `[{svc="s0"}:3, {}:3]` |
+| `/select/logsql/stream_ids` | one value | two values |
+| `/select/logsql/field_names` | `_stream`:6 | `_stream`:6 |
+
+so one store gave two answers about how many rows exist: `field_names` and
+`/query` counted six, `/streams` and the `_stream` facet counted three.
+
+**The empty stream cannot be read off the `_stream` column.** A row ingested
+without `_stream_fields` has no such column at all — it is absent from
+`StatsByField`, not present with `""` — so the first attempt, mapping `""` to
+`{}`, changed nothing and the measurement said so. Every row is in exactly one
+stream, so the empty stream is the **remainder**: `Count(q)` minus the rows in
+a named stream. That one expression covers the all-empty store and the mixed
+store, replacing the special case that only handled the first.
+
+Mixed ingestion is not exotic — it is what a store looks like while
+`_stream_fields` is being rolled out, and what any second shipper that does not
+set it produces.
+
+## 87. The empty-stream fix replaced an under-count with an over-count
+
+Entry 86 made the empty stream the REMAINDER: `Count(q)` minus the rows in a
+named stream. It added that to the count already read off the `_stream` column,
+so every row whose column is `""` was counted twice.
+
+Both ways a row reaches the empty stream have to be handled, and entry 86 only
+noticed one of them:
+
+- **no `_stream` column at all** — ingested without `_stream_fields`, so absent
+  from `StatsByField`. This is what the remainder is for.
+- **a column materialized to `""`** — the store materializes the column for a
+  whole flush group, so a row that never carried the field comes back with `""`
+  once any row in its group did. `streamValues` already returns these.
+
+Measured on ONE ingest request of six rows, three carrying `svc`:
+
+| | simdlogs after entry 86 | victoria-logs |
+|---|---|---|
+| `/streams` | `{}`:6 and `{svc="s0"}`:3 — **nine hits over six rows** | `{svc="s0"}`:3 and `{}`:3 |
+| `/stream_ids` | 6 and 3 | 3 and 3 |
+| `field_names` `_stream` | 6 | 6 |
+
+so `field_names` and `/query` said six while `/streams` said nine — the same
+one-store-two-answers shape entry 86 set out to remove, with the sign flipped.
+A missing number is not improved by a wrong one.
+
+The empty stream holds exactly the rows the named ones do not, so it is an
+ASSIGNMENT — `Count(q) - named` — and both paths fall out of it.
+
+**The fixture is the finding.** Entry 86's test posted its six rows as six
+separate requests, which land in six flush groups, so the streamless rows had no
+column at all and the `""` branch never ran. One request puts them in one group.
+The test now runs both shapes against separate stores, and its own
+"hits total 6" assertion — right all along — reddens on either.
+
+Two more from the same round:
+
+- **`/stream_ids`'s assertion could not fail.** `StreamIDs` builds one entry per
+  `Streams` entry, so comparing the two lengths is structural. Reverting the
+  fix reddened three assertions and left that one green. It compares the HITS
+  now.
+- **`packLogfmt`'s guard was pinned by nothing.** All four subtests of the
+  row-and-pack agreement test packed JSON, so `hasDuplicate` never saw a logfmt
+  pack and reverting that copy left the whole suite green — while
+  `pack_logfmt` emitted `_time=… c=1 _time=…`. Two logfmt cases now run through
+  the same comparison, with a logfmt parser that keeps the key ORDER, since a
+  map would collapse the duplicate exactly as the JSON half once did.
+
+## 88. `limit` bounds the scan on a node and the output on a router — two different answers
+
+Task #438, left open by entry 61 as "a cluster and a single node disagree on
+which rows `sort ... | limit` keeps". It is not about `sort`. It is the
+endpoint's `limit`, and it breaks four query shapes.
+
+`limit` is `LastN`, and a node applies it to the **scan**: `Run` returns the
+newest n rows newest-first and every pipe then runs on those n
+(`internal/query/engine.go:425`). The router applied it after the coordinator
+pipes — taking the last n of an ascending result and reversing it. Measured,
+three shards of ten rows with distinct timestamps, `&limit=5`, where the newest
+five all have `level=error`:
+
+| query | node | router |
+|---|---|---|
+| `* \| limit 5` | 02:09..02:05 | **00:04..00:00** |
+| `* \| sort by (_time)` | 02:05..02:09 | **02:09..02:05** |
+| `* \| sort by (_time) \| limit 5` | 02:05..02:09 | **00:04..00:00** |
+| `* \| offset 2 \| limit 3` | 02:07..02:05 | **00:04..00:02** |
+| `* \| filter level:info \| sort by (_time)` | nothing | **five `info` rows** |
+| `*` | 02:09..02:05 | 02:09..02:05 |
+| `* \| stats count() c` | 30 | 30 |
+
+Three of these are the **opposite rows**, not the opposite order. All at 200.
+
+**Two defects, two fixes.** The bound moves to where a node applies it: the
+merged rows are sorted newest-first and truncated to n *before* the coordinator
+pipes, and the post-pipeline truncation is gone. That fixes the first four rows.
+
+The fifth needs the plan to change. A shard that ran a filtering row-local pipe
+first has already discarded rows the bound would have kept, and the router
+cannot put them back — so under a bounding `limit` the push-down now stops at
+the first pipe that can change the row count. `query.ChangesRowCount` names the
+one-to-one pipes explicitly and **defaults to true**: a pipe added to the
+language is treated as unsafe to push down, which costs a shard's full match set
+and never an answer. The opposite default would make it silently eligible and
+the failure would be a short answer at 200.
+
+`* | fields _time, _msg` still pushes down with its shard `limit`, and that is
+not an exception: one row in, one row out means each shard's newest n contains
+the cluster's newest n. A first version forced the whole chain to the
+coordinator and reddened
+`TestAShardLimitThePlanKeepsIsNotSuppressedByAPostForm`, which is exactly the
+row that says so.
+
+**Why `stats` is unaffected**: `runStats` runs its own scan and never sees the
+bound, which is why `* | stats count() c` answers 30 on a node with `&limit=5`
+and not 5. `limitBoundsOutput` already named that set and is unchanged — only
+the place it is consulted moved.
+
+**Still open, and measured rather than assumed gone.** The node emits a field
+the pipeline named in second position; the coordinator rebuilds rows from each
+shard's JSON in ingest order:
+
+```
+node    {"_time":"…02:05Z","level":"error","_msg":"m","user":"u5",…}
+cluster {"_time":"…02:05Z","_msg":"m","level":"error","user":"u5",…}
+```
+
+Same rows, same values, same order, different key order — for
+`| filter level:error` and for `sort by (level, _time)`. It matters to a
+byte-comparing consumer and not to a JSON one. The parity test therefore
+compares each line as an **object**, in row order, so the row question is not
+hidden behind the key question; row count, row order, and every key and value
+are exact.
+
+Thirteen query shapes are compared against a single node holding the same rows.
+Four mutations redden it: removing the pre-pipeline bound (6 subtests), keeping
+the merge ascending (9), pushing filtering pipes down anyway (1), and making
+`ChangesRowCount` always false (1).
+
+## 89. Two of the three reasons a watermark moved for nothing
+
+Task #434. `checkWatermark` reports a lagging replica and does not refuse,
+because the first version's 503 turned out to fire on a healthy cluster. Three
+causes were named in the comment; two are now closed and one is not, and the
+difference between "closed" and "named" is what decides whether the refusal can
+come back.
+
+**Closed: the watermark was the max over OPEN tenants and over data currently
+HELD.** `highWatermark()` scanned `forEachTenantDetached`, so evicting a tenant
+dropped it — a one-node cluster reading tenant 2 and then tenant 1 reported
+itself going backwards — and retention deleting the newest rows dropped it
+legitimately. It is a running maximum now, kept on the server rather than
+derived per call, so what it reports is *the newest timestamp this node has
+accepted*. That moves for exactly one reason.
+
+**Closed: the history was keyed by shard INDEX.** `SetBackends` may repoint an
+index at a different machine, and the new machine inherited the old one's floor
+— so a freshly added, legitimately empty replica read as lagging. The entry
+records **which peer** set the high, and a high set by a peer the topology no
+longer lists is replaced rather than enforced. Keeping the shard key matters:
+the signal wanted is cross-replica (two replicas of one shard holding 12 and 8
+rows), and a peer compared only against its own history cannot show that.
+
+**Open: a restart re-derives it from the stores that load.** A replica whose
+newest data retention already deleted comes back below its sibling with nothing
+wrong. The maximum is monotonic *within a process* and not across one, and
+closing that needs it to be durable. `TestARestartStillLowersTheWatermark`
+states the shape and says in its own failure message that when it stops holding,
+the refusal can be turned back on.
+
+Three mutations redden the tests: making the watermark non-monotonic, letting a
+departed peer's floor stand, and not recording which peer set the high. The
+second of those first appeared to survive — the mutation left `present`
+assigned and never read, which does not compile, and a grep for `--- FAIL`
+counts a build failure as zero.
+
+## 90. The repair duplicate was a check-then-act in the store, not in the router
+
+Task #428. The router admits one repair at a time, and its own comment said the
+latch is per-process and cannot help when two routers point at the same
+cluster — closing that needs the decision at the destination, the only
+participant that can see it already holds the group.
+
+The destination already had the check. `AdoptGroup` asks `hasDigest` and then
+appends, and **the two steps took the store lock separately**. Measured, one
+digest of four rows, callers released together:
+
+| concurrent adopts | said adopted | groups in the store | rows |
+|---|---|---|---|
+| 2 | 1 | 1 | 4 |
+| 4 | 2 | **2** | **8** |
+| 8 | 3 | **3** | **12** |
+
+Every loser returned `adopted=false`. A caller counting successes saw exactly
+one while the store held three — which is how a repair pass reports
+`complete:true, blocked:0` over a shard it has just doubled, and why the
+duplication could not be seen from the router at all.
+
+One lock across both steps. End to end, two separate routers repairing one
+shard: the replica that was missing a group holds it once, and reverting the
+lock reddens that test on every run of ten.
+
+**Both passes may still report `copied>0`, and that is not the defect.** Each
+decided from a state that was true when it read it, and a report is about the
+decision. The rows are the assertion.
+
+The router's latch stays. It stops one router doing the whole pass twice, which
+wastes a round of fetches even when nothing duplicates — the cheap half, and no
+longer the only half.
+
+## 91. A cluster archive presented as an old node archive, and named the one flag that cannot help
+
+Task #431, first entry off the unwired baseline. `ValidateClusterBackup`'s doc
+says it is *"called BEFORE anything is unpacked"* because *"a restore that
+discovers the mismatch halfway has already written some of it"* — and nothing
+called it. It is the example the unwired-mechanism gate's own header cites.
+
+It had no caller because **there is no cluster restore**. `simdlogs restore`
+restores one node's archive; a cluster backup is `cluster.json` plus one tar per
+shard, and nothing reads it back. So the question is not "where should the
+validation run" but "what happens to the operator who has a cluster backup and
+the restore command they were given".
+
+Measured, a real two-shard cluster archive (14848 bytes: `cluster.json` 619,
+`shard-0.tar` 6656, `shard-1.tar` 4608):
+
+```
+simdlogs restore -src cluster.tar -dst DIR                storage: the backup archive carries no manifest
+simdlogs restore -src cluster.tar -dry-run                storage: the backup archive carries no manifest
+simdlogs restore -src cluster.tar -dst DIR -allow-unverified   the same, and one empty LOCK file written
+```
+
+Nothing corrupt landed — the tar's entries are not group names, so they are
+refused one at a time — and that is the whole of the good news. The message
+names `-allow-unverified`, whose help text is *"restore a pre-format-1 archive,
+which carries no manifest"*, and that flag fails identically. An operator was
+told their archive was unverifiable and pointed at the one option that cannot
+help.
+
+`ErrClusterArchive` and `ClusterArchiveError` are raised at the tar entry, not
+after the scan: the entries that follow are per-shard tars, and rejected one by
+one they produce a limit or a name error whose text says nothing about what the
+archive is. The error carries the manifest bytes out, and the restore command
+decodes them, **validates them with `ValidateClusterBackup`**, and prints the
+shard count, each shard's archive and rows, and the procedure — including that
+the shard count must match, because rows are placed by a function of it.
+
+Validated before quoted, which is the point of running it here: two archives
+claiming shard 0 would otherwise be printed as a shard list an operator could
+act on. Four malformed manifests are refused by name.
+
+The gate's baseline is a ratchet in both directions, and this is the first entry
+it has given back: an exemption that gains a production reader fails the gate,
+so it cannot outlive its reason.
+
+## 92. The count could be alerted on and nothing could say what it was
+
+Task #431, second entry off the unwired baseline. `QuarantinedGroups` returns
+every quarantine record — which group, why, its checksum, its size, when, and
+where the file went. Its entry said *"the COUNT reaches production
+(`countQuarantined` → the `simdlogs_storage_quarantined_groups` gauge); only the
+LISTING has no reader"*, and that is exactly the gap: an operator could put an
+alert on "one group is quarantined" and had no way to ask which one.
+
+`/admin/storage/quarantine` serves it through `Store.Quarantined`. Admin-only,
+like every other storage endpoint — the records name file paths and checksums,
+which describe the shape of the data.
+
+**Four gates fired on the new route before it worked**, which is the route
+surface doing its job:
+
+```
+/admin/storage/quarantine is registered but not classified
+/admin/storage/quarantine has no contract and no exemption
+docs say "46 routes" and the mux registers 47   (twice, two documents)
+surfaceRoutes() classifies 46 and the mux registers 47
+```
+
+and then a fifth caught a real defect: `tenantPaths` is an explicit allow-list,
+and without an entry `s.tn(r)` had nothing to return, so the handler panicked
+into a 500. `TestNoRouteAnswersWithAServerErrorOnAStorageNode` named it.
+
+Two behaviours are worth stating because they were chosen rather than fallen
+into:
+
+- **`[]`, never `null`.** A client that distinguishes them reads `null` as "this
+  node cannot say" and an empty list as "nothing is quarantined". Those are
+  different answers, and the encoder's default for a nil slice is the wrong one.
+- **A router refuses.** Its own store quarantines nothing, so an empty list
+  there reads as "nothing is wrong" about shards it has not asked.
+
+Three mutations redden it: answering `null`, letting a router answer, and making
+the store report nothing.
+
+## 93. Three shapes of "unwired", and only one of them was a defect
+
+Working down task #431's baseline turned up that "no production reader" is three
+different findings wearing one label, and the right answer differs for each.
+
+**A mechanism with no reader — wire it.** `ValidateClusterBackup` (entry 91) and
+`QuarantinedGroups` (entry 92). Both had an operator-visible gap behind them.
+
+**A name that lies about its category — rename it.** `SetMaxRows` and
+`SetDirRereadInterval` were listed as "a dead exported setter". They are not
+dead: fourteen tests call them, and production sets both through config
+(`-search.maxRows`, `-readiness-reread-interval`). They are test hooks whose
+names did not say so, which is why they read as unwired at all — the baseline
+already has a category for exactly this, holding `SetFaultHookForTest` and
+`FailAt`. `…ForTest` on both, and they move from "genuinely unwired" to
+"deliberate", which is what they always were.
+
+**A constant nobody writes — delete it.** `FieldRequestID`, `FieldStatus`,
+`FieldDurationMS` and `FieldRows` are log-field names, and no log line uses any
+of them. The block's own comment says field names are constants so that `tenant`
+in one file and `tenant_id` in another cannot become two fields — and a name
+nobody writes cannot cause that drift, while its presence tells a reader those
+fields are in the logs. Their only other references in the module were their own
+exemption entries. The day a request line needs `duration_ms`, the constant is
+one line and will then be true.
+
+The baseline is 16 entries down to 11. It is a ratchet in both directions, so
+none of these can come back quietly: an exemption that gains a reader fails the
+gate just as a new name without one does.
+
+## 94. Two superseded paths, kept alive by the tests that tested them
+
+Task #431, continued. Both entries said "superseded" and both were true, and
+neither was reachable from production — the question each poses is what happens
+to the tests that keep it compiling.
+
+**`SnapshotAll` was a two-line wrapper that threw away the number.** It calls
+`SnapshotAllWithSeq` and drops the manifest sequence — the value that makes a
+snapshot verifiable, and the reason the `WithSeq` form exists at all: reading
+the sequence in a second lock acquisition gives a different number, and the
+archive then declares a watermark covering a group it does not contain. Its four
+callers are tests, and every one of them wanted the pair anyway. Deleted, and
+they take it.
+
+**`RestoreTar` is the superseded UNSTAGED restore**, replaced by Task 5.2's
+staged one, and its own doc says so — *"The files are already written in that
+case -- this is the unstaged restore"*. Twelve callers, all tests, and eight of
+them are not testing restoring at all: they use it as the harness for
+`readBackup`'s entry-by-entry validation (size, checksum, `ReadGroup` parse,
+ordering, the terminator). That harness is worth keeping and is not worth
+reaching through a staged restore, which would test the staging too.
+
+So it moved into a `_test.go` file, where production cannot call it, and the two
+callers in `internal/api` moved to `Restore` — which is what a real restore
+does, and both passed unchanged.
+
+That is a fourth shape for entry 93's list: **a superseded API that survives as
+a test harness — scope it to tests rather than delete or keep**. The baseline is
+16 entries down to 9.
+
+## 95. The unwired baseline is empty, and none of it was one kind of thing
+
+Task #431 is closed. The gate's exemption list is 16 entries down to **8**, and
+all eight are deliberate test hooks that say so in their names. The "genuinely
+unwired" section is empty.
+
+What the sixteen actually were, which is the finding worth keeping:
+
+| shape | what to do | which |
+|---|---|---|
+| a mechanism with no reader | **wire it** | `ValidateClusterBackup`, `QuarantinedGroups` |
+| a name that lies about its category | **rename it** | `SetMaxRows`, `SetDirRereadInterval`, `routeCount`, `ExecuteCount` |
+| a constant nobody writes | **delete it** | `FieldRequestID`, `FieldStatus`, `FieldDurationMS`, `FieldRows` |
+| a superseded API kept alive by its own tests | **scope it to tests** | `RestoreTar` |
+| a wrapper that drops what makes the call safe | **delete it** | `SnapshotAll` |
+| dead code that reads as a live endpoint | **delete it** | `readiness` — 51 lines, no caller, while `/-/ready` goes elsewhere |
+| a deliberate test hook | **keep, and say so** | the eight that remain |
+
+Only two of the sixteen were the defect the gate was written for. Six were names
+that made a test-only helper look like production API — which is not nothing:
+that is exactly what made them read as unwired, and a reader scanning for what
+production uses was misled by every one.
+
+Two of the deletions closed a real hazard rather than tidying. `SnapshotAll`
+let a caller take a snapshot without the manifest sequence, and the sequence is
+what stops an archive declaring a watermark covering a group it does not
+contain. `readiness` was a whole superseded handler that an editor's jump-to
+would land on before the live one.
+
+The list ratchets both ways, so none of this can come back quietly: an
+exemption that gains a production reader fails the gate, and a new name without
+one fails it too.
+
+## 96. The watermark needed a generation, not durability
+
+Task #434 asked for a durable watermark so lag could be refused again. It did
+not need one. What the refusal was missing was never persistence — it was the
+ability to tell a **restart** from **lag**, and one header settles that.
+
+The watermark comparison had been demoted to a log line because three benign
+causes each looked exactly like a lagging replica:
+
+| cause | why it lowered the watermark | closed by |
+|---|---|---|
+| a per-query maximum | a narrow query saw fewer groups than a wide one | node-level running maximum (`s.hwOwn`, CAS) |
+| a different replica answering | replica B's floor compared against replica A's | recording `peer` with the floor |
+| the node restarted | the in-memory maximum started over at 0 | **this entry** |
+
+The first two are properties the node can fix about itself. The third cannot
+be: after a restart the node's watermark is genuinely lower, and no amount of
+care on the reader's side distinguishes that from a replica that has fallen
+behind. Durable state was the obvious answer and the wrong one — it makes every
+node's correctness depend on a file surviving, for a fact that expires in
+milliseconds.
+
+A **per-process generation** is enough. `newNodeGeneration()` (crypto/rand hex,
+time+pid fallback) is stamped into the `Server` at construction and travels on
+every peer envelope as `X-Simdlogs-Generation`. `observe` then has evidence:
+
+```go
+if peer == h.peer && gen != "" && h.gen != "" && gen != h.gen {
+    prev = h.hw
+    h.hw, h.peer, h.gen = hw, peer, gen
+    return false, prev, true // a restart, not lag
+}
+```
+
+Same peer, different generation, lower watermark: that is a restart, and the
+floor is re-based rather than refused. Same peer, same generation, lower
+watermark: nothing benign explains it, and the read is refused —
+`p.Complete = false`, which surfaces as 503, with `allow_partial_response=1`
+as the recoverable 206.
+
+**The fourth guard is the one that makes it deployable.** `observe` returns
+`certain`, and `checkWatermark` refuses only when `certain`. Either side
+predating the header leaves `certain` false, so during the first half of a
+rolling upgrade — when every peer is an older build sending no generation — a
+fall is logged and never refused. A false 503 across a whole cluster is worse
+than the short answer it would be preventing.
+
+Each guard was probed by mutation, and the fourth is why this entry has a
+number. Three of them redden the suite when removed:
+
+| mutation | result |
+|---|---|
+| never refuse (`p.Complete` untouched) | 3 tests red |
+| a restart counts as lag (`if false`) | 3 tests red |
+| no generation on the wire | 3 tests red |
+| **refuse without evidence (drop `certain`)** | **green** |
+
+Green, because every fixture carried a generation — `certain` was true
+everywhere and the guard could not be seen. The guard that only matters during
+an upgrade is invisible to a suite where nothing is mid-upgrade.
+`TestAPeerWithNoGenerationIsReportedNotRefused` builds the older node's
+envelope by hand, omitting exactly one header, and the fourth mutation reddens.
+
+What the fixtures mean now, which is the other half of the change:
+
+| fixture | before | now |
+|---|---|---|
+| a replica whose watermark falls within one generation | logged | **503**, 206 with `allow_partial_response=1` |
+| a peer that restarts (new generation) | logged | tolerated, floor re-based |
+| a restarted peer's **sibling** falling | logged | still refused — a restart excuses one peer |
+| a peer sending no generation | logged | logged |
+| an unchanged watermark | logged | not lag |
+| a replaced machine | logged | does not inherit the old floor |
+
+The superseded claim, corrected here rather than left standing: "#434 needs a
+durable watermark before lag can be refused (a restart still lowers it)". It
+does not. It needs to know which process answered.
+
+## 97. Entry 96's refusal was broader than entry 96's rule, and it outaged a healthy cluster
+
+A second reviewer, who did not write the change, took entry 96 apart. Three of
+its findings were wrong answers or false refusals, all three mine, and one of
+them says the headline of entry 96 was too strong.
+
+**The refusal did not match the rule as written.** Entry 96 states it as "same
+peer, same generation, lower watermark". The code refused ANY member's lower
+watermark against a single shard-wide floor. Proven with a fixture the lagging
+one cannot be told apart from: two replicas holding the **same twelve rows** at
+watermarks 2000 and 1999. Kill the first, and the second was refused
+
+	503 ... 1 of 1 shards could not answer completely (0)
+
+on an answer that would have been byte-identical — and refused permanently,
+because the floor only ever rose. On an idle shard it never cleared.
+
+That is not a fixable comparison. Two replicas of a shard taking writes are
+microseconds apart continuously, and a node-level running maximum survives
+retention, so they differ even holding identical data. Nothing in one peer's
+answer separates "replication is a millisecond behind" from "this replica lost
+a day". The first version of this check was reverted for exactly this outage;
+attaching a generation header to it did not change the comparison that caused
+it.
+
+**So the refusal is narrowed to the two observations that have no benign
+reading**, and the cross-replica case goes back to being reported:
+
+| observation | before | now |
+|---|---|---|
+| a peer below **its own floor**, same generation | refused | **refused** |
+| a peer reporting **zero** while a live sibling has data | **served at 200** | **refused** |
+| a peer below a **sibling's** watermark | refused | reported: 200 + `X-Simdlogs-Shards-Lagging` |
+| a peer that restarted | tolerated | tolerated |
+| a peer sending no generation | reported | reported |
+
+A process's watermark is a running maximum held in memory, so it cannot fall.
+The floor is now **per peer and per generation** — the highest that process has
+reported — which also fixes a second thing the shard-wide floor got wrong: with
+a last-report comparison the fall was a single-read event, refused once and
+then served short forever, because the next read compared 1000 against 1000.
+
+**Zero is not silence, and treating it as silence lost a whole shard at 200.**
+`if !p.OK() || p.HighWatermark == 0 { return }` read a reported zero as "the
+peer did not say". A replica that had lost its entire dataset reports zero, so
+the extreme case of the defect this check exists for — the whole shard's rows
+simply absent — was the one case it returned early on. The client had always
+known the difference, parsing the header only when present; `PeerResponse`
+threw it away by storing both as `int64(0)`. It carries `HasWatermark` now.
+
+Zero is unambiguous where "lower than a sibling" is not: a node holding nothing
+at all cannot be a correct replica of a shard a live member reports data for.
+That is why one refuses and the other does not.
+
+**A router signed its children's partial answer as whole.** `serveEnvelope`
+stamps `Complete` from this node's own degraded snapshot, before the handler
+runs, and the fan-out never lowered it. Measured on a real two-level cluster:
+
+	middle router -> 206, X-Simdlogs-Complete: true, missing=1(unavailable)
+
+The parent merges that as a whole answer, so a shard missing two levels down is
+invisible at the top. `fanOutChecked` now sets the header to false before it
+writes a byte — after the first write a header is dropped silently, which is
+why it cannot be done later.
+
+**And a router claimed a watermark of zero.** It holds no tenant data, so
+`highWatermark()` returns 0, and it sent that. With the zero-skip in place that
+made the whole check inert one level up; with the zero-skip removed it would
+have made every router look like a replica that lost its data. A node that did
+not answer from its own stores now omits the header entirely.
+
+Each of the six guards was probed by mutation, and all six redden:
+
+| mutation | failing tests |
+|---|---|
+| absent treated as zero again | 1 |
+| an empty replica is not refused | 2 |
+| a peer below its own floor is not refused | 6 |
+| a cross-replica shortfall is not reported | 3 |
+| a partial router still says complete | 1 |
+| a router claims a watermark | 1 |
+
+Three smaller things the same review found, fixed here: the restart branch
+logged "a peer that has left the topology" for a peer that had merely
+restarted — the departure case it shared a message with no longer exists, since
+marks are keyed by peer URL and dropped when the URL leaves the member list;
+`acknowledgeDegraded`'s doc comment had come to sit on top of `listQuarantined`,
+which does neither of the things it describes; and `storagePressure` lost its
+only production caller when `readiness` was deleted in entry 95's sweep, making
+it the seventh instance of the naming defect that sweep was about — it is
+`storagePressureForTest` now, with the exemption list at nine.
+
+**What is still open, stated plainly.** A replica genuinely behind its sibling
+still answers short at 200. It is named in `X-Simdlogs-Shards-Lagging` and
+logged, so it is not silent, but it is not refused — and it cannot be, from one
+answer, without refusing ordinary replication skew too. Catching it needs
+either a quorum read (a request per replica on every query) or an operator
+declaring how far apart their replicas are allowed to be. Neither is in the
+code. Entry 96's claim that "a genuinely lagging replica is refused" is true
+only of a replica that fell below its own floor, and this entry is the
+correction; entry 96 stays as it was written, because it is a record of what
+was believed at the time.
+
+## 98. The other three from the same review: a bare index, a race under the guard's own premise, and two guards the rewrite closed by accident
+
+Entry 97 landed the three blocking findings. These are the rest.
+
+**The refusal did not say what kind it was.** The `missing` bucket names a
+class — `0(unavailable)` — and the `incomplete` bucket was a bare index, so
+
+	503 ... 1 of 1 shards could not answer completely (0)
+
+read identically whether the shard's store had quarantined groups or its
+watermark had gone backwards. Those are different problems with different
+fixes, and after entry 97 this bucket produces mostly the second. It carries a
+reason now, `0(watermark)` or `0(degraded)`, and both are asserted — a test for
+only the watermark case would pass on a version that labelled everything
+"watermark", which is a worse answer than the bare index it replaced.
+
+**`SetBackends` was a plain assignment against readers in per-shard
+goroutines.** Nothing raced in practice: only `main.go` calls it, before
+serving. But the watermark check's peer-identity guard exists specifically for
+"SetBackends repointing an index at a different machine", and that is an
+operation the field's own type said could not be performed at runtime without
+racing. A guard whose premise the code cannot safely carry out has a hole under
+it.
+
+`atomic.Pointer[[]string]` with a `backendList()` accessor, one atomic load per
+read. Two things the first version got wrong and the tests now hold:
+
+- `shards()` called the accessor four times — the bound check and the slice
+  could see two different lists, which is the exact tear the atomic was for.
+  Moving a race from a field to its accessor is not a fix. One load, hoisted.
+- `SetBackends` stored the caller's slice. It copies: a caller appending to a
+  slice they still hold was rewriting this server's topology under the
+  goroutines reading it. `TestSetBackendsCopiesTheCallersSlice` uses spare
+  capacity so the append writes in place, which is the case aliasing loses.
+
+Reverting the field to a plain slice reddens under `-race`; aliasing the
+caller's slice reddens without it.
+
+**And two guards the reviewer found untestable are now dead, closed by entry
+97's rewrite rather than by anything aimed at them.** The restart branch's
+`gen != "" && h.gen != ""` and the unreachable `certain` computation in the
+`hw >= h.hw` arm both belonged to the old single-floor `observe`. Re-probed
+against the rewrite: making an empty generation count as the same process
+reddens 1, dropping the no-generation case reddens 2. The fixtures that closed
+them — `TestAPeerWithNoGenerationIsReportedNotRefused` and the restart
+subtests — were written for the blocking findings and cover these by
+construction, which is worth recording as the reason they are green rather than
+leaving them looking like guards nobody checked.
+
+## 99. Two OTLP encodings of one export, storing different things
+
+Task #410's OTLP round. Three of its findings were real, one was real and not
+reachable, and the test helper every value assertion in this package goes
+through was inventing fields.
+
+**`Resource.dropped_attributes_count` is field 2, and the protobuf path read
+only field 1.** The JSON path wrote `resource_dropped_attributes_count` and the
+protobuf path never did, so the same logical export stored a different set of
+fields depending on which encoding the collector was configured for — and a
+collector's otlphttp exporter sends protobuf by default. The conformance
+fixture could not see it: its builder had no way to write the field, so neither
+encoding was ever asked.
+
+**A trace ID was stored in whatever case it arrived in.** OTLP/JSON carries
+trace_id and span_id as hex, and hex is case-insensitive; the protobuf path
+carries raw bytes and renders them lowercase. Measured on the identical IDs:
+
+	proto  abcdef0123456789abcdef0123456789
+	json   ABCDEF0123456789ABCDEF0123456789
+
+The same trace under two spellings, so a query for one finds neither half of
+the other's records. Nothing validated it either: `not-hex-at-all!!`,
+`zzzz...`, a 4-character `0123` and a 128-character one all went in verbatim,
+putting arbitrary text that arrived from outside the cluster into a column
+queries treat as an identifier.
+
+Normalised in `otlpRecordFields`, which both encodings already share, so they
+agree by construction: the protobuf path hands in lowercase hex of exactly the
+right length and normalises to itself. A value that is not a trace ID is
+dropped and the RECORD is kept — one bad field is not a reason to lose a log
+line.
+
+**The depth bound's silent cut is real and cannot be observed.** The report was
+that past 16 levels the innermost value is dropped with no marker, at `{}`
+full-success — unlike `maxCompositeBytes`, which marks with `"...truncated"`.
+The first half is true. The second is not reachable: a nested array renders by
+stringifying each level and escaping it as a string at the next, so the output
+roughly doubles per level and the 64 KiB budget fires by about level 13, before
+the depth bound ever can. Measured at 22 levels: 512 KB of escaped brackets,
+marked by the byte budget.
+
+So the depth bound is a stack guard during decode, not an output guard, and no
+array or kvlist fixture can separate the two cuts. The first version of the
+test asserted `strings.Contains(value, "truncated")` and **passed on the byte
+budget's marker** — a test agreeing with whatever the code does. It pins what
+is checkable instead: both encodings produce the same value past the bound, it
+is marked, it is bounded, and the record survives.
+
+**And `fieldsOfRow` invented fields.** It reverses the row rendering by
+splitting on `|`, so a record whose `_msg` is `x|severity=ERROR` parses as
+`_msg=x` plus a `severity` field **that is not in the row**. An assertion that
+the record carries `severity=ERROR` then passed on a record with no severity at
+all — and all 27 value assertions across the OTLP, Datadog, Loki and journald
+conformance files go through this function.
+
+No separator can be reserved, because a log value holds arbitrary bytes. What
+can be fixed is the fixture, so the renderer refuses instead: a key or value
+containing the separator is a loud failure at render time, and a test that
+genuinely needs one has to compare structured fields. The refusal lives in
+`rowRenderable` rather than inline in a `t.Fatal`, because nothing could reach
+it inside one — no current fixture carries a `|`, so deleting the check left
+the whole package green, which is the state a tripwire is in right up until the
+day it matters.
+
+| mutation | failing tests |
+|---|---|
+| the resource dropped count is ignored | 1 |
+| IDs are not lowercased | 3 |
+| any length of ID is accepted | 3 |
+| non-hex characters are accepted | 3 |
+| the row separator is not refused | 1 |
+
+## 100. `git add internal/` during a review committed the reviewer's mutations
+
+Entry 99's commit, `a92b638`, contains two lines nobody wrote on purpose:
+
+	-	return p.waitReady(60 * time.Second)
+	+	return p.waitReady(1500 * time.Millisecond)
+	-			if resp.StatusCode < 500 {
+	+			if resp.StatusCode < 0 {
+
+`resp.StatusCode < 0` is never true, so `waitReady` could only time out: every
+VictoriaLogs start in `internal/bench` failed, 1.5 seconds later, in HEAD. It
+also carried a reviewer's scratch test file into the repository.
+
+They are a review agent's mutation probes, applied to the working tree while it
+was checking whether that guard can redden. The agent restores from its own
+scratchpad copy when it finishes; the commit landed in the window between the
+edit and the restore. `git add -A docs/wrong.md internal/` staged a directory,
+and `internal/bench` was in it.
+
+Nothing about the change being committed was wrong — the suite that ran before
+it was green, and it was green because it ran before the mutation. The full
+suite was run at 15:12 and the commit was made at 15:15.
+
+Three things follow, and only the first is about git:
+
+- **Stage explicit paths.** `git add internal/` is a request to commit whatever
+  is in that tree right now, which during a review is not what the author
+  wrote.
+- **A green suite is only evidence about the tree that ran.** The gap between
+  a test run and a commit is a window, and a review agent is a writer inside
+  it. This is the same shape as the `tail`-swallowed exit status: a check that
+  is true about something other than what shipped.
+- **The scratch files are `.gitignore`d now** — `zz_*_test.go` and
+  `zzz_*_test.go`, which is the convention the agents already use. That makes
+  the accident one step harder rather than impossible; the first point is the
+  one that matters.
+
+Found by reading a file-modification notice, not by any test: the bench package
+still compiled, and its own suite passes without the VictoriaLogs binary
+because every test there skips loudly when it is not staged. With the binary
+staged the differentials fail — which is to say the gate for this existed and
+was not run between the mutation and the commit.
+
+## 101. Every protobuf assertion was circular, and one severity finding was already fixed
+
+The rest of #410's OTLP round.
+
+**The wire shape was checked against itself.** The protobuf fixtures are built
+by `pbytes`/`pvarint`/`kv`/`anyString` in this repository and decoded by
+`eachField`/`decodeAnyValue` in this repository, so a matched pair of bugs -- a
+field number wrong in both, a wire type wrong in both -- produces a green suite
+and a decoder that cannot read what a real collector sends. Nothing in the
+package could tell the difference.
+
+A 32-byte golden, hand-derived from the field numbers in
+`opentelemetry/proto/logs/v1/logs.proto` and `common/v1/common.proto`:
+
+	0a 1e                       ExportLogsServiceRequest.resource_logs (1, LEN 30)
+	  0a 0a                     ResourceLogs.resource (1, LEN 10)
+	    0a 08                   Resource.attributes (1, LEN 8)
+	      0a 01 61              KeyValue.key = "a"
+	      12 03 0a 01 62        KeyValue.value = AnyValue{string_value:"b"}
+	  12 10                     ResourceLogs.scope_logs (2, LEN 16)
+	    12 0e                   ScopeLogs.log_records (2, LEN 14)
+	      09 0100000000000000   LogRecord.time_unix_nano (1, I64) = 1
+	      2a 03 0a 01 6d        LogRecord.body = AnyValue{string_value:"m"}
+
+Two assertions, and the pair is what closes the loop: the DECODER must read
+these bytes, and the fixture BUILDER must produce exactly them. Either alone
+leaves the other side free to drift. Both passed on the first run, which is
+the useful outcome -- the hand derivation and the builder agree, so the
+existing fixtures were the right bytes all along.
+
+Demonstrated on the mutation the circular tests cannot see: `Resource.attributes`
+moved from field 1 to field 2 in the decoder AND in every fixture. The JSON path
+has no field numbers, so the JSON-vs-protobuf differential compares identical
+ROWS and cannot notice; both golden assertions redden. (`TestOTLPProtoMatchesJSON`
+also reddened, because its own fixture lives in another file and was not part of
+the matched change -- which is the point: a matched change covering ALL the
+fixtures would have slipped past it too.)
+
+**And one reported finding was already closed.** Out-of-range severity numbers
+were reported as stored by the protobuf path and dropped by the JSON path.
+Measured on both encodings of the same record:
+
+| severityNumber | protobuf | JSON |
+|---|---|---|
+| 25 | dropped | dropped |
+| 100 | dropped | dropped |
+| 0 | dropped | dropped |
+| -3 | dropped | dropped |
+| 17 | `17` / `ERROR` | `17` / `ERROR` |
+| 24 | `24` / `FATAL4` | `24` / `FATAL4` |
+
+The `sevNum > 0 && sevNum < len(severityNumberName)` bound in
+`otlpRecordFields` is shared by both paths, so closing it for one closed it for
+both. Recorded as checked rather than left on the list: a finding that is fixed
+and still listed costs the next reader the same measurement.
+
+## 102. Entry 97's zero rule is retracted: it could not reach its case, and fired on the wrong one
+
+A third reviewer took entries 97 and 98 apart. Two of its three blockers are the
+same rule, failing in opposite directions, and the conclusion is that the rule
+cannot exist.
+
+Entry 97 narrowed the watermark refusal to two observations and called the
+second one unambiguous: **"a peer reporting ZERO while a live member of the same
+shard has reported data"**, on the reasoning that "a node holding nothing cannot
+be a correct replica of a shard that has some". Both halves are wrong.
+
+**It never reached the case it was written for.** The own-floor arm returns
+first, so a peer that RESTARTS onto an empty volume -- new generation, watermark
+zero -- takes the restart branch and is tolerated. Measured on this file's own
+fixture: leader with 12 rows at watermark 2000, leader restarts reporting 0, and
+the third read answers
+
+	200 total=0
+	log: a peer restarted, so its watermark floor starts again ... watermark=0 previous_floor=2000
+
+The whole shard's rows gone, at 200, with nothing in `X-Simdlogs-Shards-Missing`
+or `-Lagging`. That is the extreme case the rule claimed to close, and the rule
+could not see it whenever the router had seen that peer before with data. The
+behaviour was also self-contradictory: the identical observation was refused for
+an UNSEEN peer and served for a seen-and-restarted one, and entry 97's table
+listed "zero beside a live sibling -> refused" and "a restart -> tolerated" as
+separate rows without saying which wins.
+
+**And where it did fire, it was wrong.** `sibling.hw > 0` does not mean the
+shard currently holds anything: `highWatermark()` is a per-process running
+maximum that SURVIVES RETENTION -- which is the property entry 97 itself cites,
+four paragraphs earlier, as the reason a cross-replica comparison cannot be
+trusted. A shard both of whose replicas legitimately hold nothing:
+
+	A: up since before retention swept, running max 5000, store now empty
+	B: restarted afterwards, re-derived 0
+
+	read 1 (A)  200 total=0
+	kill A
+	read 2 (B)  503  1 of 1 shards could not answer completely (0(watermark))
+	read 3, 4   503
+
+Both would have answered with zero rows. Nothing was missing. Aggravated by
+staleness: `askShard` returns the first replica that answers, so a sibling's
+mark is only refreshed when it serves a read -- a dead-but-still-configured
+peer's last mark refuses its live sibling until it leaves the member list.
+
+**The two pull opposite ways.** Making the rule reachable after a restart makes
+the false refusal worse; dropping the comparison makes the missed case moot.
+Neither is decidable from one peer's answer, for the reason already written
+down. So the rule is gone, and the refusal is now exactly one observation:
+
+	a process reporting below its OWN floor, inside its OWN generation.
+
+**What that costs, stated rather than implied.** A replica that lost its dataset
+and came back is served at 200 with the shard's rows absent. It is real, it is
+not caught here, and it cannot be caught here -- catching it means comparing
+what the replicas actually HOLD, which is the digest and repair machinery in
+`cluster_repair.go`. `TestARestartedEmptyReplicaIsNotRefused` exists to say so
+rather than to approve of it.
+
+**And a live orphan, which is the worse half of the leak entry 100's commit
+closed.** `start()` returns an error from `waitReady` -- by which point
+`cmd.Start()` has already succeeded and the child is running -- and every call
+site registers its `t.Cleanup(p.stop)` on the line AFTER the `t.Fatalf` that
+fires on that error. Forced by pointing the readiness poll at a dead port:
+
+	pid 1560623  ppid 1  victoria-logs -httpListenAddr=127.0.0.1:19496
+	              -storageDataPath=/tmp/TestReviewC.../001 -retentionPeriod=10y
+
+Reparented to init, holding its port, serving from a directory the framework had
+already deleted. A zombie is a few bytes of kernel bookkeeping; this is a
+multi-gigabyte process with no parent left to kill it. `start` stops its own
+child on the failure path now, so no call site can forget.
+
+The first version of the test for that did not start a child at all -- it called
+the readiness half directly -- and the mutation stayed green. It reddens now,
+naming the surviving pid.
+
+Three mutations, all red: the own-floor refusal, the sibling report, and
+**restoring the retracted zero rule**, which the two new fixtures catch. A
+retraction that nothing gates is a comment.
+
+## 103. Five things that stopped one hop short, and a peer writing this node's error message
+
+The non-blocking half of the review that produced entry 102. Four of the five
+are the same shape: a signal that is correct at the node that produces it and
+absent at the node above.
+
+**A peer wrote text into this node's client-facing error.**
+`X-Simdlogs-Error-Class` was taken verbatim and rendered into this node's own
+503 as `0(<class>)`, so anything able to answer as a peer put its words in a
+message this node signs:
+
+	simdlogs: 1 of 1 shards could not answer completely
+	  (0(contact support at evil.example for your refund))
+
+Go's header parser stops CR/LF, so this is not response splitting -- it is a
+node repeating a stranger's sentence as its own. The class is checked against
+the eight known values now, and anything else is `malformed`, which is what a
+body this node cannot read already is. A recognised class still comes through,
+or the check would be satisfied by discarding all of them.
+
+**Lag stopped at depth 1.** `X-Simdlogs-Shards-Lagging` was written by a router
+and parsed by nothing, so a fan-out whose only problem was lag left `bad` empty
+one level up, the middle router's own `Complete` stayed true, and the parent saw
+a plain complete 200. Entry 97's "named in the response so the shortfall is not
+silent" held for a direct client of that router and for nobody above it.
+
+**The refusal reason stopped at depth 1, twice over.** Entry 98 gave the
+`incomplete` bucket a reason -- `watermark` or `degraded` -- and it died a hop
+up for two separate reasons, both of which had to be fixed:
+
+- A router that refuses answers **503**, so the client's error-class check
+  returned before the reason header was read. It is read first now.
+- And the parent then puts that peer in the **missing** bucket, which renders
+  `p.Class` -- derived from the status alone. Measured: `0(overloaded)` for a
+  refusal that had nothing to do with load. The reason wins over the class when
+  the peer sent one.
+
+Both reasons are a closed set (`knownIncompleteReason`), for the same rule as
+the error class: a value rendered into this node's answer is not a value a peer
+may choose.
+
+**And the envelope's internal-only scoping was uncovered.** `fanOutChecked`
+lowers `X-Simdlogs-Complete` only when the header is already present, which is
+what keeps it internal -- `serveEnvelope` stamps internal requests only.
+Deleting that condition, so every public 503 and 206 also carried the envelope,
+left the whole suite green. A public client now gets none of `Complete`,
+`Shard-ID`, `Replica-ID` or `Generation` on either the refusal or the partial.
+
+| mutation | failing |
+|---|---|
+| repeat the peer's class verbatim | 5 |
+| lag not forwarded | 1 |
+| the class rendered instead of the reason | 1 |
+| the envelope leaked to public clients | 1 |
+
+One finding is recorded and not fixed: `BehindSibling` is set on the
+own-floor-with-no-generation arm, where no sibling is involved, and its doc says
+"below one a live sibling reported". The name is wrong rather than the
+behaviour -- that arm is a peer below its own floor with no generation to prove
+a restart, which is reported and not refused, which is what the flag means. It
+is left because renaming a field across the protocol for a doc mismatch is a
+worse trade than the mismatch.
+
+## 104. A malformed query answered 503 through a router, so the client retried it forever
+
+Task #410's F3 said four read pairs disagree between a single node and a router
+on BODY SHAPE -- `/select/logsql/hits`, `/streams`, `/stream_ids`,
+`/stats_query` -- with a named root cause: `federatedValueCounts` was passed a
+key of `"streams"`/`"stream_ids"` while `writeValues` always emits under
+`"values"`.
+
+**Measured, that is fixed.** `federatedValueCounts` takes no key argument any
+more, and node and router answers are byte-identical on all four, plus
+`field_names` and `field_values`:
+
+	hits           {"hits":[{"fields":{},"timestamps":[...],"values":[1],"total":1}]}
+	streams        {"values":[{"value":"{}","hits":1}]}
+	stream_ids     {"values":[{"value":"0000...b5","hits":1}]}
+	stats_query    identical
+	field_names    identical
+	field_values   identical
+
+Recorded rather than left on the list: a finding that is fixed and still listed
+costs the next reader the same measurement.
+
+**The probe found a different one, and it is worse than the one it was looking
+for.** A query the shards refuse as malformed:
+
+	node    400  simdlogs: unknown pipe "nonsense"
+	router  503  1 of 1 shards could not answer completely (0(rejected))
+
+503 is retryable and 400 is not. A client following the router's answer retries
+a query that can never succeed, against a cluster that is not broken -- and an
+operator reading that message goes to look at shard 0, which is working.
+
+`PeerRejected`'s own doc already said what to do: "a 4xx that is not an auth or
+load problem. The router sent something this peer would not accept, so **every
+replica will refuse it identically**." `fanOutChecked` put it in the missing
+bucket with unreachable shards and degraded stores, and refused with 503 like
+the rest.
+
+EVERY shard, not any. One shard refusing while another is unreachable is a
+degraded cluster, and telling the client to fix their query would be wrong
+about a shard that never judged it. Mutating "every" to "any" reddens.
+
+And one guard came out. `allRejected := len(peers) > 0` looked like ordinary
+care and is unreachable: the code sits past the `len(bad) == 0` early return
+and `bad` is built from `peers`, so an empty list has already returned.
+Mutating it to `true` left the suite green, which is what said so.
+
+## 105. The fixture picked the one value where the bug is invisible
+
+Entry 99 fixed `Resource.dropped_attributes_count`: the protobuf path read only
+field 1 of Resource, so the JSON path wrote the field and protobuf never did.
+The fix decoded field 2 -- and decoded it **twice**.
+
+`eachField` has already decoded the varint by the time it calls back; it hands
+an 8-byte little-endian buffer, and every other wire-type-0 case in the file
+reads it with `binary.LittleEndian.Uint64`. The new case ran `binary.Uvarint`
+over that buffer.
+
+	export said   JSON stored   protobuf stored
+	          7             7                 7
+	        127           127               127
+	        128           128           (absent)
+	        200           200                72
+	        255           255               127
+	       1000          1000               488
+	      65535         65535             16383
+
+A varint below 128 is its own byte, so `Uvarint` over the decoded buffer
+returns the same number -- and the fixture that was written to catch exactly
+this used **`const dropped = 7`**. The commit whose subject is "two OTLP
+encodings of one export were storing different things" went on storing
+different things for every count of 128 or more, and now a wrong NUMBER rather
+than an absent field, which is worse: a missing column is visible and a wrong
+one is not.
+
+The fixture takes twelve values across the boundary now -- 1, 7, 127, 128, 129,
+200, 255, 300, 1000, 65535, 2^20, 2^32-1 -- and ten of them redden on the old
+code.
+
+**The lesson is about the fixture, not the decoder.** A single-value fixture
+tests a single value, and 7 is the kind of number that gets picked: small,
+readable, obviously non-zero. Every varint bug in this format hides above 127,
+which is precisely where a hand-picked small constant does not go. The same
+shape produced entry 43's writer suite, which asserted eleven things about a
+file and decoded none of its values.
+
+## 106. The refusal was right about the merge and wrong about the alternative
+
+`avg()`, `quantile()`, `uniq()`, `count_uniq()` and `histogram()` were answered
+by a single node and refused with 400 by a router in front of that same node,
+on all three stats surfaces. The reason given was true:
+
+> quantile() cannot be merged across shards: a quantile of a union is not any
+> function of the shards' quantiles (the median of medians is not the median).
+
+It is true about **merging per-shard quantiles**, which is one way to answer
+across shards. Nothing in the router was doing that. `PlanDistributed` splits a
+pipeline at the first non-row-local pipe, and a `StatsPipe` is never row-local,
+so the aggregate had never been pushed to a shard: it already ran once, at the
+coordinator, over the merged rows -- the same rows, through the same pipe, as a
+single node. The refusal was declining to return an answer the code had
+computed correctly.
+
+Measured before changing anything, two shards holding 2500 rows each against a
+single node holding all 5000, with the refusal bypassed:
+
+	query                                    /select/logsql/query
+	* | stats count() n                      identical
+	* | stats avg(lat) a                     identical
+	* | stats quantile(0.5, lat) p50         identical
+	* | stats uniq(svc) u                    identical
+	* | stats count_uniq(svc) cu             identical
+	* | stats histogram(lat) h               identical
+	* | stats by (svc) avg(lat) a            identical up to group order
+	* | stats by (svc) quantile(0.9,lat) p90 identical up to group order
+	* | stats rate() r                       node 1.3888, router 0
+
+Byte-identical, three runs. Group order differs because it is map iteration
+order, and the node's own order changes between runs.
+
+**`rate()` was the exception, and it was a defect the refusal was hiding.**
+`applyCoordinatorPipes` built its query as `&query.Query{Pipes: pipes}` with
+`From` and `To` left zero. `ApplyPipes` stamps every stats pipe with
+`rangeSec = (To-From)/1e9`, and `formatAgg` reads a zero window as "no window"
+and returns `"0"`. So the router would have answered a rate of zero, at HTTP
+200, over a store doing 5000 rows an hour. It was unreachable only because the
+400 came first.
+
+That is the shape worth naming: **a gate that returns 400 for a case the code
+beneath it gets wrong reads as policy and is a defect with a lid on it.**
+Lifting the refusal without fixing the window would have shipped the zero.
+
+The two stats endpoints are a different execution model and needed real work.
+`/select/logsql/stats_query` and `/select/logsql/stats_query_range` do not plan:
+they fan the whole stats pipe out to every shard and combine the per-shard
+outputs by output name. For an additive aggregate that is right and cheap --
+one number per group per shard. For the other five it cannot be made right at
+all. They now choose per query: mergeable aggregates keep the cheap merge, and
+the rest take the exact path -- ask the shards for the rows, aggregate once
+here. The range endpoint fetches the window's rows once and slices them per
+bucket rather than fanning out per bucket; the rows arrive sorted by time, so a
+bucket is two binary searches.
+
+The cost is real and stated rather than hidden: every matching row crosses the
+network instead of one number per group. That is the price of an exact quantile
+without a sketch. A t-digest or DDSketch with a documented error bound would
+make it cheap as well as right, and would make the choice three-way.
+
+**What the tests became.** Five test functions asserted the refusal. They were
+not deleted, they were inverted into something stronger: not "all three
+surfaces refuse alike" but "all three answer alike, and the answer is the
+node's", differentially, over fourteen queries and four surface/step
+combinations. The one refusal that survives -- an aggregate a shard computed --
+is asserted on `NonMergeableReason` rather than through HTTP, because no
+request can reach it today and a test asserting an unreachable 400 passes for
+the wrong reason.
+
+**Four mutations that stayed green, and what each meant.** The differential was
+probed by breaking the new code and requiring red:
+
+	mutation                                        result
+	coordinator window dropped (rate 0 again)       2 red
+	needsExactStats always false (back to merging)  1 red
+	reject reads CoordinatorPipes again             4 red
+	range buckets use the whole window              1 red
+	shard request loses the resolved window         GREEN -> 1 red
+	merge sort deleted                              GREEN -> 1 red
+	one parse shared across every bucket            GREEN, and it stays green
+
+The three green ones were the useful results. Two became red once the
+differential grew a fixture that could see them; the third is still green and
+the code it guards is defensive rather than load-bearing, which the comment now
+says.
+
+*The resolved window* was green because every test in the suite pinned `start`
+and `end`, and a pinned window survives the request clone. Only a request that
+leaves the window implicit can tell: `stats_query` is an instant query, `time=`
+names the instant, and the shards are asked a *row* query which has no `time`
+parameter at all. Without the two `Set` calls, every shard answers from its
+whole retention while the aggregate claims to cover one instant.
+`TestATimeOnlyInstantQueryAsksTheShardsForThatInstant` sends `time=` alone, and
+asserts the node's own answer was actually bounded -- otherwise it would be
+comparing two whole-store answers and calling them equal.
+
+*The merge sort* was green because no query in the table could see row order.
+`values()` emits in encounter order; without it, leaving the rows in whichever
+order the fan-out goroutines finished changed nothing any test could observe.
+
+*One parse shared across every bucket* is still green, over a fixture with
+three non-empty buckets that would catch accumulation -- because
+`StatsPipe.apply` builds its group map per call and `stampPipes` rewrites the
+window per call, so a shared parse carries nothing between buckets. The
+per-bucket re-parse is defensive, not load-bearing, and the comment in the code
+now says so. The first version of that comment claimed the opposite in
+confident detail ("every bucket after the first would aggregate on top of the
+previous bucket's state, so a graph would rise monotonically"). It was written
+from the shape of the code rather than from a measurement, and the measurement
+said no.
+
+## 107. Lifting a refusal turns every defect behind it into a plausible number
+
+Entry 106 replaced a 400 with an exact answer on five aggregates. A review of
+that change found five more defects, and the shape of all of them is the same:
+the refusal had been standing in front of code that was wrong, so removing it
+did not expose a gap, it exposed a *number*.
+
+**`end=0` answered the whole store as an instant.** Two functions read the time
+parameters and they do not agree. `timeWindow` returns `end` verbatim;
+`parseRequest` -- which every shard runs -- turns a zero `To` into `1<<62`, "no
+end". The exact path resolved the window with the first and wrote it onto the
+shard request, where the second read it. Measured, 2 shards x 15 rows against 1
+node x 30:
+
+	GET /select/logsql/stats_query?query=*|stats avg(n) a&end=0
+	  node     {"resultType":"vector","result":[]}
+	  cluster  {"__name__":"a","value":[0,"14.5"]}   HTTP 200
+	  before   400 avg() is not merged as an average of averages...
+
+The file's own comment says the two `Set` calls exist to stop exactly this
+("every shard would have answered from its whole retention while the aggregate
+claimed to cover one instant"). The calls fire. The value does not survive the
+hop. A window that ends at or before it starts holds no rows, so it is answered
+here without asking anyone -- which reproduces the node by construction rather
+than by matching its envelope.
+
+The same disagreement left a residue of entry 106's own rate-zero defect:
+`/select/logsql/query?query=*|stats rate() r&end=0` gave the node
+0.000000006505213034913027 and the router `"0"`, because the coordinator's
+window was [0,0) while the shards had answered from all of history.
+
+**`limit` with a non-leading aggregate.** `limitBoundsOutput` returned false if
+a stats or uniq pipe appeared ANYWHERE in the pipeline, so the router never
+bounded the merged rows. That is right only when the aggregate is FIRST, where
+a node's `runStats` runs its own scan and never sees `LastN`. Put anything in
+front of it and the scan is an ordinary bounded one. Measured, 30 rows over two
+shards, `&limit=5`:
+
+	query                            node        cluster before
+	| sort by (n) | stats avg(n) a   {"a":"27"}  {"a":"14.5"}
+	| limit 5 | stats avg(n) a       {"a":"27"}  {"a":"2"}
+	| sort by (n) | stats count() c  {"c":"5"}   {"c":"30"}
+
+The count row was already wrong -- `count` merges, so it was never refused. The
+avg row was a 400 the day before. The predicate's own doc table lists five
+measured shapes and every one of them has the aggregate leading, which is how
+a rule that is true of five cases came to be applied to all of them.
+
+**An unbounded range query span.** `/select/logsql/stats_query_range` has no
+bucket ceiling. Its loop is `for bs := from; bs < to; bs += step`, and with no
+`end` the window runs to `1<<62` -- `?step=1m` is about 77 million iterations,
+each a full scan. A single node does not answer that request; it spins. The
+exact path made it worse rather than introducing it: the router now spins while
+holding every matching row of the cluster in memory. `/select/logsql/hits` has
+had the ceiling since it was written, with the reasoning already stated there
+(an unspecified window is narrowed, an explicit one too wide for its step is a
+413) -- so the fix is that function, shared, rather than a second ceiling.
+
+Found by adding a non-mergeable aggregate to the shared completeness table: the
+whole table drove `count()`, which takes the merge branch, so nothing in the
+failure suite had ever entered the exact path. The first run hung for 30
+seconds.
+
+**`-search.maxDuration` was re-stamped per bucket.** `applyQueryBudget` sets
+`Deadline = now + MaxQueryDuration` each time it runs, and the range path
+called it once per bucket -- so a 30-bucket graph got thirty fresh deadlines
+and the operator's ceiling bounded one bucket. The node builds one budget query
+and copies its fixed deadline onto each bucket; the router now does the same.
+
+**Two comments that were not true.** The nanosecond window "round-trips
+exactly" only at or above 1e17 ns: `parseTimeParam` infers the unit from the
+magnitude, so a value in (0, 1e17) comes back as a different instant, and
+`start=1e10` overflows int64. And `federatedSQL` read `plan.Reject` for its
+error text, which entry 106 made permanently empty -- so a SQL caller asking
+for an average got the generic "it aggregates, orders or limits across the
+whole result set" where the LogsQL caller got "use sum() and count()". A dead
+branch that still compiled.
+
+**And one found by re-reading the new code rather than by review.** The
+federated quarantine listing stamps its own completeness headers, because an
+admin route carries no cluster envelope and would otherwise arrive with none.
+It stamped them unconditionally. `fanOutChecked` returns success on two paths,
+and the second is `allow_partial_response=1`: a 206 whose total/answered/missing
+headers are already set and still unflushed. So the unconditional stamp
+overwrote them, and a knowingly partial listing went out as
+
+	206  X-Simdlogs-Complete: true
+	     X-Simdlogs-Shards-Total: 1
+	     X-Simdlogs-Shards-Answered: 1
+
+with the missing shard invisible in the counts -- "nothing is quarantined"
+against "some shards were not asked", which is the exact confusion this
+endpoint used to be REFUSED to avoid, reintroduced by the code that stopped
+refusing.
+
+The reason the partial path does not set the flag itself is worth keeping: it
+LOWERS a header serveEnvelope stamps, and a router only stamps one when it is
+answering as somebody's peer. An admin route has no envelope, so the lowering
+finds nothing to lower and silently does nothing. Reading the missing-shards
+header -- the one signal set on exactly that path -- is what tells the two
+halves apart.
+
+**The lesson is about what a refusal is worth.** A 400 that says "this cannot
+be answered here" is not free: it is load-bearing for every defect on the path
+behind it, and it holds them in place invisibly. Removing one is not a
+one-line change of policy -- it is a commitment to everything that path does,
+and the way to find out what that is, is to send it the requests nobody sends.
+Every defect above was reached by a parameter value the whole suite avoided:
+`end=0`, `limit` with a sort in front, no window at all.
+
+## 108. A release gate red on a query the engine answers correctly
+
+`make fuzz` is a release gate. `FuzzResolveWindow` has been failing on a cached
+corpus entry, and the failure is not a defect in the engine:
+
+	"0_time:<0" named an upper bound and resolved to an unbounded window
+
+The invariant was `strings.Contains(s, "_time:<") && to1 == 0 && from1 == 0`.
+`0_time:<0` is a predicate on a field NAMED `0_time` -- it names no time bound,
+so no window is exactly right. Checked directly against a store holding two
+rows: `event_time:<7` returns 1 of 2, and a real `_time:<0` does not even parse
+("bad _time bound"). The engine was right every time the gate said otherwise.
+
+Anchoring the match so the field has to be `_time` itself, rather than end in
+it, fixed that entry and the fuzzer produced `#_time:<0` within seconds -- a
+comment. It would have kept going: quoted strings, regexes, pipe arguments.
+
+Whether a query names a time bound is a fact about the PARSE. The fuzz body has
+only the input text, and two attempts to recover the fact from the text were
+both wrong. So the invariant moved to a named table -- seven queries, including
+both of the shapes that reddened the gate -- and the fuzz target keeps the
+invariant that IS fuzzable without inferring intent: resolving twice does not
+move the window. 8.2M executions clean after the change.
+
+**A gate red on a non-defect is not a stricter gate.** It is one whose reader
+learns to skip it, and this one sits in front of a release. It also hid
+itself well: the failing entry lives in the fuzz CACHE, not in
+`testdata/fuzz/`, so `go test ./...` is green and only an explicit `-fuzz` run
+sees it -- which is the run people do least often.
+
+This was found while fuzzing the planner after entry 107's changes. It predates
+them: the same seed fails identically on a worktree of the commit before.
+
+## 109. The same predicate, the right rule, the wrong argument
+
+The sign-off review of entries 106-108 found five more, and two were silent
+wrong answers at HTTP 200. Both came from the fix in 107, not from the change
+in 106.
+
+**`limit` with a row-local prefix.** Entry 107 narrowed `limitBoundsOutput` to
+read only the LEADING pipe, because a node bypasses the scan bound only for a
+leading aggregate. That rule is right. `mergeRows` calls it with the wrong
+argument: `coordPipes` is the pipeline SUFFIX, and when the planner pushes a
+one-to-one row-local pipe to the shards, the suffix BEGINS with the aggregate.
+So the predicate concluded "leading aggregate, no bound" for a pipeline whose
+aggregate is not leading. `planQuery` had it right all along -- it passes the
+whole `q.Pipes` -- and the two call sites disagreed. 30 rows, 2 shards,
+`&limit=5`:
+
+	query                                node        cluster
+	| fields n, _time | stats avg(n) a   {"a":"27"}  {"a":"14.5"}
+	| fields n, _time | stats count() c  {"c":"5"}   {"c":"30"}
+	| math n * 2 as m | stats avg(m) a   {"a":"54"}  {"a":"29"}
+	| rename n as k   | stats count() c  {"c":"5"}   {"c":"30"}
+	| fields n, _time | uniq by (n)      5 rows      30 rows
+
+The avg and quantile rows were 400 the day before. The fix in 107 covered
+`| sort by (n) | stats ...` -- sort stays at the coordinator, so the suffix
+still leads with it -- and `| filter ... | stats ...`, which changes row count
+and forces the whole pipeline back. The hole was exactly the one-to-one
+row-local pipes, which is the set the earlier fix never had a fixture for.
+planQuery now returns the whole pipeline and mergeRows reads the bound off it.
+
+**A pipe the plan withheld, dropped.** `exactMatrix` re-derived its coordinator
+half per bucket with `PlanDistributed(bq.Pipes).CoordinatorPipes` instead of
+using the suffix `planQuery` returned. Those differ: when `limit` is set and
+the leading row-local pipe changes row count, planQuery sends only the head
+filter to the shards and returns the WHOLE pipeline as the coordinator half,
+while PlanDistributed splits at the first non-row-local pipe and hands back
+just the aggregate. The filter vanished. `?limit=5&query=* | filter
+level:error | stats avg(n) a`: node 14.4, cluster 14.5. `exactVector` was
+correct -- it used what planQuery returned -- so one of two paths built from
+the same plan trusted it and the other rebuilt it.
+
+**One binary, two answers to an over-wide range.** Entry 107's bucket ceiling
+was applied on the exact branch only. The merge branch forwarded the request,
+every shard applied the ceiling itself and answered 413, and fanOutChecked's
+all-rejected branch collapsed that to 400 blaming the request generically. So
+`?step=1h&start=<t>` with no end answered 413 for `avg` and 400 for `count`.
+The same forwarding let every shard resolve `now` for itself, and bucket starts
+go out as truncated seconds -- two shards whose clock reads straddle a second
+boundary emit timestamps 1s apart and the merge folds nothing: twice the
+points, each carrying one shard's value, at 200. The router resolves and bounds
+the window once now, and writes it onto the shard request, which is what the
+exact path already did and why it had neither problem.
+
+**A ceiling that overflows.** `?start=-4700000000000000000` with no end makes
+`to - from` wrap negative, so the quotient is negative and neither the
+narrowing nor the 413 fires: about 1.5e8 iterations. Pre-existing on the node;
+the router now does it holding every fetched row.
+
+**And the record.** `docs/lld/cluster.md` still listed
+`/admin/acknowledge-degraded` as refused in three places, `boundRangeBuckets`
+claimed to be "shared with selectHits" when selectHits still has its own inline
+copy, `cluster_admin_surfaces.go`'s header said both admin routes go through
+fanOutChecked while the acknowledgement's own doc said the opposite, and
+inserting `boundRangeBuckets` between `statsQueryRange`'s doc comment and its
+`func` line left those two lines heading the wrong function.
+
+**The lesson is about arguments, not rules.** Entry 107's predicate was
+correct and its call sites were not, and no test could tell: the predicate has
+one job, both callers pass "pipes", and only one of them passes the pipes the
+rule is about. A fixture with a `fields` in front of the aggregate would have
+caught it, and every fixture in the suite put `sort` or `filter` there --
+because those were the shapes the previous defect used.
+
+## 110. The comment described the trap, and the next call site walked into it
+
+The sign-off review of entry 109 found two more silent wrong answers, both
+introduced by 109's own fixes, and neither visible to any committed test.
+
+**A resolved window went to the shards as a bare nanosecond integer.**
+`parseTimeParam` infers the UNIT of a bare integer from its magnitude -- under
+1e11 seconds, under 1e14 milliseconds, under 1e17 microseconds -- so a
+nanosecond count round-trips only at or above 1e17 ns, which is 1973-03-03
+onward. Entry 109 gave `federatedMatrix` a window rewrite and wrote the
+integer form. Measured, 2 shards against 1 node:
+
+	request                                      node          cluster
+	start=100&end=200 step=10s | stats count()   [[150,"10"]]  400 "every shard refused"
+	start=100&end=200 step=3h  | stats count()   [[100,"6"]]   [[149993200,"4"]]
+	start=100&end=200 step=3h  | stats sum(n)    15            406
+	start=100&end=200          | stats avg(n)    2.5           101.5
+
+A window three decades from the one asked for, at HTTP 200.
+
+**Correction, made when a later reviewer could not reproduce those numbers from
+this repository.** They are real, and they came from a scratch fixture with
+rows in two decades at once; the committed corpus has none in the band the
+shard mis-reads. Restoring `strconv.FormatInt` at both call sites today
+reddens `TestASmallTimeWindowReachesTheShardsUnchanged` on all four queries and
+three routes -- 6 of 12 subtests, not all twelve: `stats_query` reddens on avg
+and quantile only, `stats_query_range` on all four, and `query` never, because
+it forwards the caller's window verbatim and neither edited call site is on its
+path. As node-has-rows against cluster-EMPTY, not against a plausible wrong
+number:
+
+	start=100&end=200 step=3h  | stats count()   node 20    cluster []
+	start=100&end=200 step=3h  | stats sum(n)    node 190   cluster []
+	start=100&end=200          | stats avg(n)    node 9.5   cluster []
+
+Same defect, and the shape the committed gate actually shows. The rows above
+stay because they are what was measured at the time; these are what anyone can
+reproduce now. A number in the record that the repository cannot produce is a
+number nobody can check, and the same pair had been copied into two code
+comments, where it is worse -- a comment is read as a description of the code
+in front of it.
+
+The part worth keeping: **`cluster_stats_exact.go` already carried a comment
+saying exactly this.** Reviewer A had flagged that comment for overclaiming
+("a decimal nanosecond count round-trips exactly"), and it was corrected to
+name the 1e17 threshold and the band below it. Then the next call site was
+written with `strconv.FormatInt` anyway. The knowledge was in the file, in
+prose, immediately above the line that ignored it.
+
+RFC3339Nano round-trips exactly for the whole int64 range, `1<<62` and negative
+values included, because parseTimeParam tries that layout before giving up.
+Both call sites use it now.
+
+**And the narrowed bound predicate named two of three leading pipes.**
+`RunPipeline` dispatches its leading fast path on `StatsPipe`, `TopPipe` and
+`UniqPipe` -- each runs its own scan and never sees the endpoint's `LastN`.
+Entry 109 narrowed `limitBoundsOutput` from "any pipe in the pipeline" to "the
+leading pipe", correctly, and listed stats and uniq. 3 shards, `?limit=1`:
+
+	| top 2 by (level) | stats count() c            node 2,      cluster 1
+	| top 2 by (level) | stats by (level) count()   node error,  cluster info
+
+New, because the old whole-pipeline scan happened to find the later stats pipe
+and return false -- the bound was not applied by accident, and narrowing the
+rule removed the accident. The predicate's own doc asked for this: "if a pipe
+is added whose reduction is not stats or uniq, this is the list that needs it".
+`top` was not added; it was already there.
+
+**The fixture that could not see it.** The first version of the window test put
+its rows at nanosecond 100 and queried `start=100&end=200`. Both sides read
+`100` as 100 SECONDS, so both looked at [1e11, 2e11) ns, both found nothing,
+and both agreed -- a test that passes because its data is outside the window it
+queries. Moving the rows to 1e11 ns makes both mutations red. Every other
+window fixture in the file uses 2026 dates, which are above the threshold and
+round-trip under any encoding, which is why none of them ever saw this.
+
+**Three rounds of review, three rounds of "the fix is the next defect", and
+the shape is the same each time**: a rule stated correctly, then applied to the
+wrong argument, at the wrong call site, or with a fixture that cannot reach the
+case. The rules were right every time.
+
+## 111. The type was in the list; the fast path's condition was not
+
+Round four's fixes were reviewed and two of the three defects found were
+created by round four itself. Same shape as 106/107/109/110, one level in.
+
+**A leading `top`/`uniq` with more than one `by` field is now unbounded where
+the node bounds it.** `limitBoundsOutput` decides whether the endpoint's
+`limit` shapes the output, and it decides it from the type of the first pipe:
+
+	switch pipes[0].(type) {
+	case *query.StatsPipe, *query.UniqPipe, *query.TopPipe:
+		return false
+	}
+
+`top` had been missing from that list and entry 110 added it. But `runTopFast`
+and `runUniqFast` decline a multi-field tuple -- `len(p.By) != 1`, because a
+tuple is not a single dictionary -- and when they decline, `RunPipeline` falls
+through to `Run` and `LastN` bounds the scan exactly as for any other pipe. So
+the list is right about the type and wrong about the condition. Measured,
+3 shards, `?limit=1`:
+
+	query                        node    cluster
+	| top 2 by (level)           agrees  agrees
+	| top 2 by (level, user)     1 row   2 rows
+	| uniq by (level, user)      1 row   14 rows
+
+The `uniq` row was wrong before this round; the `top` row is round four's. Both
+at HTTP 200. The test round four added drives only single-field forms, every
+one of which passes either way.
+
+The predicate now mirrors `RunPipeline`'s dispatch case for case, conditions
+included, and carries the five introspection pipes that also run their own
+scan -- reachable today only through a 400 that `ClassifyPipe` raises first,
+which is exactly the arrangement that produced the first row above the moment
+a refusal was lifted.
+
+**`end=0` with a negative start: the short-circuit only covered half of it.**
+Entry 107's fix was `if to <= from { answer here }`, which covers a window the
+ROUTER reads as empty. `start=-1&end=0` is one nanosecond wide, so it went to
+the shards, whose `parseRequest` still read the zero as "no end":
+
+	stats_query?start=-1&end=0 | stats avg(n) a   node []   cluster 14.5
+	stats_query?start=-1&end=0 | stats rate() r   node []   cluster 30000000000
+
+Both 200, both entry 107 verbatim through the window shape its fix did not
+reach. `start=-100&end=0` and `start=-1&end=1970-01-01T00:00:00Z` behave the
+same, because `parseRequest` tested the parsed VALUE and every spelling of the
+epoch parses to zero.
+
+Fixed at the cause this time. `timeWindow` never had the collision -- it starts
+`To` at `1<<62` and overwrites only when the parameter is present -- and
+`parseRequest` now does the same with an explicit `endGiven` flag. (A flag
+rather than pre-seeding the sentinel: a `_time:` filter in the query has
+already set `To` by that point, and pre-seeding would overwrite it.)
+
+**The compensating error had to come out with it.** `applyCoordinatorPipes`
+normalized `to == 0` to `1<<62` so the coordinator's window would match what
+the shards did with the same request. With the collision gone that
+normalization is itself the defect: the shards answer `[from, 0)` and `rate()`
+would divide their count by a window 146 years wide. Two changes, one fix --
+reverting either alone is worse than reverting both.
+
+**The stats surfaces did not plan at all.** The merge path sends the whole
+pipeline to every shard and combines outputs by name, which equals what a node
+does only when everything before the aggregate is row-local. `needsExactStats`
+asked "is the aggregate mergeable" instead. Measured, 3 shards:
+
+	| limit 5 | stats count() c                node 5   cluster 15
+	| sort by (n) | limit 5 | stats count() c  node 5   cluster 15
+	| uniq by (user) | stats count() c         node 7   cluster 21
+	| top 2 by (level) | stats count() c       node 2   cluster 6
+	| offset 25 | stats count() c              node 5   cluster []
+	| limit 5 | stats avg(n) a                 agrees
+	| top 2 by (level) | stats avg(n) a        agrees
+
+all 200, and `/select/logsql/query` gets every one of them right because it
+plans. **The last two rows are why this belongs here rather than only in the
+record**: the same endpoint, the same prefix, and the answer is right or wrong
+depending on which aggregate follows -- avg is non-mergeable and took the
+exact path, count took the merge path. Before entry 106 the avg rows were 400,
+so the asymmetry did not exist; lifting the refusal created it. That is the
+failure the whole change set was written to prevent, produced by it.
+
+`PlanDistributed` already computes the split, so the predicate is now "is the
+coordinator half's head the aggregate" and no second list of pipe kinds exists
+to drift from `ClassifyPipe`.
+
+**Two more range surfaces, both the same shape as 109.** `stats_query_range`
+bounded buckets before checking for a missing `query`, so a request with no
+query at all answered 413 "47189513 buckets requested" where a node answers
+400 "missing `query` arg" -- the caller's real mistake, unmentioned.
+`/select/logsql/hits` had no ceiling at all: node 413, cluster 400 "every shard
+refused this request (0(rejected),1(rejected))", which sends an operator to
+look at two healthy nodes for a fault in the request.
+
+**And three comments that were not true.** One said
+`/admin/acknowledge-degraded` is marked by `aboutHealth` "for symmetry" (it is
+not marked at all); one named an identifier, `withoutQueryLanguage`, that does
+not exist in the package; one said the leading-dispatch list was "all three of
+it" when the switch has nine cases and six run their own scan. The first had
+already been corrected once, from a different wrong claim to this one.
+
+**A number in the record that the repository cannot produce.** Entry 110 quotes
+node 6 against cluster 4 and node 15 against 406. They were measured, on a
+scratch fixture with rows in two decades at once, and the committed corpus has
+none in the band the shard mis-reads -- so restoring the defect today gives
+node-has-rows against cluster-EMPTY instead. The reviewer could not reproduce
+the pair from the tree, which is the point: the same numbers had been copied
+into two code comments, where a reader takes them as a description of the code
+in front of them. Entry 110 now carries both, the measured and the
+reproducible.
+
+**Four rounds now.** The rule was right every time and the argument, the call
+site, the condition or the fixture was wrong. What changed this round is that
+the fix went to the cause -- `parseRequest`'s sentinel, `RunPipeline`'s actual
+dispatch, `PlanDistributed`'s existing split -- instead of to the place the
+symptom appeared. Three compensating mechanisms were deleted rather than added
+to.
+
+## 112. Round five fixed three defects and shipped two, and both were the same mistake
+
+Reviewer E on round five: four MUST-FIX, two of them created by round five's
+own fixes. Fifth consecutive round of that. Both new ones are one mistake --
+**reaching for a rule that looks like the right rule instead of the one the
+other side actually applies.**
+
+**`/select/logsql/hits` got a bucket ceiling computed with the wrong step
+parser.** Round five gave the endpoint the ceiling the node has, using
+`parseStepNs`. The node's `selectHits` does not use `parseStepNs`; it has its
+own inline rule -- one minute unless `time.ParseDuration` returns a POSITIVE
+duration. `parseStepNs` additionally takes a bare integer as seconds and
+derives a default from the window. So:
+
+	/select/logsql/hits?step=1&start=<t>&end=<t+24h>&query=*
+	  node    200   1440 one-minute buckets   (ParseDuration("1") fails)
+	  cluster 413   "86400 buckets requested ... at step 1s"
+	?step=5   node 200, cluster 413
+
+A ceiling computed from a step the endpoint will not use is a ceiling on a
+different request. Round five closed one of six divergent shapes on this route
+and opened two. The rule is now one function, `hitsStepNs`, called by both.
+
+**The `end=0` collision was closed in `parseRequest` and left open one layer
+down.** `resolveTimePreds` reads `q.To == 0` as "unset" too, and lets a
+`_time:` filter widen past it. On a SINGLE NODE, no cluster involved:
+
+	/select/logsql/query?end=0&query=*                          0 rows
+	/select/logsql/query?end=0&query=_time:[2026-06-01,...]     30 rows
+
+One binary, one parameter, two answers -- entry 111's own defect shape, one
+layer down, found by the review of the fix for it. `Query.ToSet` now
+distinguishes a resolved end from an unset one, and a programmatic caller that
+leaves `To` at zero keeps the old behaviour.
+
+**And the deletion round five made was right for the wrong reason.** Removing
+`applyCoordinatorPipes`'s `to == 0` normalization was justified as "timeWindow
+is now the only reading of the window there is". It is not: `resolveTimePreds`
+is a third reader, and it is the one that decides what the SHARDS scanned.
+Measured, `/select/logsql/query`, 2 shards, all HTTP 200:
+
+	query = _time:[..12:00:00Z, ..12:00:30Z] | sort by (n) | stats rate() r
+	  no start/end     node 0.967741935483871   cluster 0.000000006505213034913027
+	  &end=0           node 0.967741935483871   cluster 0
+	  &start=-1&end=0  node 0.967741935483871   cluster 30000000000
+
+The first row needs no `end` at all: 30 seconds of rows divided by the 146
+years `to` defaults to. `ToSet` fixed rows two and three; row one needed the
+coordinator to price the window the shards SCANNED, which is the request's
+narrowed by the query's own absolute `_time:` bounds. `query.ResolvedWindow`
+computes it with the executor's own function, and all three now read
+`0.967741935483871` on both sides.
+
+**Reviewer E also could not reproduce two figures this record carries.** "Red
+on all four queries and three routes" is 6 of 12 subtests -- the `query` route
+never reddens, because it forwards the caller's window verbatim and neither
+edited call site is on its path. And "cluster 21 rows" for
+`| uniq by (level, user)` is 14: the corpus has 14 distinct pairs, and 21 was
+the figure from a different row two tables away, copied into both the record
+and a test comment. Both are corrected in place above.
+
+**One divergence is PINNED rather than fixed.** A leading stats pipe under an
+absolute `_time:` filter answers empty on a single node:
+
+	* | stats count() c                                200 {"c":"30"}
+	level:error | stats count() c                      200 {"c":"10"}
+	_time:[2026-06-01, 2026-06-02] | stats count() c   200 (empty)
+	_time:[2026-06-01, 2026-06-02]                     200, 30 rows
+
+The filter matches every row on its own and matches nothing the moment a stats
+pipe leads. The node is the wrong side and the cluster answers 30, so this is
+not a router defect and fixing it is its own change.
+`TestALeadingStatsPipeUnderATimeFilterIsAKnownNodeDefect` asserts the
+divergence and fails when the node stops doing it -- a marker saying the
+divergence is known, not an assertion that it is acceptable.
+
+**What the five rounds have in common, stated once.** Every defect has been a
+rule applied to the wrong argument: `CoordinatorPipes` where `ShardPipes` was
+meant, the type where the fast path's condition was meant, `parseStepNs` where
+`selectHits`'s own parser was meant, `timeWindow` where the scanned window was
+meant. The rules were right every time. What was wrong was believing that two
+things that mean the same in prose are the same value in code -- and the fix
+that works is always the same one: make the two callers share the function, so
+there is no second value to get wrong.
+
+## 113. The fix for a sentinel collision corrupted a node's own buckets
+
+Round six was reviewed. Five defects, two of them node-side data corruption
+introduced by round six's own `ToSet` change, which existed to fix entry 112's
+sentinel collision. Sixth consecutive round where the fix is the next defect.
+
+**`ToSet` was set in `parseRequest` and not at the two stats entry points, and
+the narrowing then stopped being narrowing.** `resolveTimePreds` reads
+`if to < q.To || !q.ToSet` -- so with the flag false it assigns the filter's
+end unconditionally, and a `_time:` filter WIDENS past the request's `end`.
+Single node, no cluster involved:
+
+	request                                        before  round 6  correct
+	stats_query start=12:00:00 end=12:00:10,
+	  _time:[12:00:00,12:00:30] | stats count()      10      30       10
+	stats_query_range same, step=10s              [10,10,10] [30,20,10] [10,10,10]
+
+The range row is the one to stare at. Only `From` moves per bucket, so every
+bucket ends at the filter's end and each is a superset of the next: buckets
+that are not buckets, at HTTP 200. `/select/logsql/query` over the same window
+and filter answered 10 throughout, so one binary answered one window two ways
+-- entry 112's own headline, caused by entry 112's own fix.
+
+`Query.SetWindow` is the answer: one function that sets From, To and ToSet, so
+the only way to resolve a window is to mark it resolved. Five call sites used
+to set them separately and two missed the flag.
+
+**`ResolvedWindow`'s safety claim was false, and it was a data race.** The
+comment said the shallow copy `c := *q` was safe because `resolveTimePreds` is
+idempotent and its narrowing only reads the predicates. The narrowing does. The
+RESOLUTION ahead of it does not -- `resolveTimePred` writes
+`p.T1, p.T2, p.Rel = from, to, false` in place, through the `Preds` backing
+array the copy shares. So a relative filter froze at whatever `now` came first:
+
+	rows at 12:00:00-12:00:29, query `_time:10s`
+	  without the call, now = base+40s                 0 rows
+	  with it at now = base+15s, then now = base+40s  10 rows
+
+It takes the query TEXT now and parses its own throwaway. There is no caller's
+state to alias, which is a smaller claim than "the copy is safe" and a true one.
+
+**And three more, each a second copy of something.** `/select/logsql/hits` had
+its own bucket ceiling with a raw `(to-from)/step`, so `?start=-4700000000000000000`
+wrapped negative, no refusal fired, and the node answered 200 with a body over
+a megabyte where the router said 413 -- the unbounded response the ceiling
+exists to stop. `federatedHits` computed the narrowed window and discarded it,
+so every shard resolved its own `now`: 480 buckets against the node's 240. And
+`exactVector`/`exactMatrix` priced the request window rather than the scanned
+one, which is entry 112's defect on the sibling route, left there because the
+test that caught it drove `/select/logsql/query` only -- `stats_query` answered
+0.00000001678877628337586 against the node's 0.967741935483871.
+
+**The one that was worth the whole round.** `matchBitset` had its own copy of
+`leafBitset`'s dispatch, missing one case:
+
+	if isTimePred(p.Kind) { return timePredBitset(g, p, n) }
+
+`_time` is a ColTimestamp, not a ColDict, so `DictIndices` returned nil and
+`predBitsetCol` matched nothing. `ParseLogsQL` puts a bare `_time:` filter in
+`q.Preds` rather than `q.Filter`, so the copy without the case is the one that
+ran, and EIGHT read surfaces answered empty for a filter matching every row:
+
+	/select/logsql/hits           [0,0,0]      control [10,10,10]
+	/select/logsql/field_values   []           3 values
+	/select/logsql/field_names    []           the full list
+	/select/logsql/facets         only _time   all fields
+	/select/logsql/streams        []           1
+	/select/logsql/stats_query    result: []   c=30
+	| top 2 by (level)            empty        2 rows
+	| uniq by (level)             empty        3 rows
+
+all at 200, and `query.Count` with them -- so an alert rule whose query carried
+a `_time:` filter never fired. The same filter with no stats pipe returned all
+30 rows, because that path goes through `leafBitset`, which is what made it
+look like a stats-pipe problem. Round six PINNED it as a known node defect
+rather than fixing it, on the reasoning that fixing the node was its own
+change; a reviewer found it is three lines. `matchBitset` now calls
+`leafBitset`, so the second copy is gone rather than corrected.
+
+**Six rounds, and the shape has not changed once.** Every defect has been one
+of two things: a rule applied to the wrong argument, or a second copy of a rule
+that drifted from the first. This round was mostly the second --
+`hitsStepNs` vs `parseStepNs`, `boundRangeBuckets` vs `selectHits`'s inline
+ceiling, `matchBitset` vs `leafBitset`, `parseRequest` vs the stats entry
+points. **The fix that works is always the same: delete the copy and call the
+original.** Where that was done -- `SetWindow`, `leafBitset`, `hitsStepNs`,
+`boundRangeBuckets` -- there is no longer a second value to get wrong.
+
+## 114. The rule looked at the pipes before the aggregate and not the ones after
+
+`needsExactStats` decides whether a stats query is answered by merging
+per-shard partials or by pulling the rows and aggregating once at the
+coordinator. It read the pipes BEFORE the aggregate -- correctly, that is
+where a non-mergeable aggregate makes the merge wrong -- and nothing at all
+after it.
+
+A pipe after the aggregate therefore took the federated path, where the WHOLE
+query is sent to every shard. Each shard applied that pipe to its own groups,
+and the coordinator merged what came back without applying it again. Three
+shards, explicit window, deterministic across two runs, **every response HTTP
+200**:
+
+	| stats by (_msg) count() c | limit 2                  node 2   cluster 6
+	| stats by (_msg) count() c | sort by (_msg) | limit 2 node 2   cluster 6
+	| stats by (_msg) count() c | offset 25                node 5   cluster 0
+	| stats by (user) count() c | limit 2                  node 2   cluster 4
+	| stats by (_msg) count() c | top 2 by (c)             1 each, different value
+	| stats by (_msg) count() c | uniq by (c)              1 each, different value
+
+`limit 2` is two groups PER SHARD, so a three-shard cluster answers six.
+`offset 25` skips twenty-five groups per shard and no shard holds
+twenty-five, so a query that answers five series on a node answers **none**
+across a cluster -- which reads as "no data" rather than as a bug, and is the
+worst of the six for that reason.
+
+WHY IT LOOKED FIXED. The round that added the coordinator check tested
+`| stats count() c | limit 1`, which agreed. It agrees because the query has
+exactly one group and `limit 1` is a no-op on it -- arithmetic, not a rule.
+Every shape that has more than one group diverges, and none was tried.
+
+THE FIX is `len(coord) > 1`: anything after the leading aggregate sends the
+query down the exact path, which computes the aggregate once at the
+coordinator over merged rows and then runs the rest of the pipeline over
+that -- what a single node does, from the same rows through the same pipes.
+
+EVERY pipe, not a list of the dangerous ones. A list has to be kept in step
+with the pipe set and its failure mode is this defect again, silently, at
+200 -- which is exactly how `limitBoundsOutput` got its list wrong in one
+direction and then its conditions wrong in the other (entry 111). The cost is
+push-down for shapes like `| stats ... | sort`, where per-shard aggregation
+would still have been correct. Correctness is not traded for that here.
+
+A MEASUREMENT THAT CHANGED THE FIX. The first plan was to route only the
+set-changing pipes and leave `sort` on the federated path. Running the table
+above with a bare `| stats by (_msg) count() c` and comparing the ORDER of the
+returned series showed node and cluster already disagree about order with no
+post-aggregate pipe at all -- the federated merge accumulates in shard-arrival
+order. So "sort is safe to push down" was never true; it was untested. With
+the fix in place both sort shapes match the node exactly, order included, and
+the bare aggregate still differs -- pre-existing, and not something an instant
+vector's contract fixes.
+
+`TestAPipeAfterTheAggregateAgreesAcrossACluster` drives all six shapes plus
+`offset 2 | limit 2`, the `limit 1` no-op that agreed all along, and a bare
+aggregate as a control. It compares labels AND values through `statsSet`,
+because the two `top`/`uniq` rows return the same NUMBER of series with a
+different value in them -- a count comparison sees nothing.
+
+Reverting the rule to `return false` turns **eight** of the ten red. Written
+here first as seven, from memory rather than from a run; counted since, twice.
+The two that stay green are the two that are supposed to:
+`| stats count() c | limit 1`, where one group makes the limit a no-op, and the
+bare `| stats by (level) count() c`, which has no post-aggregate pipe at all.
+
+## 115. Two ways to hoist a window, and only one of them is the same answer
+
+`exactMatrix` narrowed each bucket's window by calling `ResolvedWindow` inside
+the bucket loop. That is a full `ParseLogsQL` per bucket -- 748 ns, 1584 B, 15
+allocations for the review's filter -- to compute something that does not vary
+with the bucket:
+
+	                 per-bucket      hoisted     delta
+	 30 buckets      304,794 ns      217,836     +39.9%
+	240 buckets      961,684 ns      522,967     +83.9%
+	240 allocs/op      9,724           5,872     +3,852
+
+	240 B/op       1,431,899         813,455     +618 KB
+
+THAT B/op ROW WAS RETRACTED HERE AND THE RETRACTION IS WITHDRAWN. It was
+retracted on the arithmetic `239 x 1584 B = 379 KB`, against a reviewer's
+independent measurement of +394 KB. Both numbers are right, of DIFFERENT
+QUERIES:
+
+	query                                 B/op delta   allocs delta
+	... | sort by (n) | stats avg(n) a      +616 KB       +3,832
+	... | sort by (n) | stats rate() r      +399 KB       +3,592
+
+`ResolvedWindow` itself costs 1,600 B / 15 allocs for the rate() query and
+2,496 B / 16 allocs for the avg() one; 239 x 2,496 is 597 KB, which is the
++616 KB delta plus the work around it. This table is the avg() row and
+reproduces; +394 KB is the rate() row.
+
+So the original figures stand, and what was missing was WHICH QUERY each
+belongs to. The retraction took one query's per-call cost, divided another
+query's table by it, and called the table wrong -- a correction that is itself
+a number quoted out of its context, which is the fault it was written to
+correct. The ns figures were taken at load 2.4-6.8 and reproduce in DIRECTION
+only: +30.8% and +48.7% on a second machine.
+
+ns/op is indicative -- the machine carried a foreign process at 121% CPU while
+these ran -- but allocs/op and B/op are load-independent and the shape is not
+in doubt. `exactMatrix` also parses `bq` per bucket at :339, so it was TWO
+parses per bucket.
+
+A reviewer hoisted it and the whole suite stayed green while the answer went
+wrong. On a filter spanning two buckets:
+
+	_time:[12:00:00Z, 12:00:10Z] | sort by (n) | stats rate() r, step=10s
+	  node     [1, 1]
+	  cluster  [0.9090909090909091, 0.09090909090909091]
+
+Because that hoist moved the NARROWING, not the resolution: every bucket got
+the range's window and none got its own. The suite stayed green because
+`TestTheExactStatsSurfacesPriceTheScannedWindow` uses a 30-second filter inside
+a ONE-HOUR bucket, where per-bucket and range-wide narrowing coincide. It could
+not distinguish them and nothing else tried.
+
+WHAT IS ACTUALLY HOISTABLE is the resolution. Each bucket's window is then the
+range's resolved window intersected with the bucket's own edges, and that is
+the same number:
+
+	resolve(whole)      = [max(from, fs), min(to, fe)]
+	resolve(bucket)     = [max(bs, fs),   min(be, fe)]
+	bucket n resolve(w) = [max(bs, from, fs), min(be, to, fe)]
+
+equal because every bucket lies inside the range: bs >= from, be <= to. It is
+also the MORE faithful of the two, which was not the reason for doing it: the
+per-bucket call read a fresh `time.Now()` each time, so a relative filter
+drifted across the graph, where `StatsQueryRange` on a node passes one `now` to
+every bucket.
+
+`TestABucketCrossingTimeFilterIsPricedPerBucket` uses a filter that fills the
+first of two buckets and misses the second, which no single-bucket window can
+satisfy. It uses `rate()` deliberately: rate divides by the window width, so a
+mis-priced bucket is a wrong NUMBER. `count()` does not divide and cannot see
+it -- which is why the count() rows of the older window tests proved nothing
+about the window, and why they all passed while this was wrong.
+
+## 116. The second sentinel collision, found by looking one field over
+
+`Query.ToSet` exists because `To == 0` meant both "the epoch" and "no end"
+(entry 112). `Query.Now` had the identical shape one field down and nobody
+looked: `Now == 0` meant both "the epoch" and "no request time", and the
+fallback for the second reading was `To` -- whose own unset form on the paths
+that use one is the 1<<62 sentinel. So:
+
+	Now=0, To=1<<62,  _time:5m
+	  -> [4611685718427387904, 4611686018427387904]
+	  -> a five-minute window ending 2116-02-20T23:53:38Z
+
+silently, at 200, matching nothing. No route reaches it -- `parseRequest`, both
+stats entry points, alerts and logrules all set `Now` -- which is precisely
+what was true of `ToSet` until somebody wrote the caller that did not.
+
+`NowSet` and `SetNow` now mirror `ToSet` and `SetWindow`, and every assignment
+went through the setter. The fallback chain is spelled out: Now if set, else To
+if set, else the wall clock -- which is the only defensible reading of
+"relative to now" when nothing says what now is, and is what falling through to
+an unset To was pretending to be.
+
+THE EXISTING TEST CAUGHT THE CHANGE, which is the part worth recording.
+`TestTimeFilters` assigned `pq.Now` directly and went red on `_time:5m` the
+moment the flag landed, because a bare assignment leaves the flag false and the
+fallback then found the sentinel. That is the defect reproducing itself in a
+test, from a line written long before either flag existed -- the argument for
+the setter, made by the code rather than about it.
+
+`TestARelativeTimeFilterWithNoRequestTimeUsesTheClock` pins it, with `To` set
+to 1<<62 rather than left at zero: an all-zero Query would pass a fix that only
+special-cased zero, and the configuration that actually produced 2116 is the
+one to test.
+
+## 117. Round eight: two tests that could not fail, and three numbers that were not measured
+
+Round 8 shipped no new wrong answer -- the first round in eight where the
+previous round's fixes did not introduce the next round's defects. It shipped
+two tests that pass on the defect they are named for, and three figures written
+down without being run.
+
+**The `facets` case, added in round 7 precisely because facets had no case.**
+Restoring `matchBitset`'s old dispatch reddens eight surfaces and leaves this
+one GREEN. Under the defect it answers:
+
+	{"facets":[{"field_name":"_time","values":[...10 values...]}]}   defect
+	{"facets":[{"field_name":"_msg",...},{"field_name":"_time",...}]} control
+
+Non-empty, no `"values":[]` literal in it -- it has `"values":[{...}]` -- and
+node and cluster degrade IDENTICALLY, so the cross-check sees nothing either.
+Three assertions, all satisfied, on an answer that lost every field but one.
+The fix is the shape `hitValues` already established one case above it: assert
+the facet FIELD SET, not that the body has bytes in it. Both defects have the
+same form -- a surface whose empty answer is not an empty literal -- and the
+second was written after the first was fixed.
+
+**`parseRequest`'s `SetNow` had no test at all.** Reverting it to a bare
+`q.Now = time.Now().UnixNano()` -- the exact hazard `NowSet` exists to prevent
+-- left the ENTIRE suite green while:
+
+	GET /select/logsql/query?query=_time:5m   200, 0 rows   (correct: 1)
+
+`TestARelativeTimeFilterWithNoRequestTimeUsesTheClock` covers the fallback
+INSIDE `resolveTimePreds` and not the setter that feeds it. Nothing anywhere
+drove a relative `_time:` filter through an HTTP route, so the round's headline
+invariant was unenforced on the one entry point every read surface passes
+through. The new test uses RELATIVE fixture rows deliberately: the shared
+`corpus` helper pins rows to 2026-06-01, which no `_time:5m` can match, so a
+test written on it would have compared two empty answers and passed.
+
+**Three numbers.** Entry 114 said "seven of the ten red"; it is eight, counted
+twice since. Entry 115's `+618 KB` row I retracted, and the
+RETRACTION was wrong: the row is the avg() query and reproduces at +616 KB,
+while the +394 KB I replaced it with is the rate() query. Two right numbers of
+two different queries, and I divided one query's table by the other's per-call
+cost. The eight/seven count was copied from a report rather than re-run; the
+retraction was arithmetic on figures that did not belong together, which is a
+worse version of the same fault.
+
+**And a comment that a fix falsified twenty lines above itself.**
+`cluster_stats_exact.go`'s header said "the choice is per query, made by
+NonMergeableReason, so a cluster does not get slower for the queries that were
+already correct". After `needsExactStats` grew its second condition, the choice
+is made by two things and a cluster does get slower -- `| stats ... | sort` is
+the common shape. The same sentence was in `docs/lld/cluster.md` twice.
+
+KNOWN AND OPEN, from the same review: the exact path asks each shard for a BARE
+select of the whole window, so `-search.maxRows` binds across a cluster where
+it does not bind on a node. Three shards with the cap at 5:
+
+	* | stats by (_msg) count() c | limit 2    node 200   cluster 400
+	* | stats avg(n) a                         node 200   cluster 400
+	* | sort by (n) | stats count() c          node 200   cluster 400
+
+THREE shapes, not the two first written here. The third is the one that makes
+it matter: `| sort … | stats` is a console default, it has nothing after its
+aggregate, and it reaches the exact path through the condition this entry did
+not know it had (see 117's correction to "two conditions"). The avg() row is
+pre-existing (entry 106); round 8 moved the other two onto the same path.
+
+With production defaults this needs more than a million matching rows per
+shard, which is ordinary log-search scale but not a small cluster's first day.
+Not release-blocking; the RECORD and the message were, and both are fixed. The
+refusal said "That is the request, not the cluster: a retry will be refused the
+same way", which sends a caller to rewrite a query a single node answers 200.
+It now says a shard-side limit can also refuse what a node accepts.
+
+## 118. The tail delivered nothing, and six tests that could not have said so
+
+Round 9 found a shipped defect on a documented endpoint, and it is the worst
+shape this campaign has: **any relative `_time:` filter on
+`/select/logsql/tail` was a silently dead stream.** Rows ingested after the
+stream opened, delivered:
+
+	_time:1s                            0 of 3
+	_time:5m                            0 of 3
+	_time:>=5m                          0 of 3
+	_time:[2020-01-01…, 2030-01-01…]    3 of 3
+	*                                   3 of 3
+
+HTTP 200, headers sent, connection open, nothing ever arriving. Absolute
+filters and `*` work, which is what kept it invisible.
+
+TWO FAULTS, and fixing either alone leaves it broken. `backlog := *q` is a
+shallow copy: `Preds` is a slice and `Filter` is a tree of pointers, so the
+copy shares both, and `RunPipeline` resolves a relative `_time:` IN PLACE.
+Resolving the backlog therefore froze the LIVE query's window at the request
+instant. And `resolveTimePreds` is IDEMPOTENT -- it clears `Rel` -- so even a
+private copy resolved once would freeze at the first poll. A tail's relative
+window has to move with the stream, which is not something one resolved query
+can express however carefully it is copied.
+
+`Query.CloneResolvable` deep-copies exactly the two things that get mutated,
+and the loop clones and re-resolves per poll against a fresh `now`. The
+compiled `*regexp.Regexp` inside a Pred is shared deliberately: it is immutable
+and safe for concurrent use, and recompiling it per poll would be the fix
+paying for itself in the wrong currency.
+
+**AND SIX MORE TESTS OF THE RECURRING SHAPE**, which is the finding this
+campaign keeps making about itself -- three rounds running, the defect was in
+the test:
+
+	TestASmallTimeWindowReachesTheShardsUnchanged   no non-emptiness guard, so
+	  two empty answers are equal. Its OWN fixture comment records this
+	  happening once: the rows were outside the window, both sides answered
+	  nothing, and it passed. The fixture was repaired and the assertion was
+	  not, so the hole was one bad fixture from reopening.
+
+	TestAnOverflowingRangeSpanIsBoundedRatherThanIterated   status only.
+	  bodyS/bodyC were captured and used only in the failure message, so two
+	  200s with different bucket counts passed -- the same hole already found
+	  and fixed one file over, in the hits ceiling test.
+
+	TestTheRouterPlanStillWinsOverALargeForm   `gotLimit == "3"` refused one
+	  way of violating the plan. The plan requires limit=0; a limit DROPPED
+	  entirely passed and produced the same shard-local merge the test exists
+	  to prevent. Now `!= "0"` -- assert what the plan requires, not one way
+	  of breaking it.
+
+	TestTheAnswerDoesNotDependOnPipeOrder   `t.Skipf` when the node cannot
+	  answer, which retires the exact property its header says it exists for
+	  ("the single node's number, not merely a stable one"), silently, green.
+
+	TestSingleNodeAndClusterAgree   `len(gotS) != len(gotC)` then element-wise.
+	  Zero rows both sides: 0 == 0, the loop never runs, all 27 queries pass.
+	  A whole differential suite green against a binary answering nothing.
+	  Verified: an empty fixture now fatals on every case.
+
+	TestTheEndpointLimitIsTheClustersNotEachShards   counts, never content.
+	  The right NUMBER of the wrong rows passed -- verbatim the defect
+	  cluster_order_test.go's own header documents.
+
+The shape is one sentence: every assertion is satisfied by the degraded answer.
+Non-emptiness where the degradation is a non-empty wrong body; a status where
+the degradation is a different body under the same status; a count where the
+degradation is different rows; equality between two sides that degrade
+identically; and a skip that removes the assertion altogether.
+
+## 119. A retraction that was itself a number out of context
+
+Entry 115 quoted +618 KB for hoisting `ResolvedWindow` out of `exactMatrix`'s
+loop. I retracted it on arithmetic -- 239 removed calls at ~1584 B is 379 KB,
+against a reviewer's independent +394 KB -- and the retraction was wrong.
+
+Both numbers are right, of different queries:
+
+	query                                 B/op delta   ResolvedWindow per call
+	... | sort by (n) | stats avg(n) a      +616 KB      2,496 B / 16 allocs
+	... | sort by (n) | stats rate() r      +399 KB      1,600 B / 15 allocs
+
+239 x 2,496 is 597 KB, which is the +616 KB delta plus the surrounding work.
+The table is the avg() row and reproduces.
+
+I took one query's per-call cost, divided another query's table by it, and
+declared the table 1.6x too large. The correction was itself a measurement
+quoted outside the context that gave it meaning, which is precisely the fault
+it was written to correct -- and it destroyed a right answer to do it. A
+retraction is a claim like any other and gets checked like one.
+
+## 120. Round 10's own fix put every relative `_time` on `/select/sql` in 2116
+
+The round that added the `NowSet` fallback chain also added
+`q.SetWindow(timeWindow(r))` to `sqlQuery`, for an unrelated and correct reason
+(the narrowing rule needs `ToSet`). The two changes met.
+
+`SetWindow` marks the window RESOLVED, and `resolveTimePreds` reads that as
+permission to use `q.To` as `now`. With no `end` in the request `timeWindow`
+returns `To = 1<<62` -- a sentinel meaning "no upper bound", not an instant.
+`sqlQuery` never called `SetNow`. Measured, one node, HTTP 200 throughout, on a
+fixture with one row a minute old and one an hour old:
+
+	/select/logsql/query?query=_time:5m                    1 row
+	/select/sql   ... WHERE _time > '5m'                   0 rows
+	/select/sql   ... WHERE _time >= '5m'                  0 rows
+	/select/sql   ... WHERE _time > '5m'  (&end= given)    1 row
+	/select/sql   SELECT * FROM logs      (control)        2 rows
+
+The `end=`-given row is what names the cause: supply a real end and `To` is an
+instant rather than a sentinel, and the answer is right. `federatedSQL` forwards
+this query to every shard, so a cluster answered 0 exactly as a node did -- both
+halves degrading identically, which is why the differential suite could not see
+it. The whole tree was green.
+
+**A TEST THAT SUPPLIES `end=` PASSES ON THE DEFECT.** That is the trap in this
+one: the obvious way to write the test is to pin the window, and pinning the
+window is what makes the bug disappear. The gate is
+`TestARelativeTimeFilterOnSQLWithNoEndParameter`, and the `end=`-given case is
+in it as a CONTROL rather than as the assertion.
+
+## 121. Three more silent wrong answers on the tail, all in the same twenty lines
+
+Found while gating entry 120. None is round 10's; all three are on the surface
+round 10 rewrote, and all three answer 200.
+
+**`limit=` DROPPED ROWS, EVERY POLL, FOREVER.** The tail cleared `q.Limit` and
+left `q.LastN` -- and `limit=` is the parameter that sets LastN, three lines
+below the comment in `parseRequest` that says so. A tail has no last row to
+count back from, so the cap has no meaning there; what it did instead was bound
+each POLL. Five rows ingested after the stream opened:
+
+	tail?query=*            5 of 5
+	tail?query=*&limit=1    1 of 5
+	tail?query=*&limit=2    2 of 5
+
+**`| filter _time:` MATCHED NOTHING, in every form.** Two faults, either of
+which alone is enough. `resolveTimePreds` walked `q.Filter` and `q.Preds` and
+never a `FilterPipe`'s expression, so a relative pred reached the evaluator with
+`Rel` still true and T1/T2 still offsets. And `matchPredRow` had no case for the
+time kinds at all: `_time` is `Row.Time`, not a `Row.Fields` entry, so
+`rowField` returned "" and every comparison failed even for a fully resolved
+absolute range.
+
+	_time:5m                 1 row
+	* | filter _time:5m      0 rows
+	* | filter _msg:recent   1 row   (the control)
+
+The day/week test is now one function both evaluators call. Two copies of a rule
+is two places for it to drift, and the row evaluator had zero copies.
+
+**A TAIL THREW AWAY EVERY PIPE.** `q.Pipes = nil`, with the comment "a stats/sort
+pipe would never terminate" -- true of stats and sort, and it took every other
+pipe with them. Four rows of which two are level=info:
+
+	tail?query=*                       4 of 4
+	tail?query=* | filter level:error  4 of 4   (both info rows delivered)
+	tail?query=* | fields _msg         full records, every field present
+
+Someone tailing only errors got everything and had nothing to tell them so.
+
+Row-local pipes now run and the rest are REFUSED at 400. A row-local pipe is a
+function of one row, so it behaves the same on a stream as on a batch;
+`ClassifyPipe` already names that set for the distributed planner and the
+question here is the same one, so the set is read from there rather than
+restated. `| stats` on a tail has no answer -- its input never ends -- and a 400
+saying so is the only response that does not misreport what ran.
+
+## 122. The clone that nothing reached, and what made it reachable
+
+`CloneResolvable` gained `clonePipesResolvable` alongside the walk that resolves
+pipe expressions. Deleting it left the whole suite green, and not because the
+tests were weak: no caller reached it. The tail was the only repeated-run
+caller, and it set `q.Pipes = nil`; alerts re-parse per evaluation
+(`alerts.go:64`) and `stats_range` re-parses per bucket, so neither shares a
+parsed pipeline.
+
+Fixing the tail's dropped pipes is what made it load-bearing. A tail with
+`| filter _time:5m` now keeps that pipe and re-resolves it every poll, so a
+clone that shares the FilterPipe resolves the TEMPLATE and freezes it at the
+first poll's instant -- the same defect entry 118 recorded for a shared Filter
+tree, one level down. Two cases in
+`TestATailWhoseTimeFilterSitsInTheExpressionTreeKeepsDelivering` cover it, and
+removing the pipe clone now reddens both.
+
+Worth stating plainly because the reverse is the usual outcome: an unenforced
+mechanism is normally either dead code to delete or a test to write. This was a
+third thing -- correct code whose only caller was disabled by a separate bug,
+so the bug and the unreachability were the same fact.
+
+**AND THE CLONE'S OWN DOC WAS WRONG.** It said "only the two mutated things are
+deep-copied". A run mutates more than two: `stampPipes` writes `rangeSec` and
+`q` into `*StatsPipe`, `*UniqPipe` and `*TopPipe` pointers the clone shares.
+Inert on both current callers, and now written down as a limit rather than
+claimed as a property the function has.
+
+## 123. Round 11: a gate that could not fail, and new code with none
+
+Both blockers were the round's own.
+
+**THE TEST FOR THE ROUND'S DESIGN DECISION COULD NOT FAIL.**
+`resolveTimePreds` deliberately does not feed pipe-borne time bounds into the
+window narrowing, and `TestAPipeFilterDoesNotNarrowTheScanWindow` was named for
+that. It drove `* | stats count() c | filter _time:5m` over HTTP and asserted
+the body did not contain `"1"`. The stats row is `NoTime`, so the trailing
+`_time:` filter drops it whether the count is 1 or 2 -- the body is empty under
+both. Feeding the pipe bounds into the narrowing, which is exactly what the
+comment says is not done, left EVERY package green:
+
+	unmutated   From=0           To=4611686018427387904
+	mutated     From-now=-5m0s   To-now=0s      <- the pipe narrowed the scan
+
+Three assertions, every one satisfied by the degraded answer, in a test written
+to prevent that shape.
+
+The claim is about the WINDOW, so it is asserted on the window now, as a unit
+test in `internal/query` that resolves the query and reads `q.From`/`q.To`. Six
+cases, query-level and pipe-level, and a second test that the pipe's own pred is
+still RESOLVED -- because asserting only the window would be satisfied by a
+`resolveTimePipes` that does nothing at all.
+
+**AND THE DAY/WEEK ARM HAD NO TEST.** `matchDayWeek` was factored out for
+`| filter _time:day_range[...]` and `week_range[...]` specifically, and nothing
+drove either. Making the row-level arm always-false left the suite green while:
+
+	_time:day_range[09:00, 11:00]                1 row
+	* | filter _time:day_range[09:00, 11:00]     1 -> 0
+
+**AND THE HALF-OPEN CONVENTION WAS UNGATED.** The group scan is
+`from <= ts < to`; the row evaluator is `r.Time >= from && r.Time < to`. Turning
+the row evaluator's `<` into `<=` is a real divergence -- one filter, two
+spellings, two answers at the endpoint -- and nothing went red. A row exactly at
+an exclusive upper bound is the only input that separates them, so that is the
+fixture.
+
+**A COMMENT THIS ROUND FALSIFIED TWENTY LINES AWAY.** `CloneResolvable`'s doc
+said `stampPipes` is inert "because the tail sets `q.Pipes = nil`" -- and the
+same round deleted that line. The conclusion survives (`StatsPipe`, `UniqPipe`
+and `TopPipe` are all in the tail's refused set) and the reason it gave did not.
+Entry 117 recorded this exact shape.
+
+**AND THE LLD WAS NOT UPDATED FOR A CHANGED ROUTE CONTRACT.** The round added a
+new 400 to `/select/logsql/tail`, made `limit=` a no-op there, and made
+row-local pipes run; `docs/lld/api.md`'s "Live tail" said nothing about pipes
+and its `limit` entry had no exception. It also claimed the tail "tails the
+router's local store" where the code answers 501, which `docs/lld/cluster.md`
+had already corrected -- two LLDs contradicting each other, with api.md stale.
+
+## 124. OPEN: an Elasticsearch `range` on `@timestamp` is dropped for every spelling but RFC3339
+
+`esTime` accepts `RFC3339Nano` and `RFC3339` and nothing else, and the loop
+above it then falls through with the bound never applied. Measured, four
+documents, `gte` set to a far-future instant so an applied filter returns zero:
+
+	gte                              /_search total   applied
+	"2030-01-01T00:00:00Z"                        0   yes
+	"now-5m"          (ES date math)              4   NO
+	1893456000000     (epoch millis)              4   NO
+	"1893456000000"   (as a string)               4   NO
+	1893456000        (epoch seconds)             4   NO
+	"2030-01-01T00:00:00"  (no zone)              4   NO
+	"2030-01-01"      (date only)                 4   NO
+
+`/_count` agrees: control `{"count":0}`, epoch-millis `{"count":4}`. HTTP 200
+throughout, and node and router degrade identically, which is why the
+differential suite sees nothing.
+
+`es.go`'s own header says the opposite -- "Silent ignoring is the failure this
+replaces ... a dropped filter returns MORE documents than the client asked for,
+in a response that is structurally valid" -- and the file refuses a non-time
+range for exactly that reason. A time range whose VALUE it cannot parse is still
+dropped. `docs/lld/api.md`'s "A time range still becomes the window" is false of
+the tree.
+
+Pre-existing, larger than the round-11 diff, and recorded here rather than
+folded into it. `TestESTimeRangeStillDrivesTheWindow` covers the one spelling
+that works.
+
+*Correction, round 16: CLOSED. Every spelling in the table above now parses
+and applies, or the query is a 400 naming the value -- see entry 127, which
+also records three adjacent defects this entry's measurement did not reach
+(Grafana's `format` field, `must_not`/`should` lifting, and bounds that
+shadowed each other). `TestESTimeRangeSpellingsAllApplyTheBound` is this
+entry's table as a gate, every row with a far-past control.*
+
+## 125. Round 13: a refusal reason taken from the wrong axis, and three tests that could not see it
+
+All six findings are round 12's own surface: `/select/logsql/tail`'s 400, and
+the tests around the day/week time filters.
+
+**THE REASON WAS DECIDED ON THE SHARDING AXIS AND DELIVERED ON THE STREAMING
+ONE.** `nonStreamingPipe` refused a pipe when `ClassifyPipe` did not call it
+row-local -- correct -- and then took the MESSAGE from the same class. The class
+is about where a pipe may run in a CLUSTER, so two of its distinctions are
+meaningless on a single-node tail and both reached the caller:
+
+	* | limit 2                    it needs the whole result set and the input never ends
+	* | offset 2                   ... the same
+	* | stats count() c            ... the same
+	* | stats avg(d) a             it runs once over a merged result set, which a stream does not have
+	* | stats quantile(0.5, d) q   ... the same
+	* | stats count_uniq(level) u  ... the same
+
+`LimitPipe.apply` is `return rows[:p.N]` and `OffsetPipe.apply` is
+`return rows[p.N:]` -- prefix operations, and `docs/lld/api.md` calls
+`| limit N` "(first n)". They do not need the whole result set. They are
+`PipeGlobalOrder` because a shard's first N is not the cluster's first N. What
+actually stops them on a tail is entry 121's own finding: `RunPipeline` runs
+once PER POLL, so `| limit 2` bounds each poll rather than the stream.
+
+The stats pair is the same fault one level up. `ClassifyPipe` routes a
+`*StatsPipe` by `mergeableAggs` -- whether a COORDINATOR can combine partial
+states -- so `count()` and `avg()` land in different classes and got different
+messages. A live tail has no coordinator and no merge: every stats pipe is
+refused because its input never ends, and telling a single-node operator their
+`avg()` "runs once over a merged result set" names a cluster they may not have.
+
+The reason is now chosen per pipe on the streaming axis (`tailRefusal`), in
+three buckets over the 17 refused pipes: computed over the whole result set and
+the input never ends (stats/sort/uniq/top/rank and the five introspection
+pipes); a slice of a result set where each poll is its own result set
+(limit/offset/tail/sample); needs a second result set (join/union/
+stream_context).
+
+**AND THE NAME WAS NOT A TOKEN OF THE LANGUAGE.** The message took
+`strings.ToLower(strings.TrimSuffix(typeName, "Pipe"))`, whose comment said
+"the type name, lowered, is what the user typed closely enough to act on". For
+five of the seventeen it is not: `stream_context` -> `streamcontext`,
+`field_values` -> `fieldvalues`, `field_names` -> `fieldnames`,
+`blocks_count` -> `blockscount`, `block_stats` -> `blockstats`. The one message
+whose job is to name the pipe to remove named something unpasteable, and no test
+looked.
+
+**THE LLD WAS FALSE FOUR WAYS.** `docs/lld/api.md` gave two buckets: `| stats`
+whole in the first (only the mergeable half was there), the second as exactly
+sample/join/union/stream_context (six introspection pipes and non-mergeable
+stats were in it too), `| limit`/`| offset` as needing "the whole result set
+before they can emit their first row" (false), and no mention of `| tail`
+(refused). A hand-written enumeration produced all four, so the replacement is
+generated: `TestEveryPipeInTheLanguageHasATailRefusal` takes the pipe set from
+the query package's source, asserts the exact name and reason of all 39, and
+`TestTheAPILLDsTailSectionNamesWhatTheCodeRefuses` holds the document's counts
+and names to it.
+
+**A TEST WHOSE SENSITIVITY DEPENDED ON THE MONTH IT RAN IN.** Both day/week
+evaluators convert with `.UTC()`, and mutating the row evaluator's to `.Local()`
+left all six cases of
+`TestTheRowEvaluatorsDayAndWeekArmsSelectByTheRowsOwnTime` green: the machine is
+Europe/London and the fixture's March instants sit in its offset-zero window.
+Under `TZ=Asia/Tokyo` the same mutation reddened two. No fixture can fix this on
+its own -- under `TZ=UTC` the two functions are the same function -- so the test
+now runs its cases twice, the second time in a re-executed child whose
+`time.Local` is a fixed UTC+9. Measured with the mutation applied: red under the
+default zone, under `TZ=UTC` and under `TZ=Asia/Tokyo`, where before it was red
+only under `TZ=Asia/Tokyo`. Mutating the GROUP SCAN's `.UTC()` instead reddens
+the three query-spelling cases, which the pipe-spelling cases cannot see.
+
+The child is a process rather than `time.Local = ...` in the test: this package
+runs servers with live goroutines, and `time.Now()` reads that variable, so
+writing it mid-suite is a data race the race detector would eventually report.
+
+**AND THE INCLUSIVE ENDPOINTS OF `day_range` WERE NOT GATED.** `matchDayWeek`
+is `min >= p.T1 && min <= p.T2` and `bracketInner` accepts only `[` and `]`, so
+there is no exclusive spelling and the inclusive endpoints are the whole
+contract. Every fixture picked 10:00, strictly inside `[09:00, 11:00]`, so
+`min > p.T1 && min < p.T2` left all six cases green.
+`TestADayRangeIncludesBothOfItsEndpoints` puts rows at exactly 09:00 and exactly
+11:00 (with 08:59 and 11:01 outside) and reddens on that mutation in both
+spellings.
+
+**THE REFUSAL TEST COULD NOT SEE A WRONG REASON WITHIN A CLASS.** It asserted a
+SUBSTRING of one shared message, so collapsing both reasons into one string left
+`sort`, `limit`, `uniq`, `top` and `stats count()` green -- only `sample` gated
+anything, and only because its substring differed. The cases now assert the
+exact pipe-name-and-reason pairing the endpoint emits.
+
+**A GATE THAT READS THE CONSTANT CANNOT SEE THE CONSTANT CHANGE.** Written that
+way first: the table and the endpoint cases both spelled their expectation as
+`whyPerPoll`, so giving `whyPerPoll` the text of `whyNeverFinal` changed the
+server's answer AND the expectation together, and the whole package stayed
+green. Found by mutating it. `TestTheTailRefusalReasonsSayThreeDifferentThings`
+now writes each reason's distinguishing phrase out as a literal and requires the
+four to be pairwise different -- the one place the wording is duplicated, which
+is what makes the merge visible.
+
+## 126. Round 15: three assertions the tail gate set was missing, and a mutation left in the tree
+
+Round 14's surface again -- `/select/logsql/tail` -- read by a reviewer who
+found no code defect and three assertions that did not exist.
+
+**A MUTATION LEFT IN THE TREE IS A GATE NOBODY IS RUNNING.** The measuring
+agent for the last item below was killed with its mutation applied, and the
+tree kept it: `nonStreamingPipe` was `_ = pipes; return "", ""`, the
+"nothing is ever refused" form. `go test ./internal/api/` was red on 17
+subtests of `TestEveryPipeInTheLanguageHasATailRefusal`, and every tail in
+that build answered 200 for every pipe -- `* | stats count() c` included --
+streaming rows as though the pipe had been applied. Restored to the loop over
+all pipes. A mutation is applied, measured and restored in one step, from a
+scratchpad copy taken first; leaving it costs the next reader the time it takes
+to tell a left-behind probe from a real defect.
+
+**THE REFUSAL LOOP WAS ONLY EVER DRIVEN WITH ONE PIPE.** Every tail case in the
+package -- and every other `logsql/tail` call site in it -- passed `*`, a bare
+filter, or ONE pipe, so reducing `nonStreamingPipe` to inspect `pipes[0]` alone
+answered all of them identically:
+
+	if len(pipes) > 0 && query.ClassifyPipe(pipes[0]) != query.PipeRowLocal {
+		return tailRefusal(pipes[0])
+	}
+	return "", ""
+
+Measured at the endpoint with that mutation, `* | filter level:error | stats
+count() c` went 400 -> 200 and streamed rows. The whole tail gate set stayed
+green. Five chain rows now sit in
+`TestATailRunsItsRowLocalPipesAndRefusesTheRest`: refused pipe last, in the
+middle between two row-local pipes, first (the control the mutation keeps
+green), two refused pipes where the FIRST must be named, and one carrying a `+`
+inside the query.
+
+**THE BACKLOG REPLAY IS A SECOND EXECUTION OF THE PIPELINE, AND NOTHING REACHED
+IT.** A tail with `start_offset` runs `RunPipeline` twice: once over the
+backlog (`backlog := q.CloneResolvable()`), then once per poll. Both existing
+helpers ingest AFTER the stream is open, so every pipe assertion in the package
+landed on the poll loop. `backlog.Pipes = nil` after the clone left the WHOLE
+`internal/api` package green -- measured, exit 0 -- while a client with
+`start_offset` set got the first window unfiltered, at 200, silently.
+`TestATailsBacklogReplayRunsThePipes` ingests before the open and asserts the
+replay: `| filter level:error` replays 2 of 4 rows with no info row, `| fields
+_msg` replays 4 rows carrying no `level`, and a bare `*` replays 4 of 4. With
+the mutation applied, the full package run is red on that test and on nothing
+else.
+
+**A PRESENCE-ONLY DOC GATE CANNOT SEE A NAME IN THE WRONG BUCKET.** The first
+version of `TestTheAPILLDsTailSectionNamesWhatTheCodeRefuses` asked only that
+each `` `| name` `` and three anchor phrases appear SOMEWHERE in the Live tail
+section. Three edits were green under it and all three make the document false:
+moving `| limit` and `| offset` into the never-ends bullet and `| join` out of
+the second-set bullet; replacing the three buckets with ONE paragraph claiming
+all 17 are refused because the input never ends, false for 7 of them; and
+rewording `whyPerPoll` into a different claim while the document went on
+describing the old one. The gate now parses the section's top-level bullets,
+requires each reason's FULL TEXT in exactly one of them, and requires each
+refused pipe to be named under the bullet carrying ITS OWN reason and under no
+other. Matching the whole constant rather than an anchor phrase is what makes
+the rewording visible: `whyPerPoll` still contains "once per poll", so
+`TestTheTailRefusalReasonsSayThreeDifferentThings` stays green on it.
+
+**A PIPE WITH A PROMOTED `apply` IS SEEN BY ONE GATE OR THE OTHER.**
+`type EmbeddedPipe struct{ FieldsPipe }` implements `Pipe` and declares no
+`apply` FuncDecl, so an AST walk for `apply` declarations never sees it.
+Measured both ways: with a `ClassifyPipe` case added, `internal/api`'s
+enumeration is red ("EmbeddedPipe is a pipe of the language with no case
+here"), because it takes the union of the apply-declarers and `ClassifyPipe`'s
+cases; without one, `internal/query`'s `TestEveryPipeIsClassifiedExplicitly` is
+red, because it type-checks the package and demands a case for every type
+implementing `Pipe` -- and `internal/api`'s gate is green, which is the hole the
+union closes. Neither gate alone is the Pipe set; together they leave nowhere
+for a promoted `apply` to land.
+
+**READING AN ENDLESS STREAM TO EOF COSTS THE CLIENT TIMEOUT PER CASE.** The
+refusal cases fetched the tail with `chaosGet`, which reads to EOF -- and a tail
+that answers 200 never closes. Measured under the "nothing is ever refused"
+mutation, where all 18 refusal rows answer 200:
+
+	tailPipeRunBody via chaosGet     153.5 s   red
+	tailPipeRunBody via tailOpen       9.5 s   red
+
+The difference is 18 rows x the 8 s `chaosTimeout`. The reviewer's report had
+this failing with "context deadline exceeded" rather than the intended
+assertion; that half did not reproduce -- `chaosGet` discards the read error
+(`b, _ := io.ReadAll(...)`) and returns the status the headers already carried,
+so both forms say "answered 200" and only the cost differs. The helper now
+returns at the headers and reads the body only when the answer is finite.
+
+**A TEST HELPER'S ESCAPER MEASURED A DIFFERENT QUERY THAN ITS SOURCE SAYS.**
+`urlEscape` was a `strings.NewReplacer` over ten characters, leaving `+`, `%`,
+`&` and `#` alone. `+` decodes as a space, so `* | math "n + 1" as m` reached
+the parser as `math "n  1" as m`: 400 `math: unexpected "1"` through the helper,
+200 through `url.QueryEscape`. `* | extract_regexp "(?P<n>[0-9]+)"` answered 200
+both ways while running two different regexps. Nothing was red, because no query
+in the suite carried one of the four -- a property of that day's table, not of
+the helper. It is `url.QueryEscape` now, and the chain row carrying a `+` is red
+if the query does not arrive as written.
+
+The mutation table for the round, each applied to the tree, measured, and
+restored:
+
+	mutation                                            gate that reddened
+	nonStreamingPipe inspects pipes[0] only             4 chain rows of the endpoint test
+	nonStreamingPipe returns "", ""                     all 18 refusal rows, at 9.5 s
+	backlog.Pipes = nil after the clone                 the replay test, and nothing else
+	| limit,| offset -> never-ends bullet; | join out   the LLD bucket gate, 4 errors
+	the three bullets replaced by one paragraph         the LLD bucket gate, 3 errors
+	whyPerPoll reworded into a different claim          the LLD bucket gate only
+	EmbeddedPipe + a ClassifyPipe case                  internal/api's enumeration
+	EmbeddedPipe with no ClassifyPipe case              internal/query's classification gate
+	urlEscape back to the ten-character replacer        the chain row carrying a `+`
+
+## The release document's own package count was stale, in five places
+
+`docs/release-readiness.md` states "N packages ok" against five gates -- test,
+race, purego, fuzz, and crash/recovery. It said **nine**. The module has
+**ten** packages carrying tests.
+
+So every one of those five rows described a run that had not covered one
+package, in the document whose entire job is to say the release is ready.
+Nothing checked it, and the count is exactly the kind of fact that rots on the
+commit that adds a package.
+
+Measured while re-running the gates after round 15:
+
+	go test -race ./...        10 packages ok
+	go test -tags purego ./... 10 packages ok
+	go list ./...              11 packages (one carries no tests)
+
+`TestTheReleaseDocumentsPackageCountIsReal` walks the tree for directories
+containing `_test.go`, reads every "N packages ok" out of the document, and
+compares. It reads the number from the DOCUMENT rather than restating it, so a
+constant here and a number there cannot disagree; and it checks EVERY row, not
+the first, because a drift in one row is the likelier failure.
+
+The benchmark-provenance blocker recorded above is unchanged: the published
+table still has no machine-checked provenance and the release should not be
+tagged until it is re-measured on a quiet machine.
+
+## The stated cluster limitations were prose, and all four are true
+
+`docs/release-readiness.md` lists four cluster limitations under "Not blockers,
+but stated", and `CHANGELOG.md` repeats them. None was machine-checked.
+
+Measured, and all four hold:
+
+	                          router      storage node
+	/select/logsql/tail       501         200
+	/select/vector            501         (a query error, not a refusal)
+	/admin/cluster/repair     200         501
+
+The refusals are the interesting direction and each is deliberate: `tail` and
+`vector` refuse on a router because a router has no local store to stream
+from, and answering from one shard would be a tail of part of the cluster;
+`repair` refuses on a storage node because it reconciles replicas and a storage
+node has none.
+
+**A stated limitation that is no longer true is worse than the limitation.** A
+caller designs around a restriction that has been lifted, or relies on a
+refusal that has quietly become an answer — and `listQuarantined`'s own comment
+records exactly that happening in the other direction ("this used to answer 501
+... asking them is the fix"), so the prose was one edit away from being wrong
+already.
+
+`TestTheStatedClusterLimitationsAreTrue` pins all five behaviours, the two
+ANSWERS included. Without the controls a server that answered 501 to
+everything would satisfy the three refusals.
+
+**A near-miss worth recording.** The first probe hit a ROUTER for
+`/admin/cluster/repair`, got 200, and matched it against
+`cluster_surface_test.go`'s comment that the route is "a deliberate refusal" —
+a false finding, one report away from being written down. The comment is about
+a STORAGE NODE, where it does refuse. Read which case a claim is about before
+measuring the other one.
+
+## 127. Closing the ES time-range entry opened three more, all in the same loop
+
+Entry 124 recorded six spellings of an Elasticsearch `@timestamp` bound
+silently dropped at 200. Fixing it meant reading the whole range loop, and the
+loop held three more defects the entry's own measurement could not see,
+because every probe in it used exactly one bound in exactly one context.
+
+**THE FIX FOR 124 ITSELF.** `esTime` accepted `RFC3339Nano`/`RFC3339` and the
+caller fell through silently on everything else. It is now `esTimeRange` ->
+`esTimeValue`: RFC3339, zoneless datetime/date/month/year (completed by
+`time_zone`, default UTC), bare epoch numbers and numeric strings with the
+unit inferred from magnitude (`unixToNanos`, the same rule every HTTP time
+param follows) unless `format` names the unit, and `now`-anchored date math
+with calendar-aware `M`/`y`. A value it cannot read is a 400 naming it.
+Date-math rounding (`now/d`), `||` anchors, and unknown `format`/`time_zone`
+names are refused with their own messages, because approximating `now/d` is
+the silent wrong answer this surface exists to not give. Re-measured against
+entry 124's table: every spelling that answered 4-of-4 with the bound dropped
+now answers 0, and `/_count` agrees.
+
+**GRAFANA'S EVERY DASHBOARD QUERY WAS A 400.** The strict decoder is the ES
+surface's whole defence -- and `esRange` had no `format` field, while
+Grafana's ES datasource stamps `"format":"epoch_millis"` on every time range
+it sends. Measured:
+
+	{"range":{"@timestamp":{"gte":"...","lte":"...","format":"epoch_millis"}}}
+	  before   400  simdlogs: json: unknown field "format"
+	  after    200, bound applied
+
+The file's header claims "Grafana's ES datasource work[s] against this". It
+could not have: the datasource's first panel query dies on the decoder. Loud,
+at least -- but loud about the wrong thing, naming a field every real client
+sends. `format` and `time_zone` are now decoded and HONOURED (an unknown name
+in either is still a 400 naming it, because guessing `basic_date` against an
+epoch rule parses the value into a different century).
+
+**A TIME RANGE UNDER `must_not` OR `should` WAS LIFTED ONTO THE WINDOW.** The
+range loop wrote every time bound onto `q.From`/`q.To` -- and the window is an
+AND over the whole query, applied un-negated. Four documents stamped now, all
+at HTTP 200:
+
+	query                                                          got   ES
+	must_not: [range @timestamp lt 2000]      (= everything)         0    4
+	must_not: [range @timestamp gte 2030]     (= everything)         0    4
+	should: [range lt 2000, range gte 2000]   (= everything)         0    4
+
+A negated bound INVERTED and a union INTERSECTED, silently. The fix threads
+the boolean context through `esClauseToExpr`: positive conjunctive position
+(top level, `must`, `filter`) still lifts -- that is the partition skip --
+and under `must_not`/`should` the range becomes an ordinary `TimeRange`
+predicate leaf the tree negates or unions correctly. The group scan already
+evaluates time leaves (`leafBitset` -> `timePredBitset`), so the cost is
+pruning, not correctness.
+
+**BOUNDS SHADOWED AND CLAUSES OVERWROTE.** `gte` was read first and `gt` only
+when `gte` was absent or unreadable, so `{"gte": past, "gt": future}` dropped
+the stricter bound: 4 documents where ES answers 0. And a second range clause
+on the same field ASSIGNED `q.From`/`q.To`, so `must: [gte 2030, gte 2000]`
+widened the first clause away: 4 where ES answers 0. Both bounds now apply
+and both clauses narrow -- assignment became intersection.
+
+**AND THE PREDICATE PATH CHANGED THE DOCUMENT'S FIELD SET.** The first
+probe of the fixed `must_not` showed `_source` carrying a `_time` key the
+lifted path never produces. `filterFields` -- the tree evaluator's
+materialize list -- had no time-pred skip, where the flat-Preds loop three
+lines down has carried one all along ("_time is the timestamp column, not a
+materialized field"). So a tree-filtered query materialized a formatted
+`_time` field onto every row, and the same document answered with different
+fields depending on the SPELLING of the same filter. The skip is now in
+`filterFields`, which is the two-copies-of-a-dispatch shape entries 113 and
+122 already record, in its smallest form yet.
+
+The mutation table for the round, each applied to the tree, measured, and
+restored:
+
+	mutation                                            gate that reddened
+	esTimeValue -> RFC3339-only (the 124 form)          19 rows of the spellings table
+	bound errors swallowed (return 0,false,nil)         TestESUnreadableTimeBoundsAre400
+	`if lift ||true` (context ignored)                  7 of 8 must_not/should rows
+	filterFields time-pred skip reverted                the `_source` field-set check
+
+`TestGrafanaRangeBodyAgreesAcrossACluster` pins the router: the body is
+forwarded to the shards, so the decoder had to learn `format` at BOTH ends or
+the router would refuse what the node answers. `docs/lld/api.md`'s ES section
+now states the accepted spellings and the refusals instead of one sentence
+that entry 124 had already measured false.
+
+## 128. Round 16 in the tests: a subtest that retired itself, and two counts
+
+**THE RANGE ROW OF THE SURFACE SUITE STOPPED TESTING ANYTHING.** When
+`boundRangeBuckets` gave the range endpoints their default-window narrowing,
+`golden_api_test.go` got an explicit window in the same round, with a comment
+saying why: with no window the node now answers empty about the June corpus.
+`cluster_surface_test.go`'s route table did not, so
+`TestNoRouterReadSilentlyReadsTheEmptyLocalStore/stats_query_range` began
+skipping -- "the storage node's own answer is empty, so this request proves
+nothing here" -- on every run, forever, green. A skip that fires
+unconditionally is a subtest that no longer exists; entry 118 records six of
+this shape and this one appeared in the round AFTER those were written. The
+route carries the golden test's window now, and the subtest compares real
+answers again.
+
+**A NUMBER IN A GUARD COMMENT THAT THE TABLE CONTRADICTED.** The
+zero-rows guard in `TestSingleNodeAndClusterAgree` said "all 27 queries
+pass"; the table holds 26. Entries 111 and 117 both record numbers-in-prose
+nobody checks going wrong; this one was twenty lines above a table anyone
+could count. The comment is numberless now.
+
+**AND THE LLD'S COUNT OF THAT TABLE WAS UNGATED PROSE.** `docs/lld/cluster.md`
+says the differential table "has grown from fifteen to twenty-six" -- true
+today, rotting on the next query added, and unlike the tail section's counts
+(which `TestTheAPILLDsTailSectionNamesWhatTheCodeRefuses` holds to the code)
+nothing held it. The live number is a digit now and
+`TestTheLLDsDifferentialCountIsTheTables` reads BOTH sides -- the count from
+the test's own source, the claim from the document -- so neither can drift
+alone. Probed red: doc set to 27, gate names both numbers; restored.
+
+**A JUSTIFICATION THAT OUTLIVED ITS CONDITION, in a test comment.**
+`cluster_window_test.go` explained its load-bearing `| sort by (n)` with "a
+LEADING stats pipe under an absolute `_time:` filter answers empty on a
+single node -- a node defect of its own". True when written; entry 113's
+`matchBitset` fix closed it, and nobody came back. Measured now:
+`_time:[..] | stats count() c` answers `{"c":"30"}` on a node. The sort IS
+still load-bearing -- it forces the exact path so the mergeable `count()`
+control rows exercise coordinator pricing at all -- so the comment now gives
+that reason instead of the dead one. CLAUDE.md names this shape ("a deleted
+behaviour leaves its justification behind"); this is it happening inside the
+test suite that was written to catch it elsewhere.
+
+## 129. A future instant that wraps into the past matches everything
+
+Found by re-reading entry 127's own new code for overflow before calling it
+done, and the trail led OUT of the new code: the pre-existing
+`unixToNanos` -- the magnitude rule behind every HTTP `start`/`end`/`time`
+parameter, which entry 127's ES parser also adopted -- multiplies each unit up
+to nanoseconds, and every branch admits values whose product exceeds int64:
+seconds up to 1e11 against a cap of 9.2e9, millis 1e14 against 9.2e12, micros
+1e17 against 9.2e15. The wrapped product is a NEGATIVE From. Measured on a
+30-row store, all at HTTP 200:
+
+	/select/logsql/query?query=*&start=13000000000        30 rows   (epoch s, year 2381: want 0)
+	                            &start=13000000000000     30 rows   (epoch ms, year 2381)
+	                            &start=13830000000000000  30 rows   (epoch us, year 2408)
+
+An 11-digit epoch-seconds value is not exotic input; it is any script that
+computes a far-future sentinel. The first probe of this used 17-nines values
+and saw 0 rows -- those happen to wrap POSITIVE, into the year 2214 -- which
+is a reminder that one probe value per branch is not a measurement of the
+branch.
+
+The same family, in entry 127's new ES code before it shipped: `gte
+"9999-01-01"` overflowed `UnixNano` into the past, `now+300y` wrapped in the
+`Duration` multiply, and a first fix capped the date-math COUNT flat at
+3,000*366 -- which would have turned `now-31536000s` (one year, spelled in
+seconds) into 12.7 days, a wrong answer INTRODUCED by the overflow fix. The
+arithmetic now saturates on the int64-nanosecond domain instead: a bound past
+2262 is `MaxInt64`, which behaves as the +infinity that instant means --
+`gte` matches nothing, `lte` everything, and the controls pin both
+directions.
+
+Gates: the overflow rows of `TestESTimeRangeSpellingsAllApplyTheBound` (ES
+path) and `TestAFutureEpochStartMatchesNothing` (the HTTP param path the
+measurement above is about -- entry 117's rule, measured on the surface the
+claim names). Mutations, each applied, measured, restored: the saturation
+threshold ignored (multiply wraps) reddened the two epoch rows and all three
+param rows; `satNanos` reverted to bare `UnixNano` reddened the year-9999
+and `now+300y` rows. A first form of the wrap mutation DID NOT COMPILE
+(`"math" imported and not used`) and its run was misread as green until the
+build error was looked at -- a mutation that does not compile is not
+evidence, including when it is your own.
+
+*Correction, round 17: entry 129 fixed ONE of the three branches of
+`parseTimeParam` and one of the tree's eight overflowing time conversions.
+The rest are entry 130, which also records that the same instants must NOT
+saturate on ingest.*
+
+## 130. Entry 129 saturated one branch of one parser, and there were eight
+
+Entry 129 is about `unixToNanos`, the magnitude rule behind every HTTP
+`start`/`end`/`time` parameter. It fixed that function and the ES date-math
+arithmetic, and stopped. `parseTimeParam` -- the function `unixToNanos` is
+called FROM -- has three branches, and the other two convert the same instants
+into the same int64-nanosecond domain with the same wrap:
+
+	                       before        want   why
+	?start=13000000000       0 rows       0     entry 129's fix
+	?start=13000000000.5    30 rows       0     int64(f * 1e9)
+	?start=9999999999.5     30            0     the same, year 2286
+	?start=3000-01-01       30            0     t.UnixNano()
+	?start=9999-01-01       30            0     the same
+	?start=2263-01-01       30            0     the cliff; 2262 answered 0
+	?end=3000-01-01          0           30     the wrap the other way
+	?start=1000-01-01        0           30     pre-1678 wraps POSITIVE
+
+30 of 30 rows on a store stamped 2026-06-01, HTTP 200 throughout. One request,
+answered correctly spelled as an integer and wrongly spelled as a float or as a
+date -- and the integer spelling is the one the fixed function handles.
+
+**THE LogsQL SIDE WAS IN THE SAME ROUND'S OWN DIFF.** `internal/query/time_filter.go`
+changed 217 lines in the round that shipped 129, and `parseAbsTime` returned
+`t.UnixNano()` raw the whole time. Every caller then ADDS the width of the
+value's precision to it (`lo + iv`, `hi + iv`), so there were two overflows in
+series: the conversion, and the addition. Measured on the same 30 rows, all at
+200:
+
+	_time:[2000-01-01, 9999-01-01] *    0 rows   want 30
+	_time:[2000-01-01, 3000-01-01]      0        want 30
+	_time:>3000-01-01                  30        want 0
+	_time:<3000-01-01                   0        want 30
+	_time:[1000-01-01, 2100-01-01]      0        want 30
+
+`[a, 9999-01-01]` is how a client that cannot spell +infinity spells "no upper
+bound". It answered nothing. The cliff was exact -- `2262-01-01` gave 30 and
+`2263-01-01` gave 0 -- and `2262-01-01` is representable while the END of the
+year it names is not, which is the second overflow with no first one.
+
+`parseAbsTime` returns the interval's END now instead of its WIDTH, so the four
+call sites have no addition left to overflow, and both ends saturate.
+
+**AND THE ES SURFACE, IN CODE ENTRY 127 SHIPPED.** `esTimeNumber` guards the
+RAW float at +/-9.1e18 and then multiplies a fractional one by 1e9. The guard
+never covered the branch three lines under it, whose product overflows nine
+orders of magnitude sooner. `int64` of an out-of-range float64 is
+implementation-defined and is MinInt64 on amd64, so a far-FUTURE bound became
+minus infinity and the two directions of the comparison swapped:
+
+	{"gte": 13000000000.5}   4 of 4   want 0
+	{"lte": 13000000000.5}   0        want 4
+
+**THE SWEEP, which is what the site-by-site fix keeps failing to do.** Every
+conversion into int64 nanoseconds in the tree, and what each turned out to be:
+
+	site                                       verdict
+	api/server.go parseTimeParam ParseFloat    OVERFLOWED -> satFloatNanos
+	api/server.go parseTimeParam layouts       OVERFLOWED -> satNanos
+	api/server.go unixToNanos                  fixed by entry 129
+	api/es.go esTimeNumber fractional          OVERFLOWED -> satFloatNanos
+	api/es.go esTimeValue / esDateMath         fixed by entry 129
+	query/time_filter.go parseAbsTime          OVERFLOWED -> SatNanos on both ends
+	query/time_filter.go parseDurationNs       OVERFLOWED -> SatScale + SatAdd
+	query/time_filter.go resolveTimePred       OVERFLOWED -> SatAdd
+	   (both: see the relative-bound measurement below)
+	ingest/time.go parseLayout                 OVERFLOWED -> refuses, see below
+	ingest/lokipb.go seconds*1e9 + nanos       OVERFLOWED -> refuses
+	ingest/datadog.go ddTime int64(f)*1e6      OVERFLOWED -> refuses
+	api/cluster.go fastRFC3339Nano             OVERFLOWED -> refuses the year
+	api/cluster.go rowLineTime fallback        OVERFLOWED -> satNanos
+	api/cluster_rowscan.go jsonLineToRow       OVERFLOWED -> satNanos
+	api/cluster.go bucket timestamp merge      CORRECT: round-trips and refuses
+	ingest/syslog.go parse3164 AddDate(year)   CORRECT: always the current year
+	ingest/jsonline.go parseTime ParseInt      CORRECT: ParseInt bounds it
+	api/{retention,tiering,cluster_repair}.go  CORRECT: now - a time.Duration,
+	                                           and a Duration is 292 years
+	api/{alerts,logrules}.go rule windows      CORRECT: capped at MaxRuleWindow
+	api/server.go tail start_offset            CORRECT: ParseDuration caps at
+	                                           292y, and 2026-292 is above 1678
+	storage/backup.go, cluster_backup.go       CORRECT: .Unix(), seconds
+
+Twenty-one conversions checked. Fourteen of them wrapped; entry 129 fixed two
+of those and the other twelve are this entry; seven were already correct and
+are listed so the next reader does not check them again.
+`SatNanos`/`SatAdd`/`SatScale` are one definition each in
+`internal/query`, and `internal/api`'s `satNanos`/`satScale` are one-line
+wrappers, so the two languages that parse the same instants cannot answer
+differently. The old `satNanos` tested `t.Year() > 2260 || t.Year() < 1680`,
+which threw away two representable years at each end; it compares against
+`time.Unix(0, math.MinInt64)` and `time.Unix(0, math.MaxInt64)` now.
+
+**AND THE RELATIVE BOUNDS, where the overflow is in the DURATION.**
+`parseDurationNs` multiplies a count the caller wrote by a unit the file
+chooses, and `resolveTimePred` subtracts the product from `now`. Both wrapped.
+Measured interleaved, the fix applied and reverted in one session:
+
+	                            before   after
+	_time:>18446744074s   *        0       30      584 years ago
+	_time:>9999999999s    *       30       30      317 years ago
+	_time:>1h             * (ctl)   0        0
+	_time:>1000000000000d * (ctl)  30       30
+
+30 rows, HTTP 200 in every cell. 18446744074 seconds is 584 years and its
+product with a nanosecond wrapped to 290 MILLISECONDS, so "everything since 584
+years ago" answered nothing. The 317-year row is the warning: it wrapped too,
+and a SECOND wrap in `now - offset` brought it back to the right answer. One
+probe value per branch is not a measurement of the branch -- entry 129 says the
+same thing about its own 17-nines values, in the entry this one is correcting.
+
+**A ROW'S TIMESTAMP IS NOT A BOUND, AND SATURATING IT IS THE WRONG ANSWER.**
+The same wrap on ingest is not a wrong comparison, it is silent data loss. Four
+rows through `/insert/jsonline` -- one normal, year 9999, year 3000, year 1000:
+
+	POST /insert/jsonline    200 {"ingested":4,"skipped":0}
+	query=*                  1 row      (the default window)
+	query=_msg:year9999      0 rows
+	query=_msg:year3000      0 rows
+	query=_msg:year1000      0 rows
+	query=_msg:normal        1 row      (the control)
+
+After: `{"ingested":1,"skipped":3}`, and the same five queries answer
+1 / 0 / 0 / 0 / 1.
+
+Three rows written to the store, counted as ingested, and outside every window
+a query can name. Nothing in the response says so.
+
+Saturating would have been the wrong fix here, and the asymmetry is the point.
+A BOUND is a comparison, so +/-infinity is exactly what an instant past the
+domain means: `gte 9999` matches nothing, `lte 9999` matches everything, and
+both directions are gated. A ROW's `_time` is a fact. Clamping 9999-01-01 to
+2262-04-11 files the row under an instant the client never sent, where a query
+for 2262 returns it and a retention pass for 2262 deletes it -- there is no
+clamped value that is not a fabrication. So ingest REFUSES and COUNTS
+(`ErrTimeOutOfRange`), which is the call `internal/api/cluster.go` already made
+on the same shape for a bucket timestamp arriving from a shard: "converting it
+wraps to an unrelated date, so the answer is refused". Now
+`{"ingested":1,"skipped":3}` with a warning naming each ordinal.
+
+`parseTime` has three outcomes rather than two, and the third could not be
+folded into either: a row whose `_time` says 9999 is not a row with no
+timestamp, and stamping it `now` files it under an instant nobody sent just as
+surely as wrapping did.
+
+**THE DATADOG INTAKE SHOWS BOTH HALVES OF THE SAME BUG.** Its timestamp is a
+bare JSON number in milliseconds and `ddTime` was `int64(f) * 1_000_000`: a
+value past 9.2e12 ms overflows the multiply, and a float64 beyond int64's range
+is already MinInt64 before the multiply runs. Three entries -- one normal, one
+at 1.3e16 ms, one at 9.3e18:
+
+	                       before             after
+	POST /api/v2/logs      202, empty body    202 {"accepted":1,"rejected":2}
+	query=*                2 rows             1 row
+	query=_msg:far-future  0                  0
+	query=_msg:huge        1                  0
+
+An empty intake body is what "everything was accepted" looks like on this
+route. Queried over the widest window this build can express, the two rows are
+not missing -- they are THERE, at instants nobody sent:
+
+	{"_time":"1812-12-30T10:00:34.76611072Z","_msg":"far-future"}
+	{"_time":"1970-01-01T00:00:00Z","_msg":"huge"}
+
+which is the case for refusing rather than clamping, written by the tree
+itself. `far-future` was outside the default window and invisible; `huge`
+landed at the epoch and came back from `*` as an ordinary row.
+
+*Correction, round 18, three pointers. (1) THIS ENTRY'S HEADING IS THE PART
+THAT IS FALSE. "Every conversion into int64 nanoseconds in the tree" describes
+a sweep of twenty-one PARSERS -- functions that turn a client's text or bytes
+into a nanosecond count -- and the table is right about all twenty-one. It is
+not a sweep of the tree. Round 18 found eighteen more sites that wrap,
+fabricate an instant, or undo the saturation this entry installed, and EIGHT of
+them are arithmetic performed on the window AFTER it is parsed (`to - from` for
+a default step, `bs += step` and `bs + step` for a bucket walk, in both copies
+of that walk), which a sweep of parsers cannot reach by construction. Entry 131
+has the site table. (2) "Now `{"ingested":1,"skipped":3}` with a
+warning naming each ordinal" is true of the Result and NOT of the wire:
+`/insert/jsonline` and `/insert/logfmt` answer `{"ingested":N,"skipped":M}` and
+carry no warnings at all, on any body. Entry 131 has the measurement. (3) The
+row `ingest/jsonline.go parseTime ParseInt  CORRECT: ParseInt bounds it` is
+wrong in the direction that matters: ParseInt bounds what it ACCEPTS, and what
+it REFUSES for range fell through to the layouts and came back as "not a
+timestamp", so the row was stamped `now`. That is the only spelling Loki and
+OTLP send. Entry 131.*
+
+## The Elasticsearch `bool` clause: an arm that filters nothing, and a `should` beside a `must`
+
+Four documents, one error / one warn / two info, HTTP 200 throughout.
+
+**A NIL CHILD WAS DROPPED INSTEAD OF MEANING SOMETHING.** `{"match_all":{}}`,
+`{}` and `{"bool":{}}` all translate to "no filter", and the `must_not` and
+`should` loops appended only non-nil children:
+
+	query                                              got   ES
+	must_not: [match_all]                                4    0
+	must_not: [{}]                                       4    0
+	must_not: [bool {}]                                  4    0
+	must_not: [term level=error, match_all]              3    0
+	should:   [match_all, term level=error]              1    4
+
+`must_not: [{"match_all":{}}]` is Elasticsearch's canonical spelling of "match
+nothing" and Kibana emits it whenever a negated filter pill empties out. It
+answered every document in the index. A nil child matches EVERY document, so
+under `must_not` its negation matches NONE and under `should` the union with it
+is every document -- `esOrMatchAll` writes that down as an empty conjunction
+(evalExpr sets all bits and intersects nothing) rather than leaving it to the
+absence of a node.
+
+**`minimum_should_match` DOES NOT DEFAULT TO 1.** It defaults to 0 when the
+same bool carries a `must` or a `filter`, and to 1 only when it does not, so
+`should` beside `must` is OPTIONAL. It was ANDed in unconditionally:
+
+	query                                                    got   ES
+	must:   [term level=error], should: [range gte 2030]       0    1
+	filter: [term level=info],  should: [term level=error]     0    2
+	must:   [term level=error], should: [term level=info]      0    1
+
+That is Kibana's own shape -- the filter pills go in `filter`, the search bar
+goes in `should` -- so anything typed into the search bar emptied the
+dashboard. And an explicit `"minimum_should_match": 0` was a 400: the exact
+value ES defaults to, refused in the exact shape whose default was being got
+wrong. 0 and 1 are answered now; a value needing a counting operator ("at least
+2 of 5") is still a 400 naming it, because an AND/OR/NOT tree cannot express it
+without enumerating the combinations and answering it as though it were 1 is a
+wrong answer with nothing to say so.
+
+The `should` arms are still PARSED when `minimum_should_match` is 0 and they
+will be discarded: an unsupported clause under an optional arm is still a
+clause this server cannot honour, and accepting it because the arm happens not
+to constrain the answer is the silent drop the strict decoder exists to
+prevent.
+
+**AND A BARE YEAR AS A STRING WAS AN EPOCH NUMBER.** `ParseInt` ran before the
+layouts, so `{"gte":"2030"}` was read as 2030 SECONDS since the epoch --
+1970-01-01T00:33:50Z -- and matched all four documents (`"total":{"value":4}`)
+where ES answers none.
+The `"2006"` layout was in the list and unreachable by any value it accepts,
+since a bare year is all digits. The layouts run first now, which is ES's own
+order for a date field
+(`strict_date_optional_time||epoch_millis`); the 10- and 13-digit epoch
+spellings are unaffected, because a 4-digit-year layout rejects their extra
+digits, and the rows that would break if that were wrong are in the gate.
+
+## A stated cluster limitation that had been false for two rounds
+
+`docs/release-readiness.md` and `CHANGELOG.md` both said the non-mergeable
+aggregates -- `quantile`, `avg`, `uniq`, `count_uniq`, `histogram`, `rate` --
+"are refused across shards rather than answered, on every stats surface".
+
+`cluster_stats_exact.go` answers all six, exactly, and `docs/lld/cluster.md`
+has said so in the same tree ("This was a REFUSAL until 2026-08-16"). Measured
+through a two-shard router against a single node holding the same 30 rows: all
+six answer 200 and byte-identical results.
+
+`cluster_limitations_test.go` was written for exactly this -- its header says
+"a stated limitation that is no longer true is worse than the limitation" --
+and it gated the other four bullets while missing this one. It has both halves
+now: the six aggregates measured through a router against the node's answer,
+and a read of the two documents for the claim itself. A claim can go stale
+without the code changing at all, which is what happened here, so the
+behaviour half alone would not have caught it.
+
+## One dispatch, two copies, and BOTH were incomplete
+
+The reviewer's finding was that `predMatchesRow` (filter.go) has no time case
+while `matchPredRow` (pipes.go) has both. True, and unreachable: the lexer
+swallows the closing bracket of an `if (...)` into the time value, so
+`* | stats count() if (_time:5m) as c` is a 400 reading `bad _time value
+"5m)"`.
+
+The reachable half is the other direction, which nothing had measured.
+`matchPredRow` was missing RangeNum, LenRange, StringRange, IContains, Seq,
+IPv4Range, StreamIDEq and the field comparisons, so `| filter` answered ZERO
+rows at 200 for predicate kinds the identical predicate answers correctly at
+the top level. Measured on two rows:
+
+	predicate                              top level   | filter
+	n:range(1, 10)                                 1         0
+	_msg:len_range(1, 5)                           2         0
+	ip:ipv4_range(10.0.0.0, 10.0.0.255)            1         0
+	_msg:seq("al", "ha")                           1         0
+	_msg:string_range(a, b)                        1         0
+	_msg:alpha              (control)              1         1
+	n:>10                   (control)              1         1
+
+Five silent wrong answers, in the shape entries 113, 122 and 127 each record
+once -- with both copies wrong this time. There is one body now, over a
+`rowSource` that is either a decoded Row or a field-lookup function, because
+the columnar stats scan has no Row to hand over. Passed by value, so the pipe
+path builds no closure and allocates nothing per row.
+
+The columnar source still has no timestamp, so a time predicate under
+`if (...)` on that path reports no match rather than a wrong one. That is the
+pre-existing behaviour and it is NOT fixed here: `_time` is not a dictionary
+column, and materializing it into that scan is a change to the scan.
+
+## Two more gates that could not fail, and one that counted the wrong thing
+
+**A COUNT OF BACKTICKS IS NOT A COUNT OF QUERIES.**
+`TestTheLLDsDifferentialCountIsTheTables` took `strings.Count(table, backtick)
+/ 2`, so a row written as an ordinary double-quoted Go string -- the natural
+spelling for a query containing a backtick -- counted as ZERO. Measured: with a
+27th row added as `"* | limit 3"` and the document still saying 26, the old
+gate exits 0. The rewritten gate is red on the same tree, naming 26 against 27,
+and refuses any table line it cannot recognise as a single quoted query rather
+than silently not counting it.
+
+**A TEST WHOSE TWO OUTCOMES WERE `t.Logf` AND `t.Skip`.**
+`TestTheTextSplitAgreesWithTheParse` asserted nothing: the agreement it was
+named for was logged, and a query the lexer rejects was skipped -- two of its
+twelve rows skipping on every run, forever, green. It is
+`TestWhichQueriesSplitTheWayTheyParse` now, with each row declaring which of
+the three cases it is (agrees / disagrees / unparseable), so twelve rows assert
+and none skips. Probed: with `pipeSegments` reduced to `return []string{raw}`, the
+new form is red on 4 of its 12 rows and the old form exits 0. (4 and not 5,
+because `*` carries no pipes and one segment still agrees with it.)
+
+Entries 79, 117, 118, 123 and 128 record five more of this shape. This one was
+in the file written to catch the planner defect it is named after.
+
+## The mutation table for the round
+
+Each applied to the tree, measured, and restored from a scratchpad copy taken
+first.
+
+	mutation                                          gate that reddened
+	parseTimeParam layouts -> t.UnixNano()            8 rows of the param table
+	parseTimeParam float -> int64(f*1e9)              4 rows of the param table
+	parseAbsTime -> raw UnixNano on both ends         11 rows of the _time table
+	esTimeNumber fractional -> int64(x*1e9)           5 rows of the ES table
+	ingest parseLayout -> bare t.UnixNano()           3 rows of the ingest gate
+	must_not nil child dropped again                  6 rows of the bool gate
+	should nil child dropped again                    4 rows of the bool gate
+	minimum_should_match default back to 1            4 rows of the msm gate
+	release-readiness bullet back to the refusal      2 rows of the limitations gate
+	lokiNanos -> seconds*1e9 + nanos                  the loki protobuf gate
+	fastRFC3339Nano year guard removed                5 rows of the merge gate
+	rowLineTime fallback -> UnixNano                  5 rows of the merge gate
+	jsonLineToRow -> UnixNano                         4 rows of the merge gate
+	matchPredRow's seven missing kinds restored       5 rows of the pipe-filter gate
+	esTimeValue ParseInt back before the layouts      the bare-year row
+	ddTime guard disabled with `if false && (...)`    3 assertions of the DD gate
+	pipeSegments -> return []string{raw}              4 rows of the split gate
+	a 27th table row spelled with double quotes       the differential count gate
+
+The `ddTime` mutation is written `if false && (...)` rather than by deleting
+the guard, because deleting it leaves `math` and `fmt` imported and not used --
+a mutation that does not compile, which entry 129 records having been misread
+as green.
+
+## What this round did NOT fix
+
+`{"range":{"@timestamp":{"gte":null}}}` alone is still a 400. ES treats a null
+bound as no bound; here it reaches the "names no bound (gte/gt/lt/lte)"
+refusal, because `encoding/json` decodes both an absent key and an explicit
+`null` into a nil `any` and the two are indistinguishable without changing the
+four bound fields to `json.RawMessage`. A null bound BESIDE a real one already
+works, which is the shape Kibana and Grafana send. Left as a loud 400 rather
+than changed late in a round: entry 112 records a round that fixed three
+defects and shipped two, and a decoder change on the surface whose whole
+defence is strict decoding is not the place to find out.
+
+## 131. The fix that closed the wrap opened an infinite loop, and seven more
+
+Round 17 saturated the far bounds so `?start=1000-01-01&end=9999-01-01` stops
+being a window that wraps into 2218..1809 and becomes the window it says it is:
+`[MinInt64, MaxInt64]`. That is correct, and it is what made an unauthenticated
+GET spin a core forever. Two of this round's eight findings are the previous
+round's own fix; the rest are what a sweep of PARSERS could not see, because
+they are arithmetic on the window after it is parsed.
+
+**THE SITES, which is what entry 130's heading claimed to have enumerated.**
+Eighteen, none of them in its twenty-one-row table:
+
+	site                                          what it did
+	api/server.go parseStepNs (to-from)/30        WRAPPED -> exact uint64 width
+	api/server.go parseStepNs n*time.Second       WRAPPED -> satScale
+	api/server.go boundRangeBuckets step*240      could wrap -> satScale
+	query/stats_range.go step = to - from         WRAPPED -> RangeStepNs
+	query/stats_range.go bs += step               WRAPPED -> bs = be, capped
+	query/stats_range.go be = bs + step           WRAPPED -> capped at `to`
+	api/cluster_stats_exact.go step = to - from   WRAPPED -> RangeStepNs
+	api/cluster_stats_exact.go bs += step         WRAPPED -> bs = be, capped
+	api/cluster_stats_exact.go be = bs + step     WRAPPED -> capped at `to`
+	ingest/jsonline.go Number arm val.Int()       NO CHECK -> numberTime
+	ingest/jsonline.go parseTime ErrRange         FABRICATED `now` -> refuses
+	ingest/journald.go us*1000                    WRAPPED -> refuses
+	ingest/otelproto.go time_unix_nano            WRAPPED (fixed64 is unsigned)
+	ingest/otelproto.go observed_time_unix_nano   WRAPPED -> refuses
+	ingest/syslog.go parse5424                    FABRICATED `now` -> refuses
+	query/filter.go predMatchesRow                UNDID the saturation (->1970)
+	query/time_filter.go timePredBitset           UNDID the saturation (->1970)
+	api/es.go esToQuery zero From                 the same, by the zero value
+
+Eight of the eighteen are the window ARITHMETIC -- the two bucket walks and the
+step derivations that feed them. A sweep of parsers cannot reach those: by the
+time they run the parsing is over and was correct.
+
+**AN UNAUTHENTICATED GET SPUN A CORE AND NEVER ANSWERED.** One request:
+
+	GET /select/logsql/stats_query_range?query=*&start=1960-01-01&end=9999-01-01
+
+The chain, every link in the tree:
+
+	parseTimeParam        saturates `end` to MaxInt64          -- round 17's fix
+	parseStepNs("")       `to > from` is true, `to - from`
+	                      OVERFLOWS NEGATIVE, so the "1/30th
+	                      of the range" default came out 0
+	boundRangeBuckets     first line was `if step <= 0 {
+	                      return from, to, true }`, so the
+	                      413 ceiling never ran
+	StatsQueryRange       `step <= 0` -> `step = to - from`
+	                      (negative) -> `step = 1` ->
+	                      `for bs := MinInt64; bs < MaxInt64; bs += 1`
+
+Measured, one probe per fresh process, a client timeout of 5s:
+
+	                                                       answered?
+	?start=1960-01-01&end=9999-01-01                          no
+	?start=1000-01-01&end=9999-01-01                          no
+	?start=1800-01-01&end=9999-01-01                          no
+	?start=1000-01-01&end=2100-01-01                          no
+	?start=1970-01-01&end=9999-01-01                          no
+	?step=0s  &start=1960-01-01&end=9999-01-01                no
+	?step=-1s &start=1960-01-01&end=9999-01-01                no
+	?step=1h&start=2262-04-11T00:00:00Z&end=3000-01-01        no
+	?start=2026-01-01&end=2027-01-01           (control)     yes, 200, 0ms
+	?step=1s&start=1970-01-01&end=9999-01-01   (control)     yes, 413
+
+The goroutine stayed in `StatsQueryRange`; `httptest.Server.Close()` never
+returned, so the test binary had to be killed by `-timeout`. Before the
+saturation the same request answered instantly and EMPTY -- 1000-01-01 wrapped
+forward to ~2218 and 9999-01-01 wrapped back to ~1809, so `to <= from`
+short-circuited the loop. The fix for the wrap is what made the width overflow
+reachable.
+
+TWO THINGS MAKE IT THE ROUND'S OWN DEFECT RATHER THAN ONE IT WALKED PAST.
+`boundRangeBuckets` already had an overflow-safe `width()` helper, written for
+this exact class, sitting ONE LINE BELOW the early return that skipped it. And
+the trigger was already in the round's own suite -- `start=1000-01-01&end=9999-01-01`
+appears twice in `time_overflow_test.go`, pointed at `/select/logsql/query`
+and never at the range route.
+
+**AND THE BUCKET WALK ITSELF NEVER TERMINATED, AT ANY STEP.** The `?step=1h`
+row above is a second, independent wrap that no ceiling can catch: the ceiling
+counted 23 buckets and was right. `for bs := from; bs < to; bs += step` with
+`to` at MaxInt64 runs `bs` past MaxInt64 on the last bucket, wraps it to a
+large negative, finds `bs < to` true again, and climbs the whole int64 domain
+an hour at a time -- then wraps and does it again. `?start=1970-01-01&end=9999-01-01`
+with no step reaches the wrap after its thirty buckets and then circles the
+domain with a period of about sixty, forever. `be = bs + step` wrapped the same
+way one line in, so the last bucket's window was [huge, negative).
+
+Three copies of the walk: `query.StatsQueryRange` (node), `exactMatrix`
+(router, non-mergeable aggregates, holding every matching row of the cluster
+while it spins) and the shard requests `federatedMatrix` forwards. All three
+answer now: `bs = be` with `be` capped at `to`, so the walk is monotone and
+bounded whatever the caller asked for. The width is exact -- `uint64(to) -
+uint64(from)` is the true difference for any `to >= from`, whatever the signs
+-- and `parseStepNs` no longer returns a non-positive step from any of its
+three branches (`""` over a saturated window, `0s`, `-1s`).
+
+Gate: `TestASaturatedRangeWindowAnswersOnNodeAndRouter`, eleven windows against
+a node, a router federating `count()` and a router bucketing `avg()` itself,
+each with a fifteen-second wall-clock bound and a summed-count assertion so an
+empty matrix does not pass. Plus the whole of
+`TestAnOutOfRangeStartOrEndParameterSaturates`' sixteen-row table, re-run
+against the range route. "Did it answer at all, within a bound" holds at any
+machine load, which is why the gate asserts wall-clock at all.
+
+Mutations, each applied and restored:
+
+	mutation                                        gate that reddened
+	the walk alone (bs += step, be > to)            3 rows of the extended
+	                                                param table + row 1 of
+	                                                the new gate
+	the whole fix (all three files)                 row 1 of the new gate
+
+Single-file mutations of `parseStepNs` or of `boundRangeBuckets`' early return
+DO NOT redden, and that is the fix working: three layers each stop it alone.
+
+**A `_time` THAT ARRIVED AS A JSON NUMBER SKIPPED THE RANGE CHECK ENTIRELY.**
+`jsonline.go`'s Number arm was `ts, haveTS = val.Int(), true` -- no parseTime,
+no nanosOf, no comparison. Measured on /insert/jsonline, each answering
+200 `{"ingested":4,"skipped":0}`:
+
+	{"_time":9.3e18}         stored at 1677-09-21T00:12:43.145224192Z
+	{"_time":2534023008e11}  stored at 1677-09-21T00:12:43.145224192Z
+	{"_time":-9.3e18}        stored at 1677-09-21T00:12:43.145224192Z
+
+Three instants, two directions, all filed at MinInt64 -- `int64()` of an
+out-of-range float64 is implementation-defined and is MinInt64 both ways on
+amd64, which is the collapse round 17's own `satFloatNanos` doc comment
+describes on the query side. `/insert/elasticsearch/_bulk` inherits it, and so
+does any `--field-time` mapping onto a numeric field. There is one function for
+both spellings now (`numberTime`): an integer literal keeps its digits and goes
+through `parseTime`, anything else is a float64 bounded at 2^63 -- not at
+`float64(math.MaxInt64)`, which IS 2^63 and would admit the value that
+converts to MinInt64.
+
+Two more of the same class, neither in entry 130's table:
+
+	internal/ingest/journald.go   `ts, haveTS = us*1000, true`. systemd's
+	                              __REALTIME_TIMESTAMP is an UNSIGNED
+	                              microsecond count, so every instant past
+	                              2262 is a legal journal value that
+	                              overflowed the multiply.
+	internal/ingest/otelproto.go  `int64(binary.LittleEndian.Uint64(fp))`
+	                              for time_unix_nano and
+	                              observed_time_unix_nano. A proto3 fixed64
+	                              is UNSIGNED.
+
+The OTLP one is `/v1/logs` with `application/x-protobuf`, which is the
+OpenTelemetry Collector's DEFAULT encoding. Round 17 fixed `otel.go` (the JSON
+encoding, through `parseTime`) and left the file beside it -- which is this
+repository's own commit a92b638 again: "two OTLP encodings of one export were
+storing different things." `TestTheTwoOTLPEncodingsAgreeOnAnUnstorableTimestamp`
+now asserts the two ANSWER THE SAME, not merely that each is defensible.
+
+Fixing it exposed a second defect one function down: the protobuf envelope
+check reads `res.Accepted == 0 && res.Rejected > 0` as "this is a metrics or
+traces payload, not logs". A logs export whose every record carried an
+unstorable timestamp would have been told exactly that. Shape rejections are
+counted separately now, and a batch rejected only for its timestamps gets the
+partial-success body the JSON path gives.
+
+**THE ALL-DIGITS NANOSECOND SPELLING WAS STAMPED `now` -- AND IT IS THE ONLY
+SPELLING LOKI AND OTLP SEND.** `parseTime` calls `strconv.ParseInt`, and on
+`ErrRange` fell through to the layouts. None of them matches a run of digits,
+so the value came back as outcome two, "not a timestamp at all", and the caller
+stamped the receiver's clock. The doc comment three lines above says this must
+not happen: *"a row whose `_time` says 9999 is not a row with no timestamp, and
+stamping it `now` files it under an instant nobody sent just as surely as
+wrapping did."* Measured with `253402300800000000000` (year 9999 in
+nanoseconds), one storable row beside it:
+
+	/insert/jsonline    200 {"ingested":2,"skipped":1}  (the 1 is a LAYOUT row)
+	/insert/logfmt      200 {"ingested":2,"skipped":0}
+	/loki/api/v1/push   204, no X-Simdlogs-Rejected
+	/v1/logs            200 {}   -- full success
+	/api/v2/logs        202, empty body
+	control, the same year as a layout via OTLP:
+	                    200 {"partialSuccess":{"rejectedLogRecords":"1"}}
+
+A Loki push timestamp and an OTLP `timeUnixNano` are ALWAYS a decimal
+nanosecond string; neither protocol can spell a timestamp any other way. Entry
+130's ingest gate has six out-of-range rows and every one is a date layout, so
+for both of those protocols it tested a spelling they never send.
+`TestAllDigits` twenty lines below it already listed `"9999999999999999999"`
+and asserted only that `allDigits` recognises it. `ParseInt`'s sole possible
+failure after `allDigits` is `ErrRange`, so refusing it cannot refuse anything
+that was ever ordinary data.
+
+**AND SYSLOG STAMPED THE RECEIVER'S CLOCK ON PURPOSE, FOR A REASON THAT IS
+TRUE OF ONE TRANSPORT.** `parse5424` discarded the range error with the
+justification "the datagram has no client to report a per-record rejection to".
+True of the UDP listener. `/insert/syslog` is an HTTP request with a client on
+the other end -- and it was the wrong trade on the datagram too, because
+stamping a year-9999 line `now` is the same fabrication. Both transports refuse
+and count now.
+
+Eleven protocol rows are in one table
+(`TestAnAllDigitsUnstorableTimestampIsRefusedOnEveryProtocol`), and THE STORE
+IS THE ASSERTION rather than the response: the five protocols report
+differently (a count object, a 204 with a header, an OTLP partialSuccess body,
+a Datadog intake body) and only one thing is common to all of them -- what a
+query can see afterwards. A row stamped `now` is VISIBLE, which is what makes
+the table catch the fallback as well as the wrap.
+
+**`minimum_should_match: 0` ANSWERED EVERY DOCUMENT IN THE INDEX, AND THE GATE
+PINNED THE WRONG NUMBER.** Round 17 taught this surface to accept 0, which is
+the value Elasticsearch defaults to beside a `must`. It did not implement the
+other half of Lucene's rule: with NO `must` and NO `filter`, at least one
+`should` arm must still match, whatever the number says, because a document
+matching none of the optional clauses does not match the query at all.
+`must_not` is not a required clause and does not satisfy it. Four documents,
+one error, one warn, two info, all at HTTP 200:
+
+	query                                                got   ES
+	should: [error],            msm 0                      4    1
+	should: [error, warn],      msm 0                      4    2
+	must_not: [warn], should: [error], msm 0               3    1
+	should: [error], msm absent               (control)    1    1
+	must: [info], should: [error], msm 0      (control)    2    2
+
+`es.go`'s header names this the worst failure an ES surface can have -- "a
+dropped filter returns MORE documents than the client asked for, in a response
+that is structurally valid" -- and before round 17 the shape was a loud 400.
+`es_bool_test.go` asserted the 4. The gate and the code were wrong together,
+which is why nothing was red; the row is 1 now, with the two-arm union and the
+`must_not` case beside it.
+
+Negative values are still a 400 rather than folded into 1: `-1` over three arms
+means two of them, and answering one is the silent wrong answer this surface
+exists to not give. And ONLY THE INTEGER SPELLING IS ACCEPTED -- ES also takes
+`"1"`, `"0"`, `"75%"`, `"2<-25%"` and the JSON number `1.0`, every one of which
+is a 400 from the strict decoder. Loud, and a real gap for a client that sends
+the string form; said in the doc comment rather than fixed, because a decoder
+change on the surface whose whole defence is strict decoding is not a thing to
+do late in a round (entry 112).
+
+**EVERY `_bulk` REJECTION WAS A 500 `server_error`, WHICH IS A RETRY LOOP THAT
+CANNOT SUCCEED.** `markBulkRejects` was written when the only rejection was
+"the document was not stored". Every storage failure returns before it is
+called -- the parallel path on `werr`, the serial path on the parse error and
+on `FlushMark` -- so every rejection reaching it is the client's: an unreadable
+document, one with no storable field, or a `_time` outside the domain. Beats,
+Logstash and Fluentd all retry a 5xx bulk item indefinitely with backoff and
+give up permanently on a 4xx, so a document whose `_time` says 9999 became a
+pipeline that never drains. It is 400 `document_parsing_exception` now. This
+round applied exactly that reasoning to OTLP ("exporters retry 5xx and give up
+on 4xx") in the file next door and not here.
+
+**AND THE SATURATED FAR-PAST BOUND WAS TURNED BACK INTO 1970 ONE LAYER DOWN.**
+`internal/query/filter.go` and `internal/query/time_filter.go` both opened
+their TimeRange case with `if from == math.MinInt64 { from = 0 }` -- and
+MinInt64 is exactly what the round-17 saturation produces. `?start=1000-01-01`
+reached 1677 and `_time:>=1000-01-01` stopped at 1970, which is the disagreement
+between the two languages that `SatNanos`' own doc comment says one definition
+exists to prevent. A third copy of the blind spot was in the ES surface for a
+different reason: `esToQuery` built its Query with the zero `From` and the lift
+is `if from > q.From`, which can only raise it. Measured on a store holding
+1900, 1969 and 2026 -- all three ingest at `{"ingested":3,"skipped":0}` -- every
+request under `?start=1000-01-01&end=9999-01-01`:
+
+	*                                3 of 3   OK
+	_time:[1000-01-01, 2100-01-01]   1        want 3
+	_time:<2100-01-01                1        want 3
+	_time:>1000-01-01                1        want 3
+	* | filter _time:<2100-01-01     1        want 3
+	_time:<2100-01-01 | stats count()  1 row, c=1   want c=3
+	_time:[1900-01-01, 2100-01-01]   3        OK
+	_time:[1677-09-22, 2100-01-01]   3        OK
+	ES {"match_all":{}}              1        want 3
+	ES range gte 1000-01-01          1        want 3
+	ES range lte 2100-01-01          1        want 3
+
+The two representable rows are what makes this one clamp rather than a general
+pre-1970 gap: 1900-01-01 needs no saturation, never hit the clamp, and always
+answered correctly. Only the saturated spelling failed. `decodeTimeRangeInto`
+compares `mx < from` and `mn >= from`, both correct at MinInt64, and `ts >=
+MinInt64` is true for every int64 -- there was nothing for either clamp to
+protect. All three sites were mutated separately and each reddens its own rows.
+
+**FOUND AND NOT FIXED: THE DEFAULT WINDOW STILL STARTS AT THE EPOCH.**
+`timeWindow` defaults `from` to 0 when no `start` is given, so on the same
+store a query with no explicit window answers 1 row where the wide window
+answers 3 -- and `_time:[1900-01-01, 2100-01-01]` with no `?start` answers 1,
+its own stated lower bound clipped by an unstated default. Measured:
+
+	                                        no params   ?start=1000-01-01
+	*                                          1               3
+	_time:[1900-01-01, 2100-01-01]             1               3
+
+That is a DEFAULT rather than a wrong conversion, and its mirror image is
+`to`'s default of 1<<62 (the year 2116), which clips an upper bound the same
+way. Changing either is a change to what every windowless query answers, on a
+route whose default other tests depend on, and it belongs in its own round with
+its own differential. Recorded here so the next reader does not measure it
+again.
+
+**FOUR STALE CLAIMS AND TWO WRONG COUNTS, ALL UNGATED PROSE.** One of them was
+contradicted by another sentence in the same file ten lines up.
+
+	claim                                       what the tree does
+	README: ES `exists` "changes no answer"     es.go maps it to
+	  (twice, :113 and :252)                    NOT (field == ""), and
+	                                            es_contract_test.go asserts 3
+	                                            of 4 documents
+	CHANGELOG: `ValidateClusterBackup` "has     cmd/simdlogs/restore.go:159
+	  no caller"                                calls it, and
+	                                            unwired_test.go:248 already
+	                                            said so in prose
+	cluster.md:588: a downed shard              fanOutChecked REFUSES: 503
+	  "contributes nothing (a partial           unless the caller sets
+	  answer, not an error)"                    allow_partial_response=1,
+	                                            which answers 206
+	release-readiness.md:15: "22 targets"       23 `func Fuzz` in the tree
+	cluster.md:260: "14 of 46"                  47 routes, said correctly at
+	                                            :250; 18 federation branches
+
+The route-count gate matches `(\d+) routes` and so never saw "14 of 46" at
+all: the claim slipped past a gate written for exactly it, because it was
+spelled without the word the gate looks for. Both numbers are read from the
+source now (`TestTheFederationBranchCountIsTheSource`), and the other four are
+`TestTheStatedFactsAboutTheCodeAreTrueOfTheCode`, each with a BEHAVIOUR half
+first so the document is checked against a measurement rather than against
+another document -- the shape the non-mergeable-aggregate entry established.
+Every one was mutated back into its document and each reddens.
+
+AND THE COVERAGE FACT: only three tests in the repository read
+`docs/release-readiness.md` or `CHANGELOG.md` at all -- the two halves of
+`cluster_limitations_test.go` and the changelog gate in `internal/tests/docs`.
+Every other prose claim in either file is ungated, so the table above is a
+sample and not a sweep.
+
+**A SECOND `*Expr` NOBODY RESOLVED.** `resolveTimePipes`' own comment said
+"FilterPipe is the only pipe holding a free-standing `*Expr` today" and its
+switch matched the comment. `Agg.If` -- the `if (<filter>)` guard inside
+`StatsPipe.Aggs` -- is the second, and `clonePipesResolvable` missed it for the
+same reason. A relative `_time:` predicate under the guard would have kept its
+unresolved OFFSET and compared a row's nanosecond timestamp against
+300000000000: matching nothing, at 200. LATENT, and saying so is the point --
+the lexer swallows the closing bracket of `if (...)` into the time value, so
+`* | stats count() if (_time:5m) as c` is a 400 reading `bad _time value
+"5m)"`. It is reachable for every other predicate kind and one lexer fix away
+from being a wrong answer, so the gate is at package level where the lexer is
+not in the way.
+
+**A WRITE-ONLY FIELD WITH TWO INCOMPATIBLE MEANINGS IN IT.** `Warning.Offset`
+is documented as a BYTE offset into the body. Eight call sites wrote
+`res.Warn(int64(ordinal), ...)` into it -- jsonline (three), logfmt, loki,
+lokipb, otel and options -- so record 3 of a batch was recorded as byte 3 of
+the body. It compiled, it read plausibly, and nothing was red BECAUSE NOTHING
+READS THE FIELD: the API layer renders `w.Msg` and drops the position.
+`datadog.go` is the one that got it right, and it got it right by passing 0 and
+writing down why. There is a separate `Ordinal` now, and `UnknownPos` (-1) for
+a parser that cannot give one -- zero is not usable for that, because byte 0
+and record 0 are both real positions and "0" is what six sites meant by "no
+idea".
+
+**AND THE WARNINGS NEVER REACHED THE WIRE ANYWAY.** `/insert/jsonline` and
+`/insert/logfmt` answer `{"ingested":N,"skipped":M}` and carry no warnings at
+all, on any body -- so entry 130's "a warning naming each ordinal" is true of
+the `Result` and false of what a client sees. NOT FIXED, and the reason is the
+same one `markBulkRejects` already records: `IngestJSONLinesParallelCfg`
+returns `(int, int, error)` and shards the body, so a shard's ordinals index
+nothing at batch scale. Emitting warnings on the serial path only would make
+the response SHAPE depend on the body size, which is worse than silence.
+`/loki/api/v1/push`, `/v1/logs` and `/api/v2/logs` do report their reasons
+(a header, an OTLP `error_message`, an intake body).
+
+*Everything above is `go test ./...` green, `go test -race` green on
+internal/api, internal/query and internal/ingest, `go vet` clean, `gofmt -l`
+empty and `git diff --check` clean.*
+
+*Correction, round 19, five pointers. (1) "EVERY `_bulk` REJECTION WAS A 500
+... It is 400 `document_parsing_exception` now" is right about the rejections
+this round could SEE and wrong about the branch beside them. The same function
+marks EVERY candidate item when it cannot place the rejections, and the
+parallel ingest path -- taken by every body over 1 MiB -- threw the positions
+away, so at 400 a large batch reported every document it had STORED as
+permanently failed. The justification four lines above the branch
+("over-reporting causes duplicates, which a caller can reconcile") was true at
+500 and false at 400. (2) "FOUND AND NOT FIXED: THE DEFAULT WINDOW STILL
+STARTS AT THE EPOCH" is fixed: `defaultWindowFrom` is one constant both
+languages read, and the LogsQL default is MinInt64. The `to` half (1<<62, the
+year 2116) is still a default that clips a stated upper bound, and is still not
+fixed. (3) "All three sites were mutated separately and each reddens its own
+rows" is true and was true only from `internal/api`: `go test ./internal/query`
+was GREEN under both of that package's own clamp mutations. (4) The
+`minimum_should_match` gate's thirteen rows are all single-level `bool`s, and
+the lift is not a top-level rule -- gating it on positive conjunctive position
+compiled and left `go test ./...` at RC=0. (5) `/select/logsql/stats_query`
+stamps its vector samples `to / 1e9`, so the window entry 131's own probes use
+(`end=9999-01-01`) plotted the point at 9223372036 -- the last second the
+int64-nanosecond domain can express. All five are entry 132.*
+
+## 132. The round that made a rejection permanent did not look at the branch beside it
+
+Round 18 changed a `_bulk` item's rejection status from 500 to 400 because a
+5xx is retried forever by every shipper and the documents reaching that
+function can never be stored. The reasoning is right. It was applied to the
+branch that names the rejected document and not to the branch four lines below
+it, which names EVERY document in the batch -- and that branch was the one a
+real client reaches.
+
+**A 400 ON A DOCUMENT THAT IS ON DISK.** `esBulk` takes the parallel ingest
+path once the compacted document lines reach `ingest.MinParallelBytes` (1 MiB).
+`IngestJSONLinesParallelCfg` returns three integers, so the handler set
+`truncated = skip > 0` -- "the positions are not known" -- and `markBulkRejects`
+marked every candidate. Reproduced on this tree, 12,000 `index` actions of ~110
+bytes each with ONE unstorable `_time` at ordinal 7777:
+
+	items reporting a failure        12000 of 12000
+	items at 2xx                         0
+	rows in the store afterwards     11999
+
+The counting boundary is the `items` array of one `/_bulk` response, one item
+per action. 400 is permanent to Beats, Logstash and Fluentd: none of them
+re-sends a 4xx, so 11,999 documents that are on disk become `failed` in the
+client's ledger and nothing in the response says otherwise. The independent
+sign-off measured the same shape at 20,871 actions.
+
+**THE POSITIONS WERE NEVER LOST; THEY WERE DISCARDED.** `splitLines` cuts on
+line boundaries and the chunks are contiguous and in body order, and
+`IngestJSONLinesOpts` counts an ordinal for every non-blank line it sees --
+accepted or not -- so `Accepted+Rejected` is exactly how many records a shard
+consumed and therefore exactly the base for the next one. The rebase costs one
+addition per recorded position. `IngestJSONLinesParallelResult` returns a
+`Result`; `IngestJSONLinesParallelCfg` is now a two-line wrapper over it, so
+the existing callers and tests did not move.
+
+This is the merge `Result.Add` refuses to do, with its own comment saying why
+("ordinals are NOT merged: they are relative to their own pass"). The reason
+does not apply: `Add` cannot know that two results came from adjacent slices of
+one body in order, and this function does.
+
+**AND THE RESIDUAL BRANCH IS 429, NOT 400 AND NOT 500.** What is left when the
+positions genuinely cannot be placed -- more than `maxRejectedAt` (65,536)
+rejected records in one batch, or an ordinal that indexes nothing -- is a
+candidate set that mixes stored documents with permanently-bad ones. 400 loses
+the stored ones; 201 loses the bad ones; 500 names a server fault that did not
+happen (all eleven write-path fault points answer 503 + `retryable` +
+`Retry-After: 30` and return before this function is called). 429
+`es_rejected_execution_exception` is Elasticsearch's own per-item RETRYABLE
+status, it is a 4xx, and every shipper backs off and re-sends it -- which
+restores the trade the branch's own justification describes: a duplicate in an
+append-only store, which a caller can reconcile.
+
+Mutations, each applied to the tree, measured and restored:
+
+	mutation                                          gate that reddened
+	unknown branch -> 500 server_error                2 subtests of
+	                                                  TestAnUnattributableBulk-
+	                                                  RejectionIsRetryableNot-
+	                                                  Permanent
+	unknown branch -> 400 document_parsing_exception  the same 2
+	`truncated = skip > 0` restored in es.go          TestALargeBulkReportsOnly-
+	                                                  TheDocumentItRejected:
+	                                                  12000 of 12000 items
+	`base += 0` in mergeShardResults                  the same gate, and this
+	                                                  one names the WRONG
+	                                                  DOCUMENT: item 577
+	                                                  instead of 7777
+
+The first form of the 500 mutation DID NOT COMPILE (`"net/http" imported and
+not used`) and was re-run with `http.StatusInternalServerError`. Entry 129 says
+the same thing about its own mutation and it happened again in the round that
+cites it.
+
+**THE HISTOGRAM PASSED ITS OWN 413 AND THEN RENDERED TEN TIMES IT.** Two
+constants are named `maxHitsBuckets`: `internal/api`'s 10,000, which
+`boundRangeBuckets` refuses past with a 413, and `internal/query`'s 100,000.
+`docs/lld/api.md` says the first "is the one a caller meets". It was not, and
+the path there is one wrapped subtraction:
+
+	n := int((to - start + step - 1) / step)
+	if n < 0 || n > maxHitsBuckets { n = maxHitsBuckets }
+
+`?end=9999-01-01` saturates `to` to MaxInt64 -- entry 129/130's fix working --
+so the addition runs past MaxInt64 and comes back either negative or
+small-positive, and the two wraps give two different wrong answers. Measured on
+a two-row store at `step=8760h`, one year, an ordinary dashboard value, HTTP
+200 in every cell. The counting boundary is `len(hits[0].timestamps)` of one
+`/select/logsql/hits` response:
+
+	                                       413?   buckets   rows totalled
+	?start=1970-01-01&end=9999-01-01        no     100000        2
+	  the true count for that window        --        293       --
+	?start=1000-01-01&end=9999-01-01        no          0        0
+	  the true count for that window        --        585       --
+	?start=1970-01-01&end=9999-01-01        yes       --        --
+	  (no step: the 1-minute default)
+
+The first row is the negative wrap read as "no buckets" and replaced by the
+other package's ceiling; `start + int64(i)*step` then wraps too, so bucket 293
+is -9206696073709551616 and the array documented "dense, ascending and
+gap-free" is none of the three past that point. The second row is the same
+addition wrapping back small: a structurally valid empty histogram about a
+store with rows in the window. The third is the control both reviewers
+measured -- the DEFAULT step over the same window is a loud 413 and always was,
+which is why only the coarse-step path was ever wrong.
+
+`RangeWidthNs` is exact for any `to >= from` whatever the signs, and the walk
+carries `t` and stops at `to`, which is the shape `StatsQueryRange`'s bucket
+walk already uses. Mutations:
+
+	mutation                                 gate that reddened
+	the count back to the subtraction        1 row in internal/query,
+	                                         2 rows in internal/api
+	the walk back to `start + int64(i)*step` NOTHING, and it cannot
+
+The second is the fix working rather than a hole: with the count exact,
+`n = ceil(width/step)` gives `start + (n-1)*step < to`, and when `n` is capped
+at maxHitsBuckets, `n*step <= width` by construction -- so the multiply has no
+value left to overflow on. Two layers, either one sufficient, which is the
+shape entry 131 records for `parseStepNs` and `boundRangeBuckets`.
+
+`boundRangeBuckets`' doc comment said "selectHits still carries its own inline
+copy ... folding hits into this function is worth doing and is not this
+change". The round that folded it did not come back. The version before that
+one claimed the opposite -- that the rule was already shared -- while the copy
+existed. Two descriptions of the same nine lines, each false in the direction
+the other was corrected in.
+
+**HALF OF systemd's TIMESTAMP DOMAIN WAS PARSED WITH A SIGNED PARSER AND THE
+FAILURE WAS DISCARDED.** `__REALTIME_TIMESTAMP` is an UNSIGNED microsecond
+count. The read was `if us, err := strconv.ParseInt(string(val), 10, 64); err
+== nil`, so a value from 2^63 to 2^64-1 -- legal in the format -- failed for
+range, the field was ignored, `haveTS` stayed false, and the entry was stamped
+with the receiver's clock and stored. Measured through `/insert/journald`, two
+entries, one storable and one at 9223372036854775808 microseconds:
+
+	before   202, then `*` over start=1000-01-01&end=9999-01-01 answers 2 rows
+	after    202, the same query answers 1
+
+Entry 130's ingest sweep marked this site fixed and the fix covered the arm
+BELOW it: 253402300800000000 microseconds (year 9999) parses as an int64 and
+was caught by the `us > MaxInt64/1000` check, so the ErrRange fall-through had
+no probe at all. `parseTime` grew exactly this arm in round 18 and this file
+kept the fall-through -- the same defect, in the same round, in a file that was
+not re-read.
+
+AND A JUSTIFICATION THIS ROUND WROTE AND THEN MEASURED FALSE. The replacement
+is a byte scan, and the comment first said it was there because
+`strconv.ParseUint(string(val), ...)` allocates a string per entry. It does
+not: `go build -gcflags=-m` says `string(b) does not escape`, so the conversion
+uses the compiler's 32-byte stack buffer, and both forms benchmark at 0 B/op,
+0 allocs/op. The comment says that now. A claim with no number behind it does
+not go in a doc, including when it is a doc comment and including when it is
+this round's.
+
+**THE CLAMP GATE COMPARED TWO SURFACES ON TWO DIFFERENT WINDOWS, AND THE
+DIFFERENCE WAS THE DEFECT.** `TestAStorableInstantBeforeTheEpochIsReachable-
+InBothLanguages` ran its LogsQL half under `start=1000-01-01&end=9999-01-01`
+and its Elasticsearch half with no query string at all -- `/_search` reads its
+window from the body and ignores `?start`/`?end`, so neither the gate nor a
+client could bring the two onto one window. What that hid: the LogsQL default
+lower bound was the epoch and the ES default was MinInt64. Measured on a store
+holding 1900, 1969 and 2026, all three ingesting at
+`{"ingested":3,"skipped":0}`, with NO query string on any request:
+
+	/select/logsql/query?query=*                              1
+	/select/logsql/query?query=_time:[1900-01-01, 2100-01-01] 1
+	/select/sql?query=SELECT * FROM logs                      1
+	/_search {"match_all":{}}                                 3
+	/_count  {"match_all":{}}                                 3
+
+Row two is a query's own stated lower bound clipped by one it did not state.
+`defaultWindowFrom` and `defaultWindowTo` are one definition now, read by
+`timeWindow`, `timeWindowURL`, `parseRequest`, the tail's live window and
+`esToQuery`, and every row of the gate runs under BOTH windows and must answer
+the same. Entry 131 recorded this as FOUND AND NOT FIXED; the `to` half (1<<62,
+the year 2116) still clips a stated upper bound and is still not fixed.
+
+**AND THE GATE READ A ROW COUNT WHERE THE ANSWER WAS IN A FIELD.** The row
+`{"the same through a stats pipe", "_time:<2100-01-01 | stats count() c", 1}`
+asserted ONE RESPONSE LINE. A stats pipe emits one row whether `c` is 3 or 1,
+so that assertion held for every build ever written. Entry 131's own table
+records this query as "1 row, c=1 want c=3" -- the value the gate did not read.
+It reads `c` now, over four stats rows and both windows.
+
+**AND THE CLAMP FIX WAS GATED FROM ONE PACKAGE ONLY.** The counting boundary is
+`^    --- FAIL` lines, i.e. failing subtests, from one `go test -count=1 -run`
+of the named package:
+
+	mutation                                  internal/query   internal/api
+	filter.go predMatchesRow clamp                  6 (was 0)       4
+	time_filter.go timePredBitset clamp             7 (was 0)      14
+	es.go window built with the zero From            0              9
+	defaultWindowFrom = 0 (this round's own)         0             23
+
+Before `TestASaturatedLowerBoundIsNotTheEpoch`, `go test ./internal/query` was
+GREEN under both of that package's own mutations: a defect in one package that
+only another package's suite can see is a defect nobody running that package's
+tests will catch. Its last four rows assert that the ROW scan
+(`predMatchesRow`, reached through `| filter`) and the BLOCK scan
+(`timePredBitset`, reached by a bare `_time:`) agree, which is the property one
+clamp alone breaks -- the answer would depend on the spelling.
+
+The ES half also had no `must_not` bound that saturates: its only one used
+`gte 2100-01-01`, which is inside the domain and needs no saturation, so it
+answered 3 under the `es.go` mutation as well as without it. The saturating row
+(`must_not: [range gte 1000-01-01]`, which must answer 0) is what makes that
+mutation visible from the boolean tree. `/select/sql` had no row here at all
+and now has four.
+
+**`minimum_should_match: 0` WAS GATED AT THE TOP LEVEL AND THE RULE IS NOT A
+TOP-LEVEL RULE.** All thirteen rows of the gate are single-level `bool`s, and
+the top level is the one context where the lift is unconditional. Threading the
+surrounding boolean context into `esMinShouldMatch` and gating the 0 -> 1
+promotion on positive conjunctive position compiles, and `go test ./...` exited
+RC=0 with it applied, while:
+
+	query                                              mutant   ES
+	bool{should:[bool{should:[error], msm:0}]}            4       1
+	bool{must_not:[bool{should:[error], msm:0}]}          0       3
+
+The first is `es.go`'s own named worst case -- "a dropped filter returns MORE
+documents than the client asked for, in a response that is structurally valid"
+-- because a nested `bool` whose only arm is discarded translates to nil, and
+nil under `should` means match_all. Eight nested rows are in the table now, two
+of them controls with the `minimum_should_match` absent so that nesting itself
+is not what is being tested. With them the same mutation reddens three rows and
+`go test ./...` exits 1.
+
+**A VECTOR SAMPLE STAMPED AT THE END OF THE int64 DOMAIN.**
+`/select/logsql/stats_query` is the Prometheus instant-query envelope and each
+sample is `[<unix seconds>, "<value>"]`. The seconds were `to / 1e9`, and a
+saturated `end` is MaxInt64:
+
+	GET /select/logsql/stats_query?query=*|stats count() c
+	    &start=1000-01-01&end=9999-01-01
+	  {"resultType":"vector","result":[{"metric":{"__name__":"c"},
+	   "value":[9223372036,"3"]}]}
+
+9223372036 is 2262-04-11T23:47:16Z. The count is right and the instant is a
+fabrication: a Grafana panel plots that point 236 years to the right of every
+other series. The SCAN window is untouched -- a client that asked for
+everything up to 9999 still gets everything, future-stamped rows included --
+and only the reported instant falls back to the request time, which is what the
+`defaultWindowTo` sentinel one line above already resolves to for the same
+reason: neither value is an instant. An `end` inside the domain is left alone
+even when it is in the future, because a Prometheus instant query at
+`time=<future>` does report that timestamp; two control rows pin it.
+
+There are two copies of the loop that stamps a vector -- `statsQuery` on a node
+and `exactVector` on a router -- so `instantStamp` is one function and the gate
+runs against a node and a router. Mutating the shared helper reddens 3 rows;
+mutating the router's call site alone reddens 1.
+
+**THE FLAKE THAT WAS LOOKED FOR AND NOT FOUND.** One reviewer saw a one-in-five
+red on an unmutated tree, an unstable subtest count of 508 against 507 in
+`./internal/api/`. Eight runs of a single prebuilt `internal/api` binary with
+`-test.count=1` on the tree as it stood before this round:
+
+	counting boundary                          value, all 8 runs
+	`^--- PASS` (top-level tests)                   506
+	`^\(    \)*--- PASS` (every level)             1855
+	`^\(    \)*--- SKIP`                              3
+	`^\(    \)*--- FAIL`                              0
+	`^=== RUN` (every test started)                1858
+	the sorted set of `=== RUN` lines        byte-identical, 8 of 8
+
+Not reproduced, and the absolute numbers do not match the report either (506
+against 508), so the reviewer's tree was not this one. Recorded so the next
+reader knows the count boundary that was used and does not repeat the eight
+runs blind.
+
+**WHAT THIS ROUND DID NOT FIX.**
+
+- The `maxRejectedAt` bound is still 65,536 while `esBulkMaxActions` is
+  1,048,576, so a single `_bulk` with more than 65,536 rejected documents still
+  cannot attribute them and now answers 429 on every candidate. Raising the
+  bound to the action cap costs 4 MB of int32 against a response body that is
+  already tens of megabytes for such a batch, and is a change to a documented
+  bound on a struct four other protocols share.
+- `/insert/jsonline` and `/insert/logfmt` still carry no warnings on the wire,
+  which is entry 131's own NOT FIXED and unchanged. It is now in
+  `docs/lld/ingest.md` as a table of what each route actually reports, because
+  the LLD claimed a warning naming the ordinal for all of them and no route
+  renders `Warning.Ordinal` at all.
+- `defaultWindowTo` is still 1<<62. The lower default was the asymmetric one
+  and the ES surface already used 1<<62 above, so the two languages agree now;
+  a row stamped after 2116 is still invisible to a query that names no `end`.
+- Bucket alignment truncates toward zero rather than flooring for negative
+  timestamps. `histoGroup`'s key (`ts/step*step`) and `fillHits`' start
+  (`from - from%step`) truncate the same way, so no count is lost to a
+  mismatch; the convention still differs from a floor for a pre-1970 window,
+  and changing it changes every histogram this build answers.
+
+*Everything above is `go test ./...` green, `go test -race` green on
+internal/api, internal/query and internal/ingest, `go vet` clean, `gofmt -l`
+empty and `git diff --check` clean.*
+
+*Correction, round 19: FIVE of the claims above are wrong and entry 133 holds
+the measurements. The 429 branch re-created the never-draining loop this
+entry's own reasoning rules out, and it was reachable from a 5 MB body; the
+histogram mutation table is off by one in the `internal/api` column and its
+explanation of why the walk mutation is unkillable is false; the "no count is
+lost to a mismatch" bullet is the opposite of what the two sites do; "both
+forms benchmark at 0 B/op, 0 allocs/op" holds on the success path only; and
+the `defaultWindowFrom`/`defaultWindowTo` reader list omits `statsQuery` and
+`exactVector`. (Round 20: this sentence said "four" and listed five. A
+correction that miscounts its own list is the same defect it is correcting,
+one paragraph later -- entries 111, 117 and 128 all record a number in prose
+that nobody counted, and this one was in the correction footer of the entry
+that cites them.)*
+
+## 133. The retryable status that re-created the loop, and a gate the machine answered for
+
+Round 18 changed a `_bulk` item's rejection from 500 to 400 because a 5xx is
+retried forever by every shipper and the documents reaching that function can
+never be stored. Round 18's own residual branch then became 429, and 429 is
+the one 4xx that is not permanent: it inherits the 5xx's retry property and
+keeps none of the 4xx's.
+
+**A PER-ITEM 429 ON A DOCUMENT THAT CAN NEVER BE STORED.** The trigger was two
+constants that nothing held together: `Result.RejectedAt` was bounded at
+`maxRejectedAt` = 65,536 while `esBulkMaxActions` is 1,048,576, so a body
+inside the 64 MiB request limit could outrun the positions. Measured on this
+tree, a 5,254,000-byte `/_bulk` of 70,000 `index` actions with 66,000 carrying
+`"_time":"9999-01-01T00:00:00Z"`:
+
+	HTTP 200  errors=true
+	items                 70000
+	byStatus              map[429:70000]
+	byType                map[es_rejected_execution_exception:70000]
+	rows on disk           4000
+
+Every shipper that honours a per-item 429 -- Beats, Logstash, Fluentd -- backs
+off and re-sends. 66,000 of those are refused identically forever by
+`ErrTimeOutOfRange`, so **the pipeline never drains** -- which is the exact
+sentence `esbulk.go` gives as the reason 500 was wrong -- and the 4,000 that
+DID land are re-sent on every pass into an append-only store: 4,000 duplicates
+per retry, unbounded. In the ES protocol a per-item 429
+`es_rejected_execution_exception` means the write thread pool queue was full
+and that item was shed, a TRANSIENT condition; stamping it on a permanently-bad
+document asserts a transience that does not exist. The justification was
+self-contradictory in one paragraph: "4xx is permanent to every shipper" is
+why 400 beat 500, and the branch four lines down chose the one 4xx for which
+that sentence is false.
+
+Two changes, and the first is what matters:
+
+- `MaxRejectedAt` IS THE ACTION CAP (1<<20). No body `parseBulk` accepts can
+  exceed it, so the residual branch stops being reachable from client input at
+  all. `TestTheAttributionBoundCoversTheActionCap` holds the two constants
+  together across the package boundary. The worst case is 4 MB of int32
+  against a 64 MiB body limit and a `_bulk` response that is itself tens of
+  megabytes at that action count -- under 1x amplification either way, which
+  is what the old bound existed to prevent. What one route RENDERS is bounded
+  separately (`maxRenderedRejectedAt`, still 64Ki), so no error body grew.
+- WHAT IS LEFT IS ANSWERED EXACTLY OR NOT AT ALL. With every candidate
+  rejected the positions are not needed: all of them are a permanent 400, and
+  no stored document is among them to mislabel. With a mix and no positions,
+  no per-item status is true -- 400 loses the stored ones, 201 loses the bad
+  ones, 429 asserts the transience above -- so `markBulkRejects` reports
+  failure, the items array is NOT written, and the request is a 500 naming
+  what is known: how many were rejected, how many are stored, and that
+  re-sending duplicates them. That state is a server-side inconsistency now,
+  not an input.
+
+Mutations, each applied to the tree, measured at 32 CPUs AND under
+`taskset -c 0-3`, and restored:
+
+	mutation                                   gate that reddened
+	MaxRejectedAt back to 1<<16                TestTheAttributionBoundCovers-
+	                                           TheActionCap, and the 70,000-
+	                                           action gate at "status 500,
+	                                           want 200"
+	that plus the 429 branch restored          the same gate reporting
+	                                           byStatus=map[429:70000], and 2
+	                                           of 4 subtests of TestAn-
+	                                           UnattributableBulkRejectionIs-
+	                                           NotWrittenAsAnItemStatus
+
+**THE HEADLINE GATE OF ROUND 18 COULD NOT SEE THE CODE IT GATES.** The ordinal
+rebase in `mergeShardResults` is the fix that stopped a sharded `_bulk` marking
+every stored document failed, and its gate ran the SERIAL path on any machine
+with fewer than six cores. `ParallelConfig.Shards` exists for exactly this and
+`internal/api` never set it. Measured, `base += pr.Accepted + pr.Rejected`
+mutated to `base += 0`:
+
+	                              before this round        after
+	32 CPUs                       RED  (item 577)          RED (577 and 1777)
+	taskset -c 0-3                GREEN                    RED (item 1777)
+
+577 and 1777 are ONE defect seen at two shard counts, not two findings: the
+rejected document is at ordinal 7777 of 12,000, the derived count on this box
+is 10 shards of 1,200 (7777 - 6*1200 = 577) and the forced count is 4 shards
+of 3,000 (7777 - 2*3000 = 1777). The number in the message is the shard-local
+ordinal, so it moves with the shard count and says nothing more.
+
+The 4-core green is the serial fallback passing a test written about the
+concurrent branch. Two gates now: `Server.ingestShards` with
+`setIngestShardsForTest`, so `TestALargeBulkReportsOnlyTheDocumentItRejected`
+runs at the derived count AND at a forced 4; and
+`TestMergeShardResultsRebasesEveryPosition`, which calls the function directly
+so no machine can answer for it, over four shards of ten records and asserting
+all three things the rebase carries -- `RejectedAt`, `RejectedTruncated`, and
+the ordinal on a `Warning` -- plus that a `Warning.Offset` (a BYTE offset) is
+NOT rebased and that a lost shard still moves the base.
+
+`Warning.Ordinal` has **zero readers on any wire**: every ingest route either
+drops it (`warningStrings` renders `Warning.Msg` alone) or carries no warnings,
+so the rebase of it is unobservable from any surface this build serves. It is
+rebased and gated anyway, because the first reader added otherwise gets a
+plausible number measured from the wrong origin. `docs/lld/ingest.md` says so
+now.
+
+**ONE JOURNALD RECORD, TWO REJECTIONS, AND A 29-BYTE `make fuzz` CRASHER.**
+The truncated-field branch of `IngestJournaldOpts` called `res.Reject(ordinal)`
+and then `emit()`, and `emit` rejects the same ordinal again through either of
+its two refusal branches:
+
+	input: "__REALTIME_TIMESTAMP=1\nORPHAN"
+	  Accepted=0  Rejected=2  RejectedAt=[0 0]      for ONE record
+	  FuzzIngestJournald/oneEnvelope: "rejected positions are not increasing"
+
+`/insert/journald` answered `{"accepted":0,"rejected":2}` for a one-record
+upload, and with storable fields in the entry it double-counted the other way:
+`Accepted=1` AND `Rejected=1` for the same record. `make fuzz` is a release
+gate and this is 29 bytes. The two binary-field branches above it already do
+it right -- reject at the ordinal and return, no `emit()` -- so the fix is to
+make the third branch match them; a truncated field is a truncated ENTRY, so
+its earlier fields are not stored on their own. Four seeds added.
+`TestJournaldATruncatedFieldRejectsTheEntryOnce` covers all four ways in
+(timestamp-only, storable fields, the new `tsErr` branch, no timestamp) and
+asserts the envelope invariant `oneEnvelope` checks. Mutation: `emit()`
+restored -- 4 of 4 subtests RED at both core counts.
+
+**AND A SIGNED `__REALTIME_TIMESTAMP` WAS STAMPED WITH THE RECEIVER'S CLOCK.**
+Round 18 replaced `strconv.ParseInt` with a byte scan to reach the 2^63..2^64-1
+half of systemd's unsigned domain. The scan tested every byte for `'0'..'9'`,
+so `-1` and `+5` -- both of which ParseInt read -- fell into "not a decimal
+count", which is the one branch that falls back to the receiver's clock:
+
+	__REALTIME_TIMESTAMP=-1     ts stored                    counted
+	  ParseInt                  -1000 ns (1969-12-31)        accepted
+	  the byte scan             the receiver's clock, 202    accepted, no warning
+
+That is the same fabrication the range arm was added to remove, reached
+through the one input shape the rewrite was supposed to leave alone -- and the
+function's own doc comment claimed `ok=false, nil err` was "the outcome the
+caller already had for that case", which it was not for `^[+-]\d+$`. A leading
+sign is read now; the magnitude bound is symmetric, because `MinInt64/1000`
+truncates toward zero to `-maxUS`. A bare sign is still not a count, and a
+signed value past the domain is refused rather than fallen back on.
+
+**THE TREE WAS RED AT THREE TO FIVE CORES, ON AN UNMUTATED CHECKOUT.**
+
+	taskset -c 0-2 / 0-3 / 0-4   FAIL  TestInsertJSONLineFailsWhenWritesFail:
+	                                   "durable 9698, want 0"
+	taskset -c 0-5 / 0-7         pass
+
+`IngestJSONLinesParallelResult`'s serial branch returned `r` with its
+parse-time `Accepted` intact alongside the write error; the sharded branch
+zeroes a lost shard's `Accepted` in `mergeShardResults`. The branch is chosen
+by `runtime.NumCPU()/3 < 2`, so the SAME request against the SAME unwritable
+store answered `"durable":0` on a machine that sharded and `"durable":9698` on
+one that did not -- an operator on a small host told 9,698 rows landed when the
+store refused every group. Pre-existing: `git show HEAD:` has the same shape.
+The serial branch zeroes it now, which is the rule `ParallelWriteError`'s own
+doc states ("Ingested counts only the shards that succeeded"), and both the
+handler gate and `TestSerialAndShardedAgreeOnWhatIsDurable` run BOTH branches
+by forcing the shard count. Mutation: the zeroing removed -- RED at 32 CPUs
+and at 4.
+
+**AND THIS IS THE MECHANISM BEHIND ENTRY 132'S PHANTOM FLAKE.** That entry
+recorded a reviewer's one-in-five red in `./internal/api/` -- an unstable
+subtest count -- that eight runs of one prebuilt binary could not reproduce,
+and concluded the reviewer's tree was not this one. The shape reproduces
+exactly when the core count is varied instead of the run number. One prebuilt
+`internal/api` binary with the durability fix mutated out, `-test.count=1
+-test.v`:
+
+	counting boundary                  32 CPUs   taskset -c 0-3
+	`^--- PASS` (top-level tests)          512              512
+	`^\s*--- PASS` (every level)          1931             1930
+	`^\s*--- FAIL`                           2                3
+	`^=== RUN` (every test started)       1936             1936
+
+Same binary, same tree, the same number of tests STARTED, and a subtest count
+that differs by one -- and the difference is a real FAIL, not an unstable
+count. A subtest whose result depends on `runtime.NumCPU()` looks exactly like
+a flake to anyone who reruns instead of varying the core count, which is why
+eight runs on one machine could not see it.
+
+**A PRE-EPOCH HISTOGRAM DROPPED A COUNT, AND ENTRY 132 SAID IT COULD NOT.**
+That entry's fourth NOT-FIXED bullet reads: `histoGroup`'s key (`ts/step*step`)
+and `fillHits`' start (`from - from%step`) "truncate the same way, **so no
+count is lost to a mismatch**". They do truncate the same way and a count is
+lost anyway, because the mismatch is not between the two sites -- it is
+between the key and the WINDOW. Truncation toward zero makes the bucket keyed
+`0` span `(-step, +step)`, rows on both sides of the epoch, while every other
+bucket spans `[k*step, (k+1)*step)`; a window that ends before the epoch never
+reaches key 0, because the walk runs `t < to`. Two rows inside one window,
+both requests at HTTP 200:
+
+	/select/logsql/hits?query=*&start=1969-12-31T00:00:00Z
+	    &end=1969-12-31T23:59:00Z&step=1h    24 buckets, TOTAL = 1
+	/select/logsql/query, the same window                  TWO rows
+
+The row at -1800e9 keyed to bucket 0 and vanished from `Timestamps`, `Values`
+AND `Total`, with nothing in the response saying so. FIXED, not deferred:
+`alignDown` floors, both callers use it, and for `t >= 0` the floor and the
+truncation are the same value -- so no post-epoch window this build answers
+changes at all. The bottom of the domain has no aligned bucket (MinInt64 is not
+a multiple of any ordinary step and `defaultWindowFrom` IS MinInt64), so both
+callers clamp to the smallest multiple int64 can hold, which is the value the
+truncating form produced there too. Gates:
+`TestBucketKeysFloorAndTheWalkFindsThem` in the package that computes it and
+`TestAHistogramTotalsEveryRowTheQueryReturns` on the wire, the second comparing
+the histogram's total against `/select/logsql/query`'s row count over the same
+window. Mutation: `alignDown` truncating again -- RED in both packages at both
+core counts.
+
+`TestFillHitsReadsTheBucketsHistogramWrote` built its keys by repeating
+`ts/step*step` in the test body. It calls `alignDown` now: a test that
+hand-copies the loop it is measuring stops measuring the tree the moment the
+tree changes, and this one is why a truncating key survived a test written to
+pin the key.
+
+**ENTRY 132'S HISTOGRAM MUTATION TABLE IS OFF BY ONE, AND ITS EXPLANATION IS
+FALSE.** Counting boundary as that entry used: `^    --- FAIL` lines from one
+`go test -count=1` of the named package.
+
+	mutation                                  entry 132   measured
+	the count back to the subtraction         1 / 2       1 / **3**
+	full revert (count and walk)              --          2 / 5
+	the walk back to `start + int64(i)*step`  NOTHING     NOTHING (confirmed)
+
+The three `internal/api` subtests are
+`TestAHistogramOverASaturatedWindowRendersTheBucketsItPromised`'s
+`no_start,_a_coarse_step`, `an_explicit_far-past_start` and
+`a_step_wider_than_the_domain`; the one in `internal/query` is
+`TestFillHitsCountsTheWindowAndNeverLeavesIt/both_bounds_saturated`.
+
+The unkillability of the walk mutation is REAL and the reason entry 132 gives
+-- "the multiply has no value left to overflow on" -- is false. On that
+entry's own `?start=1000-01-01&end=9999-01-01&step=8760h` case
+(`start = -9208512000000000000`, n = 585) the multiply overflows for **292 of
+the 585** iterations, every `i >= 293`: `int64(293)*8760h` is
+-9206696073709551616 against a true 9240048000000000000. What makes the mutant
+correct is that Go's signed arithmetic is MODULAR, so the second wrap in
+`start + i*step` cancels the first whenever the true sum is representable --
+which the exact `n` guarantees. `start + 293*step` comes out 31536000000000000,
+the right answer, by two wraps that annihilate. The `if next <= t { break }`
+guard STAYS: one compare per bucket, and it is the only thing between a future
+change to `n` and the wrapped series entry 132 measured. The code says this at
+the guard, so the next reader does not delete it as unreachable.
+
+**AND "BOTH FORMS BENCHMARK AT 0 B/op, 0 allocs/op" IS THE SUCCESS PATH ONLY.**
+`journalMicros`' doc comment corrected one wrong justification (the string
+conversion does not allocate) and replaced it with a claim measured on one
+input. Interleaved, one session, minimum of three, `-benchmem`:
+
+	input          ParseInt          scan + fmt.Errorf   scan + tsRangeErr
+	in-range       16.77 ns  0/0     12.51 ns  0/0       13.07 ns  0/0
+	out of range   53.09 ns 72B/2   146.0  ns 200B/3      38.44 ns 48B/2
+	non-numeric    37.15 ns 64B/2     1.565 ns  0/0        1.736 ns  0/0
+
+The out-of-range path is the case the byte scan was written for, and round
+18's form was the slowest of the three there: 3 allocations for 200 bytes
+against ParseInt's 2 and 72, all of it in `fmt.Errorf` with `%w` and `%s` over
+the bytes -- the boxed `[]byte`, the formatted message, the wrapper. It is a
+struct that formats in `Error()` now, so the message is built where it is read:
+2 allocations, 48 bytes, and faster than ParseInt on the path it exists for.
+`BenchmarkJournalMicros` keeps the number in the tree. (ns/op measured at load
+average ~22 on a machine another job was using; the allocation counts and byte
+totals do not depend on that.)
+
+**AND THE `defaultWindowFrom`/`defaultWindowTo` READER LIST OMITS TWO.** Entry
+132 names five -- `timeWindow`, `timeWindowURL`, `parseRequest`, the tail's
+live window and `esToQuery`. There are seven: `statsQuery` and `exactVector`
+both read `defaultWindowTo` to test the sentinel before stamping a Prometheus
+instant. The count matters because the sentinel's meaning is what those two
+turn into a timestamp.
+
+**WHAT THIS ROUND CONFIRMED CLEAN.** The µs->ns overflow in `journalMicros` is
+NOT present: the bound is on the converted nanoseconds
+(`maxUS = MaxInt64/1000 = 9223372036854775`, and `x1000` is
+9223372036854775000 <= MaxInt64). An earlier brief's premise of 9223372036854
+was the MILLISECOND bound, off by 10^3. Two more from the independent sign-off,
+recorded as ITS measurements and not re-run here: the `_bulk` ordinal rebase
+is exact at 12,020 items / 10 shards / 89 sprayed rejects / interleaved
+non-identity `idx` / blank lines (wantFail 109, gotFail 109, missing 0, extra
+0), and `instantStamp` is two call sites and one function.
+
+**WHAT THIS ROUND DID NOT FIX.**
+
+- `docs/lld/api.md`'s tail gate is a denylist of two phrases and its own header
+  says it is "a sample, not a sweep". It is left as it is, and it is not
+  coverage: a document can say anything the two phrases do not spell.
+- `/insert/jsonline` and `/insert/logfmt` still carry no positions or warnings
+  on the wire (entry 131's NOT FIXED, unchanged). `Warning.Ordinal` therefore
+  still has no reader on any surface.
+- `defaultWindowTo` is still 1<<62, so a row stamped after 2116 is still
+  invisible to a query that names no `end`.
+- A `_bulk` whose positions cannot be placed is a 500 for the whole request.
+  That answer is retried by shippers like any 5xx, so if the inconsistency were
+  ever deterministic the batch would not drain either -- the defence is that
+  no accepted body can reach it, not that the answer is good. A per-item
+  answer would need a per-record reason on `ingest.Result`, which is a change
+  to a struct six protocols share.
+- The bucket-alignment clamp at the bottom of the int64 domain keys a row
+  within one step of 1677-09-21T00:12:43Z into a bucket that starts AFTER it.
+  The alternative is keying it to a bucket int64 cannot express; both callers
+  agree, so no count is lost either way.
+
+*Everything above is `go test ./...` green at 32 CPUs and under
+`taskset -c 0-3`, `go test -race` green on internal/api, internal/query and
+internal/ingest, `make fuzz` green, `go vet` clean, `gofmt -l` empty and
+`git diff --check` clean.*
+
+*Correction, round 20: three of the numbers above are wrong. The body is
+5,254,000 bytes, not 4,966,000 -- the gate in the tree builds it from a
+28-byte action line, a 47-byte bad source and a 48-byte good one
+(70000*28 + 66000*47 + 4000*48), measured live at `body bytes = 5254000`, and
+the wrong figure was copied into six places (this entry, `result.go`,
+`esbulk.go`, `es_bulk_contract_test.go` twice and `docs/lld/ingest.md`); the
+conclusion "inside the 64 MiB request limit" is unaffected and the fixture now
+asserts its own length so the six copies cannot drift again. The mutation
+table's second row is 2 of 4 subtests, not 3: with `MaxRejectedAt` back to
+1<<16 AND the 429 branch restored, at 32 CPUs and under `taskset -c 0-3`, only
+`positions_truncated,_a_mix` and `an_ordinal_that_indexes_nothing` fail --
+`every_candidate_rejected,_positions_unknown` and `positions_known_(control)`
+are structurally immune, because the 429 branch sat AFTER the
+`rejected >= len(idx)` arm and after the exact-positions arm, so neither can
+reach it. And "577 and 1777" is one defect at two shard counts, as the
+paragraph above now says. Round 20 also found that two of this round's own
+controls were not gated: entry 134.*
+
+## 134. The round's own new gate ran the branch it was written to leave, and the bound it leaned on had no test
+
+Round 19 closed a per-item 429 that never drained, raised `MaxRejectedAt` to
+the `_bulk` action cap, and wrote `setIngestShardsForTest` because the gate for
+the ordinal rebase had been answered by the machine rather than by the code. An
+independent sign-off then ran 24 mutations at 32 CPUs and under
+`taskset -c 0-3`, found no wrong answer to an HTTP client -- the cap raise, the
+per-item statuses, `alignDown`, the signed journald timestamp and the
+durability zeroing all behave as entry 133 describes -- and returned NOT
+MERGEABLE on two of the round's own controls.
+
+**THE ROUND'S NEW HEADLINE GATE RAN THE SERIAL PATH AT FIVE CORES OR FEWER.**
+`TestABulkPastTheOldAttributionBoundIsStillAnsweredPerItem` is the 70,000-item
+measurement this entry set is named after. It guarded on
+
+	if len(body) < ingest.MinParallelBytes {
+	    t.Fatalf("body is %d bytes: under MinParallelBytes the parallel path is not exercised", ...)
+	}
+	ts := bulkServer(t)          // no shard override
+
+and `ParallelConfig.shards` needs BOTH `n >= MinParallelBytes` AND
+`runtime.NumCPU()/3 >= 2`. The guard checked the first half and its failure
+message asserted the whole, which is a negative signal read as positive: the
+condition it tested cannot fail on this body, so the sentence it would have
+printed was never measured. Two further things were wrong with the quantity it
+read -- the bulk parallel branch is keyed on len(DOCS), not len(body) (the
+action lines are 1,960,000 of these 5,254,000 bytes and never reach the
+ingester), and `bulkServer` is `bulkServerCfg(t, nil)`, the one call in this
+file that declines the override the round added for exactly this.
+
+Measured, `base += pr.Accepted + pr.Rejected` mutated to `base += 0`:
+
+	gate                                             32 CPUs   taskset -c 0-3
+	TestABulkPastTheOldAttributionBoundIsStill-
+	  AnsweredPerItem                                  RED       **GREEN**
+	TestALargeBulkReportsOnlyTheDocumentItRejected
+	  /the_derived_shard_count                         RED       **GREEN**
+	  /shards_forced_to_4                              RED       RED
+	TestMergeShardResultsRebasesEveryPosition          RED       RED
+
+A four-core CI lost "66,000 positions survive the sharding" specifically. Both
+rows run now, and the guard ASKS: `ParallelConfig.shards` is exported as
+`ShardsFor` so a test in another package can be told which branch it is on
+instead of inferring it from a byte count. After the fix, at
+`taskset -c 0-3`, `shards_forced_to_4` is RED under the same mutation --
+`item 17522 is 201 ""` against `byStatus=map[201:52478 400:17522]`.
+
+`TestESBulkFailsWhenWritesFail` in `ingest_durability_test.go` had the same
+omission four lines below the loop that WAS given the override in round 19; it
+runs all three shard counts now. Lower impact -- it asserts only 503 and
+`Retry-After`, which both branches answer through `failIngest` -- but the same
+sentence in the same file did not carry to the function below it.
+
+**AND THE FUNCTION BELOW THAT ONE, FOUND BY LOOKING AT THE POSITION BESIDE THE
+FIX.** `TestLargeAndSmallIngestAgreeOnSchema` is the only end-to-end check that
+a large body inherits the deployment's stream fields -- the defect
+`ParallelConfig` was written for, where `Compact` was copied and the stream
+fields were not, so the same records produced a `_stream` column under the
+small-body path and none under the large one. `cfg.apply(w)` appears TWICE in
+`IngestJSONLinesParallelResult`: once on the serial fallback's single writer,
+once per shard goroutine. Covering one is not covering the other, and the test
+had no override. Measured with the SHARDED `cfg.apply(w)` deleted and the
+serial one left alone:
+
+	                                     32 CPUs   taskset -c 0-3
+	TestLargeAndSmallIngestAgreeOnSchema   FAIL       **ok**
+
+At four cores the large body took the serial fallback and was compared against
+the small body's persistent writer -- two paths that are not the test's
+subject. Both rows run now, and both are RED under that mutation.
+
+**AND `maxRenderedRejectedAt`, THE COMPENSATING BOUND THE ROUND INTRODUCED,
+HAD NO TEST.** It is the answer entry 133 gives three times in prose to "does
+raising the attribution bound 16x grow a response?" -- "what one route RENDERS
+is bounded separately (`maxRenderedRejectedAt`, still 64Ki), so no error body
+grew". Three mutations, each applied to the tree, GREEN at 32 CPUs and under
+`taskset -c 0-3`, all three observable on `/insert/journald`:
+
+	mutation                                   what went on the wire
+	at, trunc = at[:max], true -> at = at[:max] 65,536 of 131,073 positions
+	                                            and `rejectedTruncated` ABSENT
+	the clamp deleted                           65,537 positions rendered at a
+	                                            65,537-reject upload; 1,048,576
+	                                            at the attribution cap
+	maxRenderedRejectedAt 1<<16 -> 1<<20        a 7,277,653-byte error body
+
+The first is the worst of the three: the field whose entire meaning is "the
+list you have is shorter than the count" is the one that disappears, so a
+client reads a short list as complete and treats 65,537 refused records as
+stored. Dropping the `rejectedAt` field itself IS red -- an existing test reads
+it -- so the field was gated and its bound was not.
+
+Measured correct on the tree, `/insert/journald`, one storable entry followed
+by N entries carrying a timestamp and no storable field and closed by a field
+cut mid-name:
+
+	entries=65536    400  body=382,257  rejected=65537   rejectedAt=65536  truncated=true
+	entries=131072   400  body=382,258  rejected=131073  rejectedAt=65536  truncated=true
+
+`TestTheRenderedRejectedPositionsAreBounded` runs four things: the wire at
+65,537 rejections, a CONTROL at 4 (rendered whole, `rejectedTruncated` absent
+from the body entirely, so a build that always truncated would not pass), a
+direct `writeIngestErr` call at `ingest.MaxRejectedAt` positions -- which
+prices the cap without sending a 25 MB upload -- and the bound pinned as a
+literal `1<<16` with the 7,277,653 bytes in its message.
+
+**AND A WHOLLY-REJECTED UPLOAD STILL REPORTS NEITHER COUNT NOR POSITION.**
+`writeIngestErr` returns the plain `writeErr` shape when `res.Accepted == 0`,
+so a client whose entire batch was refused for a nameable reason is told "400"
+and nothing else -- no `rejected`, no `rejectedAt`. Pre-existing, documented in
+`docs/compatibility.md`, and pinned by
+`TestAWhollyRejectedIngestKeepsThePlainErrorShape`. Recorded, not changed: it
+is a wire shape. The new gate's fourth subtest says what it costs beside the
+test that pins it.
+
+**`Warning.Offset` CANNOT BE REBASED WHERE THE GATE PINNED IT.**
+`TestMergeShardResultsRebasesEveryPosition` asserts that a `Warning.Offset` is
+NOT rebased, as though pass-through were the right answer. It is not an answer
+at all: `mergeShardResults(per []Result, lost []bool)` is handed per-shard
+RECORD COUNTS and nothing else -- the chunk byte starts never leave
+`IngestJSONLinesParallelResult` -- and `splitLines` gives each shard
+`data[start:end]`, so any Offset a shard records is CHUNK-relative and passing
+it through publishes it as body-relative. Both "don't rebase Ordinal" and "also
+rebase Offset" are RED, and that gate is the only one for either, so the rule
+looked pinned from both sides. It costs nothing today because no producer
+exists on this path -- `Result.Warn`'s callers are `lokipb.go:105` (which
+passes `UnknownPos`) and three sites in `journald.go`, and journald does not
+shard -- and the gate's fixture invents `Offset: 7`. The function and the gate
+both say so now: the first shard-path caller of `Warn` has to pass `UnknownPos`
+or hand `mergeShardResults` the chunk starts.
+
+**A FORMATTED STRING PER REJECTED RECORD, THROWN AWAY.** `maxWarnings` is 32
+and a `/_bulk` at the action cap rejects up to 1,048,575 records, and the bound
+was checked inside `warn()` -- which is AFTER `fmt.Sprintf` has run at the call
+site. Every rejected record past the 32nd built a message, boxed its arguments
+and handed the result to a function whose first act was to drop it. Beside it,
+`parseTime`'s out-of-range arm still used
+`fmt.Errorf("%w: %s ns since the epoch", ...)`, which is the exact form round
+19 replaced with `tsRangeError` in `journald.go` one file over -- and it is the
+arm every `_bulk` document with an out-of-range decimal `_time` reaches, so a
+cap-sized batch paid both. Interleaved, one session, minimum of four,
+`-benchmem`, over `IngestJSONLinesOpts` on 2,000 documents whose `_time` is out
+of range:
+
+	per rejected record        allocs      bytes
+	before                       19.0      1,350
+	after                        16.0      1,050
+
+	parseTime, out of range     5 -> 3    281 B -> 104 B
+	WarnAt, past the bound      1 -> 0     48 B -> 0 B
+
+The bound is asked before the message is built (`warnFull`), and `warn()` keeps
+its own check so no caller can outrun it another way; `tsRangeError` is one
+type with a unit field, shared by both parsers, which costs the journald path
+8 bytes (2 allocs / 48 B -> 2 / 56 B, on the positive and the negative
+out-of-range input alike) and saves the `_bulk` path two allocations and
+177 bytes per rejected document. `TestABoundedWarningCostsNothingToDiscard`
+holds the zero, with a control that a warning UNDER the bound is still recorded
+with its message. NOT converted, and the same shape: `otelproto.go:182` and
+`:189`, and `time.go:122`'s float arm.
+
+**THE 500 BRANCH IS DEAD CODE, MEASURED.** Round 19's answer for a `_bulk`
+whose positions cannot be placed is a request-level 500, on the reasoning that
+after the bound raise no accepted body reaches it. That is now a measurement:
+`markBulkRejects` called and its `false` never acted on (`if
+markBulkRejects(...); false {`) COMPILES and leaves `go test ./internal/api`
+green at 32 CPUs and under `taskset -c 0-3`, 89.9s each. All three
+preconditions for `false` are unreachable from client input, and
+`TestTheAttributionBoundCoversTheActionCap` is the right invariant with an
+exact fit: `MaxRejectedAt == esBulkMaxActions == 1<<20`.
+
+**WHAT THIS ROUND DID NOT FIX.**
+
+- The independent sign-off priced what the cap sits inside: 1,585 MB live heap
+  for one cap-sized `_bulk` (a 31.5 MB body, 5,570 MB totalAlloc), and 262,144
+  actions at 1/2/4 concurrent uploads at 407 / 815 / 1,487 MB -- linear.
+  `writeSem` bounds concurrency at `MaxConcurrentWrite` (default 32) with
+  `defer release()` covering the response build, so the ceiling is about 51 GB.
+  `_bulk` is exempt from per-tenant admission on the reasoning that "an ingest
+  request does not hold memory for the length of a scan", which these numbers
+  contradict. Recorded as ITS measurements, not re-run here. Pre-existing;
+  entry 133 priced the 4 MB of `int32` and not what it sits inside.
+- `StatsQueryRange` and `exactVector` both walk `for bs := from; bs < to`, so
+  their buckets are anchored on the request's `start`, while `/hits` now floors
+  to a step multiple through `alignDown`. The same rows and the same step land
+  in differently-anchored buckets on the two surfaces. Prometheus range queries
+  are conventionally anchored on the requested start, so this is a convention
+  difference rather than a lost count -- but it is two conventions in one
+  build, and nothing says which a caller is getting.
+- Five of the sign-off's 24 mutations are unkilled and only the three above
+  were observable. `M12` (`Reject`'s bound `>=` -> `>`) and `M16` (dropping the
+  `abs > MaxInt32` check in `mergeShardResults`) are NOT observable: the
+  maximum recorded list is exactly `1<<20` and the maximum reachable ordinal is
+  about 2.7e8, so neither bound is ever the binding one.
+
+## 135. A defect class closed at three of five, and three published numbers that do not reproduce
+
+Round 20 fixed the blind parallel-ingest gates entry 134 opened, moved the
+warning bound ahead of `fmt.Sprintf`, and gave `maxRenderedRejectedAt` its
+first test. An independent sign-off then ran the round's own mutations at 32
+CPUs and under `taskset -c 0-3` and returned NOT MERGEABLE on two counts: the
+round declared the blind-test class closed after finding three instances and
+there are FIVE, and it published four measurements of which THREE do not
+reproduce. Both are recorded here with what the fourth and fifth cost, and
+with the enumeration method that turns "we found three" into "there are five".
+
+**THE ENUMERATION METHOD, WHICH IS THE PART WORTH KEEPING.** Reading tests for
+the sentence "over MinParallelBytes so the parallel path is taken" finds
+instances one at a time and stops when the reader stops. The sign-off instead
+instrumented `IngestJSONLinesParallelResult` to print every SERIAL FALLBACK
+taken on a body already past `MinParallelBytes`, ran `./internal/api
+./internal/ingest` under `taskset -c 0-3`, and attributed each hit by running
+its candidate alone. That is a complete list by construction: the failure being
+hunted is exactly "a test whose body is big enough and whose shard count is
+not", and the code that decides it is the only thing that can enumerate it.
+Two tests were blind; the rest of the hits are setup-only ingest, deliberately
+serial or derived rows, and `internal/ingest` tests that all force
+`ParallelConfig{Shards: ...}`.
+
+**THE FOURTH, AND ITS NAME IS THE CLAIM.** `TestESBulkParallelPath`
+(`internal/api/protocols_test.go`) guarded on
+
+	if sb.Len() < ingest.MinParallelBytes {
+	    t.Fatalf("body %d bytes is under MinParallelBytes %d -- test would not cover the parallel path", ...)
+	}
+
+behind `srv, _ := NewServer(t.TempDir())` -- no shard override -- under a doc
+comment that says it "drives a body over MinParallelBytes so the sharded ingest
+branch is covered". The same three faults as entry 134's, in the same shape:
+the guard checks one half of a two-half condition while the message asserts the
+whole, `ShardsFor` also needs `runtime.NumCPU()/3 >= 2`, and the bulk branch is
+keyed on `len(docs)` (`internal/api/es.go`) while the guard read `sb.Len()`.
+Instrumented, the fixture is 1,348,890 document bytes inside a 1,928,890-byte
+body, and at four cores the whole thing took the serial fallback. Measured with
+the last shard's chunk dropped in `IngestJSONLinesParallelResult`:
+
+	                                 32 CPUs                       taskset -c 0-3
+	before                RED  "bulk _count = 18021 want 20000"      **GREEN**
+	after, derived        RED  "bulk _count = 18021 want 20000"      GREEN (serial by design)
+	after, forced to 4    RED  "bulk _count = 15042 want 20000"      **RED**
+
+Both rows run now; the guard asks `ShardsFor(docBytes)`; the fixture's two byte
+counts are asserted where they can be counted rather than described in prose.
+
+**THE FIFTH, AND IT GUARDS ROUND 12's FIX.**
+`TestParallelIngestAppliesRecordLimits`
+(`internal/api/review_regressions_test.go`), a 2,097,312-byte body on
+`/insert/jsonline`, comment: "Over MinParallelBytes so the parallel path is
+taken." No override. What it is the only end-to-end check of is round 12's
+finding: `ParallelConfig` carried no `RecordLimits`, so every shard writer ran
+with a zero limit set and `add()` skipped `truncateForLimits` entirely -- a
+body over 1 MiB on `/insert/jsonline` got no field cap, no name or value cap,
+and a forgeable `.error` control name, which is the tail sentinel again.
+Measured with the SHARDED `cfg.apply(w)` deleted and the serial one left alone
+-- entry 134's own mutation:
+
+	                                          32 CPUs   taskset -c 0-3
+	TestParallelIngestAppliesRecordLimits
+	  before                                    RED       **GREEN**
+	  after, derived                            RED       GREEN (serial by design)
+	  after, forced to 4                        RED       **RED**
+	    ("stored a 512-byte value; the cap is 16")
+
+`/insert/jsonline` keys on `len(body)`, not on document bytes, so that half of
+the guard was right and the shard count was the whole defect. The test that
+sits directly above it, `TestControlFieldNamesAreNotStorable`, is the same
+claim on a one-line body: the serial path was covered and the parallel one was
+the one that had regressed.
+
+**AND ENTRY 134's OWN "BOTH ROWS ARE RED" HOLDS AT 32 CPUs ONLY.** The same
+run above measured `TestLargeAndSmallIngestAgreeOnSchema`:
+
+	                                     32 CPUs   taskset -c 0-3
+	/the_derived_shard_count               RED       **GREEN**
+	/shards_forced_to_4                    RED       RED
+
+At four cores the derived count is 1 and the derived row runs the serial
+fallback by design, which is what the forced row exists for. Entry 134's
+sentence is true of the 32-core run it was written from and not of a four-core
+CI; the forced row is what carries that gate there.
+
+**THREE OF FOUR PUBLISHED MEASUREMENTS DO NOT REPRODUCE.** Re-measured
+interleaved in one session -- BEFORE is `warnFull()` moved back inside
+`warn()`, `parseTime`'s out-of-range arm back to `fmt.Errorf("%w: %s ns since
+the epoch", ...)` and `tsRangeError` back to a journald-only struct with no
+`unit` field -- as exact `runtime.MemStats` deltas over 200,000 calls, three
+A/B pairs, every figure identical across all three:
+
+	measure                                entry 134     measured
+	per rejected record, 2,000 docs        19.0 -> 16.0  19.012 -> 16.042   OK
+	                                       1,350 -> 1,050  -300.1 B         OK
+	parseTime out of range                 5 -> 3        5 -> 3             OK
+	                                       **281 B** -> 104 B   264.5 -> 104.0
+	WarnAt past the bound                  1 -> 0        1 -> 0             OK
+	                                       **48 B** -> 0 B     144.2 -> 0
+	journald unit field                    **48 -> 56**, "costs 8"   40.0 -> 56.0, costs 16
+
+`281` is not a multiple of 8, and no single-input measurement on this allocator
+can produce it. The `48 B` is a real number attached to the wrong call: it is
+the NO-ARGUMENT shape (`WarnAt(7, "entry carries a timestamp and no storable
+field")`, 48.1 B). The reject path is `res.WarnAt(ordinal, "%v", tsErr)` at
+`internal/ingest/jsonline.go:607`, which boxes an error and calls its `Error()`
+inside `Sprintf`: 144.2 B. The saving disclosed was **a third of the real one**.
+For completeness, all three shapes at 200,000 calls:
+
+	shape                                    before        after
+	WarnAt(7, "%v", tsErr)                 1 / 144.2 B    0 / 0 B
+	WarnAt(7, "filler %d", 12345)          1 /  16.0 B    0 / 0 B
+	WarnAt(7, "entry carries ...")         1 /  48.1 B    0 / 0 B
+
+The journald figure is understated 2x in the other direction. `unit` is a
+string HEADER -- 16 bytes -- and it takes `tsRangeError` from 16 to 32, which
+is size class 16 to size class 32; the value string is a 24-byte class either
+way. On `BenchmarkJournalMicros`'s own out-of-range input, both signs, three
+A/B pairs: 2 allocs / 40.0 B -> 2 / 56.0 B. Sixteen, not eight. The trade is
+still right -- sixteen bytes on the journald reject arm buys parseTime two
+allocations and 160.5 bytes on every out-of-range `_time` a `_bulk` carries --
+but a record that discloses a cost has to state the measured one. The 281/48
+pair also shipped in the comment above
+`TestABoundedWarningCostsNothingToDiscard`; that comment now carries the
+measured table and the three shapes.
+
+**`exactVector` IS THE WRONG FUNCTION, AND THE ANCHORING DIFFERENCE IS
+OBSERVABLE.** Entry 134's last-section bullet says "`StatsQueryRange` and
+`exactVector` both walk `for bs := from; bs < to`". `exactVector`
+(`internal/api/cluster_stats_exact.go`) is the INSTANT handler and has no
+bucket loop: it stamps `instantStamp(to, nowNs)` once. The walk on that side is
+`exactMatrix`'s, further down the same file. The claim holds for
+`query.StatsQueryRange` and `exactMatrix`.
+
+And "a convention difference rather than a lost count" is right about the total
+and silent about the rest. `boundRangeBuckets` leaves an explicit `start`/`end`
+untouched, so nothing re-aligns downstream. Four rows at 00:45, 01:15, 01:45
+and 02:15 on 2026-06-01Z, `start=00:30Z end=02:30Z step=1h`, measured on one
+node:
+
+	surface                                  buckets                     values
+	/select/logsql/hits (alignDown)          00:00Z, 01:00Z, 02:00Z      1, 2, 1
+	/select/logsql/stats_query_range         1780273800, 1780277400      2, 2
+	                                         (00:30Z, 01:30Z)
+
+**Three buckets against two, and the first `/hits` bucket begins thirty minutes
+before the requested `start`.** The totals agree, 4 = 4. Not changed -- both
+anchorings are wire shapes with clients, and Prometheus range queries are
+conventionally anchored on the requested start -- but
+`TestTheTwoRangeSurfacesAnchorBucketsDifferently` pins both, both loops now
+name the other, and docs/compatibility.md says which route a caller is on. The
+gate is RED at both core counts under either anchoring being changed to match
+the other.
+
+**THE "EXACT FIT" WAS A FLOOR.** Entry 134 words the invariant as
+`MaxRejectedAt == esBulkMaxActions == 1<<20`;
+`TestTheAttributionBoundCoversTheActionCap` asserted `MaxRejectedAt <
+esBulkMaxActions`. `ingest.MaxRejectedAt = 1<<24` compiles and was GREEN at 32
+CPUs and under `taskset -c 0-3`. `>=` is the safety-relevant direction, but the
+other one costs memory on a route the action cap does not reach:
+`/insert/journald` bounds its positions by the body limit alone. Measured, a
+67,108,864-byte journald body of 24-byte rejecting entries:
+
+	MaxRejectedAt   entries     recorded    int32      rejectedTruncated
+	1<<20           2,796,202   1,048,576    4.00 MiB  true
+	1<<24           2,796,202   2,796,202   10.67 MiB  false
+
+2.67x the live list. The gate is two-sided now and RED in both directions at
+both core counts (`1<<16` and `1<<24`).
+
+**AN UNKILLED MUTATION IN THE ROUND'S OWN NEW GATE.**
+`warnFull() { return len(r.Warnings) > maxWarnings }` -- off by one, 33
+warnings kept -- compiles and was GREEN at both core counts.
+`TestABoundedWarningCostsNothingToDiscard` fills the list to exactly
+`maxWarnings`, asserts `maxWarnings`, and then makes a warm-up call before
+measuring: under the mutant that warm-up absorbs the 33rd slot and every
+`AllocsPerRun` below then runs against a list the mutant agrees is full. The
+bound is asserted AFTER the warm-up now, which is the only place the extra slot
+is visible; RED at both core counts. The gate also gained the real reject
+shape, `("%v", tsErr)`, which is the one that costs 144.2 B.
+
+**7,277,653 IS THE REAL ROUTE'S FIGURE AND WAS ATTACHED TO A FIXTURE.**
+`internal/api/ingest_partial_test.go` says "Measured with the clamp deleted:
+7,277,653 bytes" on a direct `writeIngestErr` call whose message is
+`"truncated"`. Re-measured with the clamp deleted, that call produces
+**7,277,580**. The 73 bytes are the route's 51-character message
+(`"ingest: envelope error: journal export is truncated"`), its `rejected` of
+1,048,577 against the fixture's 1,048,576, and the `rejectedTruncated` the
+fixture's body does not carry. Both numbers are right; one of them was on the
+wrong line. The two comments that name 7,277,653 for the ROUTE are correct and
+unchanged.
+
+**`hdrAccepted` WAS A CONSTANT WHOSE ONLY USE WAS DEAD CODE.**
+`internal/api/middleware.go` defines it and uses it once, after
+`if spec.format == errJSON { ... return }`; `writeIngestErr`'s only production
+caller passes `ndjsonSpec()`, which is `errJSON`. The header that reaches a
+client was a string literal in `protocols.go`, on the 204 routes
+(`/insert/loki/api/v1/push`, `/insert/syslog`). The two cannot disagree -- they
+are mutually exclusive branches -- but it was one dispatch with two spellings,
+and **no test set, read or asserted `X-Simdlogs-Accepted` at all**: on a 204
+route the headers are the only report a client gets about refused records, and
+nothing measured them. The literal is the constant now, the dead branch carries
+the "Unreachable today" note its two neighbours in that file already had, and
+`TestAReject204ReportsTheCountsInHeaders` asserts accepted, rejected and
+warning on a Loki push with one storable and one out-of-range record.
+
+That gate had to be written twice. Reading the header back through
+`r.Header.Get(hdrAccepted)` left `const hdrAccepted = "X-Simdlogs-Accept"`
+GREEN at both core counts -- the test and the handler moved together and the
+client saw a header it has never heard of. A header name is a compatibility
+surface; the test spells it the way a client does, and the rename is RED at
+both counts now.
+
+**SIX PER-RECORD `fmt.Errorf` SITES ARE UNCONVERTED, NOT THREE.** Entry 134
+names `otelproto.go:182`, `otelproto.go:189` and `time.go:122`. Also there:
+`datadog.go:148` (`"%w: %v ms since the epoch"`, per entry), `time.go:72`
+(`nanosOf`, reached per record through `parseLayout`, so every date-LAYOUT
+spelling of an unstorable instant), and `lokipb.go:171`, which is not
+`fmt.Errorf` at all -- three boxed arguments handed straight to `WarnAt`, per
+record, the exact shape `warnFull` was moved for. "Three" was a count of what
+had been looked at. The full list is on `tsRangeError` now, where the next
+reader of that class will be.
+
+**THE `1<<16` LITERAL PIN, AND WHETHER ITS MESSAGE IS ENOUGH.** It is not, as
+it was written. A raise is already RED twice over below it -- the rendered
+length and `rejectedTruncated` are both asserted on the wire -- so the only
+thing that line can refuse alone is a deliberate TIGHTENING, which is correct
+code; and its message argued only about raising, so a reader who tightened was
+answered about something else. A tightening is still a wire change: at `1<<15`
+a client that receives 65,536 positions today receives 32,768 and a
+`rejectedTruncated` it did not get before. The message says both directions
+now, which is what makes the pin something other than a restatement of the
+constant.
+
+**WHAT THIS ROUND DID NOT FIX.**
+
+- The `_bulk` heap figures entry 134 recorded from the sign-off -- 1,585 MB
+  live and 5,570 MB totalAlloc for one cap-sized `_bulk` -- were re-measured at
+  16K/32K/64K/128K actions: 900 / 989 / 918 / 928 B per action, linear, which
+  extrapolates to about **0.97 GB live and 4.0 GB totalAlloc** at `1<<20`. Same
+  order and sound in direction; the recorded pair is not reproducible as
+  stated. The finding it supports -- `_bulk` is exempt from per-tenant
+  admission on the reasoning that "an ingest request does not hold memory for
+  the length of a scan", which these numbers contradict -- stands either way.
+- The two bucket anchorings are recorded and pinned, not unified. Unifying them
+  is a wire change on one of the two routes and needs its own round.
+- `M12` (`Reject`'s bound `>=` -> `>`) and `M16` (the `abs > MaxInt32` check in
+  `mergeShardResults`) remain unkilled and remain not observable, for the
+  reason entry 134 gives.
+
+## 136. A settings list kept by hand drifted a third time, and a divergence was pinned from Prometheus while the reference sat on disk
+
+Round 21's sign-off returned NOT MERGEABLE with two blockers. The first is the
+same defect class as round 12's and round 20's, on its third setting: a body
+over `MinParallelBytes` lost every embedding, at HTTP 200, on both
+`/insert/jsonline` and `/_bulk`. The second is a gate that pinned simdlogs
+against the reference implementation `internal/bench/victoria-logs` -- which is
+in this repository, executable, and was never run. Both are fixed. Measuring
+the second against the reference found a **second** divergence the sign-off's
+own fixture could not see, on the surface the sign-off said already matched.
+
+### THE SAME OMISSION THREE TIMES IS A DESIGN SIGNAL
+
+`ParallelConfig` carried five of the tenant writer's six settings.
+`internal/api/server.go`'s `parallelCfg()` enumerated them from the SERVER's
+fields, in parallel with `tenant()` twenty lines away enumerating them onto the
+writer, and the two lists drifted:
+
+	round      forgotten       what a body over MinParallelBytes then got
+	--         StreamFields    no _stream column, on large bodies only
+	12         Limits          no field, name or value cap; a forgeable `.error`
+	21         VectorFields    every embedding dropped
+
+`IngestJSONLinesOpts` reads `w.VectorFields()` once per body and its
+`simdjson.Array` arm returns early for a field that is not configured, so the
+array was skipped and the row stored without it. Reproduced on the built
+binary, `-vector-fields=emb:4`, one server, two uploads:
+
+	body         rows      /select/vector k=6
+	105 B        3         all 3 returned, ranked
+	1,052,693 B  27,277    **0 returned**
+
+`{"ingested":27277,"skipped":0}` both times. The rows are text-queryable and
+invisible to the one search they were ingested for, which is what the reject
+arm two hundred lines below in the same file calls worse than a rejection --
+except nothing was rejected and nothing was reported. Not core-count-dependent:
+the SERIAL FALLBACK inside `IngestJSONLinesParallelResult` builds its writer
+through the same `cfg.apply`, so a four-core host loses the vectors too.
+
+**THE LIST IS GONE RATHER THAN LENGTHENED.** `Writer.ShardSettings()` reads the
+settings off the configured tenant writer and `parallelCfg(tn.w)` adds only
+`Shards`. There is no second enumeration to keep in step, because the tenant
+writer IS the specification -- the same writer a body one byte smaller is
+ingested on. `MaxDecompressedBytes` is deliberately not in `ParallelConfig` and
+says so: it is read only in `lokipb.go`, before any shard writer exists, and
+the Loki protobuf route has no sharded branch.
+
+`TestShardSettingsRoundTripEveryField` walks `ParallelConfig` by REFLECTION
+rather than naming fields, in two halves: every field except `Shards` must come
+back non-zero from `ShardSettings` on a fully configured writer, and the
+config `apply`d onto a fresh writer must read back `DeepEqual`. A field added
+to the struct and forgotten in either half fails, and a field added and not
+configured on the test's source writer fails too -- which is the point: the
+author of a new setting is made to say what a non-default value of it looks
+like, which the two-list version never asked anyone.
+
+`TestALargeBodyKeepsItsEmbeddings` is the end-to-end half, at a forced shard
+count and at the derived one, printing which branch each row is on rather than
+describing it.
+
+	                                            32 CPUs        taskset -c 0-3
+	TestALargeBodyKeepsItsEmbeddings
+	  /shards_forced_to_4                     RED (0 of 6)     RED (0 of 6)
+	  /the_derived_shard_count                RED (0 of 6)     RED (0 of 6)
+	TestShardSettingsRoundTripEveryField
+	  apply drops SetVectorFields               RED              RED
+	  ShardSettings drops VectorFields          RED              RED
+
+The derived row is RED at four cores as well, where it takes the serial
+fallback -- entry 135's "GREEN by design at four cores" holds for the SHARD
+merge and not for a setting the fallback also fails to apply.
+
+`docs/lld/ingest.md` said the settings were "`Compact` and `StreamFields`". It
+never caught up with `Limits` either. It lists all five now and names the
+gate.
+
+### THE REFERENCE WAS ON DISK AND THE GATE ARGUED FROM PROMETHEUS
+
+Entry 135 pinned `/select/logsql/hits` (three buckets) against
+`stats_query_range` (two) as "a convention difference", reasoning that
+"Prometheus range queries are conventionally anchored on the requested start".
+`internal/bench/victoria-logs` is 23 MB of executable answer in this
+repository. Run, with six rows at 00:15, 00:45, 01:15, 01:45, 02:15 and 02:45
+on 2026-06-01Z -- two of them deliberately outside the requested window --
+against both binaries on one machine:
+
+	window                    surface              VictoriaLogs         simdlogs, before
+	start=00:30Z step=1h      hits                 00:00,01:00,02:00    same labels
+	                                               = 2,2,2 total 6      = 1,2,1 total 4
+	start=00:30Z step=1h      stats_query_range    00:00,01:00,02:00    00:30,01:30
+	                                               = 2,2,2              = 2,2
+	start=00:10Z step=1h      stats_query_range    00:00,01:00,02:00    00:10,01:10,02:10
+	start=00:10Z step=30m     stats_query_range    00:00,00:30,01:00,   00:10,00:40,01:10,
+	                                               01:30,02:00           01:40,02:10
+
+**TWO FAULTS, NOT ONE.** The anchoring is the one the sign-off found. The
+second is that VictoriaLogs gives every bucket its whole `[k*step,(k+1)*step)`
+on BOTH surfaces, and simdlogs clamped the first and last to `[start,end)`.
+That one is on `/hits` as well -- the surface the sign-off said "already
+matches it" -- and neither the entry-135 fixture nor the sign-off's own could
+see it, because both used four rows all inside the requested window. The
+proposed mutation ("floor, with the query window clamped to `from`") produces
+VictoriaLogs' answer on those fixtures and not on this one: with a row at
+00:15 the clamped first bucket counts 1 where the reference counts 2.
+
+The end is unclamped too, measured by adding a row at 02:45 and asking for
+`start=00:30Z end=02:10Z step=1h`: the reference's 02:00 bucket counts both
+02:15 and 02:45, thirty-five minutes past the requested end. And the widening
+is confined to the range surfaces -- `/select/logsql/query` over the same
+window answers four rows on both engines.
+
+Both surfaces floor and both take whole buckets now, on the node
+(`query.StatsQueryRange`, `query.Hits` via the new `query.BucketSpan`) and on
+the router (`exactMatrix`, whose row FETCH is widened with the walk, or the
+cluster would answer a smaller number than the same rows on one machine).
+`ResolvedWindow` on the router moved to the fetched span, because the identity
+that lets it be hoisted -- bucket n's resolve equals the range's resolve
+intersected with the bucket -- needs every bucket to lie inside the window it
+was resolved over, and the edge buckets no longer do.
+
+Re-measured after the change, all eight comparisons in the table above are
+**byte-identical to VictoriaLogs**.
+
+`TestTheTwoRangeSurfacesAnchorBucketsDifferently` is replaced by
+`TestTheTwoRangeSurfacesAgreeOnBuckets` -- the same fixture plus the two rows
+outside the window, asserting the reference's values, the agreement between the
+surfaces as one statement, and that the point query is NOT widened. The router
+half is `TestTheRouterAndNodeAgreeOnRangeBuckets`, on `avg()` because `count()`
+merges from per-shard outputs and never reaches `exactMatrix`.
+
+	mutation                                          32 CPUs   taskset -c 0-3
+	StatsQueryRange `for bs := lo` -> `for bs := from`   RED         RED
+	StatsQueryRange bucket clamped back to `to`         RED         RED
+	Hits scan not widened (`Histogram(s, q, step)`)     RED         RED
+	exactMatrix `for bs := sf` -> `for bs := from`      RED         RED
+	exactMatrix fetch `(from, to)` not `(sf, st)`       RED         RED
+
+### THE DIFFERENTIAL EXISTED AND DID NOT COVER THE RANGE SURFACES
+
+Which is why the binary was never asked. `TestLogsQLCompat` runs 40 queries
+against `/select/logsql/query` and none against `hits` or
+`stats_query_range`. `TestRangeSurfaceCompat` (`SIMDLOGS_COMPAT=1`) is those
+two surfaces, with and without a group-by, over three windows: **12/12
+byte-identical** after normalising series ORDER, which is the one thing the two
+engines legitimately disagree on (VictoriaLogs emits label-sorted, simdlogs
+first-seen) and the only thing normalised away.
+
+Two of the three windows are deliberately UNALIGNED. The third is a control
+that is identical under either convention and stays green when the other two
+go red -- an aligned window cannot see the anchoring at all, which is how the
+divergence would have survived a differential that covered the route.
+
+	mutation                                          32 CPUs   taskset -c 0-3
+	StatsQueryRange un-floored, vs the differential   RED 8/12    RED 8/12
+	Hits scan not widened, vs the differential        RED 8/12    RED 8/12
+
+Both reddened the two unaligned windows and left the control alone, which is
+what the control is for.
+
+### THE FOURTH COPY OF THE WRONG `48 B`, ON THE FUNCTION THE ROUND MOVED
+
+`warnFull`'s own doc comment said "boxed its arguments" and then "1 alloc,
+48 B, ~42 ns each" two sentences later. 48.1 B is the shape that boxes
+NOTHING. It now carries the three measured shapes rather than one number, and
+names the two arms that actually reach it -- `("%v", tsErr)` and
+`("%v", vecErr)`, 144.2 B.
+
+### "THE FULL LIST" WAS NOT FULL, AND THE CLASS WAS WRONG
+
+`tsRangeError`'s list named six per-record sites "that still build a formatted
+string on the reject arm", by LINE NUMBER, and both cited lines had drifted 21
+lines -- the exact length of the list that named them -- so `time.go:72`
+pointed at a sentence and `time.go:122` at a closing brace.
+
+Measured with `testing.AllocsPerRun` over 200,000 calls past the bound rather
+than reasoned about:
+
+	discarded call shape                                   allocs
+	WarnAt("%v", err) / ("%s", err) / no arguments          0.000
+	WarnAt("%v: %d s + %d ns", err, int64, int64)           0.000
+	Warn("%q: %d bytes ...", string, int)                   0.000
+	fmt.Errorf on a reject arm                              2.000
+
+So `warnFull` covers EVERYTHING handed to `WarnAt` -- the variadic slice and
+the int-to-any boxing both stay on the caller's stack when the call returns
+early -- and covers NOTHING built before `WarnAt` is reached. `lokipb.go:171`
+was listed as a member and is not one: it costs zero. The members are the
+`fmt.Errorf` sites, five functions, named as functions:
+
+	nanosOf, floatNanos (time.go), ddTime (datadog.go),
+	IngestOTLPLogsProto (otelproto.go, twice),
+	IngestJSONLinesOpts (jsonline.go, the vector arm)
+
+**AND THE LAST IS ON THE `_bulk` PATH**, which the list explicitly denied of
+every member ("None is on the `_bulk` path, which is why none was converted").
+That was the whole exemption, and it did not hold. Converted to
+`vecShapeError`, the same deferred-message shape as `tsRangeError`.
+Interleaved A/B in one session, three rounds each, every figure identical:
+
+	                                   fmt.Errorf   deferred
+	construction alone                   2.000        1.000
+	real path, per rejected record      20.0265      18.0425
+
+The real-path delta is 1.984 rather than 1.000 because `key` there is a dynamic
+string and boxing it into the variadic allocates as well; the constant in the
+isolated probe does not.
+
+	mutation                                     32 CPUs   taskset -c 0-3
+	the call site back to fmt.Errorf               RED         RED
+	the message wording changed                    RED         RED
+	Unwrap removed                                 RED         RED
+
+### A 204's ONLY DIAGNOSTIC WAS ASSERTED BY PRESENCE
+
+`TestAReject204ReportsTheCountsInHeaders` asserted `X-Simdlogs-Accepted` and
+`X-Simdlogs-Rejected` by value and `X-Simdlogs-Warning` by `got == ""`.
+`protocols.go`'s `ws[0]` replaced by the literal `"x"` was GREEN at both core
+counts: a Loki-push or syslog client -- whose 204 forbids a body, so the header
+is the entire diagnostic -- received `X-Simdlogs-Warning: x` and the gate
+written for those headers said nothing. Asserted as the whole string now.
+
+	mutation                                     32 CPUs   taskset -c 0-3
+	ws[0] -> "x"                                   RED         RED
+	the header reports a different warning         RED         RED
+
+### THE INGEST MEMORY CEILING, PRICED A THIRD TIME AND STILL NOT ACTED ON
+
+Recorded in entry 134 from the sign-off, re-priced in entry 135, flagged again
+as "the largest open item". Priced here from the peak rather than from a
+per-action extrapolation: `HeapInuse` sampled every 2 ms across one `/_bulk`
+of `index` actions with a four-field document, and `TotalAlloc` across the
+request.
+
+	body      actions    peak heap-in-use    totalAlloc     per action
+	  8 MiB    77,060      89.5 MiB (11.2x)    205.1 MiB     2,791 B
+	 16 MiB   153,529     149.2 MiB ( 9.3x)    407.5 MiB     2,783 B
+	 32 MiB   306,049     292.1 MiB ( 9.1x)    826.3 MiB     2,831 B
+	 60 MiB   572,959     572.5 MiB ( 9.5x)  1,565.1 MiB     2,864 B
+
+Linear at ~9.3x the body live and ~26x churned. One request at `MaxBodyBytes`
+is ~600 MiB live; a GZIPPED one is bounded by `MaxDecompressed` instead --
+512 MiB, eight times the wire limit -- and is ~4.8 GiB. `writeSem` counts
+requests, not bytes, and admits `MaxConcurrentWrite` = 32. At 9x, rounded
+down: **18 GiB uncompressed and 144 GiB gzipped**, on one ingest surface, at
+the shipped defaults.
+
+**NOT ACTED ON, AND THE REASON.** Every lever is a change somebody notices.
+Lowering `MaxConcurrentWrite`, or admitting writes per tenant at
+`MaxQueriesPerTenant` = 16, both halve ingest concurrency for the
+single-tenant deployments that are the majority. A byte budget across
+in-flight ingests -- the lever that actually bounds the product -- is a new
+limit, a new metric and a rewrite of the admission block, and needs its own
+round with its own gates and its own line in docs/. Per-tenant admission is
+NOT that lever: it bounds one tenant's share and leaves the process-wide
+product alone.
+
+What did change is that the ceiling can no longer be raised silently.
+`TestTheIngestMemoryCeilingIsPriced` pins the three defaults together with the
+measured amplification and prints the product; raising `MaxConcurrentWrite` to
+64 or `MaxDecompressed` to 1 GiB is RED at both core counts. And the sentence
+that justified the exemption -- "an ingest request does not hold memory for
+the length of a scan" -- is gone from `middleware.go`, replaced by the table.
+It had already justified exempting live TAILS, where it is the opposite of
+true and had to be undone; leaving it standing is how a third exemption
+happens.
+
+### TWO SMALLER CORRECTIONS
+
+`ingest_partial_test.go`'s decomposition of the 73 bytes between the route's
+7,277,653 and the fixture's 7,277,580 accounted for 67. The missing 6 is that
+**the route's positions are 1-based** -- entry 0 is the stored record -- so it
+renders 1..1,048,576 where the fixture renders 0..1,048,575: the two sets
+differ by dropping `"0"` and adding `"1048576"`, one digit for seven. Checked
+by summing the digit lengths of both ranges: 6,228,928 against 6,228,922.
+42 + 25 + 6 = 73, and the `rejected` term that was listed contributes 0 --
+1,048,577 and 1,048,576 have the same digit count.
+
+`TestTheAttributionBoundCoversTheActionCap`'s `>` arm advised "Raise the
+action cap first, or price this against MaxBodyBytes". The arm fires on two
+different edits: `MaxRejectedAt` raised, and `esBulkMaxActions` LOWERED. A
+reader who had just lowered the action cap was answered with an argument about
+raising it. Both directions now, and the lowered direction is RED at both core
+counts.
+
+### WHAT THIS ROUND DID NOT FIX
+
+- The ingest byte budget, above, with the reason.
+- `stats_query_range` omits a bucket in which a series has no rows and `/hits`
+  reports `0` there. That is the one remaining shape difference between the two
+  surfaces, it is the Prometheus matrix convention, and the reference does the
+  same thing -- so it is documented in docs/compatibility.md rather than
+  unified.
+
+## 137. An eight-byte local was one heap object per protobuf varint
+
+2026-08-27, during the pre-publication review. `eachField` decoded every
+wire-type-0 protobuf value, re-encoded it into a local `[8]byte`, and passed a
+slice of that local through the callback. The callback itself did not escape;
+the payload did. Escape analysis reported `moved to heap: buf`, and the
+disassembly put `runtime.newobject` in the varint arm.
+
+The isolated walk over 64 varint fields measured the cost directly:
+
+```
+shape                         ns/op    B/op    allocs/op
+8-byte callback image         579.1     512       64
+raw encoded varint bytes      145.7       0        0
+```
+
+Passing the bytes already present in the message removes both the re-encode and
+the escaping object. The seven consumers decode those validated bytes with an
+inline `uvarint` loop. `TestEachFieldVarintZeroAlloc` gates the allocation
+count; `TestEachFieldHandsRawVarintBytes` gates the callback contract; the
+OTLP/Loki conformance tests gate the signed casts.
+
+Reviewing those casts found a separate schema error beside the allocation:
+`Resource.dropped_attributes_count` is `uint32`, but the hand-written decoder
+kept an arbitrary wire varint as `uint64`. A value of `2^32+7` was stored as
+`4294967303`; a generated protobuf decoder retains the low 32 bits and returns
+`7`. The field now has the schema's type, with an overflow regression test.
+- `M12` (`Reject`'s bound `>=` -> `>`) and `M16` remain unkilled and remain not
+  observable, for the reason entry 134 gives.

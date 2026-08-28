@@ -15,8 +15,16 @@ jobs:
   test:
     name: linux/amd64
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, so TestTheChangelogCommitCountsAreReal can resolve
+          # the sha CHANGELOG.md pins. Its skip branch exists for a source
+          # tarball, and a depth-1 checkout took it in EVERY CI run -- the gate
+          # written to stop those counts going stale ran nowhere but a
+          # developer's own clone. Proved with `git clone --depth 1`.
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.5'
@@ -30,25 +38,53 @@ jobs:
       - name: vet
         run: go vet ./...
       - name: test
-        run: go test ./...
+        # -timeout, always. go test defaults to 600s, which at the rate a
+        # runaway loop launches binaries is far too loose to bound anything;
+        # five minutes leaves headroom above the ~90s API package while the
+        # job ceiling bounds the suite as a whole.
+        run: go test -timeout 300s ./...
       - name: race
-        run: go test -race ./...
+        run: go test -race -timeout 600s ./...
       - name: purego
-        run: go test -tags purego ./...
-      - name: whitespace
-        run: git diff --check
+        run: go test -tags purego -timeout 300s ./...
+      - name: committed whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          zero=0000000000000000000000000000000000000000
+          if [ -z "${BASE_SHA}" ] || [ "${BASE_SHA}" = "$zero" ] ||
+             ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            empty=$(git hash-object -t tree /dev/null)
+            git diff --check "$empty" "$GITHUB_SHA"
+          else
+            git diff --check "${BASE_SHA}..${GITHUB_SHA}"
+          fi
 
   # Compile-only for the targets the kernels claim to support. These do not
   # run: no hardware, and a build that passes is the claim being made.
   cross:
     name: build ${{ matrix.goarch }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        goarch: [arm64, ppc64le, s390x, riscv64, 386]
+        # 386 is absent, and its absence is the accurate claim: this module
+        # depends on github.com/sebishogun/simdjson, whose marshal.go writes
+        # `math.MaxUint32` as an untyped constant, which overflows a 32-bit
+        # int. `GOARCH=386 go build ./...` has never been able to succeed here.
+        # It was listed anyway, so the matrix asserted a platform that could
+        # not compile.
+        goarch: [arm64, ppc64le, s390x, riscv64]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, so TestTheChangelogCommitCountsAreReal can resolve
+          # the sha CHANGELOG.md pins. Its skip branch exists for a source
+          # tarball, and a depth-1 checkout took it in EVERY CI run -- the gate
+          # written to stop those counts going stale ran nowhere but a
+          # developer's own clone. Proved with `git clone --depth 1`.
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.5'

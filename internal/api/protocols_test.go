@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/sebishogun/simdlogs/internal/config"
 	"io"
 	"net"
 	"net/http"
@@ -86,11 +87,22 @@ func TestAlerting(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-	postBody(t, ts, `{"_time":1,"level":"error"}`+"\n"+`{"_time":2,"level":"error"}`+"\n")
-	if err := srv.AddAlertRule("many_errors", "level:=error", ">", 1, 0); err != nil { // 2 > 1 -> firing
+	// Timestamps INSIDE the rule's window. They used to be nanoseconds 1 and
+	// 2 -- 1970 -- which every rule saw because every rule evaluated over all
+	// history. A windowed rule correctly ignores them, which is the whole
+	// point: an alert on "errors in the last hour" must not be satisfied by
+	// errors from 1970, and with the old window it could never fall back below
+	// its threshold either.
+	now := time.Now().UnixNano()
+	postBody(t, ts, recentAt(now-int64(time.Minute), "error")+recentAt(now-int64(time.Second), "error"))
+	if err := srv.AddAlertRule(config.AlertRule{Name: "many_errors", Query: "level:=error",
+		Op: ">", Threshold: 1, Window: config.Duration(time.Hour),
+		Interval: config.Duration(time.Hour)}); err != nil { // 2 > 1 -> firing
 		t.Fatal(err)
 	}
-	if err := srv.AddAlertRule("too_many_errors", "level:=error", ">", 5, 0); err != nil { // 2 > 5 -> not
+	if err := srv.AddAlertRule(config.AlertRule{Name: "too_many_errors", Query: "level:=error",
+		Op: ">", Threshold: 5, Window: config.Duration(time.Hour),
+		Interval: config.Duration(time.Hour)}); err != nil { // 2 > 5 -> not
 		t.Fatal(err)
 	}
 	var resp struct {
@@ -117,11 +129,16 @@ func TestMetricsFromLogs(t *testing.T) {
 	srv, _ := NewServer(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-	postBody(t, ts, `{"_time":1,"level":"error"}`+"\n"+`{"_time":2,"level":"error"}`+"\n"+`{"_time":3,"level":"info"}`+"\n")
-	if err := srv.AddMetricRule("by_level", "*", "level", 0); err != nil {
+	now := time.Now().UnixNano()
+	postBody(t, ts, recentAt(now-int64(3*time.Minute), "error")+
+		recentAt(now-int64(2*time.Minute), "error")+
+		recentAt(now-int64(time.Minute), "info"))
+	if err := srv.AddMetricRule(config.MetricRule{Name: "by_level", Query: "*", By: "level",
+		Window: config.Duration(time.Hour), Interval: config.Duration(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.AddMetricRule("errors", "level:=error", "", 0); err != nil {
+	if err := srv.AddMetricRule(config.MetricRule{Name: "errors", Query: "level:=error",
+		Window: config.Duration(time.Hour), Interval: config.Duration(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 	r, err := http.Get(ts.URL + "/metrics")
@@ -243,7 +260,8 @@ func TestBackupRestore(t *testing.T) {
 	// A per-tenant backup restores into that tenant's store dir; the default
 	// tenant lives under tenant-0-0.
 	dir := t.TempDir()
-	if err := storage.RestoreTar(&buf, filepath.Join(dir, "tenant-0-0")); err != nil {
+	if _, err := storage.Restore(&buf, filepath.Join(dir, "tenant-0-0"),
+		storage.RestoreOptions{}); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	srv2, err := NewServer(dir)
@@ -585,61 +603,206 @@ func TestOTLPLogsIngest(t *testing.T) {
 	}
 }
 
-// TestStripBulkActions guards the in-place compaction: it aliases the caller's
-// buffer, so an off-by-one writes a document over one not yet read.
-func TestStripBulkActions(t *testing.T) {
+// TestBulkDocsCompaction guards the in-place compaction: it aliases the
+// caller's buffer, so an off-by-one writes a document over one not yet read.
+//
+// Replaces TestStripBulkActions. The old function detected a delete with
+// bytes.Contains(line, `"delete"`), so indexing into an index NAMED delete was
+// read as a delete action and the whole rest of the body desynchronized; its
+// third case below pins that the parser now reads the action's KEY.
+func TestBulkDocsCompaction(t *testing.T) {
 	cases := []struct{ name, in, want string }{
 		{"pairs", "{\"create\":{}}\n{\"a\":1}\n{\"index\":{}}\n{\"b\":2}\n", "{\"a\":1}\n{\"b\":2}\n"},
 		{"delete carries no doc", "{\"delete\":{\"_id\":\"1\"}}\n{\"create\":{}}\n{\"a\":1}\n", "{\"a\":1}\n"},
+		// An index NAMED delete is an index action, not a delete: the value
+		// contains the word, the KEY does not.
+		{"index named delete", "{\"index\":{\"_index\":\"delete\"}}\n{\"a\":1}\n{\"index\":{}}\n{\"b\":2}\n",
+			"{\"a\":1}\n{\"b\":2}\n"},
 		{"no trailing newline", "{\"create\":{}}\n{\"a\":1}", "{\"a\":1}\n"},
 		{"blank lines", "{\"create\":{}}\n\n{\"a\":1}\n\n", "{\"a\":1}\n"},
 		{"action with no doc", "{\"create\":{}}\n", ""},
+		// update's source is a wrapper, not a document: it must not be stored.
+		{"update is not a document", "{\"update\":{\"_id\":\"1\"}}\n{\"doc\":{\"a\":1}}\n{\"create\":{}}\n{\"b\":2}\n",
+			"{\"b\":2}\n"},
 		{"empty", "", ""},
 	}
 	for _, c := range cases {
-		got := string(stripBulkActions([]byte(c.in)))
+		body := []byte(c.in)
+		ops, perr := parseBulk(body)
+		if perr != "" {
+			t.Errorf("%s: parse failed: %s", c.name, perr)
+			continue
+		}
+		got := string(bulkDocs(ops, body))
 		if got != c.want {
 			t.Errorf("%s: got %q want %q", c.name, got, c.want)
 		}
 	}
 }
 
-// TestESBulkParallelPath drives a body over MinParallelBytes so the sharded
-// ingest branch is covered, not just the small-body writer.
+// TestESBulkParallelPath drives a body whose DOCUMENT bytes are over
+// MinParallelBytes so the sharded ingest branch is covered, not just the
+// small-body writer, and runs both the derived shard count and a forced one.
+//
+// THE GUARD ASKED HALF THE CONDITION AND ITS MESSAGE ASSERTED THE WHOLE, and
+// the name of the test is the claim. It read `sb.Len() < MinParallelBytes` and
+// said "test would not cover the parallel path", which is a negative signal
+// read as positive: the condition it tested cannot fail on this body, so the
+// sentence it would have printed was never measured. Three things were wrong
+// underneath it -- the same three entry 134 found one file over:
+//
+//   - `ParallelConfig.ShardsFor` needs `Shards >= 2` as well, derived as
+//     runtime.NumCPU()/3: 1 on a four-core host, and below 2 shards the
+//     SERIAL fallback runs. `NewServer` takes the derived value.
+//   - The bulk parallel branch is keyed on len(DOCS) (es.go), not len(body):
+//     the 20,000 action lines are 580,000 of these 1,928,890 bytes and never
+//     reach the ingester. The number the guard read was the wrong number.
+//   - No shard override, in a package that has `setIngestShardsForTest` for
+//     exactly this.
+//
+// Measured with the last shard's chunk dropped in
+// IngestJSONLinesParallelResult (`internal/ingest/jsonline.go`):
+//
+//	                        32 CPUs                        taskset -c 0-3
+//	before this fix         RED "bulk _count = 18021 ..."  GREEN
+//	after, both rows        RED                            RED
 func TestESBulkParallelPath(t *testing.T) {
-	srv, _ := NewServer(t.TempDir())
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
+	t.Parallel()
 	var sb strings.Builder
 	const n = 20000
+	docBytes := 0
 	for i := 0; i < n; i++ {
 		sb.WriteString("{\"create\":{\"_index\":\"logs\"}}\n")
+		before := sb.Len()
 		fmt.Fprintf(&sb, "{\"@timestamp\":\"2023-11-14T22:13:20Z\",\"level\":\"error\",\"seq\":\"%d\"}\n", i)
+		docBytes += sb.Len() - before
 	}
-	if sb.Len() < ingest.MinParallelBytes {
-		t.Fatalf("body %d bytes is under MinParallelBytes %d -- test would not cover the parallel path",
-			sb.Len(), ingest.MinParallelBytes)
+	// The fixture counted where it can be counted, not in prose: 20,000 action
+	// lines of 29 bytes, 20,000 documents of 63 bytes plus the digits of seq
+	// (88,890 across 0..19,999). docBytes is what es.go compares against
+	// MinParallelBytes; sb.Len() is what the old guard compared.
+	const wantDocBytes = 20000*63 + 88890 // 1,348,890
+	const wantBody = 20000*29 + wantDocBytes
+	if docBytes != wantDocBytes || sb.Len() != wantBody {
+		t.Fatalf("the fixture is %d document bytes in a %d-byte body; this file says "+
+			"%d and %d. Fix the numbers in this comment or fix the fixture.",
+			docBytes, sb.Len(), wantDocBytes, wantBody)
 	}
-	r, err := http.Post(ts.URL+"/insert/elasticsearch/_bulk", "application/x-ndjson", strings.NewReader(sb.String()))
+	body := sb.String()
+	for _, tc := range []struct {
+		name   string
+		shards int
+	}{
+		{"the derived shard count", 0},
+		{"shards forced to 4", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := ingest.ParallelConfig{Shards: tc.shards}
+			if tc.shards != 0 && cfg.ShardsFor(docBytes) < 2 {
+				t.Fatalf("shards forced to %d resolves to %d over %d document bytes: "+
+					"this row runs the serial fallback and covers nothing this test is named for",
+					tc.shards, cfg.ShardsFor(docBytes), docBytes)
+			}
+			srv, err := NewServer(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer srv.Close()
+			srv.setIngestShardsForTest(tc.shards)
+			ts := httptest.NewServer(srv.Handler())
+			defer ts.Close()
+			r, err := http.Post(ts.URL+"/insert/elasticsearch/_bulk", "application/x-ndjson", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var resp struct {
+				Items  []any `json:"items"`
+				Errors bool  `json:"errors"`
+			}
+			json.NewDecoder(r.Body).Decode(&resp)
+			r.Body.Close()
+			if len(resp.Items) != n || resp.Errors {
+				t.Fatalf("bulk items = %d errors = %v, want %d false", len(resp.Items), resp.Errors, n)
+			}
+			cbody := `{"query":{"bool":{"filter":[{"term":{"level":"error"}}]}}}`
+			r, _ = http.Post(ts.URL+"/_count", "application/json", strings.NewReader(cbody))
+			var cnt struct{ Count int }
+			json.NewDecoder(r.Body).Decode(&cnt)
+			r.Body.Close()
+			if cnt.Count != n {
+				t.Fatalf("bulk _count = %d want %d", cnt.Count, n)
+			}
+		})
+	}
+}
+
+// A 204 CARRIES NO BODY, SO THE COUNTS GO IN HEADERS -- AND NOTHING READ THEM.
+//
+// `X-Simdlogs-Accepted` was spelled twice: a constant in middleware.go whose
+// only use sits after `if spec.format == errJSON { ... return }` in
+// writeIngestErr -- unreachable, because that function's one production caller
+// passes ndjsonSpec() -- and a string literal in protocols.go, which is the
+// one that reaches the wire. No test set, read or asserted either. So the
+// constant could be renamed to anything at all and nothing moved, and the
+// literal could be misspelled and nothing moved either: the only report a
+// client of a 204 route gets about refused records was untested on both
+// spellings at once.
+//
+// The Loki push route answers 204 on success. One storable record beside one
+// whose nanosecond timestamp is out of range is the smallest input that makes
+// both counts non-trivial.
+func TestAReject204ReportsTheCountsInHeaders(t *testing.T) {
+	t.Parallel()
+	srv, err := NewServer(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	var resp struct {
-		Items  []any `json:"items"`
-		Errors bool  `json:"errors"`
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	const ns9999 = "253402300800000000000" // year 9999 in nanoseconds
+	body := `{"streams":[{"stream":{"app":"a"},"values":[` +
+		`["1780315200000000000","normal"],["` + ns9999 + `","unstorable"]]}]}`
+	r, err := http.Post(ts.URL+"/insert/loki/api/v1/push", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
 	}
-	json.NewDecoder(r.Body).Decode(&resp)
 	r.Body.Close()
-	if len(resp.Items) != n || resp.Errors {
-		t.Fatalf("bulk items = %d errors = %v, want %d false", len(resp.Items), resp.Errors, n)
+	if r.StatusCode != http.StatusNoContent {
+		t.Fatalf("status %d, want 204: this route reports in headers only because "+
+			"its success code forbids a body", r.StatusCode)
 	}
-	cbody := `{"query":{"bool":{"filter":[{"term":{"level":"error"}}]}}}`
-	r, _ = http.Post(ts.URL+"/_count", "application/json", strings.NewReader(cbody))
-	var cnt struct{ Count int }
-	json.NewDecoder(r.Body).Decode(&cnt)
-	r.Body.Close()
-	if cnt.Count != n {
-		t.Fatalf("bulk _count = %d want %d", cnt.Count, n)
+	// READ BY ITS LITERAL WIRE NAME, not through hdrAccepted. Written the
+	// other way this line passed with the constant renamed to
+	// "X-Simdlogs-Accept" at 32 CPUs and under `taskset -c 0-3` -- the test
+	// and the handler moved together and the client saw a header it has never
+	// heard of. A header name is a compatibility surface: the test has to
+	// spell it the way a client does.
+	if got := r.Header.Get("X-Simdlogs-Accepted"); got != "1" {
+		t.Errorf("X-Simdlogs-Accepted = %q, want \"1\" (hdrAccepted is %q). A client "+
+			"of a 204 route has nowhere else to read how much landed, and re-sending "+
+			"the whole push duplicates the record that did.", got, hdrAccepted)
+	}
+	if got := r.Header.Get("X-Simdlogs-Rejected"); got != "1" {
+		t.Errorf("X-Simdlogs-Rejected = %q, want \"1\": one record was refused and "+
+			"the 204 says nothing about it", got)
+	}
+	// BY VALUE, like the two above it. Asserted as `got == ""` this line was
+	// GREEN with `ws[0]` in protocols.go replaced by the literal "x", at 32
+	// CPUs and under `taskset -c 0-3`: a Loki-push or syslog client -- whose
+	// 204 forbids a body, so this header is the entire diagnostic -- received
+	// `X-Simdlogs-Warning: x` and the gate that exists for those headers said
+	// nothing. Presence is not a report.
+	//
+	// The whole string, not a substring: the value is what an operator reads
+	// to find out WHICH record was refused and why, so the refused timestamp
+	// and the storable range both have to survive the trip.
+	wantWarn := ingest.ErrTimeOutOfRange.Error() + ": " + ns9999 + " ns since the epoch"
+	if got := r.Header.Get("X-Simdlogs-Warning"); got != wantWarn {
+		t.Errorf("X-Simdlogs-Warning = %q, want %q. It is the whole diagnostic a "+
+			"client of a 204 route gets: the record it names is the one to fix.",
+			got, wantWarn)
 	}
 }
 
@@ -661,12 +824,49 @@ func TestESBulkIngest(t *testing.T) {
 		t.Fatal(err)
 	}
 	var resp struct {
-		Items []any `json:"items"`
+		Errors bool `json:"errors"`
+		Items  []struct {
+			Index *struct {
+				Status int `json:"status"`
+			} `json:"index"`
+			Create *struct {
+				Status int `json:"status"`
+			} `json:"create"`
+			Delete *struct {
+				Status int                    `json:"status"`
+				Error  *struct{ Type string } `json:"error"`
+			} `json:"delete"`
+		} `json:"items"`
 	}
 	json.NewDecoder(r.Body).Decode(&resp)
 	r.Body.Close()
-	if len(resp.Items) != 3 {
-		t.Fatalf("bulk items = %d want 3 (delete has no doc)", len(resp.Items))
+	// ONE ITEM PER ACTION, including the delete. This used to be one item per
+	// INGESTED DOCUMENT -- three for four actions -- and Elasticsearch clients
+	// match items to their requests BY POSITION, so the delete's absence shifted
+	// the third action's status onto the fourth action's document.
+	if len(resp.Items) != 4 {
+		t.Fatalf("bulk items = %d want 4, one per action", len(resp.Items))
+	}
+	if resp.Items[0].Index == nil || resp.Items[0].Index.Status != 201 {
+		t.Errorf("item 0 (index) = %+v, want status 201", resp.Items[0])
+	}
+	if resp.Items[1].Create == nil || resp.Items[1].Create.Status != 201 {
+		t.Errorf("item 1 (create) = %+v, want status 201", resp.Items[1])
+	}
+	// delete is REJECTED explicitly rather than swallowed: this store is
+	// append-only, and a client asking for a deletion that silently did not
+	// happen has been told the wrong thing.
+	if resp.Items[2].Delete == nil || resp.Items[2].Delete.Status != 400 {
+		t.Errorf("item 2 (delete) = %+v, want status 400", resp.Items[2])
+	}
+	if resp.Items[2].Delete != nil && resp.Items[2].Delete.Error == nil {
+		t.Error("the rejected delete carries no error object")
+	}
+	if resp.Items[3].Index == nil || resp.Items[3].Index.Status != 201 {
+		t.Errorf("item 3 (index) = %+v, want status 201", resp.Items[3])
+	}
+	if !resp.Errors {
+		t.Error("errors = false though the delete was rejected")
 	}
 	// The two error docs are found via the ES _count DSL (@timestamp mapped).
 	cbody := `{"query":{"bool":{"filter":[{"term":{"level":"error"}}]}}}`
@@ -677,4 +877,14 @@ func TestESBulkIngest(t *testing.T) {
 	if cnt.Count != 2 {
 		t.Fatalf("bulk _count level=error = %d want 2", cnt.Count)
 	}
+}
+
+// recentAt is one NDJSON record at an explicit nanosecond timestamp.
+//
+// Rule fixtures need timestamps inside the rule's window: a rule evaluates
+// over the last `window` and a record stamped in 1970 is outside every window
+// a rule may configure. Before rules had windows, every fixture timestamp
+// worked because every rule read all of history.
+func recentAt(ts int64, level string) string {
+	return fmt.Sprintf(`{"_time":%d,"level":%q}`, ts, level) + "\n"
 }

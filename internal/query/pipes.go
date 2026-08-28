@@ -59,6 +59,11 @@ type StatsPipe struct {
 	By       []string
 	Aggs     []Agg
 	rangeSec float64 // query-window seconds, stamped at run for rate()/rate_sum()
+	// q is the running query, stamped at run so the aggregate can refuse a key
+	// space bigger than its ceiling. Not a plain int: the refusal has to be
+	// RECORDED, and a pipe that returned a truncated map would be the silent
+	// answer-change this exists to stop.
+	q *Query
 }
 
 // apply aggregates a materialized row stream -- stats used mid-pipe (e.g. after
@@ -83,6 +88,9 @@ func (p *StatsPipe) apply(rows []Row) []Row {
 			e = newStatEntry(by, p.Aggs)
 			acc[string(key)] = e
 			order = append(order, string(key))
+			if tooManyKeys(p.q, len(order), "stats by") {
+				return nil
+			}
 		}
 		accSample(e, p.Aggs,
 			func(j int) string { return rowField(r, p.Aggs[j].Field) },
@@ -115,7 +123,7 @@ func accSample(e *statEntry, aggs []Agg, valOf func(j int) string, valOf2 func(j
 	for j := range aggs {
 		a := &aggs[j]
 		sl := &e.slots[j]
-		if a.If != nil && !exprMatchesRow(a.If, getField) {
+		if a.If != nil && !exprMatchesRow(a.If, lookupOf(getField)) {
 			continue // conditional aggregate: this row does not qualify for agg j
 		}
 		if a.Kind == AggCount || a.Kind == AggRate {
@@ -215,6 +223,16 @@ func accSample(e *statEntry, aggs []Agg, valOf func(j int) string, valOf2 func(j
 func statEntryRow(sp *StatsPipe, e *statEntry) Row {
 	fields := make([]Field, 0, len(sp.By)+len(sp.Aggs))
 	for j, f := range sp.By {
+		// An EMPTY by-value is omitted, not emitted as `f=""`.
+		//
+		// This is what the reference does, and it is the whole of the original
+		// defect: the cluster answered {"svc":"","c":"10"} where VictoriaLogs
+		// answers {"c":"10"}. A fix that DROPPED those rows instead was worse --
+		// it lost 10 of 19 rows and made the node and the cluster disagree in
+		// the other direction. The group is real; only its label was wrong.
+		if e.by[j] == "" {
+			continue
+		}
 		fields = append(fields, Field{f, e.by[j]})
 	}
 	for j := range sp.Aggs {
@@ -240,12 +258,14 @@ type FieldsPipe struct{ Keep []string }
 type UniqPipe struct {
 	By    []string
 	Limit int
+	q     *Query // stamped at run; see StatsPipe.q
 }
 
 // TopPipe is `top N (fields)` -- the N most frequent field-tuples with counts.
 type TopPipe struct {
 	By []string
 	N  int
+	q  *Query // stamped at run; see StatsPipe.q
 }
 
 // TailPipe is `tail N` -- the last N rows.
@@ -302,24 +322,96 @@ type statEntry struct {
 	rows  int64 // count()
 }
 
+// tooManyKeys reports whether an aggregate has outgrown its key ceiling, and
+// records why if it has.
+//
+// Checked as keys are ADDED rather than on the finished map: the map is the
+// memory the ceiling exists to bound, so noticing after it is built is
+// noticing after the cost. A nil query means an internal caller with no
+// budget, which is unbounded on purpose.
+func tooManyKeys(q *Query, have int, what string) bool {
+	if q == nil || q.maxGroupKeys <= 0 || have <= q.maxGroupKeys {
+		return false
+	}
+	q.stop(fmt.Errorf("%w: %s produced more than %d distinct groups",
+		ErrTooManyGroupKeys, what, q.maxGroupKeys))
+	return true
+}
+
+// stampPipes gives each cardinality-bounded pipe the running query, and each
+// rate pipe the query window.
+//
+// Both entry points must call it. RunPipeline (a storage node) did; ApplyPipes
+// (a cluster coordinator) did not, and tooManyKeys returns false when q is nil
+// -- so search.maxGroupKeys was enforced on a node and not at a router. The
+// same query answered 413 against one storage node and 200 with 12 groups
+// through the cluster, which is the worse direction: the coordinator is the one
+// place holding every shard's groups at once, so it is where the ceiling
+// actually matters.
+//
+// It is a function rather than two copies of a switch for the reason the switch
+// itself exists: a new cardinality-bounded pipe added to one copy and not the
+// other is unbounded at a coordinator, and nothing would say so.
+func stampPipes(q *Query, rangeSec float64) {
+	for _, p := range q.Pipes {
+		// The window, for rate()/rate_sum(); and the running query, so a pipe
+		// that builds state proportional to CARDINALITY can stop when it blows
+		// its ceiling instead of returning a map it silently truncated.
+		switch pp := p.(type) {
+		case *StatsPipe:
+			pp.rangeSec = rangeSec
+			pp.q = q
+		case *UniqPipe:
+			pp.q = q
+		case *TopPipe:
+			pp.q = q
+		}
+	}
+}
+
 // RunPipeline runs q's filter and pipes. A leading stats pipe aggregates
 // during the scan; otherwise the filter's rows feed the pipe chain.
 func RunPipeline(s Store, q *Query) []Row {
 	resolveTimePreds(q)     // relative _time -> absolute before stats or Run see the window
 	resolveSubqueries(s, q) // in(<subquery>) -> value set, before the filter evaluates
 	rangeSec := float64(q.To-q.From) / 1e9
-	for _, p := range q.Pipes { // stamp the window on stats pipes for rate()/rate_sum()
-		if sp, ok := p.(*StatsPipe); ok {
-			sp.rangeSec = rangeSec
-		}
-	}
+	stampPipes(q, rangeSec)
 	var rows []Row
 	pipes := q.Pipes
 	if len(pipes) > 0 {
 		// Only a projecting pipe chain skips the full-record materialize. A chain
 		// that rewrites or slices rows (delete/rename/limit/...) still returns whole
 		// records, and clearing MatAll for those was dropping every field but _time.
-		if PipesProject(pipes) {
+		//
+		// A pack-all pipe overrides that. `pack_json` with no explicit field list
+		// packs whatever the row carries, and the field-collection walk adds
+		// nothing for it (there is no list to add) -- so under ANY projecting pipe
+		// in the same chain the scan materialized nothing for it and every row
+		// packed to `{}`, at HTTP 200. It cannot be satisfied from a projected
+		// column set, because the set it needs is "all of them".
+		//
+		// Forcing the full materialize is safe in the other direction too: a
+		// projecting pipe BEFORE the pack still narrows the rows first, so
+		// `fields a, b | pack_json` packs a and b. MatAll governs what the scan
+		// reads from storage, not what a pipe has already thrown away. The cost
+		// is a full-column scan for queries that contain a pack-all, which is the
+		// price of the answer being right.
+		if pipesPackAll(pipes) {
+			// MatCols, not MatAll.
+			//
+			// MatAll carries a SECOND meaning the scan does not: the API layer
+			// reads it as "this is full-record output" and synthesizes the
+			// _stream/_stream_id pair onto every row (appendRowJSON's
+			// withStream). Setting it here put `_stream:"{}"` and a
+			// _stream_id onto the output of `* | stats by (svc) count() n |
+			// pack_json as p` -- two fields those rows never carried, on a
+			// query that is not a record select.
+			//
+			// SET, not merely "do not clear": both flags are false by default
+			// for a query that has pipes at all, so guarding the clear would
+			// have left the pack-all with nothing on every path reaching here.
+			q.MatCols = true
+		} else if PipesProject(pipes) {
 			q.MatAll = false
 		}
 		switch p0 := pipes[0].(type) {
@@ -363,6 +455,17 @@ func RunPipeline(s Store, q *Query) []Row {
 		rows = Run(s, q)
 	}
 	for _, p := range pipes {
+		// Between pipes, not only during the scan. A sort or a join over a
+		// large result is a phase that runs for as long as the result is big,
+		// with no group boundary in it -- so a query cancelled during one used
+		// to run to completion and then discover nobody was waiting.
+		//
+		// Between rather than inside: a pipe that stopped halfway would return
+		// a partial result the executor then reports as complete, and the
+		// point of the checkpoint is to end the query, not to truncate it.
+		if q.exceeded(0) {
+			return nil
+		}
 		switch pp := p.(type) {
 		case *JoinPipe: // store-aware pipes run a subquery, so they cannot use apply(rows)
 			rows = pp.run(s, q, rows)
@@ -372,6 +475,22 @@ func RunPipeline(s Store, q *Query) []Row {
 			rows = pp.run(s, q, rows)
 		default:
 			rows = p.apply(rows)
+		}
+		// After every pipe, because a pipe can GROW its input. A join whose
+		// key is not unique on the right multiplies and a union appends, so a
+		// result inside MaxRows on the way in is outside every budget on the
+		// way out -- and MaxRows is checked in the scan, which has already
+		// finished by here.
+		if q.maxPipeRows > 0 && len(rows) > q.maxPipeRows {
+			q.stop(fmt.Errorf("%w: %T produced %d rows, ceiling is %d",
+				ErrPipeRowLimit, p, len(rows), q.maxPipeRows))
+			return nil
+		}
+		// And the stop a pipe recorded itself -- cardinality, or a subquery
+		// that blew its own budget. Returning the partial rows would be the
+		// silent truncation this whole change is about.
+		if q.stopErr() != nil {
+			return nil
 		}
 	}
 	return rows
@@ -496,6 +615,10 @@ func templateFields(tpl string) []string {
 // runStats aggregates matched rows by the group-by fields during the scan,
 // accumulating each aggregation without building the matched rows.
 func runStats(s Store, q *Query, sp *StatsPipe) []Row {
+	// The ceiling applies to the scan-time path as much as to the mid-pipe
+	// one. A leading `| stats by (...)` never reaches StatsPipe.apply, so a
+	// bound written only there would cover the rarer of the two.
+	sp.q = q
 	// Fast path: `by (field) count()` is the footer posting counts --
 	// StatsByField reads them from the offset table without a per-row scan
 	// for whole-in-window groups (the 1078x trick). This is the common
@@ -506,6 +629,9 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 	if len(sp.By) == 1 && len(sp.Aggs) == 1 && sp.Aggs[0].Kind == AggCount && sp.Aggs[0].If == nil {
 		alias := sp.Aggs[0].Alias
 		vcs := StatsByField(s, q, sp.By[0])
+		if tooManyKeys(q, len(vcs), "stats by") {
+			return nil
+		}
 		out := make([]Row, 0, len(vcs))
 		for _, vc := range vcs {
 			out = append(out, Row{NoTime: true, Fields: []Field{{sp.By[0], vc.Value}, {alias, strconv.Itoa(vc.Count)}}})
@@ -520,11 +646,20 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 			filterFields(sp.Aggs[i].If, ifFields)
 		}
 	}
+	var overKeys bool // set by the cardinality ceiling inside sel.ForEach
 	acc := map[string]*statEntry{}
 	var key []byte
 	sn1 := snapshotOf(s, q.From, q.To)
 	defer sn1.Close()
 	for _, g := range sn1.Groups {
+		// The deadline, checked per group. These paths return counts and
+		// facets rather than rows, so MaxBytes has nothing to measure --
+		// but a scan of every group is exactly what the wall-clock budget
+		// exists to bound, and until this went in twelve read routes ran
+		// with no bound at all.
+		if q.exceeded(0) {
+			break
+		}
 		if !groupCanMatch(g, q) {
 			continue
 		}
@@ -555,6 +690,11 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 			}
 		}
 		sel.ForEach(func(i int) {
+			// ForEach takes a func with no return, so the ceiling sets a flag
+			// the group loop reads rather than returning from inside it.
+			if overKeys {
+				return
+			}
 			key = key[:0]
 			for j := range sp.By {
 				if byCol[j] != nil {
@@ -572,6 +712,10 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 				}
 				e = newStatEntry(by, sp.Aggs)
 				acc[string(key)] = e
+				if tooManyKeys(q, len(acc), "stats by") {
+					overKeys = true
+					return
+				}
 			}
 			accSample(e, sp.Aggs, func(j int) string {
 				if aggCol[j] != nil {
@@ -590,6 +734,9 @@ func runStats(s Store, q *Query, sp *StatsPipe) []Row {
 				return ""
 			})
 		})
+		if overKeys {
+			return nil
+		}
 	}
 	out := make([]Row, 0, len(acc))
 	for _, e := range acc {
@@ -765,14 +912,48 @@ func quantileOf(vals []float64, p float64) float64 {
 	return vals[idx]
 }
 
-// rowField returns a row's value for key.
+// rowField returns a row's value for key, or "" when the row does not carry it.
 func rowField(r Row, key string) string {
+	v, _ := rowFieldOK(r, key)
+	return v
+}
+
+// rowFieldOK is rowField plus whether the row CARRIES the field at all.
+//
+// rowField alone returns "" both for "absent" and for "present and empty", and
+// every group-by pipe keyed on it -- so a row with no `svc` joined a group
+// labelled svc="" beside rows whose svc genuinely is empty. That group can
+// outrank the real ones: 22 rows of which 10 carry no `svc` gave the cluster a
+// top-2 of {"svc":"","c":"10"} then d(5), where the same query on a single node
+// answers d(5), c(4). The node's introspect path reads a group's dictionary and
+// a group with no such column has none, so those rows contribute nothing there.
+// The two halves of one system answered differently and neither said so.
+//
+// A row that does not carry the field is not a member of any group for that
+// field. A row whose value IS empty still is, and the two stay distinguishable.
+func rowFieldOK(r Row, key string) (string, bool) {
 	for _, f := range r.Fields {
 		if f.Key == key {
-			return f.Value
+			return f.Value, true
 		}
 	}
-	return ""
+	return "", false
+}
+
+// allByFieldsEmpty reports whether every by-field of r is empty -- absent or
+// present-and-empty, which the reference treats as the SAME group.
+//
+// Measured against VictoriaLogs with one row at svc="c", two at svc="" and one
+// with no svc at all: `stats by (svc) count()` answers {"svc":"c","c":"1"} and
+// {"c":"3"}. The three empty-or-absent rows are ONE group, and its output row
+// omits the svc key rather than carrying svc="".
+func allByFieldsEmpty(r Row, by []string) bool {
+	for _, f := range by {
+		if rowField(r, f) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func lessVal(a, b string) bool {
@@ -848,11 +1029,23 @@ func (p *UniqPipe) apply(rows []Row) []Row {
 	seen := make(map[string]bool, len(rows))
 	out := rows[:0]
 	for _, r := range rows {
+		// The empty group produces no `uniq` entry.
+		//
+		// Measured against VictoriaLogs: `uniq by (svc)` over rows where ten
+		// carry no svc returns only the real values. stats and top DO emit that
+		// group -- top even ranks it first -- so this is a per-pipe rule and not
+		// a shared one, which is why it is written here rather than hoisted.
+		if len(p.By) > 0 && allByFieldsEmpty(r, p.By) {
+			continue
+		}
 		k := rowKey(r, p.By)
 		if seen[k] {
 			continue
 		}
 		seen[k] = true
+		if tooManyKeys(p.q, len(seen), "uniq by") {
+			return nil
+		}
 		if len(p.By) == 0 {
 			out = append(out, r)
 			continue
@@ -882,6 +1075,9 @@ func (p *TopPipe) apply(rows []Row) []Row {
 				v[i] = rowField(r, f)
 			}
 			vals[k] = v
+			if tooManyKeys(p.q, len(vals), "top by") {
+				return nil
+			}
 		}
 		cnt[k]++
 	}
@@ -889,6 +1085,9 @@ func (p *TopPipe) apply(rows []Row) []Row {
 	for k, c := range cnt {
 		fields := make([]Field, 0, len(p.By)+1)
 		for i, f := range p.By {
+			if vals[k][i] == "" {
+				continue // see statEntryRow: the empty group carries no label
+			}
 			fields = append(fields, Field{f, vals[k][i]})
 		}
 		// VictoriaLogs names the column `hits`, and breaks count ties by the
@@ -1270,37 +1469,8 @@ func matchRow(r Row, e *Expr) bool {
 	case OpNot:
 		return !matchRow(r, e.Child)
 	default: // OpLeaf
-		return matchPredRow(r, &e.Pred)
+		return predMatchesRow(&e.Pred, rowOf(r))
 	}
-}
-
-func matchPredRow(r Row, p *Pred) bool {
-	v := rowField(r, p.Field)
-	switch p.Kind {
-	case Eq:
-		return v == p.Value
-	case Contains:
-		return strings.Contains(v, p.Value)
-	case Prefix:
-		return strings.HasPrefix(v, p.Value)
-	case In:
-		for _, x := range p.Values {
-			if x == v {
-				return true
-			}
-		}
-		return false
-	case Regexp:
-		re := p.regex()
-		return re != nil && re.MatchString(v)
-	case Lt, Le, Gt, Ge:
-		f, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			return false
-		}
-		return cmpNum(f, p.Kind, p.Num)
-	}
-	return false
 }
 
 func (p *DeletePipe) apply(rows []Row) []Row {
@@ -1329,6 +1499,18 @@ func (p *DeletePipe) apply(rows []Row) []Row {
 // whole records, so the engine must materialize every column for it -- matching
 // VictoriaLogs, where `* | limit 5` returns five full records, not five
 // timestamps.
+// pipesPackAll reports whether the chain contains a pack pipe with no explicit
+// field list -- the one pipe whose input is "every field this row has", which no
+// projection can supply. See the MatAll decision in RunPipeline.
+func pipesPackAll(pipes []Pipe) bool {
+	for _, p := range pipes {
+		if pk, ok := p.(*PackPipe); ok && len(pk.Fields) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func PipesProject(pipes []Pipe) bool {
 	for _, p := range pipes {
 		switch p.(type) {
@@ -1342,4 +1524,125 @@ func PipesProject(pipes []Pipe) bool {
 	// (delete/rename/copy/format/math/extract/unpack_*/filter/replace) -- still
 	// emits whole records, so the engine must materialize every column for them.
 	return false
+}
+
+// ApplyPipes runs a pipe chain over rows that are already materialized.
+//
+// It exists for the cluster coordinator, which has merged rows from several
+// shards and must apply the non-distributable half of a plan to them ONCE. The
+// scan-side entry points all start from a store; this one starts from rows,
+// because at that point there is no store to start from -- the rows came off
+// the wire.
+//
+// Store-aware pipes are refused rather than skipped. join, union and
+// stream_context each run a subquery against a store, and a coordinator has
+// none: skipping them would answer the query as if the pipe were not there,
+// which is the silent-wrong-answer shape this whole area is about.
+func ApplyPipes(q *Query, rows []Row) []Row {
+	// The materialized size, passed to exceeded rather than a literal zero.
+	//
+	// It was `q.exceeded(0)`, so MaxBytes could not fire here -- at the ONE
+	// place holding every matching row in the cluster at once, which is what
+	// that budget was written for. The deadline half of exceeded worked and
+	// hid it: the call looked like a budget check and enforced half of one.
+	//
+	// Recomputed per pipe because a pipe changes the set. That is one pass
+	// over rows per pipe, the same order as the pipe itself, and it is only
+	// paid when a budget is set.
+	// countsBytes, not MaxBytes alone: exceeded checks maxMemory against the
+	// same argument, so a deployment with only a memory ceiling would have had
+	// size stay 0 and the ceiling never fire -- the same shape as the defect
+	// this replaced. The engine already has that predicate and uses it in four
+	// other places.
+	// The coordinator's pipes get the running query too -- see stampPipes.
+	// Without it every cardinality ceiling was nil-guarded away at the one place
+	// that holds every shard's groups at once.
+	stampPipes(q, float64(q.To-q.From)/1e9)
+
+	measure := q.countsBytes()
+	// Measured ONCE per pipe, carried forward.
+	//
+	// The first version summed before each pipe and again after it, which is
+	// the same number computed twice: the post-pipe size of pipe k is the
+	// pre-pipe size of pipe k+1. Measured at 9.9% of a 200,000-row clustered
+	// request with four coordinator pipes; halved by carrying it.
+	var size int64
+	if measure {
+		size = rowsBytes(rows)
+	}
+	for _, p := range q.Pipes {
+		if q.exceeded(size) {
+			return nil
+		}
+		switch p.(type) {
+		case *JoinPipe, *UnionPipe, *StreamContextPipe:
+			q.stop(fmt.Errorf("%w: %T cannot run at a cluster coordinator, which has no "+
+				"store to run its subquery against", ErrNotDistributable, p))
+			return nil
+
+		// The STORE-AWARE source pipes, refused for the same reason and with
+		// the same words the comment above uses: skipping a store-aware pipe
+		// "would answer the query as if the pipe were not there, which is the
+		// silent-wrong-answer shape this whole area is about". They were not
+		// in this list and they did exactly that.
+		//
+		// On a storage node each of these is answered by a leading fast path
+		// over the store's own footers and index (runBlocksCount and friends),
+		// and `apply` is the fallback for the non-leading case. At a
+		// coordinator there is no store, so `apply` is what runs -- over the
+		// merged WIRE rows, which is a different set from the stored ones.
+		// Measured against a single node holding the same data:
+		//
+		//	* | blocks_count   node {"blocks_count":"2"}   router {"blocks_count":"12"}
+		//	                   -- len(rows), which is a ROW count
+		//	* | block_stats    node two block-stat rows    router all 12 log rows
+		//	                   -- apply returns its input unchanged, a no-op
+		//	* | field_names    node 7 names                router 8, including
+		//	                   _stream_id, which the SHARD synthesized on the
+		//	                   wire and no store holds
+		//
+		// Every one of those is a plausible number at HTTP 200. The endpoints
+		// (/select/logsql/field_names and the rest) DO federate correctly, by
+		// fanning out and merging, so the refusal names them.
+		case *BlocksCountPipe, *BlockStatsPipe:
+			q.stop(fmt.Errorf("%w: %T reads this node's own storage layout, and a "+
+				"cluster coordinator has no store -- it holds the merged rows, which "+
+				"are not blocks. Run this against a storage node directly",
+				ErrNotDistributable, p))
+			return nil
+		case *FieldNamesPipe, *FieldValuesPipe, *FacetsPipe:
+			q.stop(fmt.Errorf("%w: %T answers from a store's index on a storage node, "+
+				"and a cluster coordinator has none -- computing it from the merged "+
+				"rows counts fields the shards synthesized on the wire and misses "+
+				"fields no matching row happens to carry. Use the matching "+
+				"/select/logsql/ endpoint, which fans out and merges",
+				ErrNotDistributable, p))
+			return nil
+		}
+		rows = p.apply(rows)
+		if measure {
+			size = rowsBytes(rows)
+			if q.exceeded(size) {
+				return nil
+			}
+		}
+		if q.maxPipeRows > 0 && len(rows) > q.maxPipeRows {
+			q.stop(fmt.Errorf("%w: %T produced %d rows, ceiling is %d",
+				ErrPipeRowLimit, p, len(rows), q.maxPipeRows))
+			return nil
+		}
+		if q.stopErr() != nil {
+			return nil
+		}
+	}
+	return rows
+}
+
+// rowsBytes is the materialized size of a row set.
+func rowsBytes(rows []Row) int64 {
+	var n int64
+	for i := range rows {
+		n += rowBytes(rows[i])
+	}
+	return n
 }

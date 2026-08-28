@@ -1,0 +1,13 @@
+{
+  "facets": [
+    {
+      "field_name": "string",
+      "values": [
+        {
+          "field_value": "string",
+          "hits": "number"
+        }
+      ]
+    }
+  ]
+}

@@ -57,6 +57,15 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		rows += int64(tn.store.TotalRows())
 		tenants++
 	})
+	// Storage health comes from the SERVER's record, the same source
+	// readiness reads -- not from a walk of the open tenants.
+	//
+	// This walked forEachTenant, which is open tenants only, and so was blind
+	// to exactly the case the startup scan was added for: a degraded tenant no
+	// request has touched made /-/ready answer 503 while every one of these
+	// gauges read 0. The probe pulled the pod and the alert never fired, and
+	// two endpoints on one server disagreed about one tenant.
+	corrupt, quarantined, degraded, unacked := s.storageHealthTotals()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	m := func(name, help, typ string, v int64) {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", name, help, name, typ, name, v)
@@ -67,6 +76,19 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	m("simdlogs_insert_requests_total", "Ingest requests received.", "counter", atomic.LoadInt64(&s.nIngestReq))
 	m("simdlogs_query_requests_total", "Query requests received.", "counter", atomic.LoadInt64(&s.nQueryReq))
 	m("simdlogs_uptime_seconds", "Process uptime in seconds.", "gauge", int64(time.Since(s.started).Seconds()))
+
+	// Storage health. Four numbers rather than one, because they answer
+	// different questions and an operator needs all four: how much data is
+	// unreadable right now (corrupt), how much has ever been set aside
+	// (quarantined), how many tenants are serving less than they were given
+	// (degraded), and how many of those nobody has looked at yet
+	// (unacknowledged). The last is the one to alert on: a degraded tenant an
+	// operator has accepted is a known state, and one nobody has accepted is
+	// silently answering queries with missing rows.
+	m("simdlogs_storage_corrupt_groups", "Committed groups that could not be read at open.", "gauge", corrupt)
+	m("simdlogs_storage_quarantined_groups", "Groups moved into quarantine, over the store's history.", "gauge", quarantined)
+	m("simdlogs_storage_degraded_tenants", "Tenants serving less than their committed data.", "gauge", degraded)
+	m("simdlogs_storage_degraded_unacknowledged_tenants", "Degraded tenants no operator has acknowledged.", "gauge", unacked)
 
 	// The same numbers under the reference's names, so a dashboard written for
 	// it graphs this server unchanged. Only the metrics whose meaning we can
@@ -90,6 +112,77 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	if free := freeDiskBytes(s.dir); free >= 0 {
 		m("vl_free_disk_space_bytes", "Free bytes on the storage filesystem.", "gauge", free)
 	}
+	// The storage budget: what it is, where it is, and what it has refused.
+	//
+	// Capacity and free space are gauges an operator alerts on before writes
+	// fail; the two counters are how they tell "the machine is full" from
+	// "this tenant is over its share" after the fact, which are different
+	// incidents with different fixes.
+	var warn, reject, over int64
+	var capacity int64
+	s.forEachTenantDetached(func(tn *tenant) {
+		st := tn.store.QuotaState()
+		if st.Usage.Total > capacity {
+			capacity = st.Usage.Total
+		}
+		if st.Warn {
+			warn++
+		}
+		if st.Reject {
+			reject++
+		}
+		if st.OverQuota {
+			over++
+		}
+	})
+	// Unconditional, 0 meaning "not measurable here". A series that appears
+	// only when statfs works makes a capacity panel silently blank on the
+	// platforms where it does not -- indistinguishable from a server with
+	// nothing to report.
+	m("simdlogs_storage_capacity_bytes",
+		"Total bytes of the storage filesystem; 0 where free space cannot be measured.",
+		"gauge", capacity)
+	m("simdlogs_storage_warn_tenants", "Tenants whose free space is below the warn reserve.",
+		"gauge", warn)
+	m("simdlogs_storage_reject_tenants", "Tenants whose free space is below the reject reserve.",
+		"gauge", reject)
+	m("simdlogs_storage_over_quota_tenants", "Tenants at or above their byte quota.",
+		"gauge", over)
+	// Query governance: what the scan workers and the admission slots are
+	// doing. The worker gauge is the one that says whether the fan-out budget
+	// is the bottleneck; the rejection counter is what an operator alerts on.
+	if s.workers != nil {
+		m("simdlogs_scan_workers_total", "Scan worker slots available to all queries.",
+			"gauge", int64(s.workers.Total()))
+		m("simdlogs_scan_workers_in_use", "Scan worker slots currently held.",
+			"gauge", int64(s.workers.InUse()))
+	}
+	// Emitted unconditionally, zeroed when admission is not configured.
+	//
+	// They used to be inside `if s.admission != nil`, so a default server's
+	// /metrics had none of them while two documents listed them without
+	// qualification -- and a dashboard panel that silently has no series looks
+	// exactly like a server with nothing to report.
+	inFlight, queuedQ, rejectedQ := s.admission.Stats()
+	m("simdlogs_query_admission_in_flight", "Queries admitted and running.", "gauge", inFlight)
+	m("simdlogs_query_admission_queued", "Queries waiting for an admission slot.",
+		"gauge", queuedQ)
+	m("simdlogs_query_admission_rejected_total", "Queries refused by admission.",
+		"counter", rejectedQ)
+	m("simdlogs_query_streamed_total",
+		"Bare selects answered a group at a time, without materializing the result.",
+		"counter", atomic.LoadInt64(&s.nStreamedSelects))
+	// A dashboard quietly running on partial answers is the state the
+	// completeness gate exists to make visible, so the count is a series an
+	// operator can alert on.
+	m("simdlogs_cluster_partial_reads_total",
+		"Cluster reads knowingly answered with shards missing (allow_partial_response=1).",
+		"counter", PartialReads())
+	rejDisk, rejQuota := storage.RejectedWrites()
+	m("simdlogs_writes_rejected_disk_total", "Writes refused because free space is below the reserve.",
+		"counter", rejDisk)
+	m("simdlogs_writes_rejected_quota_total", "Writes refused because the tenant is at its quota.",
+		"counter", rejQuota)
 	// Retention health. A removal is committed to the manifest before the
 	// unlink, so a failing unlink costs disk rather than correctness -- but it
 	// costs disk silently unless it is counted.
@@ -97,6 +190,15 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		"counter", storage.RetentionFailures())
 	m("simdlogs_retention_tombstones", "Groups committed as removed whose file is still on disk.",
 		"gauge", storage.PendingTombstones())
+	// Tenant lifecycle. No tenant-id label: a per-tenant label on a map an
+	// untrusted header can grow is unbounded cardinality, which is how a
+	// metrics endpoint takes down its own scraper.
+	s.mu.Lock()
+	openTenants := int64(len(s.tenants))
+	s.mu.Unlock()
+	m("simdlogs_tenants_open", "Tenants currently held open.", "gauge", openTenants)
+	m("simdlogs_tenants_evicted_total", "Tenants closed to make room for another.", "counter", TenantsEvicted())
+	m("simdlogs_tenants_rejected_total", "Requests refused because every tenant slot was busy.", "counter", TenantsRejected())
 	s.writeRuleMetrics(w) // metrics-from-logs rules
 }
 

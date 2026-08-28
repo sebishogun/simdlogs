@@ -18,7 +18,7 @@ func TestStatsQueryRange(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	series, err := StatsQueryRange(s, `* | stats by (level) count() c`, 0, 4e9, 2e9, 0)
+	series, err := StatsQueryRange(s, `* | stats by (level) count() c`, 0, 4e9, 2e9, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -108,6 +108,23 @@ func (p *sqlParser) translate() (string, error) {
 		}
 		limit = n
 	}
+	// Nothing may be left over.
+	//
+	// The parser used to stop after LIMIT and ignore whatever followed, so
+	// `... LIMIT 5 OFFSET 10` silently dropped the OFFSET, `HAVING count > 1`
+	// silently dropped the HAVING, and a JOIN silently answered about one
+	// table. Each of those returns a DIFFERENT result set than the one asked
+	// for, in a response that looks entirely normal -- the same failure the
+	// Elasticsearch surface had, in a second query language.
+	//
+	// Naming the token rather than saying "syntax error" is the difference
+	// between a client fixing its query and a client guessing.
+	if rest := p.peek(); rest != "" {
+		return "", fmt.Errorf(
+			"simdlogs: SQL: unsupported clause starting at %q; this subset is "+
+				"SELECT columns/aggregates FROM table [WHERE ...] [GROUP BY ...] "+
+				"[ORDER BY ... [ASC|DESC]] [LIMIT n]", rest)
+	}
 
 	// Build the LogsQL string.
 	head := where

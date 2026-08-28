@@ -1,0 +1,230 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (dry run: builds and checks, publishes nothing)'
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  # The gates run FIRST and the release depends on them. A tag that fails its
+  # tests must not produce artifacts: an artifact that exists is one somebody
+  # will install, and deleting a release after the fact does not un-install it.
+  gate:
+    name: gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # The gate job runs the suite, and one gate reads git history: see
+          # the note in ci.yml.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -timeout 600s ./...
+      - name: race
+        run: go test -race -timeout 900s ./...
+      - name: purego
+        run: go test -tags purego -timeout 600s ./...
+      - name: release smoke test
+        run: ./scripts/release-check.sh
+
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: linux,  goarch: amd64}
+          - {goos: linux,  goarch: arm64}
+          - {goos: linux,  goarch: ppc64le}
+          - {goos: linux,  goarch: s390x}
+          - {goos: linux,  goarch: riscv64}
+          - {goos: darwin, goarch: amd64}
+          - {goos: darwin, goarch: arm64}
+          # 386 is absent because the dependency does not compile for it; see
+          # docs/verification.md. Listing it would assert a platform that
+          # cannot be built.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The job that COMPILES. It had no ref: while the other three did,
+          # so a dry run of v1.2.3 from main built MAIN and stamped it v1.2.3,
+          # which is the whole defect the input was meant to avoid.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          # CGO off so the binary is genuinely static and runs on a scratch
+          # image; -trimpath so the builder's directory layout does not end up
+          # inside it, which is both a leak and a reason two builds of the same
+          # source differ.
+          CGO_ENABLED: '0'
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          # GITHUB_REF_NAME is ALWAYS set -- on a workflow_dispatch it is the
+          # BRANCH -- so `${GITHUB_REF_NAME:-input}` never reached the input and
+          # a dry run built artifacts called simdlogs_main_linux_amd64.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            VERSION="${DISPATCH_TAG}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "${VERSION}" ]; then
+            echo "no version to build" >&2; exit 1
+          fi
+          NAME="simdlogs_${VERSION}_${GOOS}_${GOARCH}"
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${GITHUB_SHA::12}" \
+            -o "dist/${NAME}/simdlogs" ./cmd/simdlogs
+          cp README.md LICENSE docs/deployment.md "dist/${NAME}/" 2>/dev/null || true
+          tar -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
+          rm -rf "dist/${NAME}"
+
+      - name: checksum
+        run: cd dist && sha256sum *.tar.gz > "SHA256SUMS.${{ matrix.goos }}_${{ matrix.goarch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A dispatch runs against the ref it was started FROM, so a dry run
+          # of v1.2.3 launched from main would check out main, build it, and
+          # stamp it v1.2.3. The input names what to build; build that.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          merge-multiple: true
+
+      - name: one checksum file
+        run: |
+          set -euo pipefail
+          cd staged
+          cat SHA256SUMS.* > SHA256SUMS
+          rm -f SHA256SUMS.*
+          cat SHA256SUMS
+
+      # An SBOM says what is inside the artifact. For a static Go binary that
+      # is the module graph, which is what a consumer's vulnerability scanner
+      # needs and cannot derive from the binary alone.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+      - name: SBOM
+        run: |
+          go install sigs.k8s.io/bom/cmd/bom@v0.7.1
+          bom generate --format json -o staged/sbom.spdx.json .
+
+      # Provenance: a signed statement of WHICH workflow, at which commit,
+      # produced these bytes. Without it a checksum only proves the file has
+      # not changed since someone published it, not that the right thing
+      # published it.
+      #
+      # Gated on the same condition as the release below, because this is not a
+      # local step: it writes a signed entry to a public transparency log, and
+      # that entry cannot be withdrawn. A dry run that attested would have
+      # published a permanent statement that bytes were built from a tag they
+      # were not built from -- worse than the release it was meant to skip.
+      - uses: actions/attest-build-provenance@v1
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        with:
+          subject-path: 'staged/*.tar.gz'
+
+      # A dry run builds, checksums and SBOMs, and stops here.
+      #
+      # The condition is on the EVENT, not the ref. `startsWith(github.ref,
+      # 'refs/tags/')` looks like it says the same thing and does not: the "Run
+      # workflow" dropdown lists TAGS as well as branches, so a dispatch can
+      # arrive with github.ref = refs/tags/v1.2.3 and publish -- under the ref's
+      # tag name, while the artifacts inside carry the INPUT's version. Dispatch
+      # from v1.2.3 with input v1.2.4 produced a release named v1.2.3 holding
+      # simdlogs_v1.2.4_*.tar.gz.
+      - name: release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file <(awk '/^## /{if(n)exit; n=1} n' CHANGELOG.md) \
+            staged/*.tar.gz staged/SHA256SUMS staged/sbom.spdx.json
+
+  container:
+    name: container
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      # The same explicit resolution the build job does, rather than an
+      # expression: `inputs.tag || ref_name` yields the BRANCH if the input is
+      # ever empty, which is the defect this workflow already had once. Empty
+      # fails the job instead.
+      - name: version
+        id: v
+        env:
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            V="${DISPATCH_TAG}"
+          else
+            V="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "${V}" ]; then
+            echo "no version to build" >&2; exit 1
+          fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: build (no push; publishing needs a registry decision)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+            COMMIT=${{ github.sha }}

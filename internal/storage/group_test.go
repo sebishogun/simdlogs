@@ -32,6 +32,7 @@ func buildGroup(n int) (*Group, []corpus.Record) {
 }
 
 func TestGroupRoundTrip(t *testing.T) {
+	t.Parallel()
 	for _, n := range []int{0, 1, 1000, 100_000} {
 		g, recs := buildGroup(n)
 		r, err := ReadGroup(g.Marshal())
@@ -62,6 +63,7 @@ func TestGroupRoundTrip(t *testing.T) {
 }
 
 func TestSkipQueries(t *testing.T) {
+	t.Parallel()
 	g, _ := buildGroup(50_000)
 	r, _ := ReadGroup(g.Marshal())
 

@@ -46,6 +46,7 @@ func readAll(t *testing.T, r *Reader) [][4]string {
 }
 
 func TestRecompactPreservesDataAndShrinks(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := OpenStore(dir)
 	if err != nil {
@@ -137,6 +138,7 @@ func TestRecompactSkipsRecentGroups(t *testing.T) {
 }
 
 func TestRecompactDropPostingsPreservesData(t *testing.T) {
+	t.Parallel()
 	s, err := OpenStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
