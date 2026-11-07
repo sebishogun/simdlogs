@@ -285,6 +285,14 @@ func (s *Store) DiskBytes() int64 {
 	return total
 }
 
+// FreshDiskBytes is DiskBytes with no cache. Shrink reaches the cache only at the next
+// refresh, so a caller about to delete groups to meet a budget would otherwise delete
+// again for what it already deleted.
+func (s *Store) FreshDiskBytes() int64 {
+	s.sizeAt.Store(0)
+	return s.DiskBytes()
+}
+
 // noteGrowth adds a freshly committed group's bytes to the cached size.
 //
 // The cache is what makes the quota check cheap on the write path, and on its

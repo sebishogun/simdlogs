@@ -9,11 +9,11 @@ as an announcement: the point of the list is the rows that are not green.
 |---|---|
 | `gofmt -l .` | clean |
 | `go vet ./...` | clean |
-| `go test ./...` | 10 packages ok |
-| `go test -race ./...` | 10 packages ok, no data races |
-| `go test -tags purego ./...` | 10 packages ok |
-| Fuzz seed corpus (23 targets) | 10 packages ok |
-| Crash / recovery / restart / drills, ×5 | 10 packages ok |
+| `go test ./...` | 11 packages ok |
+| `go test -race ./...` | 11 packages ok, no data races |
+| `go test -tags purego ./...` | 11 packages ok |
+| Fuzz seed corpus (23 targets) | 11 packages ok |
+| Crash / recovery / restart / drills, ×5 | 11 packages ok |
 | Soak, 60 s with retention running | ok — groups peak 5,899 and fall to 5,677 |
 | `scripts/release-check.sh` (the artifact, not the source) | passed |
 | Cross-build arm64, ppc64le, s390x, riscv64 | ok |
