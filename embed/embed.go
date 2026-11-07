@@ -105,6 +105,37 @@ func Open(c Config) (*DB, error) {
 // substring of one string per batch, with no allocation per row.
 func (db *DB) Add(at int64, fields map[string]string) { db.writer.Add(at, fields) }
 
+// Columns adds rows by position, with the field names declared once. A host that
+// writes the same fields on every line uses it in place of Add: it takes no map, it
+// finds each column by name once per group rather than per row, and it builds the
+// _stream label once per distinct set of stream values rather than per row. Once a
+// store has flushed a batch about the size of the next, adding rows allocates
+// nothing.
+//
+// What it stores is what Add stores for a map holding the same non-empty values.
+// It is safe for concurrent use, and rows from it and from Add may be mixed.
+type Columns struct{ c *ingest.Columns }
+
+// Columns declares the fields rows will be added with, in order. A name may not be
+// empty, repeated, _time, or start with a dot.
+func (db *DB) Columns(names ...string) (*Columns, error) {
+	c, err := db.writer.Columns(names)
+	if err != nil {
+		return nil, err
+	}
+	return &Columns{c: c}, nil
+}
+
+// Add buffers len(at) rows, column by column: values[i][r] is field i of row r, and
+// each of values holds len(at) of them. An empty value is a field the row does not
+// have, as if Add's map had left the key out. The strings are kept and the slices
+// are not, so a caller may reuse every slice as soon as Add returns.
+func (c *Columns) Add(at []int64, values ...[]string) error { return c.c.Add(at, values) }
+
+// AddRow buffers one row: values[i] is field i. It costs a lock per row that Add
+// pays once per call.
+func (c *Columns) AddRow(at int64, values ...string) error { return c.c.AddRow(at, values...) }
+
 // Flush makes everything added so far durable, and returns once it is.
 func (db *DB) Flush() error { return db.writer.Flush() }
 

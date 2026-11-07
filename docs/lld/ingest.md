@@ -434,6 +434,32 @@ drains and 4,000 duplicates per retry pass. See `docs/wrong.md` entry 133.
   decision per row: a row whose override label came out empty fell back to the
   deployment fields, so one request could produce a column mixing
   `{host="h1"}` and `{service="api"}`.
+- **Declared columns (`Writer.Columns`, `internal/ingest/columns.go`)** are
+  the embedded path (`embed.DB.Columns`): field names declared once, rows
+  added column by column (`Columns.Add`) or one at a time (`AddRow`), no map.
+  It stores exactly what `Add` stores for a map holding the same non-empty
+  values — an empty value is an absent field — and the same group bytes
+  wherever a group ends on the row or byte trigger, which tests compare file
+  by file. A column is found by name once per group; new columns are created
+  in `Add`'s order (row of the first value, a row's fields by name, `_stream`
+  last); `_stream` is built once per distinct set of stream values from an
+  8-slot cache that keeps the label, not the caller's strings; a chunk ends
+  where `Add` would hand the group off (the byte trigger is bounded, then the
+  chunk halves down to one row); the time trigger is checked once per call.
+  New column buffers are sized from the previous group's row count, so a
+  host with batches of similar size adds rows with 0 allocations
+  (`embed.TestColumnsAddAllocatesNothingPerRow`). It refuses a writer with
+  record limits or vector fields (`ErrColumnsUnsupported`), and names that
+  are empty, repeated, `_time` or dotted. Measured (`embed.BenchmarkRows`,
+  nine fields, seven of them set, 8192 rows between untimed flushes; minimum
+  of six interleaved runs, Ryzen AI MAX+ 395, Go 1.27.1, load average 40
+  falling to 17, so only the three compare with each other): `Add` 556 ns,
+  698 B, 7 allocs per row; `Columns.Add` 30.7 ns, 128 B, 0 allocs; `AddRow`
+  139 ns, 128 B, 0 allocs. The 128 B is the next group's column buffers,
+  allocated once per group. The flush is now most of a line's cost
+  (`embed.BenchmarkFlush`, same session: 8192 rows 3.71 ms, 10.5 MB, 2020
+  allocations; 65536 rows 34.3 ms, 76.8 MB, 13722 allocations), and
+  `storage.BuildDict` is a third of its CPU and half its bytes.
 - **A payload field named `_stream` is not authoritative.** When the
   deployment owns labelling and the request did not override it, any `_stream`
   in the record is dropped and the synthesized label replaces it. `_stream` is

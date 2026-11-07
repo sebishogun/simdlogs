@@ -46,6 +46,16 @@ type Writer struct {
 	ts       []int64
 	cols     map[string]*colBuf
 	colOrder []string
+	// colList is cols in colOrder order, so a path that pads every column
+	// walks a slice instead of looking each name up.
+	colList []*colBuf
+	// gen counts handoffs: a Columns holding pointers into cols knows they
+	// belong to an earlier group when it differs. cfgGen counts changes to the
+	// stream and vector settings a Columns derives its plan from.
+	gen, cfgGen uint64
+	// lastRows is how many rows the last group handed off held, which sizes
+	// the next group's column buffers on the declared-columns path.
+	lastRows int
 	// newCols is scratch for the names one record introduces, so registering
 	// them in a deterministic order costs no allocation on the per-row path.
 	newCols  []string
@@ -309,6 +319,7 @@ func (w *Writer) SetVectorFields(v VectorFields) {
 	defer w.mu.Unlock()
 	w.vecFlds = v
 	w.hasVec.Store(len(v) > 0)
+	w.cfgGen++
 }
 
 // VectorFields reports the configured embedding fields.
@@ -551,6 +562,7 @@ func (w *Writer) addVec(ts int64, fields map[string]string, streamOverridden boo
 			cb := &colBuf{name: k, vals: make([]string, row)} // backfill prior rows
 			w.cols[k] = cb
 			w.colOrder = append(w.colOrder, k)
+			w.colList = append(w.colList, cb)
 			v := fields[k]
 			cb.vals = append(cb.vals, v)
 			w.bytes += len(k) + len(v)
@@ -606,6 +618,7 @@ func (w *Writer) addVec(ts int64, fields map[string]string, streamOverridden boo
 				cb = &colBuf{name: "_stream", vals: make([]string, row)}
 				w.cols["_stream"] = cb
 				w.colOrder = append(w.colOrder, "_stream")
+				w.colList = append(w.colList, cb)
 			}
 			for len(cb.vals) < row {
 				cb.vals = append(cb.vals, "")
@@ -633,6 +646,7 @@ func (w *Writer) addVec(ts int64, fields map[string]string, streamOverridden boo
 func (w *Writer) SetStreamFields(fs []string) {
 	w.mu.Lock()
 	w.strmFlds = append(w.strmFlds[:0], fs...)
+	w.cfgGen++
 	w.mu.Unlock()
 }
 
@@ -935,10 +949,17 @@ func (w *Writer) flushLocked() {
 	w.nextReceipt = ""
 
 	// Fresh buffers; the job owns the handed-off ones.
+	w.lastRows = len(w.ts)
+	w.gen++
 	w.ts = make([]int64, 0, FlushRows)
 	w.cols = map[string]*colBuf{}
 	w.vecs = map[string][]float32{}
 	w.colOrder = nil
+	// The job holds the column buffers through vals, not through colList, so
+	// the list is reused. Cleared first: a stale pointer here would keep the
+	// handed-off group's buffers alive after the job is done with them.
+	clear(w.colList)
+	w.colList = w.colList[:0]
 	w.bytes = 0
 	w.lastFlsh = nowFn()
 }
