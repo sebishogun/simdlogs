@@ -129,7 +129,7 @@ func (g *Group) Marshal() []byte {
 			}
 			m.PostLen = len(b) - m.PostOff
 			m.DictOff = len(b)
-			b = append(b, marshalDictSection(c.Dict.Dict, g.Compact)...)
+			b = appendDictSection(b, c.Dict.Dict, g.Compact)
 			m.DictLen2 = len(b) - m.DictOff
 		case ColTimestamp:
 			data := encodeTimestamps(c.Ts)

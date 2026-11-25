@@ -63,8 +63,15 @@ func flateDecompressInto(buf, src []byte, rawLen int) []byte {
 // lz4Compress produces a raw LZ4 block from src via a greedy hash-table
 // match finder. Format: LZ4 sequences (token, literal-length ext,
 // literals, offset, match-length ext), matching simd.LZ4BlockDecode.
-func lz4Compress(src []byte) []byte {
-	var out []byte
+func lz4Compress(src []byte) []byte { return lz4CompressAppend(nil, src) }
+
+// lz4Bound is the most an LZ4 block of n bytes can take: all literals, with a
+// length byte per 255 of them and a token.
+func lz4Bound(n int) int { return n + n/255 + 16 }
+
+// lz4CompressAppend is lz4Compress appending the block to out, which a caller
+// sizes with lz4Bound so the block is written in place.
+func lz4CompressAppend(out, src []byte) []byte {
 	var table [1 << 12]int32
 	for i := range table {
 		table[i] = -1
