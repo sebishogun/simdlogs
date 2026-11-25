@@ -24,8 +24,8 @@ import (
 //
 // Steady state allocates nothing per row. The column buffers of a group are
 // sized from the row count of the group before it, so a host whose batches are
-// of a similar size stops growing them after its first flush; the timestamp
-// buffer is already sized to FlushRows by every handoff.
+// of a similar size stops growing them after its first flush, and the
+// timestamp buffer is sized the same way.
 //
 // A Columns is safe for concurrent use: everything it keeps per group is read
 // and written under the writer's mutex.
