@@ -401,7 +401,7 @@ func (s *Store) mergeAndCommit(batch []*groupEntry, opt CompactOptions) (Compact
 		s.discardUncommitted(final, id, err)
 		return st, err
 	}
-	nr, err := ReadGroup(mb)
+	nr, err := readMapped(mb)
 	if err != nil {
 		unmap()
 		s.discardUncommitted(final, id, err)

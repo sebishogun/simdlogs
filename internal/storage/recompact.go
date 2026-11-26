@@ -143,7 +143,7 @@ func (s *Store) Recompact(cutoff int64, dropPostings bool) (groups int, before, 
 		if merr != nil {
 			return groups, before, after, merr
 		}
-		nr, rerr := ReadGroup(mb)
+		nr, rerr := readMapped(mb)
 		if rerr != nil {
 			unmap()
 			return groups, before, after, rerr
