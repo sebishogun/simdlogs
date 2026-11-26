@@ -68,11 +68,19 @@ type DB struct {
 
 // maintenance merges the small groups that frequent flushes leave. A host
 // flushing once a second would otherwise have 86,400 of them a day.
+//
+// A merge decodes its inputs into the heap and builds the output there, about
+// three times the rows' text: merging eight groups of 256 rows of 4 KiB, as a
+// binary stream leaves them in Cawl, held 32 MiB for one group that saved no
+// bytes, and 32 groups of 2,048 short lines into one output of 64 Ki rows, 19
+// MiB. So a group over 64 KiB on disk is big enough and stays as it is, and an
+// output holds 16 Ki rows, which a day of one line a second fills six times.
 const (
-	compactMinGroups = 8
-	compactMaxRows   = 64 << 10
-	compactOutputs   = 16
-	compactAfter     = time.Minute
+	compactMinGroups     = 8
+	compactMaxRows       = 16 << 10
+	compactMaxGroupBytes = 64 << 10
+	compactOutputs       = 16
+	compactAfter         = time.Minute
 )
 
 // Open opens Dir, creating it if need be. An unreadable group fails the open:
@@ -213,8 +221,8 @@ func (db *DB) enforce() {
 	now := time.Now()
 	// A failed merge leaves the groups as they were, and the next pass tries again.
 	db.store.CompactGroups(storage.CompactOptions{
-		MinGroups: compactMinGroups, MaxRowsPerOutput: compactMaxRows, MaxOutputs: compactOutputs,
-		OlderThan: now.Add(-compactAfter).UnixNano(),
+		MinGroups: compactMinGroups, MaxRowsPerOutput: compactMaxRows, MaxGroupBytes: compactMaxGroupBytes,
+		MaxOutputs: compactOutputs, OlderThan: now.Add(-compactAfter).UnixNano(),
 	})
 	if db.config.Retention > 0 {
 		db.store.DropGroupsBefore(now.Add(-db.config.Retention).UnixNano())
