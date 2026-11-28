@@ -11232,3 +11232,38 @@ kept an arbitrary wire varint as `uint64`. A value of `2^32+7` was stored as
 `7`. The field now has the schema's type, with an overflow regression test.
 - `M12` (`Reject`'s bound `>=` -> `>`) and `M16` remain unkilled and remain not
   observable, for the reason entry 134 gives.
+
+## 138. Verified groups stayed mapped, and maintenance merged groups that were already big
+
+2026-11-26, measuring Cawl's local daemon, which embeds a store per owner.
+
+**Mapped pages.** `ReadGroup` checks a v8 group's CRC32C over every byte, so
+every group a store wrote, opened, compacted or promoted had all its pages
+mapped into the process for as long as it was open. They are page cache, but
+they count in the process's resident size: 8.8 MiB of the daemon's peak RSS in
+one comparison run, and the size of the whole store after an open, though no
+query had read it. Cawl's default store limit is 10 GiB. `readMapped` now
+verifies and then drops the pages with `MADV_DONTNEED`; the mapping stays, and a
+query maps what it reads (`TestVerifiedGroupLeavesNoPagesMapped`, which counts
+present pages in `/proc/self/pagemap`).
+
+**Maintenance.** A merge decodes its inputs into the heap and builds the output
+there. `embed` merged any eight groups older than a minute into outputs of up to
+64 Ki rows, with no size bound, and a binary stream leaves Cawl's store groups of
+256 rows of 4 KiB, about 1 MiB each:
+
+```
+inputs                             groups   allocated   heap at peak   on disk
+8 x 256 rows of 4 KiB, before      8 -> 1     39.3 MiB       32.0 MiB   no change
+  after: left alone                8 -> 8      0                0
+32 x 2,048 short lines, 64 Ki      32 -> 1    19.9 MiB   12.8 to 18.9   290 KiB
+  after: outputs of 16 Ki          32 -> 4    20.8 MiB    6.9 to 8.6     338 KiB
+```
+
+(One process, three interleaved runs of the second shape, load 53; the heap is
+`HeapInuse` sampled every 200 µs during `enforce`.) A group over 64 KiB on disk
+is now big enough and stays as it is (`MaxGroupBytes`), and an output holds 16
+Ki rows. The cost is the merged text's compression: 16 Ki-row outputs of the
+second shape took 17% more disk than one 64 Ki-row output.
+`TestMaintenanceLeavesBigGroups` and `TestMergedGroupsHoldAtMostMaxRows` fail
+against the old limits.

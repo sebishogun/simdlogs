@@ -333,7 +333,7 @@ func OpenStoreWith(dir string, opts OpenOptions) (*Store, error) {
 			removals = append(removals, id)
 			continue
 		}
-		r, err := ReadGroup(b)
+		r, err := readMapped(b)
 		if err != nil {
 			unmap()
 			if opts.Policy != CorruptionQuarantine {
@@ -531,7 +531,7 @@ func (s *Store) commitGroupFile(staged, final string, id uint64, size int64, wid
 		s.discardUncommitted(staged, id, err)
 		return 0, err
 	}
-	r, err := ReadGroup(mb)
+	r, err := readMapped(mb)
 	if err != nil {
 		unmap()
 		s.discardUncommitted(staged, id, err)

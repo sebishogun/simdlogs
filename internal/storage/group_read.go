@@ -140,6 +140,20 @@ func ReadGroup(b []byte) (*Reader, error) {
 	}
 }
 
+// readMapped is ReadGroup for a group mapped by mmapFile. ReadGroup's checksum
+// reads every byte, which maps every page of the file into the process; they
+// stayed mapped for as long as the group was open, so a process's resident
+// size grew with the store, to the whole store after an open, though no query
+// had read it. readMapped drops them once the group is verified: the reader
+// keeps the mapping, and a query maps what it reads.
+func readMapped(b []byte) (*Reader, error) {
+	r, err := ReadGroup(b)
+	if err == nil {
+		release(b)
+	}
+	return r, err
+}
+
 // readGroupV8 verifies the trailing CRC32C, then parses the body exactly as
 // v7 is parsed. The checksum covers every byte before it, so a single flipped
 // bit anywhere -- header, column data, footer -- is caught here rather than

@@ -151,7 +151,7 @@ func (s *Store) Promote(name string, cold ColdStore) error {
 	if err != nil {
 		return err
 	}
-	r, err := ReadGroup(b)
+	r, err := readMapped(b)
 	if err != nil {
 		unmap()
 		return err

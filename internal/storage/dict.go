@@ -1,6 +1,10 @@
 package storage
 
-import "github.com/sebishogun/simd"
+import (
+	"encoding/binary"
+
+	"github.com/sebishogun/simd"
+)
 
 // The dictionary is stored block-compressed for random access from the
 // mmap'd file: values are grouped into small sorted blocks, each block LZ4'd,
@@ -27,12 +31,16 @@ const dictBlock = 64
 
 // marshalRawBlock lays out one block's values as [k+1 offsets][strings], the
 // uncompressed form that a decompressed block decodes to.
-func marshalRawBlock(vals []string) []byte {
+func marshalRawBlock(vals []string) []byte { return appendRawBlock(nil, vals) }
+
+// appendRawBlock is marshalRawBlock appending to dst, so one buffer serves every
+// block of a section.
+func appendRawBlock(dst []byte, vals []string) []byte {
 	strsLen := 0
 	for _, s := range vals {
 		strsLen += len(s)
 	}
-	out := make([]byte, 0, 4*(len(vals)+1)+strsLen)
+	out := growDouble(dst, 4*(len(vals)+1)+strsLen)
 	var off uint32
 	for _, s := range vals {
 		out = appU32(out, off)
@@ -43,6 +51,19 @@ func marshalRawBlock(vals []string) []byte {
 		out = append(out, s...)
 	}
 	return out
+}
+
+// growDouble makes room for n more bytes, at least doubling the capacity when it
+// has to grow. append grows a large slice by a quarter, so a buffer filled a few
+// bytes at a time, as the LZ4 encoder fills it, was copied about four times its
+// final size on the way; doubling bounds that at once.
+func growDouble(b []byte, n int) []byte {
+	if cap(b)-len(b) >= n {
+		return b
+	}
+	grown := make([]byte, len(b), max(2*cap(b), len(b)+n))
+	copy(grown, b)
+	return grown
 }
 
 // dictCodecFlate is the high bit of a block's rawLen field, marking the block
@@ -97,17 +118,21 @@ func hexChar(v byte) byte {
 // into [k u32][k+1 offsets][nibbles], two hex chars per byte, high nibble = the
 // first char -- the simd.HexEncode/HexDecode convention, so the hot unpack is
 // the SIMD kernel. Pack runs once at flush, so it stays a scalar loop.
-func hexPackBlock(raw []byte, count int) []byte {
+func hexPackBlock(raw []byte, count int) []byte { return appendHexPackBlock(nil, raw, count) }
+
+// appendHexPackBlock is hexPackBlock appending to dst.
+func appendHexPackBlock(dst, raw []byte, count int) []byte {
 	strBase := 4 * (count + 1)
 	strs := raw[strBase:]
 	total := len(strs)
 	nb := (total + 1) / 2
-	out := make([]byte, 0, 4+strBase+nb)
+	out := growDouble(dst, 4+strBase+nb)
 	out = appU32(out, uint32(count))
 	out = append(out, raw[:strBase]...) // char offsets verbatim
 	base := len(out)
-	out = append(out, make([]byte, nb)...)
+	out = out[:base+nb]
 	packed := out[base:]
+	clear(packed)
 	for i := 0; i < total; i += 2 {
 		hi := hexNibble(strs[i]) << 4
 		var lo byte
@@ -160,57 +185,66 @@ func hexUnpackBlockInto(buf, packed []byte) []byte {
 // marshalDictSection block-compresses a sorted dict. compact selects the flate
 // codec (smaller, slower decode) over the default LZ4 (fast SIMD decode).
 func marshalDictSection(dict []string, compact bool) []byte {
+	return appendDictSection(nil, dict, compact)
+}
+
+// appendDictSection is marshalDictSection appending to dst, which is how a group
+// is written: the section goes straight into the group's buffer. The first
+// values and the block index are laid out before the blocks are compressed,
+// each block is compressed into place, and one raw-block buffer serves the
+// whole section. The bytes are the ones the section always had
+// (TestDictSectionMatchesReference); what changed is that a flush no longer makes
+// a buffer per block, a growing copy of every compressed block, and a copy of the
+// whole section on top of the group's.
+func appendDictSection(dst []byte, dict []string, compact bool) []byte {
 	n := len(dict)
 	numBlocks := 0
 	if n > 0 {
 		numBlocks = (n + dictBlock - 1) / dictBlock
 	}
-	var fvStr []byte
-	fvOff := make([]uint32, numBlocks+1)
-	type bi struct{ compOff, compLen, rawLen uint32 }
-	idx := make([]bi, numBlocks)
-	var comp []byte
-	for k := 0; k < numBlocks; k++ {
-		lo := k * dictBlock
-		hi := lo + dictBlock
-		if hi > n {
-			hi = n
-		}
-		fvOff[k] = uint32(len(fvStr))
-		fvStr = append(fvStr, dict[lo]...)
-		raw := marshalRawBlock(dict[lo:hi])
-		var c []byte
-		rawLen := uint32(len(raw))
-		switch {
-		case allLowerHex(dict[lo:hi]): // hex codec wins on size and speed, both modes
-			c = hexPackBlock(raw, hi-lo)
-			rawLen |= dictCodecHex
-		case compact:
-			c = flateCompress(raw)
-			rawLen |= dictCodecFlate
-		default:
-			c = lz4Compress(raw)
-		}
-		idx[k] = bi{uint32(len(comp)), uint32(len(c)), rawLen}
-		comp = append(comp, c...)
+	fvLen := 0
+	for k := range numBlocks {
+		fvLen += len(dict[k*dictBlock])
 	}
-	fvOff[numBlocks] = uint32(len(fvStr))
-
-	out := make([]byte, 0, 8+4*(numBlocks+1)+4+len(fvStr)+numBlocks*12+4+len(comp))
+	out := growDouble(dst, 8+4*(numBlocks+1)+4+fvLen+12*numBlocks+4)
 	out = appU32(out, uint32(numBlocks))
 	out = appU32(out, dictBlock)
-	for _, o := range fvOff {
-		out = appU32(out, o)
+	off := 0
+	for k := range numBlocks {
+		out = appU32(out, uint32(off))
+		off += len(dict[k*dictBlock])
 	}
-	out = appU32(out, uint32(len(fvStr)))
-	out = append(out, fvStr...)
-	for _, e := range idx {
-		out = appU32(out, e.compOff)
-		out = appU32(out, e.compLen)
-		out = appU32(out, e.rawLen)
+	out = appU32(out, uint32(fvLen))
+	out = appU32(out, uint32(fvLen))
+	for k := range numBlocks {
+		out = append(out, dict[k*dictBlock]...)
 	}
-	out = appU32(out, uint32(len(comp)))
-	out = append(out, comp...)
+	idxAt := len(out)
+	out = out[:idxAt+12*numBlocks+4] // the block index and the compressed length, filled in below
+	compAt := len(out)
+	var raw []byte
+	for k := range numBlocks {
+		lo := k * dictBlock
+		hi := min(lo+dictBlock, n)
+		raw = appendRawBlock(raw[:0], dict[lo:hi])
+		rawLen := uint32(len(raw))
+		start := len(out)
+		switch {
+		case allLowerHex(dict[lo:hi]): // hex codec wins on size and speed, both modes
+			out = appendHexPackBlock(out, raw, hi-lo)
+			rawLen |= dictCodecHex
+		case compact:
+			out = append(out, flateCompress(raw)...)
+			rawLen |= dictCodecFlate
+		default:
+			out = lz4CompressAppend(growDouble(out, lz4Bound(len(raw))), raw)
+		}
+		e := out[idxAt+12*k:]
+		binary.LittleEndian.PutUint32(e, uint32(start-compAt))
+		binary.LittleEndian.PutUint32(e[4:], uint32(len(out)-start))
+		binary.LittleEndian.PutUint32(e[8:], rawLen)
+	}
+	binary.LittleEndian.PutUint32(out[compAt-4:], uint32(len(out)-compAt))
 	return out
 }
 

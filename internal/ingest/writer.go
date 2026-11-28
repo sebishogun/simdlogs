@@ -948,10 +948,13 @@ func (w *Writer) flushLocked() {
 		receipt: w.nextReceipt}
 	w.nextReceipt = ""
 
-	// Fresh buffers; the job owns the handed-off ones.
+	// Fresh buffers; the job owns the handed-off ones. The timestamps are sized
+	// as the declared columns are, from this group's row count: at FlushRows a
+	// host flushing small groups held 1 MiB of them per writer, and threw that
+	// much away at every flush.
 	w.lastRows = len(w.ts)
 	w.gen++
-	w.ts = make([]int64, 0, FlushRows)
+	w.ts = make([]int64, 0, w.rowHint())
 	w.cols = map[string]*colBuf{}
 	w.vecs = map[string][]float32{}
 	w.colOrder = nil

@@ -217,6 +217,70 @@ func TestSmallGroupsGetMerged(t *testing.T) {
 	}
 }
 
+// addGroups writes groups of rows old enough to merge; row n of the store says msg(n).
+func addGroups(t *testing.T, db *DB, groups, rows int, msg func(n int) string) {
+	t.Helper()
+	cols, err := db.Columns("_msg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour).UnixNano()
+	at, msgs := make([]int64, rows), make([]string, rows)
+	for g := range groups {
+		for i := range rows {
+			n := g*rows + i
+			at[i], msgs[i] = old+int64(n), msg(n)
+		}
+		if err := cols.Add(at, msgs); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A group over compactMaxGroupBytes is left as it is: merging eight of 1 MiB, as a binary stream
+// leaves them, held 32 MiB of heap for one group that saved nothing.
+func TestMaintenanceLeavesBigGroups(t *testing.T) {
+	db := open(t, nil)
+	addGroups(t, db, 8, 256, func(n int) string {
+		var b strings.Builder
+		for i := n; b.Len() < 4096; i++ {
+			fmt.Fprintf(&b, "%08x", uint32(i)*2654435761)
+		}
+		return b.String()
+	})
+	before := db.store.Len()
+	db.enforce()
+	if after := db.store.Len(); after != before {
+		t.Fatalf("%d groups of over %d bytes became %d", before, compactMaxGroupBytes, after)
+	}
+}
+
+// Small groups merge into outputs of at most compactMaxRows, and every row stays.
+func TestMergedGroupsHoldAtMostMaxRows(t *testing.T) {
+	db := open(t, nil)
+	addGroups(t, db, 32, 2048, func(n int) string { return fmt.Sprintf("level=info msg=served size%d", n%97) })
+	want := len(search(t, db, "size5", SearchOptions{}))
+	db.enforce()
+	groups := db.store.Groups(0, time.Now().UnixNano())
+	total := 0
+	for _, g := range groups {
+		if g.Rows > compactMaxRows {
+			t.Fatalf("a merged group holds %d rows, over %d", g.Rows, compactMaxRows)
+		}
+		total += g.Rows
+	}
+	// 64 Ki rows in outputs of 16 Ki: four groups, where an output of 64 Ki rows made one and held 19 MiB.
+	if len(groups) < 4 || len(groups) >= 32 || total != 32*2048 {
+		t.Fatalf("%d groups holding %d rows, %d bytes on disk", len(groups), total, db.DiskBytes())
+	}
+	if got := len(search(t, db, "size5", SearchOptions{})); got != want || want == 0 {
+		t.Fatalf("%d rows say size5 after the merge, %d before", got, want)
+	}
+}
+
 func TestOpenRefusesNonsense(t *testing.T) {
 	if _, err := Open(Config{}); err == nil {
 		t.Fatal("no directory")
